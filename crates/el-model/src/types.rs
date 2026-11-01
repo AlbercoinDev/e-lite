@@ -219,6 +219,25 @@ impl Chain {
         50001
     }
 
+    pub fn default_p2p_port(self) -> u16 {
+        match self {
+            Chain::Mainnet => 8333,
+            Chain::Testnet4 => 48333,
+            Chain::Signet => 38333,
+            Chain::Regtest => 18444,
+        }
+    }
+
+    /// P2P network magic bytes.
+    pub fn magic(self) -> [u8; 4] {
+        match self {
+            Chain::Mainnet => [0xf9, 0xbe, 0xb4, 0xd9],
+            Chain::Testnet4 => [0x1c, 0x16, 0x3f, 0x28],
+            Chain::Signet => [0x0a, 0x03, 0xcf, 0x40],
+            Chain::Regtest => [0xfa, 0xbf, 0xb5, 0xda],
+        }
+    }
+
     /// Known genesis hash, when we can pin it without trusting the node.
     pub fn known_genesis(self) -> Option<Hash32> {
         let hex = match self {

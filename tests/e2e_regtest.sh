@@ -79,11 +79,23 @@ assert bal["confirmed"] > 0
 assert len(call(5, "blockchain.scripthash.listunspent", [sh])) == len(h)
 assert len(call(6, "blockchain.block.header", [0])) == 160
 txid, txheight = h[0]["tx_hash"], h[0]["height"]
-assert len(call(7, "blockchain.transaction.get", [txid])) > 100
-assert call(8, "blockchain.transaction.get_merkle", [txid, txheight])["pos"] >= 0
-assert call(9, "blockchain.transaction.id_from_pos", [txheight, 0, False]) == txid
-assert call(10, "blockchain.scripthash.get_history", ["00"*32]) == []
+raw1 = call(7, "blockchain.transaction.get", [txid])
+assert len(raw1) > 100
+assert call(8, "blockchain.transaction.get", [txid]) == raw1
+assert call(9, "blockchain.transaction.get_merkle", [txid, txheight])["pos"] >= 0
+assert call(10, "blockchain.transaction.id_from_pos", [txheight, 0, False]) == txid
+assert call(11, "blockchain.scripthash.get_history", ["00"*32]) == []
 print("electrum queries OK")
+PY
+
+STATUS=$(curl -s "http://127.0.0.1:$METRICS_PORT/status")
+python3 - "$STATUS" <<'PY'
+import json, sys
+raw = json.loads(sys.argv[1])["rawtx"]
+assert raw["cache_puts"] >= 1, raw
+assert raw["cache_hits"] >= 1, raw
+assert raw["unavailable"] == 0, raw
+print("rawtx cache:", raw)
 PY
 
 echo "e2e regtest OK (height $HEIGHT)"

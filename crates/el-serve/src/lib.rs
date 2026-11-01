@@ -4,6 +4,7 @@
 //! under the write lock, so no response mixes two tips.
 
 use el_model::{merkle_branch, Hash32, NetworkIdentity, ScriptHash};
+use el_rawtx::Resolver;
 use el_rpc::CoreClient;
 use el_store::Store;
 use serde_json::{json, Value};
@@ -68,6 +69,7 @@ impl Default for Stats {
 pub struct Shared {
     pub store: Arc<Store>,
     pub core: CoreClient,
+    pub resolver: Arc<Resolver>,
     pub identity: NetworkIdentity,
     pub data_dir: std::path::PathBuf,
     pub listen: String,
@@ -92,6 +94,7 @@ impl Shared {
             _ => (0, 0, String::new()),
         };
         let core_height = self.stats.core_height.load(Ordering::Relaxed);
+        let rawtx = self.resolver.stats();
         json!({
             "version": VERSION,
             "network": self.identity.chain.name(),
@@ -112,6 +115,16 @@ impl Shared {
             "uptime_seconds": self.stats.started.elapsed().as_secs(),
             "listen": self.listen,
             "protocol": PROTOCOL_MAX,
+            "rawtx": {
+                "cache_hits": rawtx.cache_hits.load(Ordering::Relaxed),
+                "cache_puts": rawtx.cache_puts.load(Ordering::Relaxed),
+                "fetches": rawtx.fetches.load(Ordering::Relaxed),
+                "bytes": rawtx.bytes.load(Ordering::Relaxed),
+                "verify_failures": rawtx.verify_failures.load(Ordering::Relaxed),
+                "decoys": rawtx.decoys.load(Ordering::Relaxed),
+                "unavailable": rawtx.unavailable.load(Ordering::Relaxed),
+                "external_sources": self.resolver.external_sources(),
+            },
         })
     }
 }
@@ -452,15 +465,10 @@ fn transaction_get(shared: &Shared, params: &Value) -> RpcResult<Value> {
         .first()
         .copied()
         .ok_or_else(|| RpcError::server("transaction not found in the active chain"))?;
-    let rec = shared
-        .store
-        .get_block(height)
-        .map_err(|e| RpcError::server(e.to_string()))?
-        .ok_or_else(|| RpcError::server("block missing"))?;
     let raw = shared
-        .core
-        .raw_transaction_hex(txid, &rec.hash.to_hex())
-        .map_err(|e| RpcError::server(format!("rawtx unavailable: {e}")))?;
+        .resolver
+        .raw_tx(txid_hash, height)
+        .map_err(|e| RpcError::server(e.to_string()))?;
     Ok(json!(raw))
 }
 

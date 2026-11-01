@@ -159,6 +159,11 @@ impl CoreClient {
         )
     }
 
+    /// Peer addresses known to the local Core (no public DNS lookup).
+    pub fn node_addresses(&self, count: u32) -> Result<Vec<NodeAddress>> {
+        self.call("getnodeaddresses", serde_json::json!([count]))
+    }
+
     pub fn mempool_txids(&self) -> Result<Vec<String>> {
         self.call("getrawmempool", serde_json::json!([false]))
     }
@@ -167,6 +172,14 @@ impl CoreClient {
         let _: serde_json::Value = self.call("getblockcount", serde_json::json!([]))?;
         Ok(())
     }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct NodeAddress {
+    pub address: String,
+    pub port: u16,
+    #[serde(default)]
+    pub services: u64,
 }
 
 #[derive(Debug, Clone, Deserialize)]

@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.1.0-alpha.3 — 2026-11-01
+
+- **Pruned Core support for serving**: the index must already cover the chain;
+  `doctor` and the indexer refuse a prune gap with a clear message.
+- **Raw transaction resolver** with a strict order: local Core -> validated cache
+  -> external sources. Whole blocks only, never TXID lookups.
+- **Verification**: block hash/header against the local chain, Merkle root, TXID
+  and BIP141 witness commitment. Invalid data is never served or cached.
+- **Sources**: Esplora-compatible `/block/:hash/raw` endpoints and a minimal
+  Bitcoin P2P client (version/verack, getdata, NODE_NETWORK filtering).
+- **Privacy defaults**: Tor SOCKS5h with stream isolation and fail-closed without
+  Tor; 3 decoys per external fetch; 10 GiB validated LRU cache; no sensitive
+  labels in metrics.
+- `transaction.get` serves from the cache on the second access.
+- New `[rawtx]` configuration and `rawtx` counters in `/status` and `/metrics`.
+- Tests: witness/Merkle verification, cache eviction, source fallback, decoys,
+  fail-closed Tor, P2P handshake, prune-gap guard, plus live Esplora and live P2P
+  checks against real endpoints.
+
 ## 0.1.0-alpha.2 — 2026-11-01
 
 - Fix: the undo-record reader required 85 bytes per spent input instead of the

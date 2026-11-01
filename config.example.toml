@@ -25,5 +25,20 @@ max_clients = 32
 enabled = true
 listen = "127.0.0.1:9184"            # /status, /metrics, /healthz
 
+[rawtx]
+# Raw transactions for pruned blocks. Whole blocks only; verified before serving.
+cache_gib = 10                       # validated LRU cache (0 disables)
+decoys = 3                           # extra blocks fetched per real fetch
+tor_socks = "127.0.0.1:9050"         # empty requires allow_clearnet = true
+allow_clearnet = false               # fail closed without Tor
+use_p2p = true                       # minimal P2P client (v1 transport)
+use_esplora = true                   # Esplora-compatible block endpoints
+p2p_peers = []                       # empty: discover from local Core
+p2p_timeout_seconds = 20
+esplora_urls = [
+  "http://mempoolhqx4isw62xs7abwphsq7ldayuidyx2v2oethdhhj6mlo2r6ad.onion/api",
+  "https://blockstream.info/api",
+]
+
 [safety]
 allow_mainnet = false                # mainnet requires explicit opt-in

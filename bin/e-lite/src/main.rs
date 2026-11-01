@@ -5,7 +5,8 @@ use bitcoin::Block;
 use config::Config;
 use el_index::{apply_block, prune_undo, rewind_to, GroupOverlay};
 use el_model::{Chain, Hash32, IndexedTip, NetworkIdentity, ScriptHash};
-use el_rpc::{CoreClient, CoreConfig};
+use el_rawtx::{CoreBlockSource, RawtxConfig, Resolver};
+use el_rpc::{BlockchainInfo, CoreClient, CoreConfig};
 use el_serve::{state, Shared, Stats, VERSION};
 use el_store::Store;
 use rocksdb::WriteBatch;
@@ -365,18 +366,16 @@ fn cmd_doctor(cfg: &Config, chain: Chain) -> R<()> {
         Ok(n) => println!("core version: {} ({})", n.version, n.subversion.trim()),
         Err(e) => problems.push(format!("getnetworkinfo: {e}")),
     }
+    let mut core_pruned = false;
+    let mut pruneheight = 0u64;
     match core.blockchain_info() {
         Ok(info) => {
             println!(
                 "chain: {}  blocks: {}  headers: {}  pruned: {}  ibd: {}",
                 info.chain, info.blocks, info.headers, info.pruned, info.initialblockdownload
             );
-            if info.pruned {
-                problems.push(
-                    "Core is pruned and e-lite v0.1 only supports full-core: restart Core with prune=0"
-                        .to_string(),
-                );
-            }
+            core_pruned = info.pruned;
+            pruneheight = info.pruneheight;
         }
         Err(e) => problems.push(format!("getblockchaininfo: {e}")),
     }
@@ -386,6 +385,7 @@ fn cmd_doctor(cfg: &Config, chain: Chain) -> R<()> {
         Err(e) => problems.push(format!("identity: {e}")),
     }
 
+    let mut db_tip: Option<IndexedTip> = None;
     let db_dir = cfg.data_dir(chain);
     if !db_dir.exists() {
         println!("db: not initialized (run `e-lite init`)");
@@ -396,6 +396,7 @@ fn cmd_doctor(cfg: &Config, chain: Chain) -> R<()> {
                     Ok(Some(id)) => {
                         println!("db genesis: {}", id.genesis);
                         if let Ok(Some(tip)) = store.committed_tip() {
+                            db_tip = Some(tip);
                             println!(
                                 "db tip: {} {} (txnum {}, schema {})",
                                 tip.height, tip.block_hash, tip.txnum, tip.schema_version
@@ -410,6 +411,66 @@ fn cmd_doctor(cfg: &Config, chain: Chain) -> R<()> {
                 println!("db size: {} bytes", store.disk_usage_bytes());
             }
             Err(e) => problems.push(format!("open db: {e}")),
+        }
+    }
+
+    let tor = cfg.rawtx.tor_socks.clone().filter(|s| !s.trim().is_empty());
+    let external_enabled =
+        (cfg.rawtx.use_p2p || cfg.rawtx.use_esplora) && (tor.is_some() || cfg.rawtx.allow_clearnet);
+
+    if core_pruned {
+        match &db_tip {
+            None => problems.push(
+                "Core is pruned and the index is empty: build it with a full node or restore a snapshot"
+                    .to_string(),
+            ),
+            Some(t) if (t.height as u64) + 1 < pruneheight => problems.push(format!(
+                "Core is pruned from {} but the index stops at {}; missing blocks cannot be read",
+                pruneheight, t.height
+            )),
+            Some(t) => {
+                println!(
+                    "core pruned from {}; indexed tip {} is inside the retained window",
+                    pruneheight, t.height
+                );
+                println!("rawtx: old blocks will be resolved through verified external sources");
+                if !external_enabled {
+                    problems.push(
+                        "old rawtx will be unavailable: Core is pruned and no external source is enabled (Tor required by default)"
+                            .to_string(),
+                    );
+                }
+            }
+        }
+    }
+    if (cfg.rawtx.use_p2p || cfg.rawtx.use_esplora) && tor.is_none() && !cfg.rawtx.allow_clearnet {
+        problems.push(
+            "rawtx external sources disabled: Tor is required (tor_socks) or set allow_clearnet=true"
+                .to_string(),
+        );
+    }
+    if let Some(t) = &tor {
+        match t.parse::<std::net::SocketAddr>() {
+            Ok(addr) => match TcpStream::connect_timeout(&addr, Duration::from_secs(2)) {
+                Ok(_) => println!("tor proxy {}: reachable", t),
+                Err(e) => println!(
+                    "tor proxy {}: not reachable ({e}); external rawtx will be degraded",
+                    t
+                ),
+            },
+            Err(_) => println!("tor proxy {}: invalid address", t),
+        }
+    }
+    if cfg.rawtx.cache_gib > 0 {
+        let dir = cfg.data_dir(chain).join("rawtx-cache");
+        match std::fs::create_dir_all(&dir) {
+            Ok(_) => println!(
+                "rawtx cache: {} ({} GiB max, {} decoys)",
+                dir.display(),
+                cfg.rawtx.cache_gib,
+                cfg.rawtx.decoys
+            ),
+            Err(e) => problems.push(format!("rawtx cache {}: {e}", dir.display())),
         }
     }
 
@@ -585,9 +646,11 @@ impl Indexer {
         let info = self.core.blockchain_info()?;
         let core_tip = info.blocks;
         self.stats_core_height(core_tip);
+        let tip_at_start = self.store.committed_tip()?;
+        check_pruned(&info, tip_at_start.as_ref())?;
         self.handle_reorg(core_tip)?;
 
-        let mut tip = self.store.committed_tip()?;
+        let mut tip = tip_at_start;
         let start = tip.map(|t| t.height as u64 + 1).unwrap_or(0);
         if start > core_tip {
             return Ok(tip.map(|t| t.height as u64).unwrap_or(0));
@@ -722,13 +785,74 @@ fn cmd_index(cfg: &Config, chain: Chain) -> R<()> {
     }
 }
 
+/// A pruned Core can serve only if the local index already covers the gap.
+fn check_pruned(info: &BlockchainInfo, tip: Option<&IndexedTip>) -> R<()> {
+    if !info.pruned {
+        return Ok(());
+    }
+    let tip = tip.ok_or(
+        "Core is pruned and the index is empty: build the index with a full node or restore a snapshot",
+    )?;
+    if (tip.height as u64) + 1 < info.pruneheight {
+        return fail(format!(
+            "Core is pruned from height {} but the index stops at {}; blocks {}..{} are unavailable. Use a full node to build the index or restore a snapshot.",
+            info.pruneheight,
+            tip.height,
+            tip.height + 1,
+            info.pruneheight.saturating_sub(1)
+        ));
+    }
+    Ok(())
+}
+
+fn build_resolver(
+    cfg: &Config,
+    chain: Chain,
+    store: &Arc<Store>,
+    core: &CoreClient,
+) -> R<Arc<Resolver>> {
+    let mut peers = cfg.rawtx.p2p_peers.clone();
+    if cfg.rawtx.use_p2p && peers.is_empty() {
+        match core.node_addresses(64) {
+            Ok(addrs) => {
+                peers = addrs
+                    .into_iter()
+                    .filter(|a| a.services & 1 != 0)
+                    .map(|a| format!("{}:{}", a.address, a.port))
+                    .collect();
+                println!("p2p peers discovered from Core: {}", peers.len());
+            }
+            Err(e) => eprintln!("[e-lite] p2p discovery failed: {e}"),
+        }
+    }
+    let tor = cfg.rawtx.tor_socks.clone().filter(|s| !s.trim().is_empty());
+    let rc = RawtxConfig {
+        cache_gib: cfg.rawtx.cache_gib,
+        decoys: cfg.rawtx.decoys,
+        tor_socks: tor,
+        allow_clearnet: cfg.rawtx.allow_clearnet,
+        use_p2p: cfg.rawtx.use_p2p,
+        use_esplora: cfg.rawtx.use_esplora,
+        esplora_urls: cfg.rawtx.esplora_urls.clone(),
+        p2p_peers: peers,
+        p2p_timeout: Duration::from_secs(cfg.rawtx.p2p_timeout_seconds.max(1)),
+        chain,
+    };
+    let resolver = Resolver::new(Arc::clone(store), &rc)?;
+    Ok(Arc::new(
+        resolver.with_local(Arc::new(CoreBlockSource::new(core.clone()))),
+    ))
+}
+
 fn build_shared(cfg: &Config, chain: Chain) -> R<Arc<Shared>> {
     let store = open_store(cfg, chain)?;
     let core = core_client(cfg, chain)?;
     let identity = require_identity(&store, cfg, chain, &core)?;
+    let resolver = build_resolver(cfg, chain, &store, &core)?;
     let shared = Arc::new(Shared {
         store,
         core,
+        resolver,
         identity,
         data_dir: cfg.data_dir(chain),
         listen: cfg.server.listen.clone(),
@@ -753,7 +877,9 @@ fn start_transports(shared: &Arc<Shared>, cfg: &Config) -> R<()> {
 
 fn cmd_serve(cfg: &Config, chain: Chain) -> R<()> {
     let shared = build_shared(cfg, chain)?;
-    let core_tip = shared.core.blockchain_info()?.blocks;
+    let info = shared.core.blockchain_info()?;
+    check_pruned(&info, shared.store.committed_tip()?.as_ref())?;
+    let core_tip = info.blocks;
     shared.stats.core_height.store(core_tip, Ordering::Relaxed);
     let tip = shared
         .store
@@ -916,4 +1042,54 @@ fn http_get(addr: &str, path: &str) -> R<String> {
         .map(|(_, b)| b.to_string())
         .ok_or("malformed HTTP response")?;
     Ok(body)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn info(pruned: bool, pruneheight: u64) -> BlockchainInfo {
+        BlockchainInfo {
+            chain: "signet".to_string(),
+            blocks: 1000,
+            headers: 1000,
+            pruned,
+            pruneheight,
+            initialblockdownload: false,
+            signet_challenge: None,
+            verificationprogress: 1.0,
+        }
+    }
+
+    fn tip(height: u32) -> IndexedTip {
+        IndexedTip {
+            height,
+            block_hash: Hash32::ZERO,
+            schema_version: el_model::codec::SCHEMA_VERSION,
+            txnum: 0,
+        }
+    }
+
+    #[test]
+    fn full_node_allows_any_tip() {
+        assert!(check_pruned(&info(false, 0), None).is_ok());
+    }
+
+    #[test]
+    fn pruned_with_empty_index_is_rejected() {
+        assert!(check_pruned(&info(true, 100), None).is_err());
+    }
+
+    #[test]
+    fn pruned_gap_is_rejected() {
+        // Index stops at 50, Core only has blocks from 100 onwards.
+        assert!(check_pruned(&info(true, 100), Some(&tip(50))).is_err());
+        assert!(check_pruned(&info(true, 100), Some(&tip(98))).is_err());
+    }
+
+    #[test]
+    fn pruned_with_covered_tip_is_allowed() {
+        assert!(check_pruned(&info(true, 100), Some(&tip(99))).is_ok());
+        assert!(check_pruned(&info(true, 100), Some(&tip(150))).is_ok());
+    }
 }

@@ -4,6 +4,7 @@ use el_model::{
     BlockRecord, Chain, Hash32, HistoryEffect, IndexedTip, NetworkIdentity, Outpoint, ScriptHash,
     UtxoValue,
 };
+use el_rawtx::{RawtxConfig, Resolver};
 use el_rpc::{CoreClient, CoreConfig};
 use el_serve::{process_line, state, Shared, Stats};
 use el_store::Store;
@@ -104,9 +105,29 @@ fn fixture() -> (Fixture, ScriptHash, Hash32) {
     })
     .unwrap();
 
+    let resolver = Arc::new(
+        Resolver::new(
+            Arc::clone(&store),
+            &RawtxConfig {
+                cache_gib: 0,
+                decoys: 0,
+                tor_socks: None,
+                allow_clearnet: true,
+                use_p2p: false,
+                use_esplora: false,
+                esplora_urls: Vec::new(),
+                p2p_peers: Vec::new(),
+                p2p_timeout: Duration::from_secs(1),
+                chain,
+            },
+        )
+        .unwrap(),
+    );
+
     let shared = Arc::new(Shared {
         store,
         core,
+        resolver,
         identity,
         data_dir: dir.clone(),
         listen: "127.0.0.1:0".to_string(),

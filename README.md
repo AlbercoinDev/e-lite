@@ -7,7 +7,7 @@ any `scriptPubKey` in the active chain — **without registering wallets**.
 loopback. Core remains the authority for consensus and the active chain; e-lite
 never invents data.
 
-> **Status: `v0.1.0-alpha.2` — experimental, no funds.**
+> **Status: `v0.1.0-alpha.3` — experimental, no funds.**
 > Confirmed chain only: mempool, notifications push and `broadcast` are not
 > implemented yet. Use on test networks first.
 
@@ -117,13 +117,53 @@ temporary error — never a misleading empty result.
 `get_balance`, `listunspent`, `subscribe`/`unsubscribe` (status only, no push),
 `blockchain.transaction.get`, `get_merkle`, `id_from_pos`.
 
+## Pruned Core and external raw transactions
+
+The index itself must be built from a full node or restored from a snapshot. Once
+built, e-lite can keep running against a **pruned** Core:
+
+- History, balance, UTXOs, headers and Merkle proofs come from the local index.
+- `transaction.get` resolves raw data in this order:
+  1. local Core block (zero external requests),
+  2. validated on-disk cache (10 GiB, LRU),
+  3. **whole-block** fetch from P2P peers and/or Esplora-compatible endpoints,
+  4. verify header hash, Merkle root, TXID and witness commitment, then cache.
+- External traffic goes through **Tor** (`tor_socks`, stream isolation). Without
+  Tor it fails closed unless `allow_clearnet = true`.
+- Each external fetch is padded with `decoys = 3` additional blocks, and requests
+  never mention a TXID.
+- If no source can supply a block, the client gets an explicit error; history and
+  balances remain available (`DEGRADED_RAWTX`).
+
+```toml
+[rawtx]
+cache_gib = 10
+decoys = 3
+tor_socks = "127.0.0.1:9050"
+allow_clearnet = false
+use_p2p = true
+use_esplora = true
+p2p_peers = []          # empty: discovered from the local Core (getnodeaddresses)
+p2p_timeout_seconds = 20
+esplora_urls = [
+  "http://mempoolhqx4isw62xs7abwphsq7ldayuidyx2v2oethdhhj6mlo2r6ad.onion/api",
+  "https://blockstream.info/api",
+]
+```
+
+Pruning becomes a problem only if Core prunes blocks the index has not reached
+yet. `doctor` reports that and refuses to index a gap.
+
 ## Limitations (v0.1)
 
 - Confirmed chain only: no mempool overlay, no push notifications, no
   `broadcast`/`estimatefee`.
 - `full-core` only (Core `prune=0`).
-- Raw transactions require the block to still exist in Core; otherwise the error
-  is explicit (`rawtx unavailable`), never invented data.
+- Raw transactions require the block to still exist in Core or in a configured
+  external source; otherwise the error is explicit, never invented data.
+- P2P currently uses the v1 transport; BIP324 v2 is pending.
+- External rawtx requires Tor by default, so a missing Tor daemon degrades
+  `transaction.get` for pruned blocks (history/balances still work).
 - Deep reorganizations beyond `reorg_window` stop with `NEEDS_RECOVERY`.
 - No systemd unit and no aarch64 build.
 

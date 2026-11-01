@@ -15,6 +15,8 @@ pub struct Config {
     pub metrics: MetricsCfg,
     #[serde(default)]
     pub safety: SafetyCfg,
+    #[serde(default)]
+    pub rawtx: RawtxCfg,
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -112,6 +114,63 @@ impl Default for MetricsCfg {
             listen: d_metrics(),
         }
     }
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct RawtxCfg {
+    #[serde(default = "d_cache_gib")]
+    pub cache_gib: u64,
+    #[serde(default = "d_decoys")]
+    pub decoys: u32,
+    #[serde(default = "d_tor_socks")]
+    pub tor_socks: Option<String>,
+    #[serde(default)]
+    pub allow_clearnet: bool,
+    #[serde(default = "d_true")]
+    pub use_p2p: bool,
+    #[serde(default = "d_true")]
+    pub use_esplora: bool,
+    #[serde(default = "d_esplora_urls")]
+    pub esplora_urls: Vec<String>,
+    #[serde(default)]
+    pub p2p_peers: Vec<String>,
+    #[serde(default = "d_p2p_timeout")]
+    pub p2p_timeout_seconds: u64,
+}
+
+impl Default for RawtxCfg {
+    fn default() -> Self {
+        RawtxCfg {
+            cache_gib: d_cache_gib(),
+            decoys: d_decoys(),
+            tor_socks: d_tor_socks(),
+            allow_clearnet: false,
+            use_p2p: true,
+            use_esplora: true,
+            esplora_urls: d_esplora_urls(),
+            p2p_peers: Vec::new(),
+            p2p_timeout_seconds: d_p2p_timeout(),
+        }
+    }
+}
+
+fn d_cache_gib() -> u64 {
+    10
+}
+fn d_decoys() -> u32 {
+    3
+}
+fn d_tor_socks() -> Option<String> {
+    Some("127.0.0.1:9050".to_string())
+}
+fn d_p2p_timeout() -> u64 {
+    20
+}
+fn d_esplora_urls() -> Vec<String> {
+    vec![
+        "http://mempoolhqx4isw62xs7abwphsq7ldayuidyx2v2oethdhhj6mlo2r6ad.onion/api".to_string(),
+        "https://blockstream.info/api".to_string(),
+    ]
 }
 
 #[derive(Debug, Clone, serde::Deserialize, Default)]

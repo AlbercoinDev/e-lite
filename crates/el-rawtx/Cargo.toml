@@ -1,0 +1,18 @@
+[package]
+name = "el-rawtx"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+el-model = { path = "../el-model" }
+el-store = { path = "../el-store" }
+el-rpc = { path = "../el-rpc" }
+bitcoin.workspace = true
+sha2.workspace = true
+hex.workspace = true
+reqwest.workspace = true
+socks.workspace = true
+rand.workspace = true
+filetime.workspace = true

@@ -16,6 +16,7 @@ el-store = { path = "../../crates/el-store" }
 el-index = { path = "../../crates/el-index" }
 el-rpc = { path = "../../crates/el-rpc" }
 el-serve = { path = "../../crates/el-serve" }
+el-rawtx = { path = "../../crates/el-rawtx" }
 bitcoin.workspace = true
 rocksdb.workspace = true
 serde.workspace = true
