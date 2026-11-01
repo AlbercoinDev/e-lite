@@ -8,6 +8,16 @@ use std::fmt;
 pub const SCHEMA_VERSION: u32 = 1;
 pub const UNDO_MAGIC: u32 = 0x454C_5544; // "ELUD"
 
+// Exact byte sizes of one undo entry per section. Keep writer and reader in
+// sync through these constants (a mismatch here previously made valid records
+// unreadable).
+pub const UNDO_SPENT_LEN: usize = 32 + 4 + 8 + 32 + 4 + 1; // 81
+pub const UNDO_CREATED_LEN: usize = 32 + 4 + 32; // 68
+pub const UNDO_HISTORY_LEN: usize = 32 + 4 + 4; // 40
+pub const UNDO_TXID_LEN: usize = 32;
+/// magic + schema + height + block_hash + four counts + checksum
+pub const UNDO_MIN_LEN: usize = 4 + 4 + 4 + 32 + 4 * 4 + 32; // 92
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CodecError(pub String);
 
@@ -287,10 +297,10 @@ fn push_u64(out: &mut Vec<u8>, v: u64) {
 pub fn undo_value(r: &UndoRecord) -> Vec<u8> {
     let mut out = Vec::with_capacity(
         16 + 32
-            + (r.spent.len() * 85)
-            + (r.created.len() * 68)
-            + (r.history.len() * 40)
-            + (r.txids.len() * 32)
+            + (r.spent.len() * UNDO_SPENT_LEN)
+            + (r.created.len() * UNDO_CREATED_LEN)
+            + (r.history.len() * UNDO_HISTORY_LEN)
+            + (r.txids.len() * UNDO_TXID_LEN)
             + 16,
     );
     push_u32(&mut out, UNDO_MAGIC);
@@ -333,7 +343,7 @@ pub fn undo_value(r: &UndoRecord) -> Vec<u8> {
 }
 
 pub fn parse_undo_value(buf: &[u8]) -> Result<UndoRecord> {
-    if buf.len() < 16 + 32 + 4 * 4 + 32 {
+    if buf.len() < UNDO_MIN_LEN {
         return err("undo record too short");
     }
     let body_len = buf.len() - 32;
@@ -359,7 +369,10 @@ pub fn parse_undo_value(buf: &[u8]) -> Result<UndoRecord> {
 
     let spent_n = get_u32(body, off)? as usize;
     off += 4;
-    if spent_n.checked_mul(85).is_none_or(|n| n > body.len() - off) {
+    if spent_n
+        .checked_mul(UNDO_SPENT_LEN)
+        .is_none_or(|n| n > body.len() - off)
+    {
         return err("impossible spent count");
     }
     let mut spent = Vec::with_capacity(spent_n);
@@ -391,7 +404,7 @@ pub fn parse_undo_value(buf: &[u8]) -> Result<UndoRecord> {
     let created_n = get_u32(body, off)? as usize;
     off += 4;
     if created_n
-        .checked_mul(68)
+        .checked_mul(UNDO_CREATED_LEN)
         .is_none_or(|n| n > body.len() - off)
     {
         return err("impossible created count");
@@ -413,7 +426,10 @@ pub fn parse_undo_value(buf: &[u8]) -> Result<UndoRecord> {
 
     let hist_n = get_u32(body, off)? as usize;
     off += 4;
-    if hist_n.checked_mul(40).is_none_or(|n| n > body.len() - off) {
+    if hist_n
+        .checked_mul(UNDO_HISTORY_LEN)
+        .is_none_or(|n| n > body.len() - off)
+    {
         return err("impossible history count");
     }
     let mut history = Vec::with_capacity(hist_n);
@@ -431,7 +447,10 @@ pub fn parse_undo_value(buf: &[u8]) -> Result<UndoRecord> {
 
     let tx_n = get_u32(body, off)? as usize;
     off += 4;
-    if tx_n.checked_mul(32).is_none_or(|n| n > body.len() - off) {
+    if tx_n
+        .checked_mul(UNDO_TXID_LEN)
+        .is_none_or(|n| n > body.len() - off)
+    {
         return err("impossible txid count");
     }
     let mut txids = Vec::with_capacity(tx_n);
@@ -498,6 +517,58 @@ mod tests {
         let mut bad = enc.clone();
         bad[50] ^= 0xff;
         assert!(parse_undo_value(&bad).is_err());
+    }
+
+    #[test]
+    fn undo_minimal_roundtrip() {
+        let r = UndoRecord {
+            height: 1,
+            block_hash: Hash32::from_hex(&"aa".repeat(32)).unwrap(),
+            ..Default::default()
+        };
+        let enc = undo_value(&r);
+        assert_eq!(enc.len(), UNDO_MIN_LEN);
+        assert_eq!(parse_undo_value(&enc).unwrap(), r);
+        // One byte less must be rejected, not panic.
+        assert!(parse_undo_value(&enc[..UNDO_MIN_LEN - 1]).is_err());
+    }
+
+    /// Regression: a block with many spent inputs and almost no other sections.
+    /// The reader used to require 85 bytes per spent entry (the encoder writes
+    /// 81), so a valid record failed with "impossible spent count".
+    #[test]
+    fn undo_spent_heavy_roundtrip() {
+        let mut spent = Vec::new();
+        for i in 0..1000u32 {
+            let mut txid = [0u8; 32];
+            txid[0..4].copy_from_slice(&i.to_be_bytes());
+            spent.push(UndoSpent {
+                outpoint: Outpoint {
+                    txid: Hash32(txid),
+                    vout: i,
+                },
+                utxo: UtxoValue {
+                    value_sat: 1_000 + i as u64,
+                    script_hash: ScriptHash(Hash32([0x11; 32])),
+                    creation_height: i,
+                    coinbase: i % 2 == 0,
+                },
+            });
+        }
+        let r = UndoRecord {
+            height: 7,
+            block_hash: Hash32([0x22; 32]),
+            spent,
+            created: Vec::new(),
+            history: Vec::new(),
+            txids: vec![Hash32([0x33; 32])],
+        };
+        let enc = undo_value(&r);
+        assert_eq!(
+            enc.len(),
+            UNDO_MIN_LEN + 1000 * UNDO_SPENT_LEN + UNDO_TXID_LEN
+        );
+        assert_eq!(parse_undo_value(&enc).unwrap(), r);
     }
 
     #[test]

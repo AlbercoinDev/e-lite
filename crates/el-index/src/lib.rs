@@ -385,10 +385,11 @@ pub fn prune_undo(
     }
     let cutoff = tip_height - window;
     let start = cutoff.saturating_sub(64);
+    // Old undo records are outside the reorg window by definition, so deleting
+    // them is idempotent and does not require decoding them. Parsing here used
+    // to turn a codec bug into a hard indexing stop.
     for h in start..cutoff {
-        if store.get_undo(h)?.is_some() {
-            store.delete_undo(batch, h)?;
-        }
+        store.delete_undo(batch, h)?;
     }
     Ok(())
 }
@@ -584,6 +585,70 @@ mod tests {
             store.committed_tip().unwrap().unwrap().block_hash,
             hash_from_blockhash(&b[4].block_hash()).unwrap()
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn prune_undo_removes_old_records_and_keeps_recent_ones() {
+        failpoints::set(failpoints::NONE);
+        let dir = tmp("prune");
+        let store = Store::open(&dir).unwrap();
+        let mut batch = Store::batch();
+        for h in 0..20u32 {
+            // Input-heavy records: the case that broke the undo reader.
+            let mut spent = Vec::new();
+            for i in 0..200u32 {
+                let mut txid = [0u8; 32];
+                txid[0..4].copy_from_slice(&i.to_be_bytes());
+                txid[4..8].copy_from_slice(&h.to_be_bytes());
+                spent.push(UndoSpent {
+                    outpoint: Outpoint {
+                        txid: Hash32(txid),
+                        vout: i,
+                    },
+                    utxo: UtxoValue {
+                        value_sat: i as u64,
+                        script_hash: ScriptHash(Hash32([0x44; 32])),
+                        creation_height: h,
+                        coinbase: false,
+                    },
+                });
+            }
+            let rec = UndoRecord {
+                height: h,
+                block_hash: Hash32([h as u8; 32]),
+                spent,
+                created: Vec::new(),
+                history: Vec::new(),
+                txids: vec![Hash32([0x55; 32])],
+            };
+            store.put_undo(&mut batch, &rec).unwrap();
+        }
+        let tip_at_19 = IndexedTip {
+            height: 19,
+            block_hash: Hash32([19u8; 32]),
+            schema_version: SCHEMA_VERSION,
+            txnum: 0,
+        };
+        store.commit_tip_only(batch, &tip_at_19).unwrap();
+
+        let mut prune_batch = Store::batch();
+        prune_undo(&store, 19, 5, &mut prune_batch).unwrap();
+        store.commit_tip_only(prune_batch, &tip_at_19).unwrap();
+
+        for h in 0..14 {
+            assert!(
+                store.get_undo(h).unwrap().is_none(),
+                "height {h} should be pruned"
+            );
+        }
+        for h in 14..20 {
+            let rec = store
+                .get_undo(h)
+                .unwrap()
+                .unwrap_or_else(|| panic!("height {h} kept"));
+            assert_eq!(rec.spent.len(), 200);
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 

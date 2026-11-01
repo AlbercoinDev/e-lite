@@ -36,9 +36,9 @@ HEIGHT=$($CLI getblockcount)
 COMMON=(--network regtest --core-datadir "$CORE" --core-rpc "http://127.0.0.1:$RPC_PORT" --data-dir "$DATA")
 "$BIN" init "${COMMON[@]}"
 "$BIN" doctor "${COMMON[@]}" --listen "127.0.0.1:$ELECTRUM_PORT" --metrics "127.0.0.1:$METRICS_PORT"
-"$BIN" index "${COMMON[@]}" --no-follow --batch 16
+"$BIN" index "${COMMON[@]}" --no-follow --batch 16 --reorg-window 8
 
-"$BIN" run "${COMMON[@]}" --no-follow \
+"$BIN" run "${COMMON[@]}" --no-follow --reorg-window 8 \
   --listen "127.0.0.1:$ELECTRUM_PORT" --metrics "127.0.0.1:$METRICS_PORT" \
   >"$RUN/serve.log" 2>&1 &
 echo $! >"$RUN/serve.pid"

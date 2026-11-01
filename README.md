@@ -7,7 +7,7 @@ any `scriptPubKey` in the active chain — **without registering wallets**.
 loopback. Core remains the authority for consensus and the active chain; e-lite
 never invents data.
 
-> **Status: `v0.1.0-alpha.1` — experimental, no funds.**
+> **Status: `v0.1.0-alpha.2` — experimental, no funds.**
 > Confirmed chain only: mempool, notifications push and `broadcast` are not
 > implemented yet. Use on test networks first.
 
