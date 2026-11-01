@@ -136,6 +136,7 @@ fn fixture() -> (Fixture, ScriptHash, Hash32) {
         error_log: std::sync::Mutex::new(std::collections::HashMap::new()),
         clients: Arc::new(ClientRegistry::new()),
         readers: el_chain::ReaderTracker::new(),
+        silent_payments_enabled: false,
         identity,
         data_dir: dir.clone(),
         listen: "127.0.0.1:0".to_string(),
@@ -276,6 +277,25 @@ fn incompatible_protocol_is_rejected() {
     let (fx, _, _) = fixture();
     let r = call(&fx.shared, 1, "server.version", json!(["old", "1.2"]));
     assert_eq!(r["error"]["code"], -32000);
+}
+
+#[test]
+fn silent_payments_are_gated_with_an_explicit_error() {
+    let (fx, _, _) = fixture();
+    for method in [
+        "blockchain.silentpayments.subscribe",
+        "blockchain.silentpayments.unsubscribe",
+    ] {
+        let r = call(&fx.shared, 1, method, json!(["00", "00", 0, []]));
+        assert_eq!(r["error"]["code"], -32000, "{r}");
+        assert!(
+            r["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("silent payments"),
+            "{r}"
+        );
+    }
 }
 
 #[test]

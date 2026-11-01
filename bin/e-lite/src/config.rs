@@ -19,6 +19,8 @@ pub struct Config {
     pub rawtx: RawtxCfg,
     #[serde(default)]
     pub pruning: PruningCfg,
+    #[serde(default)]
+    pub silent_payments: SilentPaymentsCfg,
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -116,6 +118,14 @@ impl Default for MetricsCfg {
             listen: d_metrics(),
         }
     }
+}
+
+#[derive(Debug, Clone, serde::Deserialize, Default)]
+pub struct SilentPaymentsCfg {
+    /// Opt-in gate. The BIP352 indexer is not included yet; when disabled the
+    /// protocol methods return an explicit error instead of "unknown method".
+    #[serde(default)]
+    pub enabled: bool,
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]

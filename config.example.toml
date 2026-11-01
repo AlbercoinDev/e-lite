@@ -50,5 +50,8 @@ esplora_urls = [
   "https://blockstream.info/api",
 ]
 
+[silent_payments]
+enabled = false                      # opt-in gate; BIP352 indexer not included yet
+
 [safety]
 allow_mainnet = false                # mainnet requires explicit opt-in

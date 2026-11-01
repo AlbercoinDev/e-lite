@@ -7,7 +7,7 @@ any `scriptPubKey` in the active chain — **without registering wallets**.
 loopback. Core remains the authority for consensus and the active chain; e-lite
 never invents data.
 
-> **Status: `v0.1.0-alpha.7` — experimental, no funds.**
+> **Status: `v0.1.0-alpha.8` — experimental, no funds.**
 > Use on test networks first.
 
 ## Supported networks
@@ -205,6 +205,25 @@ removed, the request is retried only after the safe height advances by
 `min_gain_blocks`. Moving from `prune=1` to `prune=550` remains an explicit
 operator action with a restart.
 
+## Silent payments (opt-in, indexer pending)
+
+The protocol surface is reserved and gated:
+
+```toml
+[silent_payments]
+enabled = false   # default
+```
+
+- Disabled: `blockchain.silentpayments.subscribe`/`.unsubscribe` return an
+  explicit server error, not `unknown method`.
+- Enabled: the same methods return "no BIP352 indexer in this build" until the
+  indexer lands. The notification shape
+  `{subscription, progress, history:[{height, tx_hash, tweak_key}]}` is
+  documented in `docs/ADR-018-SILENT-PAYMENTS.md`.
+- Normal wallets are unaffected. The scan private key is **never** logged or
+  persisted; the future indexer also needs prevout pubkeys (schema v2) or
+  on-demand block re-reading.
+
 ## Backup and restore
 
 Stop e-lite first: RocksDB holds an exclusive lock.
@@ -228,8 +247,8 @@ and exit with code 0. No partial checkpoint is published.
 
 ## Limitations (v0.1)
 
-- `blockchain.silentpayments.*` is not implemented (normal wallets are
-  unaffected).
+- `blockchain.silentpayments.*` is gated but the BIP352 indexer is not included
+  yet; see `docs/ADR-018-SILENT-PAYMENTS.md`.
 - Real Sparrow/Electrum validation on Signet is still pending operator testing;
   the automated suite reproduces Sparrow's connect and wallet flow.
 - The index must be built with a full node (or restored from a snapshot); serving

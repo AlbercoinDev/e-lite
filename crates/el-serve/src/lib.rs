@@ -176,6 +176,7 @@ pub struct Shared {
     pub error_log: Mutex<HashMap<String, Instant>>,
     pub clients: Arc<ClientRegistry>,
     pub readers: Arc<ReaderTracker>,
+    pub silent_payments_enabled: bool,
     pub identity: NetworkIdentity,
     pub data_dir: std::path::PathBuf,
     pub listen: String,
@@ -359,6 +360,9 @@ pub fn dispatch_for(
                 "blockchain.estimatefee" => estimate_fee(shared, params),
                 "blockchain.block.stats" => block_stats(shared, params),
                 "blockchain.transaction.broadcast" => broadcast_transaction(shared, params),
+                "blockchain.silentpayments.subscribe" | "blockchain.silentpayments.unsubscribe" => {
+                    silent_payments(shared, method)
+                }
                 "blockchain.transaction.get" => transaction_get(shared, params),
                 "blockchain.transaction.get_merkle" => transaction_merkle(shared, params),
                 "blockchain.transaction.id_from_pos" => transaction_id_from_pos(shared, params),
@@ -802,6 +806,19 @@ fn broadcast_transaction(shared: &Shared, params: &Value) -> RpcResult<Value> {
         .send_raw_transaction(hex)
         .map_err(|e| RpcError::server(e.to_string()))?;
     Ok(json!(txid))
+}
+
+fn silent_payments(shared: &Shared, method: &str) -> RpcResult<Value> {
+    if !shared.silent_payments_enabled {
+        return Err(RpcError::server(
+            "silent payments are disabled by configuration ([silent_payments] enabled = false)",
+        ));
+    }
+    // The opt-in gate exists so a future BIP352 indexer can be wired without
+    // changing the protocol surface. Until then, fail explicitly.
+    Err(RpcError::server(format!(
+        "{method}: silent payments are enabled but this build has no BIP352 indexer (see docs/ADR-018)"
+    )))
 }
 
 fn scripthash_mempool(shared: &Shared, params: &Value) -> RpcResult<Value> {

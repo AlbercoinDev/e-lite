@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.1.0-alpha.8 — 2026-11-02
+
+- **Silent payments opt-in gate**: `[silent_payments] enabled = false` by
+  default. The subscribe/unsubscribe methods return an explicit server error
+  instead of `unknown method`; enabling them reports that the BIP352 indexer is
+  not in this build.
+- **ADR-018** documents the protocol shape, the scan-key privacy constraints,
+  the prevout-pubkey requirement (schema v2 or on-demand scan) and the future
+  implementation/test plan.
+- No protocol or schema change for normal wallets.
+
 ## 0.1.0-alpha.7 — 2026-11-01
 
 - **Mode B (`pruned-ibd`)**: index while Core runs with `prune=1` (manual).

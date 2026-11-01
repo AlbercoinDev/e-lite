@@ -522,6 +522,15 @@ fn cmd_doctor(cfg: &Config, chain: Chain) -> R<()> {
         }
     }
 
+    println!(
+        "silent payments: {}",
+        if cfg.silent_payments.enabled {
+            "enabled (BIP352 indexer not included in this build)"
+        } else {
+            "disabled (opt-in)"
+        }
+    );
+
     let free = el_serve::disk_free_bytes(&cfg.data_dir(chain));
     println!("disk free: {} GiB", free / (1024 * 1024 * 1024));
 
@@ -1058,6 +1067,7 @@ fn build_shared(cfg: &Config, chain: Chain) -> R<Arc<Shared>> {
         error_log: Mutex::new(std::collections::HashMap::new()),
         clients: Arc::new(el_serve::ClientRegistry::new()),
         readers: el_chain::ReaderTracker::new(),
+        silent_payments_enabled: cfg.silent_payments.enabled,
         identity,
         data_dir: cfg.data_dir(chain),
         listen: cfg.server.listen.clone(),
