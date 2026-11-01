@@ -198,7 +198,8 @@ case "$CORE_MODE" in
       latest="$(core_latest)"
       have="$(core_installed_version || true)"
       if [ -n "$latest" ] && [ "$have" != "$latest" ]; then
-        printf 'Bitcoin Core %s installed; install/update to the latest official %s? [y/N] ' "${have:-not }" "$latest" >/dev/tty
+        if [ -n "$have" ]; then state="Bitcoin Core $have installed"; else state="Bitcoin Core not installed"; fi
+        printf '%s. Install/update to the latest official %s? [y/N] ' "$state" "$latest" >/dev/tty
         ans=""
         read -r ans </dev/tty || ans=""
         case "$ans" in

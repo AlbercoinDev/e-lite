@@ -29,7 +29,8 @@ Testnet3 is intentionally not supported.
 curl -fsSL https://raw.githubusercontent.com/AlbercoinDev/e-lite/main/install.sh | sh
 ```
 
-The same command installs or **updates** e-lite (atomic binary replacement,
+The installer needs `curl` and `ca-certificates` (present on standard Debian
+desktops). The same command installs or **updates** e-lite (atomic binary replacement,
 config and database untouched) and **asks** whether to install/update the latest
 official Bitcoin Core. Without a terminal it defaults to *no*.
 
