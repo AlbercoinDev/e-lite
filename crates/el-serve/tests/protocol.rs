@@ -1,0 +1,250 @@
+//! C7 — Electrum 1.4 fixtures exercised through the real JSON-RPC dispatcher.
+
+use el_model::{
+    BlockRecord, Chain, Hash32, HistoryEffect, IndexedTip, NetworkIdentity, Outpoint, ScriptHash,
+    UtxoValue,
+};
+use el_rpc::{CoreClient, CoreConfig};
+use el_serve::{process_line, state, Shared, Stats};
+use el_store::Store;
+use serde_json::{json, Value};
+use std::path::PathBuf;
+use std::sync::atomic::AtomicU8;
+use std::sync::{Arc, RwLock};
+use std::time::Duration;
+
+struct Fixture {
+    dir: PathBuf,
+    shared: Arc<Shared>,
+}
+
+impl Drop for Fixture {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+fn fixture() -> (Fixture, ScriptHash, Hash32) {
+    let dir = std::env::temp_dir().join(format!(
+        "e-lite-protocol-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    let store = Arc::new(Store::open(&dir).unwrap());
+
+    let chain = Chain::Regtest;
+    let genesis = Chain::Regtest.known_genesis().unwrap();
+    let identity = NetworkIdentity::new(chain, genesis);
+    store.init_identity(&identity).unwrap();
+
+    let blockchain = Hash32::from_hex(&"aa".repeat(32)).unwrap();
+    let txid = Hash32::from_hex(&"bb".repeat(32)).unwrap();
+    let script = ScriptHash::from_script(b"\x51");
+    let op = Outpoint { txid, vout: 0 };
+    let utxo = UtxoValue {
+        value_sat: 1000,
+        script_hash: script,
+        creation_height: 0,
+        coinbase: true,
+    };
+
+    let mut batch = Store::batch();
+    store
+        .put_block(
+            &mut batch,
+            &BlockRecord {
+                height: 0,
+                hash: blockchain,
+                header: [0x42; 80],
+                tx_count: 1,
+                txnum_base: 0,
+            },
+        )
+        .unwrap();
+    store.put_occurrence(&mut batch, txid, 0, 0).unwrap();
+    store
+        .put_history(
+            &mut batch,
+            script,
+            0,
+            0,
+            &HistoryEffect {
+                received_sat: 1000,
+                spent_sat: 0,
+                flags: 0,
+            },
+        )
+        .unwrap();
+    store.put_utxo(&mut batch, &op, &utxo).unwrap();
+    store
+        .commit(
+            batch,
+            &IndexedTip {
+                height: 0,
+                block_hash: blockchain,
+                schema_version: el_model::codec::SCHEMA_VERSION,
+                txnum: 1,
+            },
+            &[txid],
+        )
+        .unwrap();
+
+    let cookie = dir.join("cookie");
+    std::fs::write(&cookie, "user:pass").unwrap();
+    let core = CoreClient::connect(&CoreConfig {
+        rpc_url: "http://127.0.0.1:1".to_string(),
+        cookie_file: Some(cookie),
+        core_datadir: None,
+        chain,
+        timeout: Duration::from_millis(200),
+    })
+    .unwrap();
+
+    let shared = Arc::new(Shared {
+        store,
+        core,
+        identity,
+        data_dir: dir.clone(),
+        listen: "127.0.0.1:0".to_string(),
+        max_clients: 4,
+        state: AtomicU8::new(state::READY),
+        lock: Arc::new(RwLock::new(())),
+        stats: Stats::default(),
+    });
+
+    (
+        Fixture {
+            dir,
+            shared: Arc::clone(&shared),
+        },
+        script,
+        txid,
+    )
+}
+
+fn call(shared: &Shared, id: u64, method: &str, params: Value) -> Value {
+    let line = json!({"jsonrpc":"2.0","id":id,"method":method,"params":params}).to_string();
+    process_line(shared, &line)
+}
+
+#[test]
+fn electrum_14_fixtures() {
+    let (fx, script, txid) = fixture();
+    let s = &fx.shared;
+
+    let r = call(s, 1, "server.version", json!(["test", "1.4"]));
+    assert_eq!(r["result"][1], "1.4", "{r}");
+    assert!(r["result"][0].as_str().unwrap().starts_with("e-lite "));
+
+    let r = call(s, 2, "server.features", json!([]));
+    assert_eq!(
+        r["result"]["genesis_hash"],
+        Chain::Regtest.known_genesis().unwrap().to_hex()
+    );
+    assert_eq!(r["result"]["hash_function"], "sha256");
+    assert_eq!(r["result"]["protocol_max"], "1.4");
+
+    let r = call(s, 3, "server.ping", json!([]));
+    assert!(r["result"].is_null());
+
+    let r = call(s, 4, "blockchain.headers.subscribe", json!([]));
+    assert_eq!(r["result"]["height"], 0);
+    assert_eq!(
+        r["result"]["hex"].as_str().unwrap(),
+        hex::encode([0x42u8; 80])
+    );
+
+    let r = call(s, 5, "blockchain.block.header", json!([0]));
+    assert_eq!(r["result"].as_str().unwrap().len(), 160);
+
+    let r = call(s, 6, "blockchain.block.headers", json!([0, 10]));
+    assert_eq!(r["result"]["count"], 1);
+    assert_eq!(r["result"]["max"], 2016);
+
+    let sh = script.to_electrum_hex();
+    let r = call(s, 7, "blockchain.scripthash.get_history", json!([sh]));
+    assert_eq!(r["result"].as_array().unwrap().len(), 1);
+    assert_eq!(r["result"][0]["tx_hash"], txid.to_hex());
+    assert_eq!(r["result"][0]["height"], 0);
+
+    let r = call(s, 8, "blockchain.scripthash.get_balance", json!([sh]));
+    assert_eq!(r["result"]["confirmed"], 1000);
+    assert_eq!(r["result"]["unconfirmed"], 0);
+
+    let r = call(s, 9, "blockchain.scripthash.listunspent", json!([sh]));
+    assert_eq!(r["result"].as_array().unwrap().len(), 1);
+    assert_eq!(r["result"][0]["tx_hash"], txid.to_hex());
+    assert_eq!(r["result"][0]["value"], 1000);
+
+    let r = call(s, 10, "blockchain.scripthash.subscribe", json!([sh]));
+    assert_eq!(r["result"].as_str().unwrap().len(), 64);
+
+    let r = call(
+        s,
+        11,
+        "blockchain.transaction.get_merkle",
+        json!([txid.to_hex(), 0]),
+    );
+    assert_eq!(r["result"]["pos"], 0);
+    assert_eq!(r["result"]["merkle"].as_array().unwrap().len(), 0);
+
+    let r = call(
+        s,
+        12,
+        "blockchain.transaction.id_from_pos",
+        json!([0, 0, true]),
+    );
+    assert_eq!(r["result"]["tx_hash"], txid.to_hex());
+
+    let r = call(
+        s,
+        13,
+        "blockchain.scripthash.get_history",
+        json!(["00".repeat(32)]),
+    );
+    assert_eq!(r["result"], json!([]));
+
+    let r = call(s, 14, "does.not.exist", json!([]));
+    assert_eq!(r["error"]["code"], -32601);
+}
+
+#[test]
+fn building_state_is_not_an_empty_answer() {
+    let (fx, script, _) = fixture();
+    fx.shared.set_state(state::BUILDING);
+    let r = call(
+        &fx.shared,
+        1,
+        "blockchain.scripthash.get_history",
+        json!([script.to_electrum_hex()]),
+    );
+    assert_eq!(r["error"]["code"], -32000);
+    assert!(r["error"]["message"].as_str().unwrap().contains("building"));
+}
+
+#[test]
+fn malformed_json_and_bad_params() {
+    let (fx, _, _) = fixture();
+    let r = process_line(&fx.shared, "{not json");
+    assert_eq!(r["error"]["code"], -32700);
+    let r = call(
+        &fx.shared,
+        1,
+        "blockchain.scripthash.get_history",
+        json!(["zz"]),
+    );
+    assert_eq!(r["error"]["code"], -32602);
+    let r = call(&fx.shared, 2, "blockchain.block.header", json!(["nope"]));
+    assert_eq!(r["error"]["code"], -32602);
+}
+
+#[test]
+fn incompatible_protocol_is_rejected() {
+    let (fx, _, _) = fixture();
+    let r = call(&fx.shared, 1, "server.version", json!(["old", "1.2"]));
+    assert_eq!(r["error"]["code"], -32000);
+}

@@ -1,0 +1,387 @@
+{
+  "project": "electrum-lite-universal",
+  "version": "1.0.0-draft",
+  "updated": "2026-11-01",
+  "language": "es",
+  "implementation_status": "not-started",
+  "source_of_truth": "ESPECIFICACION_MAESTRA_IA.md",
+  "entry_point": "AGENTS.md",
+  "gates": {
+    "G0": "contrato y codec",
+    "G1": "Core completo",
+    "G2": "Merkle/RPC/reorg",
+    "G3": "IBD podado y paridad A/B",
+    "G4": "rawtx verificado",
+    "G5": "beta clientes y benchmarks",
+    "G6": "optimizaciones"
+  },
+  "tickets": [
+    {
+      "id": "EL-001",
+      "title": "Esquema lógico, codecs y BD transaccional",
+      "priority": "P0",
+      "phase": "F0",
+      "depends_on": [],
+      "status": "todo",
+      "evidence": [],
+      "deliverable": "workspace Rust inicial, tipos fuertes (NetworkIdentity, BlockPosition, TxRef u64, ScriptHash, Outpoint, IndexedTip), codec versionado, Storage trait y backend provisional RocksDB; tests golden de endian, clave ordenada, identidad de red, batch atómico, reopen, undo corrupto.",
+      "acceptance": "`cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace`; crashes simulados no avanzan checkpoint parcial. Documentar tamaños observados o que aún faltan mediciones. **No** incluir IBD ni servicio."
+    },
+    {
+      "id": "EL-002",
+      "title": "Fixtures sintéticos y oráculo independiente",
+      "priority": "P0",
+      "phase": "F0",
+      "depends_on": [
+        "EL-001"
+      ],
+      "status": "todo",
+      "evidence": [],
+      "deliverable": "generador determinista de cadena de prueba con 1k/100k TX y scripts repetidos; oráculo simple independiente de RocksDB para saldos, UTXO e historial; seeds reproducibles.",
+      "acceptance": "paridad en corpus de 100k, sin desbordamientos, cobertura de scripts vacíos, múltiples salidas y cambio."
+    },
+    {
+      "id": "EL-003",
+      "title": "Benchmark de almacenamiento F0",
+      "priority": "P0",
+      "phase": "F0",
+      "depends_on": [
+        "EL-001",
+        "EL-002"
+      ],
+      "status": "todo",
+      "evidence": [],
+      "deliverable": "script reproducible con datos de host/SSD/compresor, GB reales de SST+WAL, pico de RAM, operaciones por segundo, ratios e intervalos.",
+      "acceptance": "`docs/benchmarks/F0.md` con resultados y limitaciones verificables."
+    },
+    {
+      "id": "EL-004",
+      "title": "Adaptador Bitcoin Core por RPC autenticado",
+      "priority": "P0",
+      "phase": "F1",
+      "depends_on": [
+        "EL-001"
+      ],
+      "status": "todo",
+      "evidence": [],
+      "deliverable": "interfaz `CoreSource`, autenticación cookie, timeouts/retry seguro, tip/hash por altura, `getblock`, capacidades RPC, pin de red/génesis; tests con Core en regtest si existe.",
+      "acceptance": "detectar datadir incorrecto, prune inesperado, falta de bloque y reorg sin datos falsos."
+    },
+    {
+      "id": "EL-005",
+      "title": "Extracción de scripts, prevouts y UTXO",
+      "priority": "P0",
+      "phase": "F1",
+      "depends_on": [
+        "EL-001",
+        "EL-002",
+        "EL-004"
+      ],
+      "status": "todo",
+      "evidence": [],
+      "deliverable": "indexador transacción/bloque en orden, resolución de prevouts con UTXO local + optimización opcional Core, relaciones `(script, tx_ref)` deduplicadas, `utxo` y balances.",
+      "acceptance": "fixtures P2PKH/SegWit/Taproot/OP_RETURN y gasto múltiple; nadie entra en historia con `prevout=0` inventado."
+    },
+    {
+      "id": "EL-006",
+      "title": "Aplicación atómica de bloques y reanudación",
+      "priority": "P0",
+      "phase": "F1",
+      "depends_on": [
+        "EL-005"
+      ],
+      "status": "todo",
+      "evidence": [],
+      "deliverable": "`committed_tip`, WAL/durabilidad definidos, undo completo, reaplicación idempotente y failpoints antes/después de commit.",
+      "acceptance": "prueba SIGKILL/reopen en 100+ puntos; mismo fingerprint que oráculo."
+    },
+    {
+      "id": "EL-007",
+      "title": "Modo full-core desde génesis a tip",
+      "priority": "P0",
+      "phase": "F1",
+      "depends_on": [
+        "EL-004",
+        "EL-006"
+      ],
+      "status": "todo",
+      "evidence": [],
+      "deliverable": "CLI inicial `index --mode full-core`, checkpoint/recovery, `getblockhash(h)` y lectura raw/verbose sin txindex obligatorio; progreso/errores claros.",
+      "acceptance": "regtest de 1k bloques y reinicio a mitad equivalen a ejecución continua; no leer datadir no autorizado."
+    },
+    {
+      "id": "EL-008",
+      "title": "Histórico BIP30, génesis y canonicidad",
+      "priority": "P0",
+      "phase": "F2",
+      "depends_on": [
+        "EL-005",
+        "EL-007"
+      ],
+      "status": "todo",
+      "evidence": [],
+      "deliverable": "`txid -> [ocurrencias]`, protección contra claves sobrescritas, excepción genesis coinbase, fixtures mainnet BIP30.",
+      "acceptance": "test explícito de bloques 91842 y 91880 (fixtures validados), sin saldo duplicado."
+    },
+    {
+      "id": "EL-009",
+      "title": "Pruebas Merkle y cabeceras",
+      "priority": "P0",
+      "phase": "F2",
+      "depends_on": [
+        "EL-007"
+      ],
+      "status": "todo",
+      "evidence": [],
+      "deliverable": "TXID ordenados por bloque, merkle double-SHA256, duplicación de hojas impares, proof por `(height,pos)`, block header bytes.",
+      "acceptance": "vectores golden comparables a Core y test de transacción confirmada con inclusión válida."
+    },
+    {
+      "id": "EL-010",
+      "title": "Servidor Electrum JSON-RPC 1.4 mínimo",
+      "priority": "P0",
+      "phase": "F2",
+      "depends_on": [
+        "EL-007",
+        "EL-009"
+      ],
+      "status": "todo",
+      "evidence": [],
+      "deliverable": "`server.version`, `features`, headers, scripthash.get_history/get_balance/listunspent; loopback, límites por cliente, snapshots de lectura.",
+      "acceptance": "fixtures JSON correctos, handshake negociado, usuario puede consultar script sin registrar, `BUILDING_INDEX` no responde vacío engañoso."
+    },
+    {
+      "id": "EL-011",
+      "title": "Reorganizaciones y journal de reversión",
+      "priority": "P0",
+      "phase": "F2",
+      "depends_on": [
+        "EL-006",
+        "EL-010"
+      ],
+      "status": "todo",
+      "evidence": [],
+      "deliverable": "detecta fork, rebobina UTXO/history/txids con undo, repite nueva rama y actualiza respuestas; estados de fallo recuperables.",
+      "acceptance": "reorg de 1 y N bloques y crash en mitad de undo; sin inconsistencias."
+    },
+    {
+      "id": "EL-012",
+      "title": "Supervisor de disco y backpressure",
+      "priority": "P0",
+      "phase": "F3",
+      "depends_on": [
+        "EL-007",
+        "EL-011"
+      ],
+      "status": "todo",
+      "evidence": [],
+      "deliverable": "disco bajo/sobre umbrales, Core network active, histeresis, límites de lag y pausa/reinicio, métricas; no borrar bloques directamente.",
+      "acceptance": "pruebas con cuota pequeña, no commits corruptos, estado claro si no hay espacio."
+    },
+    {
+      "id": "EL-013",
+      "title": "Barrera segura de poda manual",
+      "priority": "P0",
+      "phase": "F3",
+      "depends_on": [
+        "EL-012"
+      ],
+      "status": "todo",
+      "evidence": [],
+      "deliverable": "Core `prune=1`, cálculo de altura segura, lectores activos y margen undo/reorg, RPC `pruneblockchain`, observabilidad.",
+      "acceptance": "no solicitar poda por encima de altura duradera; rechazar si red errónea, skip o reader pending."
+    },
+    {
+      "id": "EL-014",
+      "title": "Modo pruned-IBD desde cero",
+      "priority": "P0",
+      "phase": "F3",
+      "depends_on": [
+        "EL-013"
+      ],
+      "status": "todo",
+      "evidence": [],
+      "deliverable": "flujo de indexación y poda manual continuos desde Core vacío, recuperación de apagados y normalización de lag.",
+      "acceptance": "Regtest/Signet de extremo a extremo, pruebas de core adelantado; ninguna pérdida silenciosa de bloques."
+    },
+    {
+      "id": "EL-015",
+      "title": "Exportación canónica y prueba diferencial A/B",
+      "priority": "P0",
+      "phase": "F3",
+      "depends_on": [
+        "EL-007",
+        "EL-014"
+      ],
+      "status": "todo",
+      "evidence": [],
+      "deliverable": "exportación ordenada por red/altura/familia y hash canónico; comparador de dos DB; sin mempool ni timestamps; tipos versionados.",
+      "acceptance": "mismo hash de snapshot en modo A y modo B sobre la **misma cadena** y muestra de UTXO/historial."
+    },
+    {
+      "id": "EL-016",
+      "title": "Resolver de rawtx desde Core y caché",
+      "priority": "P0",
+      "phase": "F4",
+      "depends_on": [
+        "EL-009",
+        "EL-010"
+      ],
+      "status": "todo",
+      "evidence": [],
+      "deliverable": "lectura Core por hash de bloque, caché con límites y validación de identidad, `transaction.get` con errores separados.",
+      "acceptance": "raw correcto mientras bloque existe, timeout no rompe historial."
+    },
+    {
+      "id": "EL-017",
+      "title": "Recuperación de bloque histórico desde archivo",
+      "priority": "P0",
+      "phase": "F4",
+      "depends_on": [
+        "EL-016"
+      ],
+      "status": "todo",
+      "evidence": [],
+      "deliverable": "proveedor P2P/configurable que captura bloque histórico, verifica bloque/cabecera/Merkle/witness y atiende consulta antigua; no depender exclusivamente de RPC asíncrono `getblockfrompeer`.",
+      "acceptance": "transacción con witness en bloque podado recuperada y verificada, falsificación rechazada."
+    },
+    {
+      "id": "EL-018",
+      "title": "Merkle RPC, id_from_pos y resiliencia rawtx",
+      "priority": "P0",
+      "phase": "F4",
+      "depends_on": [
+        "EL-017"
+      ],
+      "status": "todo",
+      "evidence": [],
+      "deliverable": "`transaction.get_merkle`, `transaction.id_from_pos` y errores coherentes con protocolo; caché frío, servidor de archivo offline y fuentes malas.",
+      "acceptance": "Electrum verifica transacciones antiguas; errores cuando no haya archivo, no resultados inventados."
+    },
+    {
+      "id": "EL-019",
+      "title": "Overlay de mempool y notificaciones",
+      "priority": "P1",
+      "phase": "F5",
+      "depends_on": [
+        "EL-010",
+        "EL-011"
+      ],
+      "status": "todo",
+      "evidence": [],
+      "deliverable": "mempool reconstruible, subscribe/unsubscribe, secuencia/reorg coherentes, saldo confirmado/unconfirmed.",
+      "acceptance": "emisión de TX y recepción de eventos correctos bajo retry/reinicio."
+    },
+    {
+      "id": "EL-020",
+      "title": "Fees, broadcast y funcionalidades de servidor",
+      "priority": "P1",
+      "phase": "F5",
+      "depends_on": [
+        "EL-019"
+      ],
+      "status": "todo",
+      "evidence": [],
+      "deliverable": "`transaction.broadcast`, `estimatefee`, métodos auxiliares 1.4 necesarios para clientes y manejo de errores Core.",
+      "acceptance": "fixtures + cliente compatible, sin anunciar métodos no implementados."
+    },
+    {
+      "id": "EL-021",
+      "title": "Backup, restore y diagnósticos de operador",
+      "priority": "P1",
+      "phase": "F5",
+      "depends_on": [
+        "EL-015"
+      ],
+      "status": "todo",
+      "evidence": [],
+      "deliverable": "snapshot, versión de esquema, comando doctor, salud de Core/BD, backup consistente, restauración testada.",
+      "acceptance": "restauración de copia produce idéntico fingerprint y consulta."
+    },
+    {
+      "id": "EL-022",
+      "title": "Hardening, documentación Debian y systemd",
+      "priority": "P1",
+      "phase": "F5",
+      "depends_on": [
+        "EL-020",
+        "EL-021"
+      ],
+      "status": "todo",
+      "evidence": [],
+      "deliverable": "servicio no-root, localhost, cookie Core, límites, métricas, logs privados, parada limpia; despliegue Signet con datadir nuevo.",
+      "acceptance": "análisis de superficies y pruebas de exposición de puertos."
+    },
+    {
+      "id": "EL-023",
+      "title": "Compatibilidad Electrum y Sparrow real",
+      "priority": "P1",
+      "phase": "F5",
+      "depends_on": [
+        "EL-018",
+        "EL-019",
+        "EL-020"
+      ],
+      "status": "todo",
+      "evidence": [],
+      "deliverable": "tests de versiones conocidas, restauración wallet de historial antiguo y comprobación pruebas SPV; fallos documentados.",
+      "acceptance": "comportamiento completo en escenario Signet y mainnet experimental sin desactivar comprobaciones."
+    },
+    {
+      "id": "EL-024",
+      "title": "Benchmark mainnet y criterios de hardware",
+      "priority": "P1",
+      "phase": "F5",
+      "depends_on": [
+        "EL-022",
+        "EL-023"
+      ],
+      "status": "todo",
+      "evidence": [],
+      "deliverable": "consumo de RAM, discos, pico IBD, throughput, p95/p99, read amplification, comparador electrs, límites recomendados.",
+      "acceptance": "datos medidos y reproducibles; no confundir estimación con resultado."
+    },
+    {
+      "id": "EL-025",
+      "title": "Adaptador Electrum 1.7",
+      "priority": "P2",
+      "phase": "F6",
+      "depends_on": [
+        "EL-023"
+      ],
+      "status": "todo",
+      "evidence": [],
+      "deliverable": "`scriptpubkey.*`, nuevos formatos, notificaciones y negociación 1.7.",
+      "acceptance": "suite 1.7 completa sin regresiones en 1.4."
+    },
+    {
+      "id": "EL-026",
+      "title": "Índice y compresión optimizados",
+      "priority": "P2",
+      "phase": "F6",
+      "depends_on": [
+        "EL-024"
+      ],
+      "status": "todo",
+      "evidence": [],
+      "deliverable": "comparar layout de RocksDB, bindex, compresión de historial, compact lookup, 40-bit refs solo con prueba de migración.",
+      "acceptance": "menor coste real sin perder corrección y benchmarks antes/después."
+    },
+    {
+      "id": "EL-027",
+      "title": "Reducción del mínimo de hardware",
+      "priority": "P2",
+      "phase": "F6",
+      "depends_on": [
+        "EL-024",
+        "EL-026"
+      ],
+      "status": "todo",
+      "evidence": [],
+      "deliverable": "perfiles medidos de 2/4/8 GiB RAM, HDD/SSD, discos de 128/256/512 GB.",
+      "acceptance": "requisitos basados en medidas, no supuestos."
+    }
+  ],
+  "first_ticket": "EL-001",
+  "not_ready_for_production": true
+}

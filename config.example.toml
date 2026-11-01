@@ -1,0 +1,29 @@
+# e-lite configuration (v0.1)
+# Every value shown is the default unless stated otherwise.
+
+[network]
+name = "regtest"                     # regtest | signet | testnet4 | mainnet
+# data_dir = "/home/USER/.local/share/e-lite/regtest"
+
+[core]
+# rpc_url = "http://127.0.0.1:18443"  # default port depends on the network
+# cookie_file = ""                    # explicit cookie; overrides core_datadir
+# core_datadir = "/home/USER/.bitcoin"
+timeout_seconds = 30
+
+[index]
+mode = "full-core"                   # v0.1 only supports full-core (Core prune=0)
+batch_blocks = 32                    # blocks per atomic commit (WAL fsync)
+reorg_window = 288                   # undo records kept for reorgs
+follow = true                        # keep following the tip
+
+[server]
+listen = "127.0.0.1:50001"           # loopback only by default
+max_clients = 32
+
+[metrics]
+enabled = true
+listen = "127.0.0.1:9184"            # /status, /metrics, /healthz
+
+[safety]
+allow_mainnet = false                # mainnet requires explicit opt-in

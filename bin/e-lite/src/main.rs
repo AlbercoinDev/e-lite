@@ -1,0 +1,919 @@
+mod config;
+
+use bitcoin::consensus::deserialize;
+use bitcoin::Block;
+use config::Config;
+use el_index::{apply_block, prune_undo, rewind_to, GroupOverlay};
+use el_model::{Chain, Hash32, IndexedTip, NetworkIdentity, ScriptHash};
+use el_rpc::{CoreClient, CoreConfig};
+use el_serve::{state, Shared, Stats, VERSION};
+use el_store::Store;
+use rocksdb::WriteBatch;
+use serde_json::json;
+use std::io::{Read, Write};
+use std::net::TcpStream;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, RwLock};
+use std::time::{Duration, Instant};
+
+type E = Box<dyn std::error::Error + Send + Sync>;
+type R<T> = std::result::Result<T, E>;
+
+fn fail<T>(msg: impl Into<String>) -> R<T> {
+    Err(msg.into().into())
+}
+
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+enum Command {
+    Help,
+    Version,
+    Init,
+    Doctor,
+    Index,
+    Serve,
+    Run,
+    Status,
+    ExportSnapshot,
+}
+
+#[derive(Default)]
+struct Args {
+    command: Option<Command>,
+    config: Option<String>,
+    network: Option<String>,
+    data_dir: Option<String>,
+    rpc_url: Option<String>,
+    core_datadir: Option<String>,
+    cookie_file: Option<String>,
+    listen: Option<String>,
+    metrics: Option<String>,
+    allow_mainnet: bool,
+    json: bool,
+    no_follow: bool,
+    batch: Option<u32>,
+    reorg_window: Option<u32>,
+}
+
+fn parse_args() -> R<Args> {
+    let mut args = Args::default();
+    let mut it = std::env::args().skip(1);
+    while let Some(raw) = it.next() {
+        let (flag, inline) = match raw.split_once('=') {
+            Some((f, v)) => (f.to_string(), Some(v.to_string())),
+            None => (raw.clone(), None),
+        };
+        let mut value = |name: &str| -> R<String> {
+            if let Some(v) = inline.clone() {
+                return Ok(v);
+            }
+            it.next()
+                .ok_or_else(|| format!("{name} needs a value").into())
+        };
+        match flag.as_str() {
+            "-h" | "--help" => args.command = Some(Command::Help),
+            "--version" | "-V" => args.command = Some(Command::Version),
+            "--config" => args.config = Some(value("--config")?),
+            "--network" => args.network = Some(value("--network")?),
+            "--data-dir" => args.data_dir = Some(value("--data-dir")?),
+            "--core-rpc" => args.rpc_url = Some(value("--core-rpc")?),
+            "--core-datadir" => args.core_datadir = Some(value("--core-datadir")?),
+            "--cookie-file" => args.cookie_file = Some(value("--cookie-file")?),
+            "--listen" => args.listen = Some(value("--listen")?),
+            "--metrics" => args.metrics = Some(value("--metrics")?),
+            "--batch" => args.batch = Some(value("--batch")?.parse()?),
+            "--reorg-window" => args.reorg_window = Some(value("--reorg-window")?.parse()?),
+            "--allow-mainnet" => args.allow_mainnet = true,
+            "--json" => args.json = true,
+            "--no-follow" => args.no_follow = true,
+            other if other.starts_with('-') => return fail(format!("unknown flag: {other}")),
+            other => {
+                if args.command.is_some() {
+                    return fail(format!("unexpected argument: {other}"));
+                }
+                args.command = Some(match other {
+                    "init" => Command::Init,
+                    "doctor" => Command::Doctor,
+                    "index" => Command::Index,
+                    "serve" => Command::Serve,
+                    "run" => Command::Run,
+                    "status" => Command::Status,
+                    "export-snapshot" => Command::ExportSnapshot,
+                    "version" => Command::Version,
+                    "help" => Command::Help,
+                    _ => return fail(format!("unknown command: {other}")),
+                });
+            }
+        }
+    }
+    Ok(args)
+}
+
+fn effective_config(args: &Args) -> R<(Config, Chain)> {
+    let mut cfg = Config::load(args.config.as_deref())?;
+    if let Some(n) = &args.network {
+        cfg.network.name = n.clone();
+    }
+    if let Some(d) = &args.data_dir {
+        cfg.network.data_dir = Some(d.clone());
+    }
+    if let Some(r) = &args.rpc_url {
+        cfg.core.rpc_url = Some(r.clone());
+    }
+    if let Some(d) = &args.core_datadir {
+        cfg.core.core_datadir = Some(d.clone());
+    }
+    if let Some(c) = &args.cookie_file {
+        cfg.core.cookie_file = Some(c.clone());
+    }
+    if let Some(l) = &args.listen {
+        cfg.server.listen = l.clone();
+    }
+    if let Some(m) = &args.metrics {
+        cfg.metrics.listen = m.clone();
+    }
+    if let Some(b) = args.batch {
+        cfg.index.batch_blocks = b.max(1);
+    }
+    if let Some(w) = args.reorg_window {
+        cfg.index.reorg_window = w.max(1);
+    }
+    if args.no_follow {
+        cfg.index.follow = false;
+    }
+    if args.allow_mainnet {
+        cfg.safety.allow_mainnet = true;
+    }
+    if cfg.index.mode != "full-core" {
+        return fail(format!(
+            "index mode \"{}\" is not supported in v0.1 (only full-core)",
+            cfg.index.mode
+        ));
+    }
+    let chain = cfg.chain()?;
+    if chain.requires_explicit_opt_in() && !cfg.safety.allow_mainnet {
+        return fail(
+            "mainnet requires explicit opt-in: pass --allow-mainnet or set [safety] allow_mainnet = true",
+        );
+    }
+    Ok((cfg, chain))
+}
+
+fn core_client(cfg: &Config, chain: Chain) -> R<CoreClient> {
+    let cc = CoreConfig {
+        rpc_url: cfg.rpc_url(chain),
+        cookie_file: cfg.cookie_file(),
+        core_datadir: Some(cfg.core_datadir()),
+        chain,
+        timeout: Duration::from_secs(cfg.core.timeout_seconds.max(1)),
+    };
+    Ok(CoreClient::connect(&cc)?)
+}
+
+fn core_identity(core: &CoreClient, chain: Chain) -> R<NetworkIdentity> {
+    let info = core.blockchain_info()?;
+    let core_chain = match info.chain.as_str() {
+        "main" | "mainnet" => Chain::Mainnet,
+        "testnet4" => Chain::Testnet4,
+        "signet" => Chain::Signet,
+        "regtest" => Chain::Regtest,
+        other => return fail(format!("Core reports unsupported chain: {other}")),
+    };
+    if core_chain != chain {
+        return fail(format!(
+            "network mismatch: config says {}, Core says {}",
+            chain.name(),
+            core_chain.name()
+        ));
+    }
+    let genesis = Hash32::from_hex(&core.block_hash(0)?)?;
+    let signet_challenge = match (&info.signet_challenge, chain) {
+        (Some(hex_challenge), Chain::Signet) => {
+            let bytes = hex::decode(hex_challenge)?;
+            Some(ScriptHash::from_script(&bytes).0)
+        }
+        _ => None,
+    };
+    let identity = NetworkIdentity {
+        chain,
+        genesis,
+        signet_challenge,
+    };
+    identity.check_known_genesis()?;
+    Ok(identity)
+}
+
+fn open_store(cfg: &Config, chain: Chain) -> R<Arc<Store>> {
+    let dir = cfg.data_dir(chain);
+    Ok(Arc::new(Store::open(dir)?))
+}
+
+fn require_identity(
+    store: &Store,
+    cfg: &Config,
+    chain: Chain,
+    core: &CoreClient,
+) -> R<NetworkIdentity> {
+    let stored = store
+        .network_identity()?
+        .ok_or("database is not initialized; run `e-lite init` first")?;
+    if stored.chain != chain {
+        return fail(format!(
+            "database belongs to {}, config says {}",
+            stored.chain.name(),
+            chain.name()
+        ));
+    }
+    let live = core_identity(core, chain)?;
+    if stored.genesis != live.genesis {
+        return fail(format!(
+            "genesis mismatch: db {} vs core {}",
+            stored.genesis, live.genesis
+        ));
+    }
+    if stored.signet_challenge != live.signet_challenge {
+        return fail("signet challenge mismatch");
+    }
+    let _ = cfg;
+    Ok(stored)
+}
+
+fn main() {
+    if let Err(e) = run() {
+        eprintln!("e-lite: error: {e}");
+        std::process::exit(1);
+    }
+}
+
+fn run() -> R<()> {
+    let args = parse_args()?;
+    let cmd = args.command.unwrap_or(Command::Help);
+    if cmd == Command::Help {
+        print_help();
+        return Ok(());
+    }
+    if cmd == Command::Version {
+        println!("e-lite {VERSION}");
+        return Ok(());
+    }
+
+    let (cfg, chain) = effective_config(&args)?;
+    match cmd {
+        Command::Init => cmd_init(&cfg, chain),
+        Command::Doctor => cmd_doctor(&cfg, chain),
+        Command::Index => cmd_index(&cfg, chain),
+        Command::Serve => cmd_serve(&cfg, chain),
+        Command::Run => cmd_run(&cfg, chain),
+        Command::Status => cmd_status(&cfg, chain, args.json),
+        Command::ExportSnapshot => cmd_export(&cfg, chain),
+        Command::Help | Command::Version => unreachable!(),
+    }
+}
+
+fn print_help() {
+    println!(
+        r#"e-lite {VERSION} — Electrum 1.4 server for Bitcoin Core
+
+USAGE:
+    e-lite <command> [options]
+
+COMMANDS:
+    init             validate network/genesis against Core and create the database
+    doctor           check config, Core, disk, ports and database integrity
+    index            index the active chain (add --no-follow to stop at tip)
+    serve            serve Electrum queries from an already indexed database
+    run              index and serve in one process (recommended)
+    status           print health (via local HTTP, or the database if stopped)
+    export-snapshot  print the canonical digest and tip
+    version          print version
+
+OPTIONS:
+    --config <path>         TOML config file
+    --network <name>        regtest | signet | testnet4 | mainnet
+    --data-dir <path>       index directory
+    --core-rpc <url>        http://127.0.0.1:<port>
+    --core-datadir <path>   Core datadir (cookie is read from there)
+    --cookie-file <path>    explicit Core cookie
+    --listen <addr>         Electrum listen address (default 127.0.0.1:50001)
+    --metrics <addr>        status/metrics listen address (default 127.0.0.1:9184)
+    --batch <n>             blocks per atomic commit (default 32)
+    --reorg-window <n>      undo window in blocks (default 288)
+    --allow-mainnet         required for mainnet
+    --no-follow             stop when caught up
+    --json                  JSON output for status
+"#
+    );
+}
+
+fn cmd_init(cfg: &Config, chain: Chain) -> R<()> {
+    let core = core_client(cfg, chain)?;
+    let live = core_identity(&core, chain)?;
+    let store = open_store(cfg, chain)?;
+    match store.network_identity()? {
+        Some(stored) => {
+            if stored.chain != live.chain
+                || stored.genesis != live.genesis
+                || stored.signet_challenge != live.signet_challenge
+            {
+                return fail(format!(
+                    "database identity does not match Core (db genesis {}, core genesis {})",
+                    stored.genesis, live.genesis
+                ));
+            }
+            println!(
+                "already initialized: {} genesis {}",
+                chain.name(),
+                stored.genesis
+            );
+        }
+        None => {
+            store.init_identity(&live)?;
+            println!(
+                "initialized {} at {}",
+                chain.name(),
+                cfg.data_dir(chain).display()
+            );
+            println!("genesis: {}", live.genesis);
+            if let Some(c) = live.signet_challenge {
+                println!("signet challenge hash: {c}");
+            }
+        }
+    }
+    let info = core.blockchain_info()?;
+    println!("core: {} ({} blocks)", info.chain, info.blocks);
+    Ok(())
+}
+
+fn cmd_doctor(cfg: &Config, chain: Chain) -> R<()> {
+    let mut problems: Vec<String> = Vec::new();
+    println!("e-lite {} doctor", VERSION);
+    println!("network: {}", chain.name());
+    println!("data dir: {}", cfg.data_dir(chain).display());
+
+    let core = match core_client(cfg, chain) {
+        Ok(c) => {
+            println!("core rpc: {}", cfg.rpc_url(chain));
+            c
+        }
+        Err(e) => {
+            problems.push(format!("Core RPC: {e}"));
+            print_problems(&problems);
+            return fail("doctor found blocking problems");
+        }
+    };
+
+    match core.network_info() {
+        Ok(n) => println!("core version: {} ({})", n.version, n.subversion.trim()),
+        Err(e) => problems.push(format!("getnetworkinfo: {e}")),
+    }
+    match core.blockchain_info() {
+        Ok(info) => {
+            println!(
+                "chain: {}  blocks: {}  headers: {}  pruned: {}  ibd: {}",
+                info.chain, info.blocks, info.headers, info.pruned, info.initialblockdownload
+            );
+            if info.pruned {
+                problems.push(
+                    "Core is pruned and e-lite v0.1 only supports full-core: restart Core with prune=0"
+                        .to_string(),
+                );
+            }
+        }
+        Err(e) => problems.push(format!("getblockchaininfo: {e}")),
+    }
+
+    match core_identity(&core, chain) {
+        Ok(id) => println!("genesis: {}", id.genesis),
+        Err(e) => problems.push(format!("identity: {e}")),
+    }
+
+    let db_dir = cfg.data_dir(chain);
+    if !db_dir.exists() {
+        println!("db: not initialized (run `e-lite init`)");
+    } else {
+        match Store::open(&db_dir) {
+            Ok(store) => {
+                match store.network_identity() {
+                    Ok(Some(id)) => {
+                        println!("db genesis: {}", id.genesis);
+                        if let Ok(Some(tip)) = store.committed_tip() {
+                            println!(
+                                "db tip: {} {} (txnum {}, schema {})",
+                                tip.height, tip.block_hash, tip.txnum, tip.schema_version
+                            );
+                        } else {
+                            println!("db tip: empty (run `e-lite index`)");
+                        }
+                    }
+                    Ok(None) => println!("db: not initialized (run `e-lite init`)"),
+                    Err(e) => problems.push(format!("db identity: {e}")),
+                }
+                println!("db size: {} bytes", store.disk_usage_bytes());
+            }
+            Err(e) => problems.push(format!("open db: {e}")),
+        }
+    }
+
+    let free = el_serve::disk_free_bytes(&cfg.data_dir(chain));
+    println!("disk free: {} GiB", free / (1024 * 1024 * 1024));
+
+    if bind_ok(&cfg.server.listen) {
+        println!("electrum listen {}: available", cfg.server.listen);
+    } else {
+        problems.push(format!(
+            "electrum listen {} is already in use",
+            cfg.server.listen
+        ));
+    }
+    if cfg.metrics.enabled {
+        if bind_ok(&cfg.metrics.listen) {
+            println!("metrics listen {}: available", cfg.metrics.listen);
+        } else {
+            problems.push(format!(
+                "metrics listen {} is already in use",
+                cfg.metrics.listen
+            ));
+        }
+    }
+
+    if problems.is_empty() {
+        println!("OK: no blocking problems found");
+        Ok(())
+    } else {
+        print_problems(&problems);
+        fail("doctor found blocking problems")
+    }
+}
+
+fn print_problems(p: &[String]) {
+    for x in p {
+        eprintln!("PROBLEM: {x}");
+    }
+}
+
+fn bind_ok(addr: &str) -> bool {
+    std::net::TcpListener::bind(addr).is_ok()
+}
+
+// ------------------------------------------------------------------- indexing
+
+struct Indexer {
+    store: Arc<Store>,
+    core: CoreClient,
+    cfg: Config,
+    lock: Arc<RwLock<()>>,
+    shared: Option<Arc<Shared>>,
+}
+
+impl Indexer {
+    fn new(
+        store: Arc<Store>,
+        core: CoreClient,
+        cfg: Config,
+        lock: Arc<RwLock<()>>,
+        shared: Option<Arc<Shared>>,
+    ) -> Self {
+        Indexer {
+            store,
+            core,
+            cfg,
+            lock,
+            shared,
+        }
+    }
+
+    fn stats_core_height(&self, h: u64) {
+        if let Some(sh) = &self.shared {
+            sh.stats.core_height.store(h, Ordering::Relaxed);
+        }
+    }
+
+    fn stats_tip(&self, tip: &IndexedTip, last_block_ms: u64) {
+        if let Some(sh) = &self.shared {
+            sh.stats
+                .indexed_height
+                .store(tip.height as u64, Ordering::Relaxed);
+            sh.stats.txnum.store(tip.txnum, Ordering::Relaxed);
+            sh.stats
+                .last_block_ms
+                .store(last_block_ms, Ordering::Relaxed);
+        }
+    }
+
+    fn handle_reorg(&self, core_tip: u64) -> R<()> {
+        let Some(tip) = self.store.committed_tip()? else {
+            return Ok(());
+        };
+        let check_height = (tip.height as u64).min(core_tip);
+        let core_hash = self.core.block_hash(check_height)?;
+        let db_rec = self
+            .store
+            .get_block(check_height as u32)?
+            .ok_or("database is missing its own tip block")?;
+        if db_rec.hash.to_hex() == core_hash {
+            return Ok(());
+        }
+
+        if let Some(sh) = &self.shared {
+            sh.set_state(state::REORG);
+        }
+        let window = self.cfg.index.reorg_window as u64;
+        let mut h = check_height;
+        loop {
+            if h == 0 {
+                return fail(format!(
+                    "genesis mismatch: db {}, core {} — wrong network or wiped node",
+                    tip.block_hash,
+                    self.core.block_hash(0)?
+                ));
+            }
+            let ch = self.core.block_hash(h)?;
+            let db = self
+                .store
+                .get_block(h as u32)?
+                .ok_or_else(|| format!("db missing block {h}"))?;
+            if db.hash.to_hex() == ch {
+                break;
+            }
+            h -= 1;
+            if (tip.height as u64).saturating_sub(h) > window {
+                return fail(format!(
+                    "reorg deeper than the {window}-block undo window: NEEDS_RECOVERY (restore a snapshot or reindex)"
+                ));
+            }
+        }
+        eprintln!(
+            "[e-lite] reorg detected: rewinding from {} to {} and replaying the active chain",
+            tip.height, h
+        );
+        {
+            let _g = self.lock.write().map_err(|_| "lock poisoned")?;
+            rewind_to(&self.store, h as u32)?;
+        }
+        Ok(())
+    }
+
+    fn commit_group(
+        &self,
+        batch: WriteBatch,
+        tip: &IndexedTip,
+        txids: &[Hash32],
+        last_block_ms: u64,
+    ) -> R<()> {
+        let mut batch = batch;
+        prune_undo(
+            &self.store,
+            tip.height,
+            self.cfg.index.reorg_window,
+            &mut batch,
+        )?;
+        {
+            let _g = self.lock.write().map_err(|_| "lock poisoned")?;
+            if let Err(e) = self.store.commit(batch, tip, txids) {
+                // Whatever happened, keep the flat file aligned with the DB.
+                if let Ok(Some(t)) = self.store.committed_tip() {
+                    self.store.truncate_txids(t.txnum)?;
+                }
+                return Err(e.into());
+            }
+        }
+        self.stats_tip(tip, last_block_ms);
+        Ok(())
+    }
+
+    fn catch_up(&self) -> R<u64> {
+        let started = Instant::now();
+        let info = self.core.blockchain_info()?;
+        let core_tip = info.blocks;
+        self.stats_core_height(core_tip);
+        self.handle_reorg(core_tip)?;
+
+        let mut tip = self.store.committed_tip()?;
+        let start = tip.map(|t| t.height as u64 + 1).unwrap_or(0);
+        if start > core_tip {
+            return Ok(tip.map(|t| t.height as u64).unwrap_or(0));
+        }
+
+        let (tx, rx) = std::sync::mpsc::sync_channel::<
+            std::result::Result<(u64, String, Vec<u8>), String>,
+        >(16);
+        let core = self.core.clone();
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_thread = Arc::clone(&stop);
+        let fetcher = std::thread::spawn(move || {
+            for h in start..=core_tip {
+                if stop_thread.load(Ordering::Relaxed) {
+                    break;
+                }
+                let item = (|| -> std::result::Result<(u64, String, Vec<u8>), String> {
+                    let hash = core.block_hash(h).map_err(|e| e.to_string())?;
+                    let raw = core.block_hex(&hash).map_err(|e| e.to_string())?;
+                    let bytes = hex::decode(&raw).map_err(|e| e.to_string())?;
+                    Ok((h, hash, bytes))
+                })();
+                if tx.send(item).is_err() {
+                    break;
+                }
+            }
+        });
+
+        let mut overlay = GroupOverlay::new();
+        let mut batch = WriteBatch::default();
+        let mut group_txids: Vec<Hash32> = Vec::new();
+        let mut count = 0u32;
+        let mut last_ms = 0u64;
+        let mut result: R<()> = Ok(());
+
+        for item in rx {
+            let (height, expected_hash, bytes) = match item {
+                Ok(v) => v,
+                Err(e) => {
+                    result = Err(e.into());
+                    break;
+                }
+            };
+            let block: Block = match deserialize(&bytes) {
+                Ok(b) => b,
+                Err(e) => {
+                    result = Err(format!("cannot decode block {height}: {e}").into());
+                    break;
+                }
+            };
+            let actual_hash = block.block_hash().to_string();
+            if actual_hash != expected_hash {
+                result = Err(format!(
+                    "block hash mismatch at {height}: core {expected_hash}, computed {actual_hash}"
+                )
+                .into());
+                break;
+            }
+            let t0 = Instant::now();
+            match apply_block(
+                &self.store,
+                height as u32,
+                &block,
+                tip,
+                &mut overlay,
+                &mut batch,
+            ) {
+                Ok(out) => {
+                    group_txids.extend_from_slice(&out.txids);
+                    tip = Some(out.tip);
+                    count += 1;
+                    last_ms = t0.elapsed().as_millis() as u64;
+                }
+                Err(e) => {
+                    result = Err(e.into());
+                    break;
+                }
+            }
+            if count >= self.cfg.index.batch_blocks {
+                let current = tip.expect("tip set");
+                if let Err(e) =
+                    self.commit_group(std::mem::take(&mut batch), &current, &group_txids, last_ms)
+                {
+                    result = Err(e);
+                    break;
+                }
+                print_progress(&current, started, info.initialblockdownload);
+                group_txids.clear();
+                overlay.clear();
+                count = 0;
+            }
+        }
+
+        if result.is_ok() && count > 0 {
+            let current = tip.expect("tip set");
+            self.commit_group(std::mem::take(&mut batch), &current, &group_txids, last_ms)?;
+            print_progress(&current, started, info.initialblockdownload);
+        }
+
+        stop.store(true, Ordering::Relaxed);
+        let _ = fetcher.join();
+        result?;
+        Ok(tip.map(|t| t.height as u64).unwrap_or(0))
+    }
+}
+
+fn print_progress(tip: &IndexedTip, started: Instant, ibd: bool) {
+    let secs = started.elapsed().as_secs_f64().max(0.001);
+    let rate = tip.txnum as f64 / secs;
+    eprintln!(
+        "[e-lite] height {}  txnum {}  {:.0} tx/s{}",
+        tip.height,
+        tip.txnum,
+        rate,
+        if ibd { "  (core in IBD)" } else { "" }
+    );
+}
+
+fn cmd_index(cfg: &Config, chain: Chain) -> R<()> {
+    let store = open_store(cfg, chain)?;
+    let core = core_client(cfg, chain)?;
+    require_identity(&store, cfg, chain, &core)?;
+    let lock = Arc::new(RwLock::new(()));
+    let idx = Indexer::new(store, core, cfg.clone(), lock, None);
+    loop {
+        let height = idx.catch_up()?;
+        if !cfg.index.follow {
+            println!("caught up at height {height}");
+            return Ok(());
+        }
+        std::thread::sleep(Duration::from_secs(2));
+    }
+}
+
+fn build_shared(cfg: &Config, chain: Chain) -> R<Arc<Shared>> {
+    let store = open_store(cfg, chain)?;
+    let core = core_client(cfg, chain)?;
+    let identity = require_identity(&store, cfg, chain, &core)?;
+    let shared = Arc::new(Shared {
+        store,
+        core,
+        identity,
+        data_dir: cfg.data_dir(chain),
+        listen: cfg.server.listen.clone(),
+        max_clients: cfg.server.max_clients,
+        state: std::sync::atomic::AtomicU8::new(state::BUILDING),
+        lock: Arc::new(RwLock::new(())),
+        stats: Stats::default(),
+    });
+    Ok(shared)
+}
+
+fn start_transports(shared: &Arc<Shared>, cfg: &Config) -> R<()> {
+    let server = Arc::clone(shared);
+    el_serve::start_server(server).map_err(|e| format!("cannot bind {}: {e}", shared.listen))?;
+    if cfg.metrics.enabled {
+        let m = Arc::clone(shared);
+        el_serve::start_metrics(m, cfg.metrics.listen.clone())
+            .map_err(|e| format!("cannot bind metrics {}: {e}", cfg.metrics.listen))?;
+    }
+    Ok(())
+}
+
+fn cmd_serve(cfg: &Config, chain: Chain) -> R<()> {
+    let shared = build_shared(cfg, chain)?;
+    let core_tip = shared.core.blockchain_info()?.blocks;
+    shared.stats.core_height.store(core_tip, Ordering::Relaxed);
+    let tip = shared
+        .store
+        .committed_tip()?
+        .map(|t| t.height as u64)
+        .unwrap_or(0);
+    if tip >= core_tip && tip > 0 {
+        shared.set_state(state::READY);
+    } else {
+        shared.set_state(state::BUILDING);
+        eprintln!(
+            "[e-lite] index is behind (indexed {tip}, core {core_tip}); queries will fail until caught up. Use `e-lite run` to index and serve."
+        );
+    }
+    start_transports(&shared, cfg)?;
+    println!(
+        "serving Electrum {} on {} (network {}, indexed height {})",
+        el_serve::PROTOCOL_MAX,
+        cfg.server.listen,
+        chain.name(),
+        tip
+    );
+    loop {
+        std::thread::sleep(Duration::from_secs(3600));
+    }
+}
+
+fn cmd_run(cfg: &Config, chain: Chain) -> R<()> {
+    let shared = build_shared(cfg, chain)?;
+    start_transports(&shared, cfg)?;
+    shared.set_state(state::BUILDING);
+    println!(
+        "e-lite {}: indexing and serving on {} (network {}, core {})",
+        VERSION,
+        cfg.server.listen,
+        chain.name(),
+        cfg.rpc_url(chain)
+    );
+    let idx = Indexer::new(
+        Arc::clone(&shared.store),
+        shared.core.clone(),
+        cfg.clone(),
+        Arc::clone(&shared.lock),
+        Some(Arc::clone(&shared)),
+    );
+    let mut first = true;
+    loop {
+        match idx.catch_up() {
+            Ok(height) => {
+                shared.set_state(state::READY);
+                if first {
+                    println!("index ready at height {height}");
+                    first = false;
+                }
+            }
+            Err(e) => {
+                shared.set_state(state::FATAL);
+                return Err(e);
+            }
+        }
+        if !cfg.index.follow {
+            // Keep serving after a one-shot catch-up.
+            loop {
+                std::thread::sleep(Duration::from_secs(3600));
+            }
+        }
+        std::thread::sleep(Duration::from_secs(1));
+    }
+}
+
+fn cmd_status(cfg: &Config, chain: Chain, as_json: bool) -> R<()> {
+    if cfg.metrics.enabled {
+        if let Ok(body) = http_get(&cfg.metrics.listen, "/status") {
+            if as_json {
+                let v: serde_json::Value = serde_json::from_str(&body).unwrap_or(json!({}));
+                println!("{}", serde_json::to_string_pretty(&v)?);
+            } else {
+                let v: serde_json::Value = serde_json::from_str(&body).unwrap_or(json!({}));
+                print_status_human(&v);
+            }
+            return Ok(());
+        }
+    }
+    // Fallback: read the database directly (works when the server is stopped).
+    let store = open_store(cfg, chain)?;
+    let tip = store.committed_tip()?;
+    let v = json!({
+        "version": VERSION,
+        "network": chain.name(),
+        "state": "STOPPED",
+        "indexed_height": tip.as_ref().map(|t| t.height).unwrap_or(0),
+        "txnum": tip.as_ref().map(|t| t.txnum).unwrap_or(0),
+        "db_bytes": store.disk_usage_bytes(),
+        "disk_free_bytes": el_serve::disk_free_bytes(&cfg.data_dir(chain)),
+        "data_dir": cfg.data_dir(chain).display().to_string(),
+    });
+    if as_json {
+        println!("{}", serde_json::to_string_pretty(&v)?);
+    } else {
+        print_status_human(&v);
+    }
+    Ok(())
+}
+
+fn print_status_human(v: &serde_json::Value) {
+    let g = |k: &str| v.get(k).and_then(|x| x.as_u64()).unwrap_or(0);
+    println!(
+        "network   {}   state {}",
+        v.get("network").and_then(|x| x.as_str()).unwrap_or("?"),
+        v.get("state").and_then(|x| x.as_str()).unwrap_or("?")
+    );
+    println!(
+        "index     height {}   txnum {}   lag {}",
+        g("indexed_height"),
+        g("txnum"),
+        g("lag_blocks")
+    );
+    println!(
+        "core      height {}   last block {} ms",
+        g("core_height"),
+        g("last_block_ms")
+    );
+    println!(
+        "storage   {:.2} GiB   free {:.2} GiB",
+        g("db_bytes") as f64 / 1e9,
+        g("disk_free_bytes") as f64 / 1e9
+    );
+    println!(
+        "clients   {} (max {})   requests {}   errors {}",
+        g("clients"),
+        g("max_clients"),
+        g("requests_total"),
+        g("errors_total")
+    );
+}
+
+fn cmd_export(cfg: &Config, chain: Chain) -> R<()> {
+    let store = open_store(cfg, chain)?;
+    let tip = store.committed_tip()?;
+    let digest = store.canonical_digest()?;
+    println!("network: {}", chain.name());
+    match tip {
+        Some(t) => println!("tip: {} {}", t.height, t.block_hash),
+        None => println!("tip: empty"),
+    }
+    println!("logical_snapshot_hash: {digest}");
+    Ok(())
+}
+
+fn http_get(addr: &str, path: &str) -> R<String> {
+    let mut stream = TcpStream::connect(addr)?;
+    stream.set_read_timeout(Some(Duration::from_secs(3)))?;
+    let req = format!("GET {path} HTTP/1.0\r\nHost: {addr}\r\nConnection: close\r\n\r\n");
+    stream.write_all(req.as_bytes())?;
+    let mut resp = Vec::new();
+    stream.read_to_end(&mut resp)?;
+    let text = String::from_utf8_lossy(&resp);
+    let body = text
+        .split_once("\r\n\r\n")
+        .map(|(_, b)| b.to_string())
+        .ok_or("malformed HTTP response")?;
+    Ok(body)
+}

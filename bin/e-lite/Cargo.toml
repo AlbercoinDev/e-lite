@@ -1,0 +1,24 @@
+[package]
+name = "e-lite"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Electrum server for Bitcoin Core — query any script without registration"
+
+[[bin]]
+name = "e-lite"
+path = "src/main.rs"
+
+[dependencies]
+el-model = { path = "../../crates/el-model" }
+el-store = { path = "../../crates/el-store" }
+el-index = { path = "../../crates/el-index" }
+el-rpc = { path = "../../crates/el-rpc" }
+el-serve = { path = "../../crates/el-serve" }
+bitcoin.workspace = true
+rocksdb.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+toml.workspace = true
+hex.workspace = true

@@ -1,0 +1,50 @@
+# CONFIGURACIÓN OBJETIVO: la aplicación todavía NO existe.
+# Estos nombres son una propuesta; EL-010 fijará su esquema validado.
+
+[application]
+network = "regtest"  # regtest | signet | mainnet
+data_dir = "./.local/electrum-lite"
+log_level = "info"
+
+[core]
+source_mode = "full-core" # full-core | pruned-ibd
+rpc_url = "http://127.0.0.1:18443"
+cookie_file = "./.local/bitcoin/regtest/.cookie"
+rest_enabled = false
+request_timeout_seconds = 30
+
+[indexer]
+start_height = 0
+max_inflight_blocks = 2
+verify_merkle = true
+max_reorg_undo_blocks = 288 # límite operativo de ejemplo, NO garantía de consenso
+
+[pruning]
+enabled = false # habilitar únicamente en modo pruned-ibd validado
+manual_only_during_ibd = true
+min_free_disk_gib = 5 # hipótesis a medir; no límite suficiente universal
+stop_download_at_usage_percent = 85
+resume_download_at_usage_percent = 70
+operator_approval_required_for_auto_prune = true
+
+[storage]
+engine = "rocksdb"
+create_if_missing = true
+sync_commits = true
+rawtx_cache_max_gib = 2
+
+[electrum]
+listen = "127.0.0.1:50001"
+protocol_min = "1.4"
+protocol_max = "1.4"
+max_clients = 32
+
+[rawtx]
+allow_external_archive_peers = false # hasta cumplir pruebas de integridad
+fetch_timeout_seconds = 30
+validate_witness_commitment = true
+
+[security]
+allow_public_listener = false
+allow_existing_bitcoin_datadir_modification = false
+log_client_scripthashes = false

@@ -1,0 +1,8 @@
+/target
+/dist
+/.local
+*.deb
+*.tar.gz
+*.sha256
+/.cache
+*.zip
