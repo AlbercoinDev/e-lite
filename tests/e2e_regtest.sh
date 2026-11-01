@@ -73,7 +73,7 @@ def call(i, m, p):
 assert call(1, "server.version", ["e2e", "1.4"])[1] == "1.4"
 assert call(2, "blockchain.headers.subscribe", [])["height"] == height
 h = call(3, "blockchain.scripthash.get_history", [sh])
-assert h and len(h) == height + 1, len(h)
+assert h and len(h) == height, len(h)  # heights 1..height pay to the mined address
 bal = call(4, "blockchain.scripthash.get_balance", [sh])
 assert bal["confirmed"] > 0
 assert len(call(5, "blockchain.scripthash.listunspent", [sh])) == len(h)
