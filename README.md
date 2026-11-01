@@ -7,9 +7,8 @@ any `scriptPubKey` in the active chain — **without registering wallets**.
 loopback. Core remains the authority for consensus and the active chain; e-lite
 never invents data.
 
-> **Status: `v0.1.0-alpha.3` — experimental, no funds.**
-> Confirmed chain only: mempool, notifications push and `broadcast` are not
-> implemented yet. Use on test networks first.
+> **Status: `v0.1.0-alpha.4` — experimental, no funds.**
+> Use on test networks first.
 
 ## Supported networks
 
@@ -154,16 +153,32 @@ esplora_urls = [
 Pruning becomes a problem only if Core prunes blocks the index has not reached
 yet. `doctor` reports that and refuses to index a gap.
 
+## Mempool, fees and notifications
+
+- The mempool overlay is rebuilt from Core (`getrawmempool` plus batched raw
+  transaction fetches), refreshed every 3 s and immediately after each block.
+- `scripthash.get_mempool`, unconfirmed balances and `listunspent` include
+  unconfirmed transactions; status subscriptions notify clients when they change.
+- `blockchain.estimatefee`, `blockchain.relayfee`, `mempool.get_fee_histogram`,
+  `blockchain.block.stats`, verbose `transaction.get` and
+  `blockchain.transaction.broadcast` are implemented.
+- `blockchain.headers.subscribe` and `blockchain.scripthash.subscribe` push
+  notifications to connected clients.
+- `estimatefee` never returns `-1`: it falls back to `max(mempoolminfee,
+  relayfee)` so wallets can still compose transactions.
+
 ## Limitations (v0.1)
 
-- Confirmed chain only: no mempool overlay, no push notifications, no
-  `broadcast`/`estimatefee`.
-- `full-core` only (Core `prune=0`).
+- `blockchain.silentpayments.*` is not implemented (normal wallets are
+  unaffected).
+- The index must be built with a full node (or restored from a snapshot); serving
+  against a pruned Core is supported.
 - Raw transactions require the block to still exist in Core or in a configured
   external source; otherwise the error is explicit, never invented data.
 - P2P currently uses the v1 transport; BIP324 v2 is pending.
 - External rawtx requires Tor by default, so a missing Tor daemon degrades
   `transaction.get` for pruned blocks (history/balances still work).
+- The first mempool load on a large mempool can take a few seconds.
 - Deep reorganizations beyond `reorg_window` stop with `NEEDS_RECOVERY`.
 - No systemd unit and no aarch64 build.
 

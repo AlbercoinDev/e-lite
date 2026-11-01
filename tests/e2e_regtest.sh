@@ -88,6 +88,9 @@ assert call(11, "blockchain.scripthash.get_history", ["00"*32]) == []
 print("electrum queries OK")
 PY
 
+echo "== Sparrow-like sequence: fees, broadcast, mempool, notifications =="
+python3 "$(dirname "$0")/e2e_sparrow.py" "$ELECTRUM_PORT" "$CORE" "$RPC_PORT" "$ADDR"
+
 STATUS=$(curl -s "http://127.0.0.1:$METRICS_PORT/status")
 python3 - "$STATUS" <<'PY'
 import json, sys

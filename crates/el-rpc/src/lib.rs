@@ -95,14 +95,7 @@ impl CoreClient {
         })
     }
 
-    fn call<T: DeserializeOwned>(&self, method: &str, params: serde_json::Value) -> Result<T> {
-        let body = serde_json::json!({
-            "jsonrpc": "1.0",
-            "id": "e-lite",
-            "method": method,
-            "params": params,
-        })
-        .to_string();
+    fn post(&self, body: &str) -> Result<Vec<u8>> {
         let addr = format!("{}:{}", self.host, self.port);
         let sockaddr = addr
             .to_socket_addrs()?
@@ -121,9 +114,19 @@ impl CoreClient {
         );
         stream.write_all(req.as_bytes())?;
         stream.flush()?;
+        read_http_body(&mut stream)
+    }
 
-        let body = read_http_body(&mut stream)?;
-        let parsed: serde_json::Value = serde_json::from_slice(&body)
+    fn call<T: DeserializeOwned>(&self, method: &str, params: serde_json::Value) -> Result<T> {
+        let body = serde_json::json!({
+            "jsonrpc": "1.0",
+            "id": "e-lite",
+            "method": method,
+            "params": params,
+        })
+        .to_string();
+        let bytes = self.post(&body)?;
+        let parsed: serde_json::Value = serde_json::from_slice(&bytes)
             .map_err(|e| CoreError(format!("invalid JSON from Core: {e}")))?;
         if !parsed["error"].is_null() {
             return err(format!(
@@ -133,6 +136,51 @@ impl CoreClient {
         }
         serde_json::from_value(parsed["result"].clone())
             .map_err(|e| CoreError(format!("cannot decode {method} result: {e}")))
+    }
+
+    /// JSON-RPC batch: one HTTP request for many calls of the same method.
+    pub fn batch(
+        &self,
+        method: &str,
+        params_list: Vec<serde_json::Value>,
+    ) -> Result<Vec<std::result::Result<serde_json::Value, String>>> {
+        if params_list.is_empty() {
+            return Ok(Vec::new());
+        }
+        let requests: Vec<serde_json::Value> = params_list
+            .iter()
+            .enumerate()
+            .map(|(i, p)| {
+                serde_json::json!({
+                    "jsonrpc": "1.0",
+                    "id": i,
+                    "method": method,
+                    "params": p,
+                })
+            })
+            .collect();
+        let body = serde_json::to_string(&requests)
+            .map_err(|e| CoreError(format!("cannot encode batch: {e}")))?;
+        let bytes = self.post(&body)?;
+        let parsed: Vec<serde_json::Value> = serde_json::from_slice(&bytes)
+            .map_err(|e| CoreError(format!("invalid batch JSON from Core: {e}")))?;
+        let mut out: Vec<std::result::Result<serde_json::Value, String>> =
+            vec![Err("missing batch result".to_string()); params_list.len()];
+        for item in parsed {
+            let id = item["id"].as_u64().unwrap_or(u64::MAX) as usize;
+            if id >= out.len() {
+                continue;
+            }
+            if item["error"].is_null() {
+                out[id] = Ok(item["result"].clone());
+            } else {
+                out[id] = Err(item["error"]["message"]
+                    .as_str()
+                    .unwrap_or("core error")
+                    .to_string());
+            }
+        }
+        Ok(out)
     }
 
     pub fn network_info(&self) -> Result<NetworkInfo> {
@@ -159,6 +207,59 @@ impl CoreClient {
         )
     }
 
+    /// Raw transaction without requiring a block hash (works for mempool txs).
+    pub fn raw_transaction_hex_opt(&self, txid: &str, blockhash: Option<&str>) -> Result<String> {
+        let params = match blockhash {
+            Some(h) => serde_json::json!([txid, false, h]),
+            None => serde_json::json!([txid, false]),
+        };
+        self.call("getrawtransaction", params)
+    }
+
+    /// Raw transactions for a batch of txids (mempool or txindex). Missing
+    /// transactions yield `None` instead of failing the whole batch.
+    pub fn batch_raw_transactions(&self, txids: &[String]) -> Result<Vec<Option<String>>> {
+        let params: Vec<serde_json::Value> = txids.iter().map(|t| serde_json::json!([t])).collect();
+        let results = self.batch("getrawtransaction", params)?;
+        Ok(results
+            .into_iter()
+            .map(|r| r.ok().and_then(|v| v.as_str().map(|s| s.to_string())))
+            .collect())
+    }
+
+    /// Verbose transaction (for Electrum `transaction.get(..., true)`).
+    pub fn raw_transaction_json(
+        &self,
+        txid: &str,
+        blockhash: Option<&str>,
+    ) -> Result<serde_json::Value> {
+        let params = match blockhash {
+            Some(h) => serde_json::json!([txid, true, h]),
+            None => serde_json::json!([txid, true]),
+        };
+        self.call("getrawtransaction", params)
+    }
+
+    pub fn send_raw_transaction(&self, tx_hex: &str) -> Result<String> {
+        self.call("sendrawtransaction", serde_json::json!([tx_hex]))
+    }
+
+    pub fn raw_mempool_verbose(&self) -> Result<std::collections::HashMap<String, MempoolEntry>> {
+        self.call("getrawmempool", serde_json::json!([true]))
+    }
+
+    pub fn mempool_info(&self) -> Result<MempoolInfo> {
+        self.call("getmempoolinfo", serde_json::json!([]))
+    }
+
+    pub fn estimate_smart_fee(&self, target: u32) -> Result<EstimateSmartFee> {
+        self.call("estimatesmartfee", serde_json::json!([target]))
+    }
+
+    pub fn block_stats(&self, height: u64) -> Result<serde_json::Value> {
+        self.call("getblockstats", serde_json::json!([height]))
+    }
+
     /// Peer addresses known to the local Core (no public DNS lookup).
     pub fn node_addresses(&self, count: u32) -> Result<Vec<NodeAddress>> {
         self.call("getnodeaddresses", serde_json::json!([count]))
@@ -175,6 +276,42 @@ impl CoreClient {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+pub struct MempoolFees {
+    #[serde(default)]
+    pub base: f64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct MempoolEntry {
+    #[serde(default)]
+    pub vsize: u64,
+    #[serde(default)]
+    pub fees: Option<MempoolFees>,
+    #[serde(default)]
+    pub depends: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct MempoolInfo {
+    #[serde(default)]
+    pub mempoolminfee: f64,
+    #[serde(default)]
+    pub minrelaytxfee: f64,
+    #[serde(default)]
+    pub size: u64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct EstimateSmartFee {
+    #[serde(default)]
+    pub feerate: Option<f64>,
+    #[serde(default)]
+    pub blocks: Option<u32>,
+    #[serde(default)]
+    pub errors: Option<Vec<String>>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
 pub struct NodeAddress {
     pub address: String,
     pub port: u16,
@@ -187,6 +324,8 @@ pub struct NetworkInfo {
     pub version: u64,
     #[serde(default)]
     pub subversion: String,
+    #[serde(default)]
+    pub relayfee: f64,
 }
 
 #[derive(Debug, Clone, Deserialize)]

@@ -1,8 +1,9 @@
-//! Electrum JSON-RPC 1.4 server (confirmed chain only) and local metrics.
+//! Electrum JSON-RPC 1.4 server and local metrics.
 //!
 //! Each request reads the index through a shared read lock; the indexer commits
 //! under the write lock, so no response mixes two tips.
 
+use el_mempool::Mempool;
 use el_model::{merkle_branch, Hash32, NetworkIdentity, ScriptHash};
 use el_rawtx::Resolver;
 use el_rpc::CoreClient;
@@ -12,8 +13,8 @@ use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::sync::atomic::{AtomicU64, AtomicU8, AtomicUsize, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 pub const PROTOCOL_MIN: &str = "1.4";
@@ -48,6 +49,9 @@ pub struct Stats {
     pub errors_total: AtomicU64,
     pub clients: AtomicUsize,
     pub last_block_ms: AtomicU64,
+    pub notifier_runs: AtomicU64,
+    pub notifications_sent: AtomicU64,
+    pub notifier_errors: AtomicU64,
     pub started: Instant,
 }
 
@@ -61,8 +65,97 @@ impl Default for Stats {
             errors_total: AtomicU64::new(0),
             clients: AtomicUsize::new(0),
             last_block_ms: AtomicU64::new(0),
+            notifier_runs: AtomicU64::new(0),
+            notifications_sent: AtomicU64::new(0),
+            notifier_errors: AtomicU64::new(0),
             started: Instant::now(),
         }
+    }
+}
+
+pub struct ClientState {
+    pub id: u64,
+    pub writer: Mutex<TcpStream>,
+    pub subs: Mutex<HashMap<ScriptHash, Option<String>>>,
+    pub headers: AtomicBool,
+    pub last_height: AtomicU64,
+    pub alive: AtomicBool,
+}
+
+impl ClientState {
+    pub fn send(&self, value: &Value) -> bool {
+        if !self.alive.load(Ordering::Relaxed) {
+            return false;
+        }
+        let mut bytes = match serde_json::to_vec(value) {
+            Ok(b) => b,
+            Err(_) => return false,
+        };
+        bytes.push(b'\n');
+        let mut writer = match self.writer.lock() {
+            Ok(w) => w,
+            Err(_) => return false,
+        };
+        if writer
+            .write_all(&bytes)
+            .and_then(|_| writer.flush())
+            .is_err()
+        {
+            self.alive.store(false, Ordering::SeqCst);
+            return false;
+        }
+        true
+    }
+}
+
+#[derive(Default)]
+pub struct ClientRegistry {
+    next: AtomicU64,
+    clients: Mutex<HashMap<u64, Arc<ClientState>>>,
+}
+
+impl ClientRegistry {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn register(&self, writer: TcpStream) -> Arc<ClientState> {
+        let id = self.next.fetch_add(1, Ordering::SeqCst) + 1;
+        let state = Arc::new(ClientState {
+            id,
+            writer: Mutex::new(writer),
+            subs: Mutex::new(HashMap::new()),
+            headers: AtomicBool::new(false),
+            last_height: AtomicU64::new(0),
+            alive: AtomicBool::new(true),
+        });
+        if let Ok(mut c) = self.clients.lock() {
+            c.insert(id, Arc::clone(&state));
+        }
+        state
+    }
+
+    pub fn unregister(&self, id: u64) {
+        if let Ok(mut c) = self.clients.lock() {
+            if let Some(state) = c.remove(&id) {
+                state.alive.store(false, Ordering::SeqCst);
+            }
+        }
+    }
+
+    pub fn snapshot(&self) -> Vec<Arc<ClientState>> {
+        self.clients
+            .lock()
+            .map(|c| c.values().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    pub fn len(&self) -> usize {
+        self.clients.lock().map(|c| c.len()).unwrap_or(0)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
     }
 }
 
@@ -70,6 +163,10 @@ pub struct Shared {
     pub store: Arc<Store>,
     pub core: CoreClient,
     pub resolver: Arc<Resolver>,
+    pub mempool: Arc<RwLock<Mempool>>,
+    pub relayfee: Mutex<f64>,
+    pub fee_estimates: Mutex<HashMap<u32, (f64, Instant)>>,
+    pub clients: Arc<ClientRegistry>,
     pub identity: NetworkIdentity,
     pub data_dir: std::path::PathBuf,
     pub listen: String,
@@ -115,6 +212,17 @@ impl Shared {
             "uptime_seconds": self.stats.started.elapsed().as_secs(),
             "listen": self.listen,
             "protocol": PROTOCOL_MAX,
+            "notifier": {
+                "runs": self.stats.notifier_runs.load(Ordering::Relaxed),
+                "sent": self.stats.notifications_sent.load(Ordering::Relaxed),
+                "errors": self.stats.notifier_errors.load(Ordering::Relaxed),
+            },
+            "mempool": {
+                "count": self.mempool.read().map(|m| m.len()).unwrap_or(0),
+                "version": self.mempool.read().map(|m| m.version()).unwrap_or(0),
+                "unresolved_inputs": self.mempool.read().map(|m| m.unresolved_inputs()).unwrap_or(0),
+                "histogram_buckets": self.mempool.read().map(|m| m.fee_histogram().len()).unwrap_or(0),
+            },
             "rawtx": {
                 "cache_hits": rawtx.cache_hits.load(Ordering::Relaxed),
                 "cache_puts": rawtx.cache_puts.load(Ordering::Relaxed),
@@ -177,11 +285,20 @@ type RpcResult<T> = std::result::Result<T, RpcError>;
 pub const METHOD_NOT_FOUND: i64 = -32601;
 
 pub fn dispatch(shared: &Shared, method: &str, params: &Value) -> RpcResult<Value> {
+    dispatch_for(shared, None, method, params)
+}
+
+pub fn dispatch_for(
+    shared: &Shared,
+    client: Option<&Arc<ClientState>>,
+    method: &str,
+    params: &Value,
+) -> RpcResult<Value> {
     match method {
         "server.version" => server_version(params),
         "server.ping" => Ok(Value::Null),
         "server.banner" => Ok(json!(format!(
-            "e-lite {} — confirmed chain only, no wallet registration",
+            "e-lite {} — no wallet registration",
             VERSION
         ))),
         "server.donation_address" => Ok(json!("")),
@@ -196,14 +313,29 @@ pub fn dispatch(shared: &Shared, method: &str, params: &Value) -> RpcResult<Valu
                 .map_err(|_| RpcError::server("lock poisoned"))?;
             check_ready(shared)?;
             match method {
-                "blockchain.headers.subscribe" => headers_subscribe(shared),
+                "blockchain.headers.subscribe" => headers_subscribe(shared, client),
                 "blockchain.block.header" => block_header(shared, params),
                 "blockchain.block.headers" => block_headers(shared, params),
                 "blockchain.scripthash.get_history" => scripthash_history(shared, params),
                 "blockchain.scripthash.get_balance" => scripthash_balance(shared, params),
                 "blockchain.scripthash.listunspent" => scripthash_listunspent(shared, params),
-                "blockchain.scripthash.subscribe" => scripthash_subscribe(shared, params),
-                "blockchain.scripthash.unsubscribe" => Ok(json!(true)),
+                "blockchain.scripthash.subscribe" => scripthash_subscribe(shared, client, params),
+                "blockchain.scripthash.unsubscribe" => {
+                    if let Some(c) = client {
+                        if let Ok(script) = param_scripthash(params) {
+                            if let Ok(mut subs) = c.subs.lock() {
+                                subs.remove(&script);
+                            }
+                        }
+                    }
+                    Ok(json!(true))
+                }
+                "blockchain.scripthash.get_mempool" => scripthash_mempool(shared, params),
+                "mempool.get_fee_histogram" => fee_histogram(shared),
+                "blockchain.relayfee" => relay_fee(shared),
+                "blockchain.estimatefee" => estimate_fee(shared, params),
+                "blockchain.block.stats" => block_stats(shared, params),
+                "blockchain.transaction.broadcast" => broadcast_transaction(shared, params),
                 "blockchain.transaction.get" => transaction_get(shared, params),
                 "blockchain.transaction.get_merkle" => transaction_merkle(shared, params),
                 "blockchain.transaction.id_from_pos" => transaction_id_from_pos(shared, params),
@@ -287,8 +419,12 @@ fn tip_block(shared: &Shared) -> RpcResult<el_model::BlockRecord> {
         .ok_or_else(|| RpcError::server("tip block missing"))
 }
 
-fn headers_subscribe(shared: &Shared) -> RpcResult<Value> {
+fn headers_subscribe(shared: &Shared, client: Option<&Arc<ClientState>>) -> RpcResult<Value> {
     let rec = tip_block(shared)?;
+    if let Some(c) = client {
+        c.headers.store(true, Ordering::SeqCst);
+        c.last_height.store(rec.height as u64, Ordering::SeqCst);
+    }
     Ok(json!({
         "height": rec.height,
         "hex": hex::encode(rec.header),
@@ -407,8 +543,19 @@ fn scripthash_balance(shared: &Shared, params: &Value) -> RpcResult<Value> {
         .store
         .utxos_for_script(script)
         .map_err(|e| RpcError::server(e.to_string()))?;
-    let confirmed: u64 = utxos.iter().map(|(_, v, _, _)| *v).sum();
-    Ok(json!({"confirmed": confirmed, "unconfirmed": 0}))
+    let mem = shared
+        .mempool
+        .read()
+        .map_err(|_| RpcError::server("mempool lock poisoned"))?;
+    let confirmed: u64 = utxos
+        .iter()
+        .filter(|(op, _, _, _)| !mem.is_spent(op))
+        .map(|(_, v, _, _)| *v)
+        .sum();
+    Ok(json!({
+        "confirmed": confirmed,
+        "unconfirmed": mem.balance_delta(script),
+    }))
 }
 
 fn scripthash_listunspent(shared: &Shared, params: &Value) -> RpcResult<Value> {
@@ -417,8 +564,15 @@ fn scripthash_listunspent(shared: &Shared, params: &Value) -> RpcResult<Value> {
         .store
         .utxos_for_script(script)
         .map_err(|e| RpcError::server(e.to_string()))?;
-    let mut arr = Vec::with_capacity(utxos.len());
+    let mem = shared
+        .mempool
+        .read()
+        .map_err(|_| RpcError::server("mempool lock poisoned"))?;
+    let mut arr = Vec::new();
     for (op, value, height, _coinbase) in utxos {
+        if mem.is_spent(&op) {
+            continue;
+        }
         arr.push(json!({
             "tx_hash": op.txid.to_hex(),
             "tx_pos": op.vout,
@@ -426,20 +580,53 @@ fn scripthash_listunspent(shared: &Shared, params: &Value) -> RpcResult<Value> {
             "value": value,
         }));
     }
+    for (op, value) in mem.utxos(script) {
+        arr.push(json!({
+            "tx_hash": op.txid.to_hex(),
+            "tx_pos": op.vout,
+            "height": 0,
+            "value": value,
+        }));
+    }
     Ok(Value::Array(arr))
 }
 
-fn scripthash_subscribe(shared: &Shared, params: &Value) -> RpcResult<Value> {
-    let script = param_scripthash(params)?;
+fn script_status(shared: &Shared, script: ScriptHash) -> RpcResult<Option<String>> {
     let entries = history_entries(shared, script)?;
-    if entries.is_empty() {
-        return Ok(Value::Null);
+    let mem = shared
+        .mempool
+        .read()
+        .map_err(|_| RpcError::server("mempool lock poisoned"))?;
+    let mem_entries = mem.history(script);
+    if entries.is_empty() && mem_entries.is_empty() {
+        return Ok(None);
     }
     let mut hasher = Sha256::new();
     for (height, _, txid, _, _) in entries {
         hasher.update(format!("{txid}:{height}:").as_bytes());
     }
-    Ok(json!(hex::encode(hasher.finalize())))
+    for (txid, _) in mem_entries {
+        hasher.update(format!("{}:0:", txid).as_bytes());
+    }
+    Ok(Some(hex::encode(hasher.finalize())))
+}
+
+fn scripthash_subscribe(
+    shared: &Shared,
+    client: Option<&Arc<ClientState>>,
+    params: &Value,
+) -> RpcResult<Value> {
+    let script = param_scripthash(params)?;
+    let status = script_status(shared, script)?;
+    if let Some(c) = client {
+        if let Ok(mut subs) = c.subs.lock() {
+            subs.insert(script, status.clone());
+        }
+    }
+    match status {
+        Some(status) => Ok(json!(status)),
+        None => Ok(Value::Null),
+    }
 }
 
 fn transaction_get(shared: &Shared, params: &Value) -> RpcResult<Value> {
@@ -448,28 +635,162 @@ fn transaction_get(shared: &Shared, params: &Value) -> RpcResult<Value> {
         .and_then(|a| a.first())
         .and_then(|v| v.as_str())
         .ok_or_else(|| RpcError::invalid("expected txid"))?;
-    if params
+    let verbose = params
         .as_array()
         .and_then(|a| a.get(1))
         .map(|v| v.as_bool().unwrap_or(false))
-        .unwrap_or(false)
-    {
-        return Err(RpcError::server("verbose transaction.get is not supported"));
-    }
+        .unwrap_or(false);
     let txid_hash = Hash32::from_hex(txid).map_err(RpcError::invalid)?;
     let occ = shared
         .store
         .occurrences(txid_hash)
         .map_err(|e| RpcError::server(e.to_string()))?;
-    let (height, _) = occ
-        .first()
-        .copied()
-        .ok_or_else(|| RpcError::server("transaction not found in the active chain"))?;
-    let raw = shared
-        .resolver
-        .raw_tx(txid_hash, height)
+
+    if verbose {
+        let blockhash = match occ.first() {
+            Some((height, _)) => shared
+                .store
+                .get_block(*height)
+                .ok()
+                .flatten()
+                .map(|r| r.hash.to_hex()),
+            None => None,
+        };
+        return shared
+            .core
+            .raw_transaction_json(txid, blockhash.as_deref())
+            .map_err(|e| RpcError::server(format!("rawtx unavailable: {e}")));
+    }
+
+    match occ.first().copied() {
+        Some((height, _)) => shared
+            .resolver
+            .raw_tx(txid_hash, height)
+            .map(|raw| json!(raw))
+            .map_err(|e| RpcError::server(e.to_string())),
+        None => shared
+            .core
+            .raw_transaction_hex_opt(txid, None)
+            .map(|raw| json!(raw))
+            .map_err(|e| RpcError::server(format!("transaction not found: {e}"))),
+    }
+}
+
+fn fee_histogram(shared: &Shared) -> RpcResult<Value> {
+    let mem = shared
+        .mempool
+        .read()
+        .map_err(|_| RpcError::server("mempool lock poisoned"))?;
+    Ok(Value::Array(
+        mem.fee_histogram()
+            .into_iter()
+            .map(|(rate, size)| json!([rate, size]))
+            .collect(),
+    ))
+}
+
+fn relay_fee(shared: &Shared) -> RpcResult<Value> {
+    let mut fee = *shared
+        .relayfee
+        .lock()
+        .map_err(|_| RpcError::server("fee lock poisoned"))?;
+    if fee <= 0.0 {
+        if let Ok(info) = shared.core.network_info() {
+            if info.relayfee > 0.0 {
+                fee = info.relayfee;
+                *shared
+                    .relayfee
+                    .lock()
+                    .map_err(|_| RpcError::server("fee lock poisoned"))? = fee;
+            }
+        }
+    }
+    if fee <= 0.0 {
+        fee = 0.00001;
+    }
+    Ok(json!(fee))
+}
+
+fn estimate_fee(shared: &Shared, params: &Value) -> RpcResult<Value> {
+    let target = param_u32(params, 0)?.clamp(1, 1008);
+    {
+        let cache = shared
+            .fee_estimates
+            .lock()
+            .map_err(|_| RpcError::server("fee lock poisoned"))?;
+        if let Some((value, at)) = cache.get(&target) {
+            if at.elapsed() < Duration::from_secs(30) {
+                return Ok(json!(value));
+            }
+        }
+    }
+
+    let mut value = None;
+    if let Ok(estimate) = shared.core.estimate_smart_fee(target) {
+        if let Some(rate) = estimate.feerate {
+            if rate > 0.0 {
+                value = Some(rate);
+            }
+        }
+    }
+    let value = value.unwrap_or_else(|| {
+        // Never return -1: clients (Sparrow) treat it as a failure when sending.
+        let mut fallback = *shared.relayfee.lock().unwrap_or_else(|e| e.into_inner());
+        if fallback <= 0.0 {
+            fallback = 0.00001;
+        }
+        if let Ok(info) = shared.core.mempool_info() {
+            fallback = fallback.max(info.mempoolminfee);
+        }
+        fallback
+    });
+    shared
+        .fee_estimates
+        .lock()
+        .map_err(|_| RpcError::server("fee lock poisoned"))?
+        .insert(target, (value, Instant::now()));
+    Ok(json!(value))
+}
+
+fn block_stats(shared: &Shared, params: &Value) -> RpcResult<Value> {
+    let height = param_u32(params, 0)? as u64;
+    shared
+        .core
+        .block_stats(height)
+        .map_err(|e| RpcError::server(e.to_string()))
+}
+
+fn broadcast_transaction(shared: &Shared, params: &Value) -> RpcResult<Value> {
+    let hex = params
+        .as_array()
+        .and_then(|a| a.first())
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| RpcError::invalid("expected raw transaction hex"))?;
+    let txid = shared
+        .core
+        .send_raw_transaction(hex)
         .map_err(|e| RpcError::server(e.to_string()))?;
-    Ok(json!(raw))
+    Ok(json!(txid))
+}
+
+fn scripthash_mempool(shared: &Shared, params: &Value) -> RpcResult<Value> {
+    let script = param_scripthash(params)?;
+    let mem = shared
+        .mempool
+        .read()
+        .map_err(|_| RpcError::server("mempool lock poisoned"))?;
+    let arr: Vec<Value> = mem
+        .history(script)
+        .into_iter()
+        .map(|(txid, fee)| {
+            json!({
+                "tx_hash": txid.to_hex(),
+                "height": 0,
+                "fee": fee,
+            })
+        })
+        .collect();
+    Ok(Value::Array(arr))
 }
 
 fn transaction_merkle(shared: &Shared, params: &Value) -> RpcResult<Value> {
@@ -533,6 +854,155 @@ fn transaction_id_from_pos(shared: &Shared, params: &Value) -> RpcResult<Value> 
     }))
 }
 
+/// Poll Core and keep the mempool overlay fresh. Core remains the source of
+/// truth; nothing is persisted.
+pub fn start_mempool(shared: Arc<Shared>) -> std::thread::JoinHandle<()> {
+    std::thread::spawn(move || {
+        let mut last_err = String::new();
+        let mut last_fee = Instant::now()
+            .checked_sub(Duration::from_secs(600))
+            .unwrap_or_else(Instant::now);
+        let mut last_tip = u64::MAX;
+        let mut last_refresh = Instant::now()
+            .checked_sub(Duration::from_secs(60))
+            .unwrap_or_else(Instant::now);
+        loop {
+            // Reconcile immediately after a new block; otherwise poll every 3 s.
+            let tip = shared
+                .store
+                .committed_tip()
+                .ok()
+                .flatten()
+                .map(|t| t.height as u64)
+                .unwrap_or(0);
+            let tip_changed = tip != last_tip;
+            if !tip_changed && last_refresh.elapsed() < Duration::from_secs(3) {
+                std::thread::sleep(Duration::from_secs(1));
+                continue;
+            }
+            let result = {
+                let mut mem = match shared.mempool.write() {
+                    Ok(m) => m,
+                    Err(_) => break,
+                };
+                mem.refresh(&shared.core, &shared.store)
+            };
+            last_tip = tip;
+            last_refresh = Instant::now();
+            match result {
+                Ok(_) => {
+                    if !last_err.is_empty() {
+                        eprintln!("[e-lite] mempool refresh recovered");
+                        last_err.clear();
+                    }
+                }
+                Err(e) => {
+                    let msg = e.to_string();
+                    if msg != last_err {
+                        eprintln!("[e-lite] mempool refresh: {msg}");
+                        last_err = msg;
+                    }
+                }
+            }
+            if last_fee.elapsed() >= Duration::from_secs(60) {
+                if let Ok(info) = shared.core.network_info() {
+                    if info.relayfee > 0.0 {
+                        if let Ok(mut fee) = shared.relayfee.lock() {
+                            *fee = info.relayfee;
+                        }
+                    }
+                }
+                last_fee = Instant::now();
+            }
+            std::thread::sleep(Duration::from_secs(3));
+        }
+    })
+}
+
+/// Push notifications for subscribed clients (headers and scripthash status).
+/// Recomputed only when the tip or the mempool overlay changes.
+pub fn start_notifications(shared: Arc<Shared>) -> std::thread::JoinHandle<()> {
+    std::thread::spawn(move || {
+        let mut last_height = u64::MAX;
+        let mut last_mempool = u64::MAX;
+        loop {
+            shared.stats.notifier_runs.fetch_add(1, Ordering::Relaxed);
+            let tip = shared.store.committed_tip().ok().flatten();
+            let (height, header) = match tip {
+                Some(t) => (
+                    t.height as u64,
+                    shared
+                        .store
+                        .get_block(t.height)
+                        .ok()
+                        .flatten()
+                        .map(|r| hex::encode(r.header)),
+                ),
+                None => (0, None),
+            };
+            let mem_version = shared.mempool.read().map(|m| m.version()).unwrap_or(0);
+            let new_block = height != last_height;
+            let mem_changed = mem_version != last_mempool;
+            if new_block || mem_changed {
+                for client in shared.clients.snapshot() {
+                    if !client.alive.load(Ordering::SeqCst) {
+                        continue;
+                    }
+                    if new_block && client.headers.load(Ordering::SeqCst) {
+                        if let Some(h) = &header {
+                            let notification = json!({
+                                "jsonrpc": "2.0",
+                                "method": "blockchain.headers.subscribe",
+                                "params": [{"height": height, "hex": h}],
+                            });
+                            if client.send(&notification) {
+                                shared
+                                    .stats
+                                    .notifications_sent
+                                    .fetch_add(1, Ordering::Relaxed);
+                                client.last_height.store(height, Ordering::SeqCst);
+                            } else {
+                                shared.stats.notifier_errors.fetch_add(1, Ordering::Relaxed);
+                            }
+                        }
+                    }
+                    let subs: Vec<(ScriptHash, Option<String>)> = client
+                        .subs
+                        .lock()
+                        .map(|s| s.iter().map(|(k, v)| (*k, v.clone())).collect())
+                        .unwrap_or_default();
+                    for (script, old) in subs {
+                        let Ok(new) = script_status(&shared, script) else {
+                            continue;
+                        };
+                        if new != old {
+                            let notification = json!({
+                                "jsonrpc": "2.0",
+                                "method": "blockchain.scripthash.subscribe",
+                                "params": [script.to_electrum_hex(), new],
+                            });
+                            if client.send(&notification) {
+                                shared
+                                    .stats
+                                    .notifications_sent
+                                    .fetch_add(1, Ordering::Relaxed);
+                                if let Ok(mut subs) = client.subs.lock() {
+                                    subs.insert(script, new);
+                                }
+                            } else {
+                                shared.stats.notifier_errors.fetch_add(1, Ordering::Relaxed);
+                            }
+                        }
+                    }
+                }
+                last_height = height;
+                last_mempool = mem_version;
+            }
+            std::thread::sleep(Duration::from_secs(2));
+        }
+    })
+}
+
 // ------------------------------------------------------------------- transports
 
 pub fn start_server(shared: Arc<Shared>) -> std::io::Result<std::thread::JoinHandle<()>> {
@@ -548,9 +1018,13 @@ pub fn start_server(shared: Arc<Shared>) -> std::io::Result<std::thread::JoinHan
                 continue;
             }
             let shared = Arc::clone(&shared);
+            let Ok(writer) = stream.try_clone() else {
+                continue;
+            };
+            let client = shared.clients.register(writer);
             std::thread::spawn(move || {
                 shared.stats.clients.fetch_add(1, Ordering::SeqCst);
-                let _ = handle_client(&shared, stream);
+                let _ = handle_client(&shared, stream, client);
                 shared.stats.clients.fetch_sub(1, Ordering::SeqCst);
             });
         }
@@ -558,31 +1032,48 @@ pub fn start_server(shared: Arc<Shared>) -> std::io::Result<std::thread::JoinHan
     Ok(handle)
 }
 
-fn handle_client(shared: &Shared, stream: TcpStream) -> std::io::Result<()> {
+fn handle_client(
+    shared: &Shared,
+    stream: TcpStream,
+    client: Arc<ClientState>,
+) -> std::io::Result<()> {
     stream.set_read_timeout(Some(Duration::from_secs(600)))?;
     stream.set_write_timeout(Some(Duration::from_secs(30)))?;
-    let mut writer = stream.try_clone()?;
-    let reader = BufReader::new(stream);
-    for line in reader.lines() {
-        let line = match line {
-            Ok(l) => l,
+    let mut reader = BufReader::new(stream);
+    let mut buf = Vec::new();
+    loop {
+        buf.clear();
+        match reader.read_until(b'\n', &mut buf) {
+            Ok(0) => break,
+            Ok(_) => {}
             Err(_) => break,
-        };
+        }
+        if buf.len() > 1024 * 1024 {
+            let _ = client.send(&json!({
+                "jsonrpc": "2.0",
+                "id": Value::Null,
+                "error": {"code": -32600, "message": "request too large"},
+            }));
+            break;
+        }
+        let line = String::from_utf8_lossy(&buf);
         if line.trim().is_empty() {
             continue;
         }
-        let response = process_line(shared, &line);
-        let mut bytes = serde_json::to_vec(&response).unwrap_or_else(|_| b"{}".to_vec());
-        bytes.push(b'\n');
-        if writer.write_all(&bytes).is_err() {
+        let response = process_line_for(shared, Some(&client), &line);
+        if !client.send(&response) {
             break;
         }
-        let _ = writer.flush();
     }
+    shared.clients.unregister(client.id);
     Ok(())
 }
 
 pub fn process_line(shared: &Shared, line: &str) -> Value {
+    process_line_for(shared, None, line)
+}
+
+pub fn process_line_for(shared: &Shared, client: Option<&Arc<ClientState>>, line: &str) -> Value {
     shared.stats.requests_total.fetch_add(1, Ordering::Relaxed);
     let request: Value = match serde_json::from_str(line) {
         Ok(v) => v,
@@ -608,7 +1099,7 @@ pub fn process_line(shared: &Shared, line: &str) -> Value {
         }
     };
     let params = request.get("params").cloned().unwrap_or(json!([]));
-    match dispatch(shared, method, &params) {
+    match dispatch_for(shared, client, method, &params) {
         Ok(result) => json!({"jsonrpc": "2.0", "id": id, "result": result}),
         Err(e) => {
             shared.stats.errors_total.fetch_add(1, Ordering::Relaxed);

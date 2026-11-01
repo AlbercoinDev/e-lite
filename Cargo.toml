@@ -7,11 +7,12 @@ members = [
     "crates/el-rpc",
     "crates/el-serve",
     "crates/el-rawtx",
+    "crates/el-mempool",
     "bin/e-lite",
 ]
 
 [workspace.package]
-version = "0.1.0-alpha.3"
+version = "0.1.0-alpha.4"
 edition = "2021"
 license = "MIT"
 rust-version = "1.85"
@@ -38,4 +39,5 @@ panic = "abort"
 
 [profile.dev]
 opt-level = 1
-debug = 1
+debug = 0
+incremental = false

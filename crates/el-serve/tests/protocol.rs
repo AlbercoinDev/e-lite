@@ -1,12 +1,13 @@
 //! C7 — Electrum 1.4 fixtures exercised through the real JSON-RPC dispatcher.
 
+use el_mempool::Mempool;
 use el_model::{
     BlockRecord, Chain, Hash32, HistoryEffect, IndexedTip, NetworkIdentity, Outpoint, ScriptHash,
     UtxoValue,
 };
 use el_rawtx::{RawtxConfig, Resolver};
 use el_rpc::{CoreClient, CoreConfig};
-use el_serve::{process_line, state, Shared, Stats};
+use el_serve::{process_line, state, ClientRegistry, Shared, Stats};
 use el_store::Store;
 use serde_json::{json, Value};
 use std::path::PathBuf;
@@ -128,6 +129,10 @@ fn fixture() -> (Fixture, ScriptHash, Hash32) {
         store,
         core,
         resolver,
+        mempool: Arc::new(RwLock::new(Mempool::new())),
+        relayfee: std::sync::Mutex::new(0.0),
+        fee_estimates: std::sync::Mutex::new(std::collections::HashMap::new()),
+        clients: Arc::new(ClientRegistry::new()),
         identity,
         data_dir: dir.clone(),
         listen: "127.0.0.1:0".to_string(),
@@ -268,4 +273,22 @@ fn incompatible_protocol_is_rejected() {
     let (fx, _, _) = fixture();
     let r = call(&fx.shared, 1, "server.version", json!(["old", "1.2"]));
     assert_eq!(r["error"]["code"], -32000);
+}
+
+#[test]
+fn fee_and_mempool_methods_never_return_method_not_found() {
+    let (fx, script, _) = fixture();
+    let r = call(&fx.shared, 1, "blockchain.relayfee", json!([]));
+    assert!(r["result"].as_f64().unwrap() > 0.0, "{r}");
+    let r = call(&fx.shared, 2, "blockchain.estimatefee", json!([6]));
+    assert!(r["result"].as_f64().unwrap() > 0.0, "{r}");
+    let r = call(&fx.shared, 3, "mempool.get_fee_histogram", json!([]));
+    assert_eq!(r["result"], json!([]), "{r}");
+    let r = call(
+        &fx.shared,
+        4,
+        "blockchain.scripthash.get_mempool",
+        json!([script.to_electrum_hex()]),
+    );
+    assert_eq!(r["result"], json!([]), "{r}");
 }

@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.1.0-alpha.4 — 2026-11-01
+
+- **Mempool overlay** rebuilt from Core: per-script unconfirmed history, balance
+  deltas, mempool UTXOs and spent outpoints (including chained transactions),
+  refreshed every 3 s and immediately after a new block.
+- **Fees**: `blockchain.estimatefee`, `blockchain.relayfee` and
+  `mempool.get_fee_histogram`; `estimatefee` never returns `-1`.
+- **Broadcast and verbose tx**: `blockchain.transaction.broadcast`,
+  `transaction.get(..., true)` and `blockchain.block.stats`.
+- **Push notifications**: headers and scripthash status are pushed to subscribed
+  clients; status includes mempool entries.
+- `scripthash.get_mempool`, unconfirmed balances and `listunspent` now include
+  mempool data.
+- `run` always follows the tip (`--no-follow` applies only to `index`).
+- Per-request line limit (1 MiB) and notification counters in `/status` and
+  `/metrics`.
+- Tests: Sparrow-like connect sequence, broadcast, mempool overlay, notifications,
+  fee fallbacks and block stats.
+
 ## 0.1.0-alpha.3 — 2026-11-01
 
 - **Pruned Core support for serving**: the index must already cover the chain;

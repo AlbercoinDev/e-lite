@@ -4,6 +4,7 @@ use bitcoin::consensus::deserialize;
 use bitcoin::Block;
 use config::Config;
 use el_index::{apply_block, prune_undo, rewind_to, GroupOverlay};
+use el_mempool::Mempool;
 use el_model::{Chain, Hash32, IndexedTip, NetworkIdentity, ScriptHash};
 use el_rawtx::{CoreBlockSource, RawtxConfig, Resolver};
 use el_rpc::{BlockchainInfo, CoreClient, CoreConfig};
@@ -14,7 +15,7 @@ use serde_json::json;
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 type E = Box<dyn std::error::Error + Send + Sync>;
@@ -860,6 +861,10 @@ fn build_shared(cfg: &Config, chain: Chain) -> R<Arc<Shared>> {
         store,
         core,
         resolver,
+        mempool: Arc::new(RwLock::new(Mempool::new())),
+        relayfee: Mutex::new(0.0),
+        fee_estimates: Mutex::new(std::collections::HashMap::new()),
+        clients: Arc::new(el_serve::ClientRegistry::new()),
         identity,
         data_dir: cfg.data_dir(chain),
         listen: cfg.server.listen.clone(),
@@ -879,6 +884,8 @@ fn start_transports(shared: &Arc<Shared>, cfg: &Config) -> R<()> {
         el_serve::start_metrics(m, cfg.metrics.listen.clone())
             .map_err(|e| format!("cannot bind metrics {}: {e}", cfg.metrics.listen))?;
     }
+    el_serve::start_mempool(Arc::clone(shared));
+    el_serve::start_notifications(Arc::clone(shared));
     Ok(())
 }
 
@@ -947,12 +954,8 @@ fn cmd_run(cfg: &Config, chain: Chain) -> R<()> {
                 return Err(e);
             }
         }
-        if !cfg.index.follow {
-            // Keep serving after a one-shot catch-up.
-            loop {
-                std::thread::sleep(Duration::from_secs(3600));
-            }
-        }
+        // `run` always follows the tip: it is the daemon mode that indexes and
+        // serves. `--no-follow` only applies to the one-shot `index` command.
         std::thread::sleep(Duration::from_secs(1));
     }
 }
