@@ -164,11 +164,21 @@ core_latest() {
 core_installed_version() {
   for c in "$PREFIX/bitcoind" /usr/local/bin/bitcoind /usr/bin/bitcoind; do
     if [ -x "$c" ]; then
-      "$c" -version 2>/dev/null | head -n 1 | awk '{print $NF}' | sed 's/^v//'
+      "$c" -version 2>/dev/null | head -n 1 \
+        | sed -n 's/.*version v\{0,1\}\([0-9][0-9]*\.[0-9][0-9]*\(\.[0-9][0-9]*\)*\).*/\1/p'
       return 0
     fi
   done
   return 1
+}
+
+# Compare versions treating "32.1" and "32.1.0" as equal.
+same_version() {
+  a="$1"; b="$2"
+  [ "$a" = "$b" ] && return 0
+  pa="$(printf '%s' "$a" | awk -F. '{printf "%d.%d.%d", $1, $2, $3+0}')"
+  pb="$(printf '%s' "$b" | awk -F. '{printf "%d.%d.%d", $1, $2, $3+0}')"
+  [ "$pa" = "$pb" ]
 }
 
 install_core() {
@@ -181,7 +191,7 @@ install_core() {
   fi
 
   have="$(core_installed_version || true)"
-  if [ "$have" = "$want" ]; then
+  if [ -n "$have" ] && same_version "$have" "$want"; then
     log "Bitcoin Core is already up to date ($have)"
     return 0
   fi
@@ -215,7 +225,7 @@ case "$CORE_MODE" in
     elif (: </dev/tty) 2>/dev/null; then
       latest="$(core_latest)"
       have="$(core_installed_version || true)"
-      if [ -n "$latest" ] && [ "$have" != "$latest" ]; then
+      if [ -n "$latest" ] && ! same_version "$have" "$latest"; then
         if [ -n "$have" ]; then state="Bitcoin Core $have installed"; else state="Bitcoin Core not installed"; fi
         printf '%s. Install/update to the latest official %s? [y/N] ' "$state" "$latest" >/dev/tty
         ans=""
