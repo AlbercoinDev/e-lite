@@ -141,6 +141,7 @@ fn config(decoys: u32, cache_gib: u64) -> RawtxConfig {
         allow_clearnet: true,
         use_p2p: false,
         use_esplora: false,
+        p2p_v2: false,
         esplora_urls: Vec::new(),
         p2p_peers: Vec::new(),
         p2p_timeout: Duration::from_secs(1),
@@ -390,11 +391,15 @@ fn live_p2p_regtest() {
     let peer = std::env::var("E_LITE_P2P_PEER").expect("E_LITE_P2P_PEER");
     let hash =
         Hash32::from_hex(&std::env::var("E_LITE_P2P_HASH").expect("E_LITE_P2P_HASH")).unwrap();
+    let v2 = std::env::var("E_LITE_P2P_V2")
+        .map(|v| v != "0")
+        .unwrap_or(true);
     let src = el_rawtx::P2pSource::new(
         vec![peer],
         None,
         Duration::from_secs(10),
         el_model::Chain::Regtest,
+        v2,
     );
     let bytes = src.fetch_block(&hash).unwrap();
     let block: Block = bitcoin::consensus::deserialize(&bytes).unwrap();

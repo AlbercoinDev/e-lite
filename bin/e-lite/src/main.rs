@@ -893,6 +893,7 @@ fn build_resolver(
         allow_clearnet: cfg.rawtx.allow_clearnet,
         use_p2p: cfg.rawtx.use_p2p,
         use_esplora: cfg.rawtx.use_esplora,
+        p2p_v2: cfg.rawtx.p2p_v2,
         esplora_urls: cfg.rawtx.esplora_urls.clone(),
         p2p_peers: peers,
         p2p_timeout: Duration::from_secs(cfg.rawtx.p2p_timeout_seconds.max(1)),

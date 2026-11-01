@@ -31,7 +31,8 @@ cache_gib = 10                       # validated LRU cache (0 disables)
 decoys = 3                           # extra blocks fetched per real fetch
 tor_socks = "127.0.0.1:9050"         # empty requires allow_clearnet = true
 allow_clearnet = false               # fail closed without Tor
-use_p2p = true                       # minimal P2P client (v1 transport)
+use_p2p = true                       # minimal P2P client
+p2p_v2 = true                        # BIP324 encrypted transport, fallback to v1
 use_esplora = true                   # Esplora-compatible block endpoints
 p2p_peers = []                       # empty: discover from local Core
 p2p_timeout_seconds = 20

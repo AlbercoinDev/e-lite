@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.1.0-alpha.6 — 2026-11-01
+
+- **BIP324 v2 P2P transport** (encrypted, via the `bip324` crate) with fallback
+  to v1 for peers that do not support it. Per-peer Tor isolation is unchanged.
+- Correct BIP324 application framing (1/13-byte message type) and short type IDs
+  for block/ping/pong/getdata.
+- New `[rawtx] p2p_v2` option (default true).
+- Tests: v2 mock peer, v1 fallback, and live v2/v1 fetches against Bitcoin Core.
+
 ## 0.1.0-alpha.5 — 2026-11-01
 
 - **Clean shutdown**: SIGTERM/SIGINT stop at a commit boundary, flush the pending

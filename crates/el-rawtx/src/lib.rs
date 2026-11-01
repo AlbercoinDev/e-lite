@@ -90,6 +90,7 @@ pub struct RawtxConfig {
     pub allow_clearnet: bool,
     pub use_p2p: bool,
     pub use_esplora: bool,
+    pub p2p_v2: bool,
     pub esplora_urls: Vec<String>,
     pub p2p_peers: Vec<String>,
     pub p2p_timeout: Duration,
@@ -122,6 +123,7 @@ impl Resolver {
                     tor.clone(),
                     cfg.p2p_timeout,
                     cfg.chain,
+                    cfg.p2p_v2,
                 )));
             }
         }

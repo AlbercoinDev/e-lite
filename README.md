@@ -7,7 +7,7 @@ any `scriptPubKey` in the active chain — **without registering wallets**.
 loopback. Core remains the authority for consensus and the active chain; e-lite
 never invents data.
 
-> **Status: `v0.1.0-alpha.5` — experimental, no funds.**
+> **Status: `v0.1.0-alpha.6` — experimental, no funds.**
 > Use on test networks first.
 
 ## Supported networks
@@ -147,6 +147,7 @@ use_p2p = true
 use_esplora = true
 p2p_peers = []          # empty: discovered from the local Core (getnodeaddresses)
 p2p_timeout_seconds = 20
+p2p_v2 = true            # BIP324 encrypted transport, fallback to v1
 esplora_urls = [
   "http://mempoolhqx4isw62xs7abwphsq7ldayuidyx2v2oethdhhj6mlo2r6ad.onion/api",
   "https://blockstream.info/api",
@@ -203,7 +204,8 @@ and exit with code 0. No partial checkpoint is published.
   against a pruned Core is supported.
 - Raw transactions require the block to still exist in Core or in a configured
   external source; otherwise the error is explicit, never invented data.
-- P2P currently uses the v1 transport; BIP324 v2 is pending.
+- P2P negotiates **BIP324 v2** and falls back to v1 for peers that do not
+  support it.
 - External rawtx requires Tor by default, so a missing Tor daemon degrades
   `transaction.get` for pruned blocks (history/balances still work).
 - The first mempool load on a large mempool can take a few seconds.

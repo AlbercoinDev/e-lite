@@ -2,14 +2,17 @@
 //!
 //! Only whole blocks are requested (never txids). Peers must advertise
 //! NODE_NETWORK; pruned peers (NODE_NETWORK_LIMITED) are not used for old
-//! blocks. Use Tor for network privacy.
+//! blocks. BIP324 v2 is tried first and falls back to v1. Use Tor for network
+//! privacy.
 
 use crate::{BlockSource, RawtxError, Result};
+use bip324::io::{Payload, Protocol};
+use bip324::{PacketType, Role};
 use el_model::{Chain, Hash32};
 use rand::seq::SliceRandom;
 use rand::thread_rng;
 use sha2::{Digest, Sha256};
-use std::io::{self, Read, Write};
+use std::io::{self, BufReader, Read, Write};
 use std::net::TcpStream;
 use std::time::Duration;
 
@@ -23,10 +26,8 @@ pub struct P2pSource {
     tor_socks: Option<String>,
     timeout: Duration,
     magic: [u8; 4],
+    v2: bool,
 }
-
-trait ReadWrite: Read + Write {}
-impl<T: Read + Write> ReadWrite for T {}
 
 fn sha256d(data: &[u8]) -> [u8; 32] {
     let mut h = Sha256::new();
@@ -44,23 +45,27 @@ fn checksum(payload: &[u8]) -> [u8; 4] {
     [d[0], d[1], d[2], d[3]]
 }
 
+fn build_message(magic: [u8; 4], command: &str, payload: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(24 + payload.len());
+    out.extend_from_slice(&magic);
+    let mut cmd = [0u8; 12];
+    let bytes = command.as_bytes();
+    let n = bytes.len().min(12);
+    cmd[..n].copy_from_slice(&bytes[..n]);
+    out.extend_from_slice(&cmd);
+    out.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+    out.extend_from_slice(&checksum(payload));
+    out.extend_from_slice(payload);
+    out
+}
+
 fn send_message<W: Write>(
     w: &mut W,
     magic: [u8; 4],
     command: &str,
     payload: &[u8],
 ) -> io::Result<()> {
-    let mut header = Vec::with_capacity(24);
-    header.extend_from_slice(&magic);
-    let mut cmd = [0u8; 12];
-    let bytes = command.as_bytes();
-    let n = bytes.len().min(12);
-    cmd[..n].copy_from_slice(&bytes[..n]);
-    header.extend_from_slice(&cmd);
-    header.extend_from_slice(&(payload.len() as u32).to_le_bytes());
-    header.extend_from_slice(&checksum(payload));
-    w.write_all(&header)?;
-    w.write_all(payload)?;
+    w.write_all(&build_message(magic, command, payload))?;
     w.flush()
 }
 
@@ -70,8 +75,6 @@ fn read_message<R: Read>(r: &mut R, magic: [u8; 4], max: u32) -> io::Result<(Str
     if header[0..4] != magic {
         return Err(io::Error::new(io::ErrorKind::InvalidData, "bad magic"));
     }
-    let cmd_end = header[4..16].iter().position(|b| *b == 0).unwrap_or(12);
-    let command = String::from_utf8_lossy(&header[4..4 + cmd_end]).to_string();
     let len = u32::from_le_bytes([header[16], header[17], header[18], header[19]]);
     if len > max {
         return Err(io::Error::new(
@@ -84,7 +87,11 @@ fn read_message<R: Read>(r: &mut R, magic: [u8; 4], max: u32) -> io::Result<(Str
     if checksum(&payload) != header[20..24] {
         return Err(io::Error::new(io::ErrorKind::InvalidData, "bad checksum"));
     }
-    Ok((command, payload))
+    let cmd_end = header[4..16].iter().position(|b| *b == 0).unwrap_or(12);
+    Ok((
+        String::from_utf8_lossy(&header[4..4 + cmd_end]).to_string(),
+        payload,
+    ))
 }
 
 fn put_varint(v: u64, out: &mut Vec<u8>) {
@@ -116,18 +123,16 @@ fn version_payload(services: u64, height: i32) -> Vec<u8> {
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0);
     p.extend_from_slice(&now.to_le_bytes());
-    // addr_recv: services, ipv6-mapped-zero, port
     p.extend_from_slice(&0u64.to_le_bytes());
     p.extend_from_slice(&[0u8; 16]);
     p.extend_from_slice(&0u16.to_be_bytes());
-    // addr_from
     p.extend_from_slice(&0u64.to_le_bytes());
     p.extend_from_slice(&[0u8; 16]);
     p.extend_from_slice(&0u16.to_be_bytes());
     p.extend_from_slice(&rand::random::<u64>().to_le_bytes());
     put_varstr(b"/e-lite:0.1/", &mut p);
     p.extend_from_slice(&height.to_le_bytes());
-    p.push(1); // relay
+    p.push(1);
     p
 }
 
@@ -142,9 +147,93 @@ fn pong_payload(ping: &[u8]) -> Vec<u8> {
 fn getdata_payload(hash: &Hash32) -> Vec<u8> {
     let mut p = Vec::with_capacity(37);
     put_varint(1, &mut p);
-    p.extend_from_slice(&2u32.to_le_bytes()); // MSG_BLOCK
+    p.extend_from_slice(&2u32.to_le_bytes());
     p.extend_from_slice(&hash.reversed().0);
     p
+}
+
+/// BIP324 application message: 0x00 + 12-byte ASCII type + payload.
+fn v2_message(command: &str, payload: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(13 + payload.len());
+    out.push(0);
+    let mut cmd = [0u8; 12];
+    let bytes = command.as_bytes();
+    let n = bytes.len().min(12);
+    cmd[..n].copy_from_slice(&bytes[..n]);
+    out.extend_from_slice(&cmd);
+    out.extend_from_slice(payload);
+    out
+}
+
+/// Parse a BIP324 application message (short type ID or long ASCII type).
+fn v2_parse(contents: &[u8]) -> io::Result<(String, Vec<u8>)> {
+    let Some(first) = contents.first() else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "empty v2 message",
+        ));
+    };
+    if *first == 0 {
+        if contents.len() < 13 {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "short v2 type"));
+        }
+        let cmd_end = contents[1..13].iter().position(|b| *b == 0).unwrap_or(12);
+        Ok((
+            String::from_utf8_lossy(&contents[1..1 + cmd_end]).to_string(),
+            contents[13..].to_vec(),
+        ))
+    } else {
+        let command = match *first {
+            1 => "addr",
+            2 => "block",
+            3 => "blocktxn",
+            4 => "cmpctblock",
+            5 => "feefilter",
+            6 => "filteradd",
+            7 => "filterclear",
+            8 => "filterload",
+            9 => "getblocks",
+            10 => "getblocktxn",
+            11 => "getdata",
+            12 => "getheaders",
+            13 => "headers",
+            14 => "inv",
+            15 => "mempool",
+            16 => "merkleblock",
+            17 => "notfound",
+            18 => "ping",
+            19 => "pong",
+            20 => "sendcmpct",
+            21 => "tx",
+            22 => "getcfilters",
+            23 => "cfilter",
+            24 => "getcfheaders",
+            25 => "cfheaders",
+            26 => "getcfcheckpt",
+            27 => "cfcheckpt",
+            28 => "addrv2",
+            other => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("unknown v2 type {other}"),
+                ))
+            }
+        };
+        Ok((command.to_string(), contents[1..].to_vec()))
+    }
+}
+
+fn check_block(payload: &[u8], hash: &Hash32, peer: &str) -> Result<()> {
+    let block: bitcoin::Block = bitcoin::consensus::deserialize(payload)
+        .map_err(|e| RawtxError::Verify(format!("{peer} bad block: {e}")))?;
+    let got = Hash32::from_hex(&block.block_hash().to_string())
+        .map_err(|e| RawtxError::Verify(e.to_string()))?;
+    if got != *hash {
+        return Err(RawtxError::Verify(format!(
+            "{peer} served hash {got}, expected {hash}"
+        )));
+    }
+    Ok(())
 }
 
 impl P2pSource {
@@ -153,50 +242,59 @@ impl P2pSource {
         tor_socks: Option<String>,
         timeout: Duration,
         chain: Chain,
+        v2: bool,
     ) -> Self {
         P2pSource {
             peers,
             tor_socks,
             timeout,
             magic: chain.magic(),
+            v2,
         }
     }
 
-    fn connect(&self, peer: &str) -> Result<Box<dyn ReadWrite>> {
-        if let Some(proxy) = &self.tor_socks {
-            // Unique credentials per stream: Tor's IsolateSOCKSAuth gives every
-            // peer its own circuit.
+    fn connect_raw(&self, peer: &str) -> Result<TcpStream> {
+        let stream = if let Some(proxy) = &self.tor_socks {
             let user = format!("e-lite-{}", rand::random::<u64>());
-            let stream =
+            let s =
                 socks::Socks5Stream::connect_with_password(proxy.as_str(), peer, &user, "e-lite")
                     .map_err(|e| RawtxError::Unavailable(format!("tor connect {peer}: {e}")))?;
-            stream
-                .get_ref()
-                .set_read_timeout(Some(self.timeout))
-                .map_err(|e| RawtxError::Io(e.to_string()))?;
-            stream
-                .get_ref()
-                .set_write_timeout(Some(self.timeout))
-                .map_err(|e| RawtxError::Io(e.to_string()))?;
-            Ok(Box::new(stream))
+            s.into_inner()
         } else {
-            let stream = TcpStream::connect(peer)
-                .map_err(|e| RawtxError::Unavailable(format!("connect {peer}: {e}")))?;
-            stream
-                .set_nodelay(true)
-                .map_err(|e| RawtxError::Io(e.to_string()))?;
-            stream
-                .set_read_timeout(Some(self.timeout))
-                .map_err(|e| RawtxError::Io(e.to_string()))?;
-            stream
-                .set_write_timeout(Some(self.timeout))
-                .map_err(|e| RawtxError::Io(e.to_string()))?;
-            Ok(Box::new(stream))
-        }
+            TcpStream::connect(peer)
+                .map_err(|e| RawtxError::Unavailable(format!("connect {peer}: {e}")))?
+        };
+        stream
+            .set_nodelay(true)
+            .map_err(|e| RawtxError::Io(e.to_string()))?;
+        stream
+            .set_read_timeout(Some(self.timeout))
+            .map_err(|e| RawtxError::Io(e.to_string()))?;
+        stream
+            .set_write_timeout(Some(self.timeout))
+            .map_err(|e| RawtxError::Io(e.to_string()))?;
+        Ok(stream)
     }
 
     fn fetch_from(&self, peer: &str, hash: &Hash32) -> Result<Vec<u8>> {
-        let mut stream = self.connect(peer)?;
+        let mut v2_error = None;
+        if self.v2 {
+            match self.fetch_from_v2(peer, hash) {
+                Ok(bytes) => return Ok(bytes),
+                Err(e) => v2_error = Some(e),
+            }
+        }
+        match self.fetch_from_v1(peer, hash) {
+            Ok(bytes) => Ok(bytes),
+            Err(e) => match v2_error {
+                Some(v2) => Err(RawtxError::Unavailable(format!("{v2}; v1: {e}"))),
+                None => Err(e),
+            },
+        }
+    }
+
+    fn fetch_from_v1(&self, peer: &str, hash: &Hash32) -> Result<Vec<u8>> {
+        let mut stream = self.connect_raw(peer)?;
         send_message(&mut stream, self.magic, "version", &version_payload(0, 0))
             .map_err(|e| RawtxError::Unavailable(format!("{peer} version: {e}")))?;
 
@@ -225,32 +323,16 @@ impl P2pSource {
                 _ => {}
             }
         }
-
-        if services & NODE_NETWORK == 0 {
-            let limited = services & NODE_NETWORK_LIMITED != 0;
-            return Err(RawtxError::Unavailable(format!(
-                "{peer} does not serve full blocks (services={services:#x}{})",
-                if limited { ", limited" } else { "" }
-            )));
-        }
+        self.require_network(peer, services)?;
 
         send_message(&mut stream, self.magic, "getdata", &getdata_payload(hash))
             .map_err(|e| RawtxError::Unavailable(format!("{peer} getdata: {e}")))?;
-
         loop {
             let (cmd, payload) = read_message(&mut stream, self.magic, MAX_MESSAGE)
                 .map_err(|e| RawtxError::Unavailable(format!("{peer} block: {e}")))?;
             match cmd.as_str() {
                 "block" => {
-                    let block: bitcoin::Block = bitcoin::consensus::deserialize(&payload)
-                        .map_err(|e| RawtxError::Verify(format!("{peer} bad block: {e}")))?;
-                    let got = Hash32::from_hex(&block.block_hash().to_string())
-                        .map_err(|e| RawtxError::Verify(e.to_string()))?;
-                    if got != *hash {
-                        return Err(RawtxError::Verify(format!(
-                            "{peer} served hash {got}, expected {hash}"
-                        )));
-                    }
+                    check_block(&payload, hash, peer)?;
                     return Ok(payload);
                 }
                 "ping" => {
@@ -259,6 +341,99 @@ impl P2pSource {
                 _ => {}
             }
         }
+    }
+
+    fn fetch_from_v2(&self, peer: &str, hash: &Hash32) -> Result<Vec<u8>> {
+        let stream = self.connect_raw(peer)?;
+        let reader = BufReader::new(
+            stream
+                .try_clone()
+                .map_err(|e| RawtxError::Io(e.to_string()))?,
+        );
+        let writer = stream;
+        let mut protocol =
+            Protocol::new(self.magic, Role::Initiator, None, None, reader, writer)
+                .map_err(|e| RawtxError::Unavailable(format!("{peer} v2 handshake: {e}")))?;
+
+        self.v2_send(&mut protocol, "version", &version_payload(0, 0))?;
+        let mut got_version = false;
+        let mut services = 0u64;
+        loop {
+            let (cmd, payload) = self.v2_read(&mut protocol, peer)?;
+            match cmd.as_str() {
+                "version" => {
+                    got_version = true;
+                    if payload.len() >= 12 {
+                        services = u64::from_le_bytes(payload[4..12].try_into().unwrap());
+                    }
+                    self.v2_send(&mut protocol, "verack", &[])?;
+                }
+                "verack" => {
+                    if got_version {
+                        break;
+                    }
+                }
+                "ping" => {
+                    let _ = self.v2_send(&mut protocol, "pong", &pong_payload(&payload));
+                }
+                _ => {}
+            }
+        }
+        self.require_network(peer, services)?;
+
+        self.v2_send(&mut protocol, "getdata", &getdata_payload(hash))?;
+        loop {
+            let (cmd, payload) = self.v2_read(&mut protocol, peer)?;
+            match cmd.as_str() {
+                "block" => {
+                    check_block(&payload, hash, peer)?;
+                    return Ok(payload);
+                }
+                "ping" => {
+                    let _ = self.v2_send(&mut protocol, "pong", &pong_payload(&payload));
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn v2_send(
+        &self,
+        protocol: &mut Protocol<BufReader<TcpStream>, TcpStream>,
+        command: &str,
+        payload: &[u8],
+    ) -> Result<()> {
+        protocol
+            .write(&Payload::genuine(v2_message(command, payload)))
+            .map_err(|e| RawtxError::Unavailable(format!("v2 write: {e}")))
+    }
+
+    fn v2_read(
+        &self,
+        protocol: &mut Protocol<BufReader<TcpStream>, TcpStream>,
+        peer: &str,
+    ) -> Result<(String, Vec<u8>)> {
+        loop {
+            let packet = protocol
+                .read()
+                .map_err(|e| RawtxError::Unavailable(format!("{peer} v2 read: {e}")))?;
+            if matches!(packet.packet_type(), PacketType::Decoy) {
+                continue;
+            }
+            return v2_parse(packet.contents())
+                .map_err(|e| RawtxError::Unavailable(format!("{peer} v2 message: {e}")));
+        }
+    }
+
+    fn require_network(&self, peer: &str, services: u64) -> Result<()> {
+        if services & NODE_NETWORK == 0 {
+            let limited = services & NODE_NETWORK_LIMITED != 0;
+            return Err(RawtxError::Unavailable(format!(
+                "{peer} does not serve full blocks (services={services:#x}{})",
+                if limited { ", limited" } else { "" }
+            )));
+        }
+        Ok(())
     }
 }
 
@@ -327,10 +502,16 @@ mod tests {
         block
     }
 
-    fn mock_peer(services: u64, block_bytes: Vec<u8>) -> String {
+    fn mock_peer_v1(services: u64, block_bytes: Vec<u8>, discard_first: bool) -> String {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap().to_string();
         std::thread::spawn(move || {
+            if discard_first {
+                // The client probes BIP324 first; drop that connection so it
+                // retries with v1 on a fresh one.
+                let (probe, _) = listener.accept().unwrap();
+                drop(probe);
+            }
             let (mut sock, _) = listener.accept().unwrap();
             sock.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
             let magic = Chain::Regtest.magic();
@@ -347,13 +528,117 @@ mod tests {
         addr
     }
 
+    fn mock_peer_v2(services: u64, block_bytes: Vec<u8>) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        std::thread::spawn(move || {
+            let (sock, _) = listener.accept().unwrap();
+            sock.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            let magic = Chain::Regtest.magic();
+            let reader = BufReader::new(sock.try_clone().unwrap());
+            let mut protocol = match Protocol::new(magic, Role::Responder, None, None, reader, sock)
+            {
+                Ok(p) => p,
+                Err(e) => {
+                    eprintln!("v2 mock: handshake error {e}");
+                    return;
+                }
+            };
+            // Client version.
+            let (cmd, _) = v2_read_test(&mut protocol, magic);
+            assert_eq!(cmd, "version");
+            v2_send_test(
+                &mut protocol,
+                magic,
+                "version",
+                &version_payload(services, 0),
+            );
+            v2_send_test(&mut protocol, magic, "verack", &[]);
+            loop {
+                let (cmd, _) = v2_read_test(&mut protocol, magic);
+                if cmd == "getdata" {
+                    v2_send_test(&mut protocol, magic, "block", &block_bytes);
+                }
+                // Keep the session open: getdata follows verack.
+            }
+        });
+        addr
+    }
+
+    fn v2_read_test(
+        protocol: &mut Protocol<BufReader<TcpStream>, TcpStream>,
+        magic: [u8; 4],
+    ) -> (String, Vec<u8>) {
+        loop {
+            let packet = protocol.read().unwrap();
+            if matches!(packet.packet_type(), PacketType::Decoy) {
+                continue;
+            }
+            let _ = magic;
+            match v2_parse(packet.contents()) {
+                Ok(v) => return v,
+                Err(e) => panic!("v2 parse: {e}"),
+            }
+        }
+    }
+
+    fn v2_send_test(
+        protocol: &mut Protocol<BufReader<TcpStream>, TcpStream>,
+        magic: [u8; 4],
+        cmd: &str,
+        payload: &[u8],
+    ) {
+        let _ = magic;
+        protocol
+            .write(&Payload::genuine(v2_message(cmd, payload)))
+            .unwrap();
+    }
+
     #[test]
-    fn fetches_block_from_peer() {
+    fn fetches_block_over_v1() {
         let block = test_block();
         let bytes = bitcoin::consensus::serialize(&block);
         let hash = Hash32::from_hex(&block.block_hash().to_string()).unwrap();
-        let addr = mock_peer(NODE_NETWORK, bytes.clone());
-        let src = P2pSource::new(vec![addr], None, Duration::from_secs(5), Chain::Regtest);
+        let addr = mock_peer_v1(NODE_NETWORK, bytes.clone(), false);
+        let src = P2pSource::new(
+            vec![addr],
+            None,
+            Duration::from_secs(5),
+            Chain::Regtest,
+            false,
+        );
+        assert_eq!(src.fetch_block(&hash).unwrap(), bytes);
+    }
+
+    #[test]
+    fn fetches_block_over_v2() {
+        let block = test_block();
+        let bytes = bitcoin::consensus::serialize(&block);
+        let hash = Hash32::from_hex(&block.block_hash().to_string()).unwrap();
+        let addr = mock_peer_v2(NODE_NETWORK, bytes.clone());
+        let src = P2pSource::new(
+            vec![addr],
+            None,
+            Duration::from_secs(5),
+            Chain::Regtest,
+            true,
+        );
+        assert_eq!(src.fetch_block(&hash).unwrap(), bytes);
+    }
+
+    #[test]
+    fn falls_back_to_v1_when_v2_is_unsupported() {
+        let block = test_block();
+        let bytes = bitcoin::consensus::serialize(&block);
+        let hash = Hash32::from_hex(&block.block_hash().to_string()).unwrap();
+        let addr = mock_peer_v1(NODE_NETWORK, bytes.clone(), true);
+        let src = P2pSource::new(
+            vec![addr],
+            None,
+            Duration::from_secs(5),
+            Chain::Regtest,
+            true,
+        );
         assert_eq!(src.fetch_block(&hash).unwrap(), bytes);
     }
 
@@ -362,8 +647,14 @@ mod tests {
         let block = test_block();
         let bytes = bitcoin::consensus::serialize(&block);
         let hash = Hash32::from_hex(&block.block_hash().to_string()).unwrap();
-        let addr = mock_peer(NODE_NETWORK_LIMITED, bytes);
-        let src = P2pSource::new(vec![addr], None, Duration::from_secs(5), Chain::Regtest);
+        let addr = mock_peer_v1(NODE_NETWORK_LIMITED, bytes, false);
+        let src = P2pSource::new(
+            vec![addr],
+            None,
+            Duration::from_secs(5),
+            Chain::Regtest,
+            false,
+        );
         assert!(src.fetch_block(&hash).is_err());
     }
 }

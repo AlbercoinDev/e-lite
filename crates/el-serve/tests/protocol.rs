@@ -116,6 +116,7 @@ fn fixture() -> (Fixture, ScriptHash, Hash32) {
                 allow_clearnet: true,
                 use_p2p: false,
                 use_esplora: false,
+                p2p_v2: false,
                 esplora_urls: Vec::new(),
                 p2p_peers: Vec::new(),
                 p2p_timeout: Duration::from_secs(1),

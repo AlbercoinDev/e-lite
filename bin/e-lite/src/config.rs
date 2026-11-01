@@ -130,6 +130,8 @@ pub struct RawtxCfg {
     pub use_p2p: bool,
     #[serde(default = "d_true")]
     pub use_esplora: bool,
+    #[serde(default = "d_true")]
+    pub p2p_v2: bool,
     #[serde(default = "d_esplora_urls")]
     pub esplora_urls: Vec<String>,
     #[serde(default)]
@@ -147,6 +149,7 @@ impl Default for RawtxCfg {
             allow_clearnet: false,
             use_p2p: true,
             use_esplora: true,
+            p2p_v2: true,
             esplora_urls: d_esplora_urls(),
             p2p_peers: Vec::new(),
             p2p_timeout_seconds: d_p2p_timeout(),

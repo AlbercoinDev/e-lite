@@ -16,3 +16,4 @@ reqwest.workspace = true
 socks.workspace = true
 rand.workspace = true
 filetime.workspace = true
+bip324.workspace = true
