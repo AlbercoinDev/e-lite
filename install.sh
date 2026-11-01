@@ -27,6 +27,23 @@ PIN_VERSION=""
 CORE_VERSION=""
 ASSET="e-lite_x86_64-unknown-linux-gnu.tar.gz"
 
+usage() {
+  cat <<'EOF'
+e-lite installer / updater (Debian 12+, x86_64)
+
+  curl -fsSL https://raw.githubusercontent.com/AlbercoinDev/e-lite/main/install.sh | sh
+
+Options (after `sh -s --`):
+  --with-core | --no-core   install/update Bitcoin Core, or skip it (default: ask)
+  --yes                     non-interactive
+  --prefix DIR              install prefix (default: ~/.local/bin)
+  --system                  install the .deb (requires root)
+  --version X.Y.Z           pin the e-lite release
+  --core-version X.Y.Z      pin the Bitcoin Core version
+  --force                   continue on non-Debian systems
+EOF
+}
+
 log() { printf '%s\n' "$*"; }
 warn() { printf 'warning: %s\n' "$*" >&2; }
 die() { printf 'error: %s\n' "$*" >&2; exit 1; }
@@ -44,7 +61,7 @@ while [ $# -gt 0 ]; do
     --version=*) PIN_VERSION="${1#--version=}" ;;
     --core-version) shift; [ $# -gt 0 ] || die "--core-version needs a value"; CORE_VERSION="$1" ;;
     --core-version=*) CORE_VERSION="${1#--core-version=}" ;;
-    -h|--help) sed -n '2,22p' "$0" 2>/dev/null || true; exit 0 ;;
+    -h|--help) usage; exit 0 ;;
     *) die "unknown option: $1" ;;
   esac
   shift
@@ -113,7 +130,8 @@ else
     mkdir -p "$TMP/pkg"
     tar -xzf "$TMP/$ASSET" -C "$TMP/pkg"
     [ -x "$TMP/pkg/e-lite" ] || die "unexpected archive layout (missing e-lite binary)"
-    mkdir -p "$PREFIX"
+    mkdir -p "$PREFIX" 2>/dev/null || die "cannot create $PREFIX"
+    [ -w "$PREFIX" ] || die "$PREFIX is not writable (use --prefix or --system)"
     install -m 0755 "$TMP/pkg/e-lite" "$PREFIX/.e-lite.new"
     mv -f "$PREFIX/.e-lite.new" "$PREFIX/e-lite"
     CURRENT="$("$PREFIX/e-lite" --version | awk '{print $2}')"
