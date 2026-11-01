@@ -26,7 +26,7 @@ Testnet3 is intentionally not supported.
 ## Install (one line, also updates)
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/AlbercoinDev/e-lite/main/install.sh | sh
+curl -fsSL https://github.com/AlbercoinDev/e-lite/releases/latest/download/install.sh | sh
 ```
 
 The installer needs `curl` and `ca-certificates` (present on standard Debian
@@ -38,10 +38,10 @@ Non-interactive variants:
 
 ```bash
 # e-lite + Bitcoin Core, no questions
-curl -fsSL https://raw.githubusercontent.com/AlbercoinDev/e-lite/main/install.sh | sh -s -- --with-core --yes
+curl -fsSL https://github.com/AlbercoinDev/e-lite/releases/latest/download/install.sh | sh -s -- --with-core --yes
 
 # only e-lite
-curl -fsSL https://raw.githubusercontent.com/AlbercoinDev/e-lite/main/install.sh | sh -s -- --no-core
+curl -fsSL https://github.com/AlbercoinDev/e-lite/releases/latest/download/install.sh | sh -s -- --no-core
 
 # system-wide .deb (root)
 curl -fsSL https://github.com/AlbercoinDev/e-lite/releases/latest/download/e-lite_amd64.deb -o /tmp/e-lite.deb && sudo dpkg -i /tmp/e-lite.deb

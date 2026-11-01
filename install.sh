@@ -1,7 +1,7 @@
 #!/bin/sh
 # e-lite installer / updater for Debian-based Linux (x86_64).
 #
-#   curl -fsSL https://raw.githubusercontent.com/AlbercoinDev/e-lite/main/install.sh | sh
+#   curl -fsSL https://github.com/AlbercoinDev/e-lite/releases/latest/download/install.sh | sh
 #
 # Options (pass after `sh -s --`):
 #   --with-core | --no-core   install/update Bitcoin Core, or skip it (default: ask)
@@ -31,7 +31,7 @@ usage() {
   cat <<'EOF'
 e-lite installer / updater (Debian 12+, x86_64)
 
-  curl -fsSL https://raw.githubusercontent.com/AlbercoinDev/e-lite/main/install.sh | sh
+  curl -fsSL https://github.com/AlbercoinDev/e-lite/releases/latest/download/install.sh | sh
 
 Options (after `sh -s --`):
   --with-core | --no-core   install/update Bitcoin Core, or skip it (default: ask)
