@@ -818,7 +818,14 @@ fn build_resolver(
                 peers = addrs
                     .into_iter()
                     .filter(|a| a.services & 1 != 0)
-                    .map(|a| format!("{}:{}", a.address, a.port))
+                    .map(|a| {
+                        let host = if a.address.contains(':') && !a.address.starts_with('[') {
+                            format!("[{}]", a.address)
+                        } else {
+                            a.address.clone()
+                        };
+                        format!("{host}:{}", a.port)
+                    })
                     .collect();
                 println!("p2p peers discovered from Core: {}", peers.len());
             }
