@@ -12,7 +12,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.0-alpha.4"
+version = "0.1.0-alpha.5"
 edition = "2021"
 license = "MIT"
 rust-version = "1.85"
@@ -30,6 +30,9 @@ reqwest = { version = "0.12", default-features = false, features = ["blocking", 
 socks = "0.3"
 rand = "0.8"
 filetime = "0.2"
+signal-hook = "0.3"
+tar = "0.4"
+flate2 = "1"
 
 [profile.release]
 opt-level = 3

@@ -101,4 +101,25 @@ assert raw["unavailable"] == 0, raw
 print("rawtx cache:", raw)
 PY
 
+echo "== graceful shutdown (SIGTERM) =="
+kill -TERM "$(cat "$RUN/serve.pid")"
+set +e
+wait "$(cat "$RUN/serve.pid")"
+RC=$?
+set -e
+echo "shutdown exit=$RC"
+[ "$RC" -eq 0 ] || { cat "$RUN/serve.log"; exit 1; }
+grep -q "shutdown requested" "$RUN/serve.log" || { cat "$RUN/serve.log"; exit 1; }
+"$BIN" status --network regtest --data-dir "$DATA" --metrics "127.0.0.1:$METRICS_PORT" --json \
+  | grep -q '"state": "STOPPED"'
+
+echo "== snapshot export/import =="
+SNAP="$RUN/snapshot.tar.gz"
+"$BIN" export-snapshot --network regtest --data-dir "$DATA" --output "$SNAP"
+D1=$("$BIN" export-snapshot --network regtest --data-dir "$DATA" | sed -n 's/^logical_snapshot_hash: //p')
+"$BIN" import-snapshot --network regtest --data-dir "$RUN/imported" --input "$SNAP"
+D2=$("$BIN" export-snapshot --network regtest --data-dir "$RUN/imported" | sed -n 's/^logical_snapshot_hash: //p')
+[ -n "$D1" ] && [ "$D1" = "$D2" ] || { echo "snapshot digest mismatch: $D1 vs $D2" >&2; exit 1; }
+echo "snapshot digest: $D1"
+
 echo "e2e regtest OK (height $HEIGHT)"

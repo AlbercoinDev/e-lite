@@ -28,6 +28,7 @@ pub mod state {
     pub const DEGRADED: u8 = 2;
     pub const REORG: u8 = 3;
     pub const FATAL: u8 = 4;
+    pub const CORE_UNAVAILABLE: u8 = 5;
 
     pub fn name(v: u8) -> &'static str {
         match v {
@@ -36,6 +37,7 @@ pub mod state {
             DEGRADED => "DEGRADED_RAWTX",
             REORG => "REORG_RECOVERY",
             FATAL => "FATAL_INTEGRITY",
+            CORE_UNAVAILABLE => "CORE_UNAVAILABLE",
             _ => "UNKNOWN",
         }
     }
@@ -166,6 +168,7 @@ pub struct Shared {
     pub mempool: Arc<RwLock<Mempool>>,
     pub relayfee: Mutex<f64>,
     pub fee_estimates: Mutex<HashMap<u32, (f64, Instant)>>,
+    pub error_log: Mutex<HashMap<String, Instant>>,
     pub clients: Arc<ClientRegistry>,
     pub identity: NetworkIdentity,
     pub data_dir: std::path::PathBuf,
@@ -284,6 +287,20 @@ type RpcResult<T> = std::result::Result<T, RpcError>;
 
 pub const METHOD_NOT_FOUND: i64 = -32601;
 
+fn log_rpc_error(shared: &Shared, method: &str, code: i64) {
+    let key = format!("{method}:{code}");
+    let Ok(mut seen) = shared.error_log.lock() else {
+        return;
+    };
+    if let Some(at) = seen.get(&key) {
+        if at.elapsed() < Duration::from_secs(60) {
+            return;
+        }
+    }
+    seen.insert(key, Instant::now());
+    eprintln!("[e-lite] rpc error: method={method} code={code}");
+}
+
 pub fn dispatch(shared: &Shared, method: &str, params: &Value) -> RpcResult<Value> {
     dispatch_for(shared, None, method, params)
 }
@@ -347,7 +364,7 @@ pub fn dispatch_for(
 
 fn check_ready(shared: &Shared) -> RpcResult<()> {
     match shared.get_state() {
-        state::READY | state::DEGRADED => Ok(()),
+        state::READY | state::DEGRADED | state::CORE_UNAVAILABLE => Ok(()),
         state::BUILDING => {
             let tip = shared
                 .store
@@ -1103,6 +1120,7 @@ pub fn process_line_for(shared: &Shared, client: Option<&Arc<ClientState>>, line
         Ok(result) => json!({"jsonrpc": "2.0", "id": id, "result": result}),
         Err(e) => {
             shared.stats.errors_total.fetch_add(1, Ordering::Relaxed);
+            log_rpc_error(shared, method, e.code);
             json!({
                 "jsonrpc": "2.0",
                 "id": id,

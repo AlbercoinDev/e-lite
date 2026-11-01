@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.1.0-alpha.5 — 2026-11-01
+
+- **Clean shutdown**: SIGTERM/SIGINT stop at a commit boundary, flush the pending
+  group and exit 0.
+- **Core outage resilience**: transient RPC failures set `CORE_UNAVAILABLE`,
+  keep serving confirmed reads from the index and retry with backoff (1s→30s).
+  Core cookies are reloaded on 401, so a Core restart (which rotates the cookie)
+  recovers automatically.
+- **Snapshot export/import**: `export-snapshot --output` writes a tar.gz with a
+  manifest (network, genesis, tip, txnum, schema, canonical digest);
+  `import-snapshot --input` restores into an empty data directory and verifies
+  the digest.
+- Rate-limited protocol error logging (method + code, no sensitive data).
+- New resilience test: Core stop → reads still work → Core restart with rotated
+  cookie → recovery → SIGTERM exit 0.
+- E2E now also checks snapshot digest equality after restore.
+
 ## 0.1.0-alpha.4 — 2026-11-01
 
 - **Mempool overlay** rebuilt from Core: per-script unconfirmed history, balance

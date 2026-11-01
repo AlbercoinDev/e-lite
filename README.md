@@ -7,7 +7,7 @@ any `scriptPubKey` in the active chain — **without registering wallets**.
 loopback. Core remains the authority for consensus and the active chain; e-lite
 never invents data.
 
-> **Status: `v0.1.0-alpha.4` — experimental, no funds.**
+> **Status: `v0.1.0-alpha.5` — experimental, no funds.**
 > Use on test networks first.
 
 ## Supported networks
@@ -104,8 +104,11 @@ Useful flags: `--config`, `--network`, `--data-dir`, `--core-rpc`,
 - Logs to stderr; `SIGTERM` stops cleanly at a commit boundary.
 
 States reported by the server: `BUILDING_INDEX`, `READY`, `DEGRADED_RAWTX`,
-`REORG_RECOVERY`, `FATAL_INTEGRITY`. While building, queries return an explicit
-temporary error — never a misleading empty result.
+`CORE_UNAVAILABLE`, `REORG_RECOVERY`, `FATAL_INTEGRITY`. While building, queries
+return an explicit temporary error — never a misleading empty result. When Core
+is temporarily unreachable, confirmed history/balances stay available and the
+index resumes with backoff when Core returns (the cookie is reloaded if it
+rotated).
 
 ## Electrum methods (1.4)
 
@@ -167,10 +170,35 @@ yet. `doctor` reports that and refuses to index a gap.
 - `estimatefee` never returns `-1`: it falls back to `max(mempoolminfee,
   relayfee)` so wallets can still compose transactions.
 
+## Backup and restore
+
+Stop e-lite first: RocksDB holds an exclusive lock.
+
+```bash
+e-lite export-snapshot --config e-lite.toml --output e-lite-backup.tar.gz
+# restore into a new, empty data directory (can be another machine)
+e-lite import-snapshot --config e-lite.toml --input e-lite-backup.tar.gz \
+  --data-dir /var/lib/e-lite/restored
+```
+
+The archive contains the database plus a manifest with network, genesis, tip,
+txnum and the canonical digest. Import verifies the network and recomputes the
+digest; it refuses a non-empty target or a mismatched snapshot. The rawtx cache
+is not included (it is rebuildable).
+
+## Clean shutdown
+
+`SIGTERM`/`SIGINT` stop the index at a commit boundary, flush the current group
+and exit with code 0. No partial checkpoint is published.
+
 ## Limitations (v0.1)
 
 - `blockchain.silentpayments.*` is not implemented (normal wallets are
   unaffected).
+- Mode B (`pruned-IBD` building the index while Core syncs with `prune=1`) is
+  not implemented; build the index with a full node or restore a snapshot.
+- Real Sparrow/Electrum validation on Signet is still pending operator testing;
+  the automated suite reproduces Sparrow's connect and wallet flow.
 - The index must be built with a full node (or restored from a snapshot); serving
   against a pruned Core is supported.
 - Raw transactions require the block to still exist in Core or in a configured

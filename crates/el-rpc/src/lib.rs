@@ -69,7 +69,8 @@ impl CoreConfig {
 pub struct CoreClient {
     host: String,
     port: u16,
-    auth: String,
+    auth: std::sync::Arc<std::sync::Mutex<String>>,
+    cookie_path: Option<PathBuf>,
     timeout: Duration,
 }
 
@@ -90,7 +91,8 @@ impl CoreClient {
         Ok(CoreClient {
             host,
             port,
-            auth,
+            auth: std::sync::Arc::new(std::sync::Mutex::new(auth)),
+            cookie_path: Some(cookie_path),
             timeout: cfg.timeout,
         })
     }
@@ -106,15 +108,38 @@ impl CoreClient {
         stream.set_read_timeout(Some(self.timeout))?;
         stream.set_write_timeout(Some(self.timeout))?;
 
+        let auth = self
+            .auth
+            .lock()
+            .map_err(|_| CoreError("core auth lock poisoned".into()))?
+            .clone();
         let req = format!(
             "POST / HTTP/1.1\r\nHost: {addr}\r\nAuthorization: Basic {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-            base64(self.auth.as_bytes()),
+            base64(auth.as_bytes()),
             body.len(),
             body
         );
         stream.write_all(req.as_bytes())?;
         stream.flush()?;
         read_http_body(&mut stream)
+    }
+
+    /// Core rotates its cookie on restart; reload it before retrying a 401.
+    fn refresh_auth(&self) -> Result<()> {
+        let Some(path) = &self.cookie_path else {
+            return err("core cookie path is unknown");
+        };
+        let cookie = std::fs::read_to_string(path)
+            .map_err(|e| CoreError(format!("cannot reload Core cookie {}: {e}", path.display())))?;
+        let cookie = cookie.trim().to_string();
+        if cookie.is_empty() {
+            return err("Core cookie is empty");
+        }
+        *self
+            .auth
+            .lock()
+            .map_err(|_| CoreError("core auth lock poisoned".into()))? = cookie;
+        Ok(())
     }
 
     fn call<T: DeserializeOwned>(&self, method: &str, params: serde_json::Value) -> Result<T> {
@@ -125,7 +150,14 @@ impl CoreClient {
             "params": params,
         })
         .to_string();
-        let bytes = self.post(&body)?;
+        let bytes = match self.post(&body) {
+            Ok(b) => b,
+            Err(e) if e.0.contains("401") => {
+                self.refresh_auth()?;
+                self.post(&body)?
+            }
+            Err(e) => return Err(e),
+        };
         let parsed: serde_json::Value = serde_json::from_slice(&bytes)
             .map_err(|e| CoreError(format!("invalid JSON from Core: {e}")))?;
         if !parsed["error"].is_null() {
@@ -161,7 +193,14 @@ impl CoreClient {
             .collect();
         let body = serde_json::to_string(&requests)
             .map_err(|e| CoreError(format!("cannot encode batch: {e}")))?;
-        let bytes = self.post(&body)?;
+        let bytes = match self.post(&body) {
+            Ok(b) => b,
+            Err(e) if e.0.contains("401") => {
+                self.refresh_auth()?;
+                self.post(&body)?
+            }
+            Err(e) => return Err(e),
+        };
         let parsed: Vec<serde_json::Value> = serde_json::from_slice(&bytes)
             .map_err(|e| CoreError(format!("invalid batch JSON from Core: {e}")))?;
         let mut out: Vec<std::result::Result<serde_json::Value, String>> =
@@ -449,7 +488,11 @@ fn read_http_body(stream: &mut TcpStream) -> Result<Vec<u8>> {
 
     if !status_ok {
         let text = String::from_utf8_lossy(&body);
-        return err(format!("HTTP error from Core: {}", text.trim()));
+        let status_line = headers.lines().next().unwrap_or("").trim().to_string();
+        return err(format!(
+            "HTTP error from Core ({status_line}): {}",
+            text.trim()
+        ));
     }
     Ok(body)
 }
@@ -483,7 +526,11 @@ fn decode_http_body(resp: &[u8]) -> Result<Vec<u8>> {
     }
     if !status_ok {
         let text = String::from_utf8_lossy(&body);
-        return err(format!("HTTP error from Core: {}", text.trim()));
+        let status_line = headers.lines().next().unwrap_or("").trim().to_string();
+        return err(format!(
+            "HTTP error from Core ({status_line}): {}",
+            text.trim()
+        ));
     }
     Ok(body)
 }

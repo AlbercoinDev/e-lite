@@ -1,4 +1,5 @@
 mod config;
+mod snapshot;
 
 use bitcoin::consensus::deserialize;
 use bitcoin::Block;
@@ -15,7 +16,7 @@ use serde_json::json;
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::{Duration, Instant};
 
 type E = Box<dyn std::error::Error + Send + Sync>;
@@ -23,6 +24,30 @@ type R<T> = std::result::Result<T, E>;
 
 fn fail<T>(msg: impl Into<String>) -> R<T> {
     Err(msg.into().into())
+}
+
+/// Set once; SIGTERM/SIGINT request a clean stop at a commit boundary.
+fn shutdown_flag() -> Arc<AtomicBool> {
+    static FLAG: OnceLock<Arc<AtomicBool>> = OnceLock::new();
+    FLAG.get_or_init(|| {
+        let flag = Arc::new(AtomicBool::new(false));
+        let _ = signal_hook::flag::register(signal_hook::consts::SIGTERM, Arc::clone(&flag));
+        let _ = signal_hook::flag::register(signal_hook::consts::SIGINT, Arc::clone(&flag));
+        flag
+    })
+    .clone()
+}
+
+/// Errors that retrying cannot fix: wrong network, prune gap, corrupt schema...
+fn is_permanent_error(msg: &str) -> bool {
+    let m = msg.to_ascii_lowercase();
+    m.contains("pruned")
+        || m.contains("genesis mismatch")
+        || m.contains("needs_recovery")
+        || m.contains("not initialized")
+        || m.contains("schema")
+        || m.contains("identity")
+        || m.contains("txids.dat")
 }
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
@@ -36,6 +61,7 @@ enum Command {
     Run,
     Status,
     ExportSnapshot,
+    ImportSnapshot,
 }
 
 #[derive(Default)]
@@ -54,6 +80,8 @@ struct Args {
     no_follow: bool,
     batch: Option<u32>,
     reorg_window: Option<u32>,
+    output: Option<String>,
+    input: Option<String>,
 }
 
 fn parse_args() -> R<Args> {
@@ -84,6 +112,8 @@ fn parse_args() -> R<Args> {
             "--metrics" => args.metrics = Some(value("--metrics")?),
             "--batch" => args.batch = Some(value("--batch")?.parse()?),
             "--reorg-window" => args.reorg_window = Some(value("--reorg-window")?.parse()?),
+            "--output" => args.output = Some(value("--output")?),
+            "--input" => args.input = Some(value("--input")?),
             "--allow-mainnet" => args.allow_mainnet = true,
             "--json" => args.json = true,
             "--no-follow" => args.no_follow = true,
@@ -100,6 +130,7 @@ fn parse_args() -> R<Args> {
                     "run" => Command::Run,
                     "status" => Command::Status,
                     "export-snapshot" => Command::ExportSnapshot,
+                    "import-snapshot" => Command::ImportSnapshot,
                     "version" => Command::Version,
                     "help" => Command::Help,
                     _ => return fail(format!("unknown command: {other}")),
@@ -266,7 +297,8 @@ fn run() -> R<()> {
         Command::Serve => cmd_serve(&cfg, chain),
         Command::Run => cmd_run(&cfg, chain),
         Command::Status => cmd_status(&cfg, chain, args.json),
-        Command::ExportSnapshot => cmd_export(&cfg, chain),
+        Command::ExportSnapshot => cmd_export(&cfg, chain, args.output.as_deref()),
+        Command::ImportSnapshot => cmd_import(&cfg, chain, args.input.as_deref()),
         Command::Help | Command::Version => unreachable!(),
     }
 }
@@ -285,7 +317,8 @@ COMMANDS:
     serve            serve Electrum queries from an already indexed database
     run              index and serve in one process (recommended)
     status           print health (via local HTTP, or the database if stopped)
-    export-snapshot  print the canonical digest and tip
+    export-snapshot  print the canonical digest, or write a backup with --output
+    import-snapshot  restore a backup with --input (target must be empty)
     version          print version
 
 OPTIONS:
@@ -302,6 +335,8 @@ OPTIONS:
     --allow-mainnet         required for mainnet
     --no-follow             stop when caught up
     --json                  JSON output for status
+    --output <path>         snapshot file for export-snapshot
+    --input <path>          snapshot file for import-snapshot
 "#
     );
 }
@@ -524,6 +559,7 @@ struct Indexer {
     cfg: Config,
     lock: Arc<RwLock<()>>,
     shared: Option<Arc<Shared>>,
+    shutdown: Arc<AtomicBool>,
 }
 
 impl Indexer {
@@ -533,6 +569,7 @@ impl Indexer {
         cfg: Config,
         lock: Arc<RwLock<()>>,
         shared: Option<Arc<Shared>>,
+        shutdown: Arc<AtomicBool>,
     ) -> Self {
         Indexer {
             store,
@@ -540,6 +577,7 @@ impl Indexer {
             cfg,
             lock,
             shared,
+            shutdown,
         }
     }
 
@@ -688,6 +726,9 @@ impl Indexer {
         let mut result: R<()> = Ok(());
 
         for item in rx {
+            if self.shutdown.load(Ordering::SeqCst) {
+                break;
+            }
             let (height, expected_hash, bytes) = match item {
                 Ok(v) => v,
                 Err(e) => {
@@ -749,6 +790,12 @@ impl Indexer {
             let current = tip.expect("tip set");
             self.commit_group(std::mem::take(&mut batch), &current, &group_txids, last_ms)?;
             print_progress(&current, started, info.initialblockdownload);
+            if self.shutdown.load(Ordering::SeqCst) {
+                eprintln!(
+                    "[e-lite] shutdown requested; flushed at height {}",
+                    current.height
+                );
+            }
         }
 
         stop.store(true, Ordering::Relaxed);
@@ -775,8 +822,13 @@ fn cmd_index(cfg: &Config, chain: Chain) -> R<()> {
     let core = core_client(cfg, chain)?;
     require_identity(&store, cfg, chain, &core)?;
     let lock = Arc::new(RwLock::new(()));
-    let idx = Indexer::new(store, core, cfg.clone(), lock, None);
+    let flag = shutdown_flag();
+    let idx = Indexer::new(store, core, cfg.clone(), lock, None, Arc::clone(&flag));
     loop {
+        if flag.load(Ordering::SeqCst) {
+            println!("shutdown requested; index stopped");
+            return Ok(());
+        }
         let height = idx.catch_up()?;
         if !cfg.index.follow {
             println!("caught up at height {height}");
@@ -864,6 +916,7 @@ fn build_shared(cfg: &Config, chain: Chain) -> R<Arc<Shared>> {
         mempool: Arc::new(RwLock::new(Mempool::new())),
         relayfee: Mutex::new(0.0),
         fee_estimates: Mutex::new(std::collections::HashMap::new()),
+        error_log: Mutex::new(std::collections::HashMap::new()),
         clients: Arc::new(el_serve::ClientRegistry::new()),
         identity,
         data_dir: cfg.data_dir(chain),
@@ -916,9 +969,12 @@ fn cmd_serve(cfg: &Config, chain: Chain) -> R<()> {
         chain.name(),
         tip
     );
-    loop {
-        std::thread::sleep(Duration::from_secs(3600));
+    let flag = shutdown_flag();
+    while !flag.load(Ordering::SeqCst) {
+        std::thread::sleep(Duration::from_secs(1));
     }
+    println!("[e-lite] shutdown requested; serving stopped");
+    Ok(())
 }
 
 fn cmd_run(cfg: &Config, chain: Chain) -> R<()> {
@@ -932,32 +988,58 @@ fn cmd_run(cfg: &Config, chain: Chain) -> R<()> {
         chain.name(),
         cfg.rpc_url(chain)
     );
+    let flag = shutdown_flag();
     let idx = Indexer::new(
         Arc::clone(&shared.store),
         shared.core.clone(),
         cfg.clone(),
         Arc::clone(&shared.lock),
         Some(Arc::clone(&shared)),
+        Arc::clone(&flag),
     );
     let mut first = true;
+    let mut backoff = 1u64;
     loop {
+        if flag.load(Ordering::SeqCst) {
+            break;
+        }
         match idx.catch_up() {
             Ok(height) => {
                 shared.set_state(state::READY);
+                backoff = 1;
                 if first {
                     println!("index ready at height {height}");
                     first = false;
                 }
             }
             Err(e) => {
-                shared.set_state(state::FATAL);
-                return Err(e);
+                let msg = e.to_string();
+                if is_permanent_error(&msg) {
+                    shared.set_state(state::FATAL);
+                    return Err(e);
+                }
+                // A transient Core outage must not kill a server that can still
+                // answer confirmed reads from its own index.
+                shared.set_state(state::CORE_UNAVAILABLE);
+                eprintln!(
+                    "[e-lite] transient error: {msg}; retrying in {backoff}s (serving cached index)"
+                );
+                for _ in 0..backoff {
+                    if flag.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_secs(1));
+                }
+                backoff = (backoff * 2).min(30);
+                continue;
             }
         }
         // `run` always follows the tip: it is the daemon mode that indexes and
         // serves. `--no-follow` only applies to the one-shot `index` command.
         std::thread::sleep(Duration::from_secs(1));
     }
+    println!("[e-lite] shutdown requested; stopped cleanly");
+    Ok(())
 }
 
 fn cmd_status(cfg: &Config, chain: Chain, as_json: bool) -> R<()> {
@@ -1026,16 +1108,44 @@ fn print_status_human(v: &serde_json::Value) {
     );
 }
 
-fn cmd_export(cfg: &Config, chain: Chain) -> R<()> {
+fn cmd_export(cfg: &Config, chain: Chain, output: Option<&str>) -> R<()> {
     let store = open_store(cfg, chain)?;
     let tip = store.committed_tip()?;
     let digest = store.canonical_digest()?;
-    println!("network: {}", chain.name());
-    match tip {
-        Some(t) => println!("tip: {} {}", t.height, t.block_hash),
-        None => println!("tip: empty"),
+    match output {
+        None => {
+            println!("network: {}", chain.name());
+            match tip {
+                Some(t) => println!("tip: {} {}", t.height, t.block_hash),
+                None => println!("tip: empty"),
+            }
+            println!("logical_snapshot_hash: {digest}");
+        }
+        Some(path) => {
+            let info = snapshot::export(&store, chain, std::path::Path::new(path), VERSION)?;
+            println!(
+                "snapshot: {} ({:.2} MiB)",
+                info.path.display(),
+                info.bytes as f64 / (1024.0 * 1024.0)
+            );
+            println!("network: {}", chain.name());
+            println!("tip: {} {}", info.height, info.hash);
+            println!("txnum: {}", info.txnum);
+            println!("logical_snapshot_hash: {}", info.digest);
+        }
     }
-    println!("logical_snapshot_hash: {digest}");
+    Ok(())
+}
+
+fn cmd_import(cfg: &Config, chain: Chain, input: Option<&str>) -> R<()> {
+    let input = input.ok_or("import-snapshot requires --input <file.tar.gz>")?;
+    let target = cfg.data_dir(chain);
+    let info = snapshot::import(std::path::Path::new(input), &target, chain)?;
+    println!("restored: {}", target.display());
+    println!("network: {}", chain.name());
+    println!("tip: {} {}", info.height, info.hash);
+    println!("txnum: {}", info.txnum);
+    println!("logical_snapshot_hash: {}", info.digest);
     Ok(())
 }
 

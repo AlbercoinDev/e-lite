@@ -132,6 +132,7 @@ fn fixture() -> (Fixture, ScriptHash, Hash32) {
         mempool: Arc::new(RwLock::new(Mempool::new())),
         relayfee: std::sync::Mutex::new(0.0),
         fee_estimates: std::sync::Mutex::new(std::collections::HashMap::new()),
+        error_log: std::sync::Mutex::new(std::collections::HashMap::new()),
         clients: Arc::new(ClientRegistry::new()),
         identity,
         data_dir: dir.clone(),
