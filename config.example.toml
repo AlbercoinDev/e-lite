@@ -12,7 +12,7 @@ name = "regtest"                     # regtest | signet | testnet4 | mainnet
 timeout_seconds = 30
 
 [index]
-mode = "full-core"                   # v0.1 only supports full-core (Core prune=0)
+mode = "full-core"                   # full-core | pruned-ibd (Core prune=1)
 batch_blocks = 32                    # blocks per atomic commit (WAL fsync)
 reorg_window = 288                   # undo records kept for reorgs
 follow = true                        # keep following the tip
@@ -24,6 +24,15 @@ max_clients = 32
 [metrics]
 enabled = true
 listen = "127.0.0.1:9184"            # /status, /metrics, /healthz
+
+[pruning]
+enabled = true
+disk_low_free_gib = 5                # pause Core downloads below this
+disk_resume_free_gib = 10            # resume above this (hysteresis)
+undo_margin_blocks = 288             # safety behind the committed tip
+core_recent_blocks_margin = 300      # Core keeps at least 288 anyway
+min_gain_blocks = 288                # minimum progress between prune requests
+poll_seconds = 15
 
 [rawtx]
 # Raw transactions for pruned blocks. Whole blocks only; verified before serving.

@@ -3,6 +3,7 @@
 //! Each request reads the index through a shared read lock; the indexer commits
 //! under the write lock, so no response mixes two tips.
 
+use el_chain::ReaderTracker;
 use el_mempool::Mempool;
 use el_model::{merkle_branch, Hash32, NetworkIdentity, ScriptHash};
 use el_rawtx::Resolver;
@@ -29,6 +30,8 @@ pub mod state {
     pub const REORG: u8 = 3;
     pub const FATAL: u8 = 4;
     pub const CORE_UNAVAILABLE: u8 = 5;
+    pub const PAUSE_DOWNLOAD: u8 = 6;
+    pub const PRUNING: u8 = 7;
 
     pub fn name(v: u8) -> &'static str {
         match v {
@@ -38,6 +41,8 @@ pub mod state {
             REORG => "REORG_RECOVERY",
             FATAL => "FATAL_INTEGRITY",
             CORE_UNAVAILABLE => "CORE_UNAVAILABLE",
+            PAUSE_DOWNLOAD => "PAUSE_DOWNLOAD",
+            PRUNING => "PRUNING",
             _ => "UNKNOWN",
         }
     }
@@ -170,6 +175,7 @@ pub struct Shared {
     pub fee_estimates: Mutex<HashMap<u32, (f64, Instant)>>,
     pub error_log: Mutex<HashMap<String, Instant>>,
     pub clients: Arc<ClientRegistry>,
+    pub readers: Arc<ReaderTracker>,
     pub identity: NetworkIdentity,
     pub data_dir: std::path::PathBuf,
     pub listen: String,
@@ -364,7 +370,11 @@ pub fn dispatch_for(
 
 fn check_ready(shared: &Shared) -> RpcResult<()> {
     match shared.get_state() {
-        state::READY | state::DEGRADED | state::CORE_UNAVAILABLE => Ok(()),
+        state::READY
+        | state::DEGRADED
+        | state::CORE_UNAVAILABLE
+        | state::PAUSE_DOWNLOAD
+        | state::PRUNING => Ok(()),
         state::BUILDING => {
             let tip = shared
                 .store
@@ -680,11 +690,15 @@ fn transaction_get(shared: &Shared, params: &Value) -> RpcResult<Value> {
     }
 
     match occ.first().copied() {
-        Some((height, _)) => shared
-            .resolver
-            .raw_tx(txid_hash, height)
-            .map(|raw| json!(raw))
-            .map_err(|e| RpcError::server(e.to_string())),
+        Some((height, _)) => {
+            // Keep the prune gate away from this height while we resolve.
+            let _guard = shared.readers.enter(height);
+            shared
+                .resolver
+                .raw_tx(txid_hash, height)
+                .map(|raw| json!(raw))
+                .map_err(|e| RpcError::server(e.to_string()))
+        }
         None => shared
             .core
             .raw_transaction_hex_opt(txid, None)

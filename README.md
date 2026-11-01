@@ -7,7 +7,7 @@ any `scriptPubKey` in the active chain — **without registering wallets**.
 loopback. Core remains the authority for consensus and the active chain; e-lite
 never invents data.
 
-> **Status: `v0.1.0-alpha.6` — experimental, no funds.**
+> **Status: `v0.1.0-alpha.7` — experimental, no funds.**
 > Use on test networks first.
 
 ## Supported networks
@@ -104,7 +104,8 @@ Useful flags: `--config`, `--network`, `--data-dir`, `--core-rpc`,
 - Logs to stderr; `SIGTERM` stops cleanly at a commit boundary.
 
 States reported by the server: `BUILDING_INDEX`, `READY`, `DEGRADED_RAWTX`,
-`CORE_UNAVAILABLE`, `REORG_RECOVERY`, `FATAL_INTEGRITY`. While building, queries
+`CORE_UNAVAILABLE`, `PAUSE_DOWNLOAD`, `PRUNING`, `REORG_RECOVERY`,
+`FATAL_INTEGRITY`. While building, queries
 return an explicit temporary error — never a misleading empty result. When Core
 is temporarily unreachable, confirmed history/balances stay available and the
 index resumes with backoff when Core returns (the cookie is reloaded if it
@@ -171,6 +172,39 @@ yet. `doctor` reports that and refuses to index a gap.
 - `estimatefee` never returns `-1`: it falls back to `max(mempoolminfee,
   relayfee)` so wallets can still compose transactions.
 
+## Mode B: pruned IBD
+
+Set `[index] mode = "pruned-ibd"` and run Core with `prune=1` (manual). e-lite
+indexes blocks as they arrive and a supervisor decides when it is safe to ask
+Core to prune:
+
+```toml
+[index]
+mode = "pruned-ibd"
+
+[pruning]
+enabled = true
+disk_low_free_gib = 5          # pause downloads below this
+disk_resume_free_gib = 10      # resume above this (hysteresis)
+undo_margin_blocks = 288       # keep this much behind the committed tip
+core_recent_blocks_margin = 288
+min_gain_blocks = 288          # minimum progress between prune requests
+poll_seconds = 15
+```
+
+The safe height is the minimum of:
+
+- `committed_height - undo_margin`,
+- `earliest_active_reader - 1` (rawtx resolutions in flight),
+- `core_tip - core_recent_margin`.
+
+e-lite only calls Core's `pruneblockchain`; it **never deletes block files** and
+never prunes while downloads are paused, while the index is behind, or when a
+reader still needs the height. If Core reports that no whole block file can be
+removed, the request is retried only after the safe height advances by
+`min_gain_blocks`. Moving from `prune=1` to `prune=550` remains an explicit
+operator action with a restart.
+
 ## Backup and restore
 
 Stop e-lite first: RocksDB holds an exclusive lock.
@@ -196,8 +230,6 @@ and exit with code 0. No partial checkpoint is published.
 
 - `blockchain.silentpayments.*` is not implemented (normal wallets are
   unaffected).
-- Mode B (`pruned-IBD` building the index while Core syncs with `prune=1`) is
-  not implemented; build the index with a full node or restore a snapshot.
 - Real Sparrow/Electrum validation on Signet is still pending operator testing;
   the automated suite reproduces Sparrow's connect and wallet flow.
 - The index must be built with a full node (or restored from a snapshot); serving

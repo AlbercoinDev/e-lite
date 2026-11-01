@@ -80,6 +80,7 @@ struct Args {
     no_follow: bool,
     batch: Option<u32>,
     reorg_window: Option<u32>,
+    mode: Option<String>,
     output: Option<String>,
     input: Option<String>,
 }
@@ -112,6 +113,7 @@ fn parse_args() -> R<Args> {
             "--metrics" => args.metrics = Some(value("--metrics")?),
             "--batch" => args.batch = Some(value("--batch")?.parse()?),
             "--reorg-window" => args.reorg_window = Some(value("--reorg-window")?.parse()?),
+            "--mode" => args.mode = Some(value("--mode")?),
             "--output" => args.output = Some(value("--output")?),
             "--input" => args.input = Some(value("--input")?),
             "--allow-mainnet" => args.allow_mainnet = true,
@@ -170,15 +172,18 @@ fn effective_config(args: &Args) -> R<(Config, Chain)> {
     if let Some(w) = args.reorg_window {
         cfg.index.reorg_window = w.max(1);
     }
+    if let Some(m) = &args.mode {
+        cfg.index.mode = m.clone();
+    }
     if args.no_follow {
         cfg.index.follow = false;
     }
     if args.allow_mainnet {
         cfg.safety.allow_mainnet = true;
     }
-    if cfg.index.mode != "full-core" {
+    if cfg.index.mode != "full-core" && cfg.index.mode != "pruned-ibd" {
         return fail(format!(
-            "index mode \"{}\" is not supported in v0.1 (only full-core)",
+            "unknown index mode \"{}\": use full-core or pruned-ibd",
             cfg.index.mode
         ));
     }
@@ -333,6 +338,7 @@ OPTIONS:
     --batch <n>             blocks per atomic commit (default 32)
     --reorg-window <n>      undo window in blocks (default 288)
     --allow-mainnet         required for mainnet
+    --mode <mode>           full-core | pruned-ibd
     --no-follow             stop when caught up
     --json                  JSON output for status
     --output <path>         snapshot file for export-snapshot
@@ -456,10 +462,16 @@ fn cmd_doctor(cfg: &Config, chain: Chain) -> R<()> {
 
     if core_pruned {
         match &db_tip {
-            None => problems.push(
-                "Core is pruned and the index is empty: build it with a full node or restore a snapshot"
-                    .to_string(),
-            ),
+            None => {
+                if pruneheight == 0 && cfg.index.mode == "pruned-ibd" {
+                    println!("core pruned (manual, pruneheight 0): pruned-ibd can start indexing");
+                } else {
+                    problems.push(
+                        "Core is pruned and the index is empty: build it with a full node or restore a snapshot"
+                            .to_string(),
+                    );
+                }
+            }
             Some(t) if (t.height as u64) + 1 < pruneheight => problems.push(format!(
                 "Core is pruned from {} but the index stops at {}; missing blocks cannot be read",
                 pruneheight, t.height
@@ -680,7 +692,9 @@ impl Indexer {
         Ok(())
     }
 
-    fn catch_up(&self) -> R<u64> {
+    /// Index at most `max_blocks` before returning, so the supervisor can act
+    /// between steps (disk backpressure, pruning).
+    fn catch_up_limited(&self, max_blocks: u64) -> R<u64> {
         let started = Instant::now();
         let info = self.core.blockchain_info()?;
         let core_tip = info.blocks;
@@ -691,9 +705,10 @@ impl Indexer {
 
         let mut tip = tip_at_start;
         let start = tip.map(|t| t.height as u64 + 1).unwrap_or(0);
-        if start > core_tip {
+        if start > core_tip || max_blocks == 0 {
             return Ok(tip.map(|t| t.height as u64).unwrap_or(0));
         }
+        let target = core_tip.min(start.saturating_add(max_blocks.saturating_sub(1)));
 
         let (tx, rx) = std::sync::mpsc::sync_channel::<
             std::result::Result<(u64, String, Vec<u8>), String>,
@@ -702,7 +717,7 @@ impl Indexer {
         let stop = Arc::new(AtomicBool::new(false));
         let stop_thread = Arc::clone(&stop);
         let fetcher = std::thread::spawn(move || {
-            for h in start..=core_tip {
+            for h in start..=target {
                 if stop_thread.load(Ordering::Relaxed) {
                     break;
                 }
@@ -817,6 +832,99 @@ fn print_progress(tip: &IndexedTip, started: Instant, ibd: bool) {
     );
 }
 
+fn supervisor_config(cfg: &Config) -> el_chain::SupervisorConfig {
+    const GIB: u64 = 1024 * 1024 * 1024;
+    el_chain::SupervisorConfig {
+        disk_enabled: true,
+        disk_low_bytes: cfg.pruning.disk_low_free_gib.saturating_mul(GIB),
+        disk_resume_bytes: cfg.pruning.disk_resume_free_gib.saturating_mul(GIB),
+        prune_enabled: cfg.pruning.enabled && cfg.index.mode == "pruned-ibd",
+        undo_margin: cfg.index.reorg_window.max(cfg.pruning.undo_margin_blocks),
+        core_recent_margin: cfg.pruning.core_recent_blocks_margin,
+        min_gain: cfg.pruning.min_gain_blocks.max(1),
+    }
+}
+
+fn supervisor_tick(
+    sup: &mut el_chain::Supervisor,
+    core: &CoreClient,
+    store: &Store,
+    readers: Option<&el_chain::ReaderTracker>,
+    data_dir: &std::path::Path,
+) -> R<Vec<el_chain::Action>> {
+    let info = core.blockchain_info()?;
+    let committed = store.committed_tip()?.map(|t| t.height as u64).unwrap_or(0);
+    let free = el_chain::disk_free_bytes(data_dir);
+    let input = el_chain::TickInput {
+        committed_height: committed.min(u32::MAX as u64) as u32,
+        core_tip: info.blocks.min(u32::MAX as u64) as u32,
+        core_pruned: info.pruned,
+        core_pruneheight: info.pruneheight.min(u32::MAX as u64) as u32,
+        free_bytes: free,
+        readers_min: readers.and_then(|r| r.earliest()),
+    };
+    Ok(sup.tick(&input))
+}
+
+fn apply_supervisor_actions(
+    sup: &mut el_chain::Supervisor,
+    core: &CoreClient,
+    actions: Vec<el_chain::Action>,
+    shared: Option<&Arc<Shared>>,
+) {
+    for action in actions {
+        match action {
+            el_chain::Action::PauseDownloads => match core.set_network_active(false) {
+                Ok(_) => {
+                    if let Some(sh) = shared {
+                        sh.set_state(state::PAUSE_DOWNLOAD);
+                    }
+                    eprintln!("[e-lite] disk low: paused Core downloads");
+                }
+                Err(e) => eprintln!("[e-lite] cannot pause Core downloads: {e}"),
+            },
+            el_chain::Action::ResumeDownloads => match core.set_network_active(true) {
+                Ok(_) => {
+                    if let Some(sh) = shared {
+                        sh.set_state(state::READY);
+                    }
+                    eprintln!("[e-lite] disk recovered: resumed Core downloads");
+                }
+                Err(e) => eprintln!("[e-lite] cannot resume Core downloads: {e}"),
+            },
+            el_chain::Action::Prune(height) => {
+                sup.on_prune_requested();
+                if let Some(sh) = shared {
+                    sh.set_state(state::PRUNING);
+                }
+                match core.prune_blockchain(height as u64) {
+                    Ok(got) if got >= 0 => {
+                        sup.on_pruned(height);
+                        eprintln!(
+                            "[e-lite] pruned Core blocks below {height} (Core reports {got})"
+                        );
+                    }
+                    Ok(got) => {
+                        // Core had no whole block file to remove. Cooldown until
+                        // the safe height advances by min_gain.
+                        sup.on_pruned(height);
+                        eprintln!(
+                            "[e-lite] prune at {height} not possible yet (Core reports {got}); waiting for more blocks"
+                        );
+                    }
+                    Err(e) => {
+                        sup.on_prune_failed();
+                        eprintln!("[e-lite] prune request failed: {e}");
+                    }
+                }
+                if let Some(sh) = shared {
+                    sh.set_state(state::READY);
+                }
+            }
+        }
+    }
+}
+
 fn cmd_index(cfg: &Config, chain: Chain) -> R<()> {
     let store = open_store(cfg, chain)?;
     let core = core_client(cfg, chain)?;
@@ -824,17 +932,38 @@ fn cmd_index(cfg: &Config, chain: Chain) -> R<()> {
     let lock = Arc::new(RwLock::new(()));
     let flag = shutdown_flag();
     let idx = Indexer::new(store, core, cfg.clone(), lock, None, Arc::clone(&flag));
+    let mut supervisor = el_chain::Supervisor::new(supervisor_config(cfg));
+    let poll = Duration::from_secs(cfg.pruning.poll_seconds.max(1));
+    let mut last_tick = Instant::now()
+        .checked_sub(poll)
+        .unwrap_or_else(Instant::now);
     loop {
         if flag.load(Ordering::SeqCst) {
             println!("shutdown requested; index stopped");
             return Ok(());
         }
-        let height = idx.catch_up()?;
-        if !cfg.index.follow {
-            println!("caught up at height {height}");
-            return Ok(());
+        let height = idx.catch_up_limited(512)?;
+        if last_tick.elapsed() >= poll {
+            match supervisor_tick(
+                &mut supervisor,
+                &idx.core,
+                &idx.store,
+                None,
+                &cfg.data_dir(chain),
+            ) {
+                Ok(actions) => apply_supervisor_actions(&mut supervisor, &idx.core, actions, None),
+                Err(e) => eprintln!("[e-lite] supervisor: {e}"),
+            }
+            last_tick = Instant::now();
         }
-        std::thread::sleep(Duration::from_secs(2));
+        if !cfg.index.follow {
+            let core_tip = idx.core.blockchain_info()?.blocks;
+            if height >= core_tip {
+                println!("caught up at height {height}");
+                return Ok(());
+            }
+        }
+        std::thread::sleep(Duration::from_secs(1));
     }
 }
 
@@ -843,9 +972,18 @@ fn check_pruned(info: &BlockchainInfo, tip: Option<&IndexedTip>) -> R<()> {
     if !info.pruned {
         return Ok(());
     }
-    let tip = tip.ok_or(
-        "Core is pruned and the index is empty: build the index with a full node or restore a snapshot",
-    )?;
+    let tip = match tip {
+        Some(t) => t,
+        None => {
+            // pruned-ibd can bootstrap while Core has not pruned anything yet.
+            if info.pruneheight == 0 {
+                return Ok(());
+            }
+            return fail(
+                "Core is pruned and the index is empty: build the index with a full node or restore a snapshot",
+            );
+        }
+    };
     if (tip.height as u64) + 1 < info.pruneheight {
         return fail(format!(
             "Core is pruned from height {} but the index stops at {}; blocks {}..{} are unavailable. Use a full node to build the index or restore a snapshot.",
@@ -919,6 +1057,7 @@ fn build_shared(cfg: &Config, chain: Chain) -> R<Arc<Shared>> {
         fee_estimates: Mutex::new(std::collections::HashMap::new()),
         error_log: Mutex::new(std::collections::HashMap::new()),
         clients: Arc::new(el_serve::ClientRegistry::new()),
+        readers: el_chain::ReaderTracker::new(),
         identity,
         data_dir: cfg.data_dir(chain),
         listen: cfg.server.listen.clone(),
@@ -998,15 +1137,24 @@ fn cmd_run(cfg: &Config, chain: Chain) -> R<()> {
         Some(Arc::clone(&shared)),
         Arc::clone(&flag),
     );
+    let mut supervisor = el_chain::Supervisor::new(supervisor_config(cfg));
+    let poll = Duration::from_secs(cfg.pruning.poll_seconds.max(1));
+    let mut last_tick = Instant::now()
+        .checked_sub(poll)
+        .unwrap_or_else(Instant::now);
     let mut first = true;
     let mut backoff = 1u64;
     loop {
         if flag.load(Ordering::SeqCst) {
             break;
         }
-        match idx.catch_up() {
+        match idx.catch_up_limited(512) {
             Ok(height) => {
-                shared.set_state(state::READY);
+                shared.set_state(if supervisor.paused() {
+                    state::PAUSE_DOWNLOAD
+                } else {
+                    state::READY
+                });
                 backoff = 1;
                 if first {
                     println!("index ready at height {height}");
@@ -1034,6 +1182,21 @@ fn cmd_run(cfg: &Config, chain: Chain) -> R<()> {
                 backoff = (backoff * 2).min(30);
                 continue;
             }
+        }
+        if last_tick.elapsed() >= poll {
+            match supervisor_tick(
+                &mut supervisor,
+                &shared.core,
+                &shared.store,
+                Some(shared.readers.as_ref()),
+                &shared.data_dir,
+            ) {
+                Ok(actions) => {
+                    apply_supervisor_actions(&mut supervisor, &shared.core, actions, Some(&shared))
+                }
+                Err(e) => eprintln!("[e-lite] supervisor: {e}"),
+            }
+            last_tick = Instant::now();
         }
         // `run` always follows the tip: it is the daemon mode that indexes and
         // serves. `--no-follow` only applies to the one-shot `index` command.

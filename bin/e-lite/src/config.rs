@@ -17,6 +17,8 @@ pub struct Config {
     pub safety: SafetyCfg,
     #[serde(default)]
     pub rawtx: RawtxCfg,
+    #[serde(default)]
+    pub pruning: PruningCfg,
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -114,6 +116,57 @@ impl Default for MetricsCfg {
             listen: d_metrics(),
         }
     }
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct PruningCfg {
+    #[serde(default = "d_true")]
+    pub enabled: bool,
+    #[serde(default = "d_disk_low")]
+    pub disk_low_free_gib: u64,
+    #[serde(default = "d_disk_resume")]
+    pub disk_resume_free_gib: u64,
+    #[serde(default = "d_undo_margin")]
+    pub undo_margin_blocks: u32,
+    #[serde(default = "d_core_margin")]
+    pub core_recent_blocks_margin: u32,
+    #[serde(default = "d_min_gain")]
+    pub min_gain_blocks: u32,
+    #[serde(default = "d_poll")]
+    pub poll_seconds: u64,
+}
+
+impl Default for PruningCfg {
+    fn default() -> Self {
+        PruningCfg {
+            enabled: true,
+            disk_low_free_gib: d_disk_low(),
+            disk_resume_free_gib: d_disk_resume(),
+            undo_margin_blocks: d_undo_margin(),
+            core_recent_blocks_margin: d_core_margin(),
+            min_gain_blocks: d_min_gain(),
+            poll_seconds: d_poll(),
+        }
+    }
+}
+
+fn d_disk_low() -> u64 {
+    5
+}
+fn d_disk_resume() -> u64 {
+    10
+}
+fn d_undo_margin() -> u32 {
+    288
+}
+fn d_core_margin() -> u32 {
+    288
+}
+fn d_min_gain() -> u32 {
+    288
+}
+fn d_poll() -> u64 {
+    15
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]

@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.1.0-alpha.7 — 2026-11-01
+
+- **Mode B (`pruned-ibd`)**: index while Core runs with `prune=1` (manual).
+- **Disk supervisor** with hysteresis: pauses Core downloads
+  (`setnetworkactive(false)`) below the low watermark and resumes above the high
+  watermark.
+- **Safe prune gate**: minimum of committed-tip minus undo margin, earliest
+  active rawtx reader minus one, and Core tip minus recent-blocks margin. Never
+  prunes while paused, behind, or with an active reader; `min_gain` prevents
+  request storms. Only `pruneblockchain` is used; no block files are deleted by
+  e-lite.
+- Bounded indexing steps so the supervisor can act during long catch-ups.
+- Reader tracking around `transaction.get` so pruning respects in-flight rawtx
+  resolutions.
+- Tests: gate formula, hysteresis, reader blocking, prune gain, and a regtest
+  `prune=1 -fastprune` E2E: 2000 blocks indexed, Core pruned to 1530, old block
+  unavailable in Core while e-lite still served 2000 history entries.
+
 ## 0.1.0-alpha.6 — 2026-11-01
 
 - **BIP324 v2 P2P transport** (encrypted, via the `bip324` crate) with fallback

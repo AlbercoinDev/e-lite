@@ -135,6 +135,7 @@ fn fixture() -> (Fixture, ScriptHash, Hash32) {
         fee_estimates: std::sync::Mutex::new(std::collections::HashMap::new()),
         error_log: std::sync::Mutex::new(std::collections::HashMap::new()),
         clients: Arc::new(ClientRegistry::new()),
+        readers: el_chain::ReaderTracker::new(),
         identity,
         data_dir: dir.clone(),
         listen: "127.0.0.1:0".to_string(),

@@ -299,6 +299,16 @@ impl CoreClient {
         self.call("getblockstats", serde_json::json!([height]))
     }
 
+    /// Ask Core to prune block files up to (not including) `height`.
+    /// Returns the height Core actually pruned to.
+    pub fn prune_blockchain(&self, height: u64) -> Result<i64> {
+        self.call("pruneblockchain", serde_json::json!([height]))
+    }
+
+    pub fn set_network_active(&self, active: bool) -> Result<bool> {
+        self.call("setnetworkactive", serde_json::json!([active]))
+    }
+
     /// Peer addresses known to the local Core (no public DNS lookup).
     pub fn node_addresses(&self, count: u32) -> Result<Vec<NodeAddress>> {
         self.call("getnodeaddresses", serde_json::json!([count]))

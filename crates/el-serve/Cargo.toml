@@ -11,6 +11,7 @@ el-store = { path = "../el-store" }
 el-rpc = { path = "../el-rpc" }
 el-rawtx = { path = "../el-rawtx" }
 el-mempool = { path = "../el-mempool" }
+el-chain = { path = "../el-chain" }
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
