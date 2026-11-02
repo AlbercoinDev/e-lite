@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.1.0-alpha.11 — 2026-11-02
 
 ### Autonomous startup and Core lifecycle
 
