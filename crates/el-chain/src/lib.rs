@@ -184,6 +184,10 @@ pub struct Supervisor {
     state: State,
     paused: bool,
     last_prune: Option<u32>,
+    /// Last height we asked Core to prune to. Core prunes at block-file
+    /// granularity and can report a much lower height, so retries are
+    /// throttled on the request, not on the reported result.
+    last_attempt: Option<u32>,
 }
 
 impl Supervisor {
@@ -197,6 +201,7 @@ impl Supervisor {
             state: State::Bootstrap,
             paused: false,
             last_prune: None,
+            last_attempt: None,
         }
     }
 
@@ -262,9 +267,13 @@ impl Supervisor {
                 self.cfg.core_recent_margin,
             );
             let advanced = safe > input.core_pruneheight
-                && self
-                    .last_prune
-                    .is_none_or(|last| safe >= last.saturating_add(self.cfg.min_gain));
+                && safe
+                    >= [self.last_attempt, self.last_prune]
+                        .into_iter()
+                        .flatten()
+                        .max()
+                        .unwrap_or(0)
+                        .saturating_add(self.cfg.min_gain);
             if advanced && safe > 0 {
                 self.state = State::PruneEligible;
                 actions.push(Action::Prune(safe));
@@ -281,7 +290,8 @@ impl Supervisor {
         actions
     }
 
-    pub fn on_prune_requested(&mut self) {
+    pub fn on_prune_requested(&mut self, height: u32) {
+        self.last_attempt = Some(height);
         self.state = State::Pruning;
     }
 
@@ -397,6 +407,23 @@ mod tests {
         assert_eq!(safe_prune_height(103, None, 200, 10, 10), 93);
         assert!(s.tick(&i).is_empty());
         // Enough gain.
+        i.committed_height = 110;
+        assert_eq!(s.tick(&i), vec![Action::Prune(100)]);
+    }
+
+    #[test]
+    fn prune_retry_waits_for_safe_gain_even_if_core_reports_less() {
+        let mut s = Supervisor::new(cfg());
+        let mut i = input(100, 200);
+        i.core_pruneheight = 80;
+        assert_eq!(s.tick(&i), vec![Action::Prune(90)]);
+        s.on_prune_requested(90);
+        // Core could only prune up to a block-file boundary, far below the
+        // requested height. That must not trigger a request on every tick.
+        s.on_pruned(80);
+        assert!(s.tick(&i).is_empty(), "same safe height: no retry");
+        i.committed_height = 104;
+        assert!(s.tick(&i).is_empty(), "gain below min_gain: no retry");
         i.committed_height = 110;
         assert_eq!(s.tick(&i), vec![Action::Prune(100)]);
     }

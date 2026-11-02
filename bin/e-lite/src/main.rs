@@ -1417,8 +1417,11 @@ impl Indexer {
                 .store(info.initialblockdownload, Ordering::Relaxed);
         }
         // A previous e-lite run may have paused Core and crashed. The marker
-        // is only written by e-lite, so resuming is safe.
+        // is only written by e-lite, so resuming is safe. Do not consume a
+        // marker written by a *live* lag pause: the guard owns that state and
+        // must resume at its own watermark (75% of the limit).
         if self.can_control_core
+            && !self.lag_paused.load(Ordering::Relaxed)
             && self.pause_marker.is_file()
             && self.core.set_network_active(true).is_ok()
         {
@@ -1619,6 +1622,7 @@ impl Indexer {
                     started,
                     start_height,
                     start_txnum,
+                    info.blocks,
                     info.initialblockdownload,
                 );
                 if let Some(sh) = &self.shared {
@@ -1644,6 +1648,7 @@ impl Indexer {
                 started,
                 start_height,
                 start_txnum,
+                info.blocks,
                 info.initialblockdownload,
             );
             if let Some(sh) = &self.shared {
@@ -1706,17 +1711,23 @@ fn print_progress(
     started: Instant,
     start_height: u32,
     start_txnum: u64,
+    core_height: u64,
     ibd: bool,
 ) {
     let secs = started.elapsed().as_secs_f64().max(0.001);
     let blocks = tip.height.saturating_sub(start_height) as f64;
     let txs = tip.txnum.saturating_sub(start_txnum) as f64;
+    let lag = core_height.saturating_sub(tip.height as u64);
     eprintln!(
-        "[e-lite] height {}  txnum {}  {:.1} blocks/s  {:.0} tx/s{}",
+        "[e-lite] height {}  txnum {}  core {}  lag {}  {:.1} blocks/s  {:.0} tx/s  \
+         elapsed {:.1}s{}",
         tip.height,
         tip.txnum,
+        core_height,
+        lag,
         blocks / secs,
         txs / secs,
+        secs,
         if ibd { "  (core in IBD)" } else { "" }
     );
 }
@@ -1843,7 +1854,7 @@ fn apply_supervisor_actions(
                 if !can_control_core {
                     continue;
                 }
-                sup.on_prune_requested();
+                sup.on_prune_requested(height);
                 if let Some(sh) = shared {
                     sh.stats.prune_requests.fetch_add(1, Ordering::Relaxed);
                     sh.set_state(state::PRUNING);

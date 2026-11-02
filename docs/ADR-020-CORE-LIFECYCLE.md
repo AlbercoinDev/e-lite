@@ -22,7 +22,7 @@ be paused safely.
    Core's `blocks/` directory and a Core owned by e-lite. An external or remote
    pruned Core with an empty index is rejected with instructions.
 4. **Lag guard uses the real retention window.** `lag_limit = min(configured,
-   (blocks - pruneheight) - 32)`, default 256, resume at 75%. While
+   (blocks - pruneheight) - 32)`, default 512, resume at 75%. While
    `pruneheight == 0` nothing has been pruned, so the guard does not slow down
    the initial index. Active rawtx readers below `pruneheight + 32` also pause
    Core.
@@ -32,7 +32,10 @@ be paused safely.
 6. **Pause marker.** A pause writes `<data-dir>/core-paused-by-e-lite`; after a
    crash, the next start resumes `setnetworkactive(true)` and removes it.
 7. **Manual prune uses the height Core actually reports**, not the requested
-   height, and is only issued for a Core owned by e-lite.
+   height, and is only issued for a Core owned by e-lite. Retries are throttled
+   by the *requested* height with `min_gain` blocks of progress, because Core
+   prunes at block-file granularity and can report the same height for a long
+   time.
 8. **Remote Core is maintenance-only.** HTTP over SSH/VPN; `rpc_user`/
    `rpc_password` or a copied cookie. No REST/P2P ingest in this iteration.
 

@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.1.0-alpha.12 — 2026-11-02
+
+### Download and prune fixes
+
+- **The lag pause is no longer undone by the crash-recovery marker.** The
+  `core-paused-by-e-lite` recovery ran on every catch-up call, so a live lag
+  pause was resumed on the next iteration, bypassing the 75% hysteresis and the
+  reader check. Recovery now only runs when no live lag pause is in progress.
+- **Prune requests are throttled by the requested height.** Core prunes at
+  block-file granularity and can return the same height for thousands of
+  blocks; retrying on every supervisor tick forced Core to flush during IBD.
+  The supervisor now records the last requested height and only retries after
+  `min_gain` blocks of safe-height progress.
+- **Default `max_core_lag_blocks` is 512** (still capped by `blocks -
+  pruneheight - 32`). On signet with `prune=550` the retention is thousands of
+  blocks, so the old 256 limit paused Core unnecessarily.
+- **Progress lines include `core`, `lag` and elapsed seconds**, so the catch-up
+  burst rate is interpretable. All-in-one and network tests now use 512.
+
 ## 0.1.0-alpha.11 — 2026-11-02
 
 ### Autonomous startup and Core lifecycle

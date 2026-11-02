@@ -308,7 +308,7 @@ fn d_min_free() -> u64 {
     10
 }
 fn d_max_lag() -> u32 {
-    256
+    512
 }
 fn d_poll() -> u64 {
     10
@@ -471,7 +471,7 @@ mod tests {
         assert_eq!(cfg.core.manage, CoreManage::Auto);
         assert_eq!(cfg.core.prune_mib, 550);
         assert_eq!(cfg.index.reorg_window, 288);
-        assert_eq!(cfg.pruning.max_core_lag_blocks, 256);
+        assert_eq!(cfg.pruning.max_core_lag_blocks, 512);
         assert_eq!(cfg.rawtx.cache_mib, 2048);
         assert!(cfg.rawtx.esplora_urls.is_empty());
     }

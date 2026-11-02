@@ -7,7 +7,7 @@ any `scriptPubKey` in the active chain — **without registering wallets**.
 loopback by default. Core remains the authority for consensus and the active
 chain; e-lite never invents data.
 
-> **Status: `v0.1.0-alpha.10` — experimental, no funds.**
+> **Status: `v0.1.0-alpha.12` — experimental, no funds.**
 > Use on test networks first.
 >
 > **Testing from scratch:** see [`docs/GETTING-STARTED.md`](docs/GETTING-STARTED.md)
@@ -146,7 +146,7 @@ This is the supported path for “both start from zero”:
 4. e-lite never lets the index fall below `pruneheight`.
 
 The guard uses the real retention (`blocks - pruneheight`), not a fixed 32:
-the default `max_core_lag_blocks = 256` is capped by Core's window and resumes
+the default `max_core_lag_blocks = 512` is capped by Core's window and resumes
 at 75%. It also pauses Core while a `transaction.get` is resolving a block near
 the prune boundary.
 
@@ -213,7 +213,7 @@ follow = true
 
 [pruning]
 min_free_gib = 10             # pause Core + indexing below this
-max_core_lag_blocks = 256     # capped by Core retention
+max_core_lag_blocks = 512     # capped by Core retention
 poll_seconds = 10
 
 [server]

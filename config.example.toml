@@ -31,7 +31,7 @@ follow = true                       # keep following the tip
 
 [pruning]
 min_free_gib = 10                   # pause Core + indexing below this
-max_core_lag_blocks = 256           # capped by Core's retention window
+max_core_lag_blocks = 512           # capped by Core's retention window
 poll_seconds = 10
 
 [server]

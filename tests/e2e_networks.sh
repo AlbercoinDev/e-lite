@@ -75,7 +75,7 @@ reorg_window = 288
 
 [pruning]
 min_free_gib = $MIN_FREE
-max_core_lag_blocks = 256
+max_core_lag_blocks = 512
 poll_seconds = 10
 
 [server]
