@@ -261,15 +261,27 @@ fn require_identity(
             chain.name()
         ));
     }
-    let live = core_identity(core, chain)?;
-    if stored.genesis != live.genesis {
-        return fail(format!(
-            "genesis mismatch: db {} vs core {}",
-            stored.genesis, live.genesis
-        ));
-    }
-    if stored.signet_challenge != live.signet_challenge {
-        return fail("signet challenge mismatch");
+    match core_identity(core, chain) {
+        Ok(live) => {
+            if stored.genesis != live.genesis {
+                return fail(format!(
+                    "genesis mismatch: db {} vs core {}",
+                    stored.genesis, live.genesis
+                ));
+            }
+            if stored.signet_challenge != live.signet_challenge {
+                return fail("signet challenge mismatch");
+            }
+        }
+        Err(e) => {
+            // Core may be restarting; the database identity is pinned and can
+            // be trusted while we serve the cached index. The indexer will
+            // re-verify the chain as soon as Core returns.
+            eprintln!(
+                "[e-lite] Core unavailable at startup ({e}); using the pinned database identity"
+            );
+            stored.check_known_genesis()?;
+        }
     }
     let _ = cfg;
     Ok(stored)
@@ -844,7 +856,9 @@ fn print_progress(tip: &IndexedTip, started: Instant, ibd: bool) {
 fn supervisor_config(cfg: &Config) -> el_chain::SupervisorConfig {
     const GIB: u64 = 1024 * 1024 * 1024;
     el_chain::SupervisorConfig {
-        disk_enabled: true,
+        // Disk backpressure only applies to Mode B: a full-core node is not
+        // pruning, and pausing its downloads would be surprising.
+        disk_enabled: cfg.pruning.enabled && cfg.index.mode == "pruned-ibd",
         disk_low_bytes: cfg.pruning.disk_low_free_gib.saturating_mul(GIB),
         disk_resume_bytes: cfg.pruning.disk_resume_free_gib.saturating_mul(GIB),
         prune_enabled: cfg.pruning.enabled && cfg.index.mode == "pruned-ibd",
@@ -1094,15 +1108,24 @@ fn start_transports(shared: &Arc<Shared>, cfg: &Config) -> R<()> {
 
 fn cmd_serve(cfg: &Config, chain: Chain) -> R<()> {
     let shared = build_shared(cfg, chain)?;
-    let info = shared.core.blockchain_info()?;
-    check_pruned(&info, shared.store.committed_tip()?.as_ref())?;
-    let core_tip = info.blocks;
-    shared.stats.core_height.store(core_tip, Ordering::Relaxed);
     let tip = shared
         .store
         .committed_tip()?
         .map(|t| t.height as u64)
         .unwrap_or(0);
+    let core_tip = match shared.core.blockchain_info() {
+        Ok(info) => {
+            check_pruned(&info, shared.store.committed_tip()?.as_ref())?;
+            info.blocks
+        }
+        Err(e) => {
+            eprintln!(
+                "[e-lite] Core unavailable at startup ({e}); serving the cached index (height {tip})"
+            );
+            tip
+        }
+    };
+    shared.stats.core_height.store(core_tip, Ordering::Relaxed);
     if tip >= core_tip && tip > 0 {
         shared.set_state(state::READY);
     } else {

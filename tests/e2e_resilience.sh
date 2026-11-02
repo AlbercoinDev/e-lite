@@ -75,6 +75,31 @@ ENTRIES=$(python3 tests/query_history.py "$ELECTRUM" "$SH")
 [ "$ENTRIES" -ge 101 ] || { echo "history missing while Core down: $ENTRIES" >&2; exit 1; }
 echo "history while Core down: $ENTRIES entries"
 
+echo "== restart e-lite while Core is still down =="
+kill -TERM "$(cat "$RUN/serve.pid")"
+set +e
+wait "$(cat "$RUN/serve.pid")"
+RC=$?
+set -e
+[ "$RC" -eq 0 ] || { echo "shutdown before offline start failed: $RC" >&2; tail -20 "$RUN/serve.log"; exit 1; }
+"$BIN" run --network regtest --core-datadir "$CORE" --core-rpc "http://127.0.0.1:$RPC" \
+  --data-dir "$DATA" --listen "127.0.0.1:$ELECTRUM" --metrics "127.0.0.1:$METRICS" \
+  >"$RUN/serve2.log" 2>&1 &
+echo $! >"$RUN/serve.pid"
+for _ in $(seq 1 60); do
+  curl -s "http://127.0.0.1:$METRICS/status" >/dev/null 2>&1 && break
+  sleep 0.5
+done
+for _ in $(seq 1 30); do
+  S=$(status_state)
+  [ "$S" = READY ] || [ "$S" = CORE_UNAVAILABLE ] && break
+  sleep 0.5
+done
+echo "offline start state: $(status_state)"
+ENTRIES=$(python3 tests/query_history.py "$ELECTRUM" "$SH")
+[ "$ENTRIES" -ge 101 ] || { echo "offline start history missing: $ENTRIES" >&2; tail -20 "$RUN/serve2.log"; exit 1; }
+echo "offline start history: $ENTRIES entries"
+
 echo "== restart Core (cookie rotates) =="
 start_core
 for _ in $(seq 1 90); do [ "$(status_state)" = READY ] && break; sleep 1; done

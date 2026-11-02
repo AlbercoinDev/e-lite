@@ -7,7 +7,7 @@ any `scriptPubKey` in the active chain — **without registering wallets**.
 loopback. Core remains the authority for consensus and the active chain; e-lite
 never invents data.
 
-> **Status: `v0.1.0-alpha.8` — experimental, no funds.**
+> **Status: `v0.1.0-alpha.9` — experimental, no funds.**
 > Use on test networks first.
 
 ## Supported networks
@@ -239,6 +239,14 @@ The archive contains the database plus a manifest with network, genesis, tip,
 txnum and the canonical digest. Import verifies the network and recomputes the
 digest; it refuses a non-empty target or a mismatched snapshot. The rawtx cache
 is not included (it is rebuildable).
+
+## Starting without Core
+
+The database identity is pinned at `init` time. If Core is down when e-lite
+starts, `run` still binds the Electrum and metrics ports and serves confirmed
+history/balances from the local index. The Core cookie is loaded lazily (Core
+removes it on shutdown and writes a new one on start), so when Core comes back
+the indexer re-verifies the chain and resumes without a restart.
 
 ## Clean shutdown
 

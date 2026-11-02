@@ -78,16 +78,13 @@ impl CoreClient {
     pub fn connect(cfg: &CoreConfig) -> Result<Self> {
         let (host, port) = parse_url(&cfg.rpc_url)?;
         let cookie_path = cfg.resolve_cookie()?;
-        let cookie = std::fs::read_to_string(&cookie_path).map_err(|e| {
-            CoreError(format!(
-                "cannot read Core cookie {}: {e}",
-                cookie_path.display()
-            ))
-        })?;
-        let auth = cookie.trim().to_string();
-        if auth.is_empty() {
-            return err("Core cookie is empty");
-        }
+        // Core deletes its cookie on shutdown. Do not fail construction: a
+        // server with a valid index must be able to start while Core is down,
+        // and the cookie is (re)loaded lazily once Core is back.
+        let auth = match std::fs::read_to_string(&cookie_path) {
+            Ok(cookie) => cookie.trim().to_string(),
+            Err(_) => String::new(),
+        };
         Ok(CoreClient {
             host,
             port,
@@ -108,11 +105,21 @@ impl CoreClient {
         stream.set_read_timeout(Some(self.timeout))?;
         stream.set_write_timeout(Some(self.timeout))?;
 
-        let auth = self
+        let mut auth = self
             .auth
             .lock()
             .map_err(|_| CoreError("core auth lock poisoned".into()))?
             .clone();
+        if auth.is_empty() {
+            // Core may have just come back and written a fresh cookie.
+            if self.refresh_auth().is_ok() {
+                auth = self
+                    .auth
+                    .lock()
+                    .map_err(|_| CoreError("core auth lock poisoned".into()))?
+                    .clone();
+            }
+        }
         let req = format!(
             "POST / HTTP/1.1\r\nHost: {addr}\r\nAuthorization: Basic {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
             base64(auth.as_bytes()),

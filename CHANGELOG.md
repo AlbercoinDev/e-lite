@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.1.0-alpha.9 — 2026-11-02
+
+- **Offline startup**: `e-lite run` now starts while Core is down. The database
+  identity is trusted from disk, the Electrum/metrics ports bind, and confirmed
+  history/balances are served from the cached index (`CORE_UNAVAILABLE`).
+- **Lazy Core cookie**: construction no longer fails when the cookie file is
+  missing (Core deletes it on shutdown); the cookie is loaded on the first
+  request and refreshed on 401.
+- Disk backpressure is scoped to `pruned-ibd`, so a full-core node is never
+  paused by e-lite.
+- Resilience E2E now restarts e-lite while Core is down and verifies 101 history
+  entries, then recovery and SIGTERM exit 0.
+
 ## 0.1.0-alpha.8 — 2026-11-02
 
 - **Silent payments opt-in gate**: `[silent_payments] enabled = false` by
