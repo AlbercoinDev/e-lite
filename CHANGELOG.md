@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.1.0-alpha.10 — 2026-11-02
+
+- **Reorg both ways**: when Core's chain is shorter than the index
+  (`invalidateblock`, manual rollback), the index now rewinds to the common
+  ancestor instead of staying on the orphaned tip. Longer-chain reorgs keep
+  using the undo window.
+- **Mempool-aware history**: `blockchain.scripthash.get_history` appends
+  unconfirmed transactions (`height` 0, or -1 when a parent is unconfirmed).
+- **Correct balance semantics**: `confirmed` ignores mempool events and
+  `unconfirmed` carries the net delta; previously a mempool spend was subtracted
+  twice.
+- **Chained mempool height**: `get_mempool`/`get_history` report `-1` for
+  transactions with unconfirmed parents.
+- **Checkpoint proofs**: `blockchain.block.header` and `blockchain.block.headers`
+  accept `cp_height` and return the header merkle `root` plus `branch`.
+- E2E additions: transaction merkle proof against the header root, checkpoint
+  proof over the whole header chain, sender balance semantics, and a full
+  reorg cycle (confirm -> invalidate -> rollback -> re-mine).
+
 ## 0.1.0-alpha.9 — 2026-11-02
 
 - **Offline startup**: `e-lite run` now starts while Core is down. The database

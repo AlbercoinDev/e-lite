@@ -7,7 +7,7 @@ any `scriptPubKey` in the active chain — **without registering wallets**.
 loopback. Core remains the authority for consensus and the active chain; e-lite
 never invents data.
 
-> **Status: `v0.1.0-alpha.9` — experimental, no funds.**
+> **Status: `v0.1.0-alpha.10` — experimental, no funds.**
 > Use on test networks first.
 
 ## Supported networks
@@ -162,8 +162,17 @@ yet. `doctor` reports that and refuses to index a gap.
 
 - The mempool overlay is rebuilt from Core (`getrawmempool` plus batched raw
   transaction fetches), refreshed every 3 s and immediately after each block.
-- `scripthash.get_mempool`, unconfirmed balances and `listunspent` include
-  unconfirmed transactions; status subscriptions notify clients when they change.
+- `scripthash.get_history` appends mempool entries (`height` 0, or -1 for
+  chained transactions); `get_mempool`, `listunspent` and status subscriptions
+  include them too.
+- `get_balance` follows Electrum semantics: `confirmed` ignores mempool events
+  and `unconfirmed` carries the net delta (so spending a confirmed UTXO shows a
+  negative unconfirmed value instead of lowering the confirmed balance).
+- Reorganisations are handled both ways: a longer Core chain and a shorter one
+  (`invalidateblock`) rewind the index to the common ancestor; deep reorgs beyond
+  `reorg_window` stop with `NEEDS_RECOVERY`.
+- `blockchain.block.header`/`block.headers` support `cp_height` checkpoint
+  proofs (merkle root of all headers up to `cp_height` plus the branch).
 - `blockchain.estimatefee`, `blockchain.relayfee`, `mempool.get_fee_histogram`,
   `blockchain.block.stats`, verbose `transaction.get` and
   `blockchain.transaction.broadcast` are implemented.

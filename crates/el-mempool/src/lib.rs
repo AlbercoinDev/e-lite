@@ -47,6 +47,9 @@ pub struct MempoolTx {
     /// Per-script (received_sat, spent_sat) for this transaction.
     pub effects: HashMap<ScriptHash, (u64, u64)>,
     pub outputs: Vec<(Outpoint, ScriptHash, u64)>,
+    /// Electrum height: 0 when all inputs are confirmed, -1 when the tx
+    /// depends on another unconfirmed transaction.
+    pub height: i32,
 }
 
 #[derive(Default)]
@@ -92,13 +95,17 @@ impl Mempool {
         self.spending.contains(op)
     }
 
-    /// Unconfirmed transactions touching `script`, with their fee.
-    pub fn history(&self, script: ScriptHash) -> Vec<(Hash32, u64)> {
+    /// Unconfirmed transactions touching `script`: (txid, fee, electrum height).
+    pub fn history(&self, script: ScriptHash) -> Vec<(Hash32, u64, i32)> {
         self.by_script
             .get(&script)
             .map(|v| {
                 v.iter()
-                    .filter_map(|txid| self.txs.get(txid).map(|tx| (tx.txid, tx.fee_sat)))
+                    .filter_map(|txid| {
+                        self.txs
+                            .get(txid)
+                            .map(|tx| (tx.txid, tx.fee_sat, tx.height))
+                    })
                     .collect()
             })
             .unwrap_or_default()
@@ -197,6 +204,7 @@ impl Mempool {
         for (txid, tx) in &self.raw {
             let (vsize, fee_sat) = wanted.get(txid).copied().unwrap_or((0, 0));
             let mut effects: HashMap<ScriptHash, (u64, u64)> = HashMap::new();
+            let mut all_inputs_confirmed = true;
             for input in &tx.input {
                 if input.previous_output.is_null() {
                     continue;
@@ -206,7 +214,8 @@ impl Mempool {
                         .unwrap_or(Hash32::ZERO),
                     vout: input.previous_output.vout,
                 };
-                let prev = outputs.get(&op).copied().or_else(|| {
+                let from_mempool = outputs.get(&op).copied();
+                let prev = from_mempool.or_else(|| {
                     store
                         .get_utxo(&op)
                         .ok()
@@ -215,11 +224,17 @@ impl Mempool {
                 });
                 match prev {
                     Some((script, value)) => {
+                        if from_mempool.is_some() {
+                            all_inputs_confirmed = false;
+                        }
                         let e = effects.entry(script).or_default();
                         e.1 = e.1.saturating_add(value);
                         spending.insert(op);
                     }
-                    None => unresolved += 1,
+                    None => {
+                        all_inputs_confirmed = false;
+                        unresolved += 1;
+                    }
                 }
             }
             let mut tx_outputs = Vec::new();
@@ -242,6 +257,7 @@ impl Mempool {
                     vsize,
                     effects,
                     outputs: tx_outputs,
+                    height: if all_inputs_confirmed { 0 } else { -1 },
                 },
             );
         }
@@ -406,11 +422,15 @@ mod tests {
         for (txid, tx) in &m.raw {
             let (vsize, fee_sat) = wanted[txid];
             let mut effects: HashMap<ScriptHash, (u64, u64)> = HashMap::new();
+            let mut confirmed_parents = true;
             for input in &tx.input {
                 let op = Outpoint {
                     txid: Hash32::from_hex(&input.previous_output.txid.to_string()).unwrap(),
                     vout: input.previous_output.vout,
                 };
+                if outputs.contains_key(&op) {
+                    confirmed_parents = false;
+                }
                 let (script, value) = outputs
                     .get(&op)
                     .copied()
@@ -443,6 +463,7 @@ mod tests {
                     vsize,
                     effects,
                     outputs: outs,
+                    height: if confirmed_parents { 0 } else { -1 },
                 },
             );
         }
@@ -463,7 +484,11 @@ mod tests {
         assert_eq!(m.balance_delta(script_b), 0);
         assert_eq!(m.utxos(script_a).len(), 1);
         assert_eq!(m.utxos(script_b).len(), 0);
-        assert_eq!(m.history(script_a).len(), 2);
+        let hist = m.history(script_a);
+        assert_eq!(hist.len(), 2);
+        // The child spends an unconfirmed parent, so its Electrum height is -1.
+        assert!(hist.iter().any(|(_, _, h)| *h == -1));
+        assert!(hist.iter().any(|(_, _, h)| *h == 0));
         assert!(!m.fee_histogram().is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -643,6 +643,23 @@ impl Indexer {
             .get_block(check_height as u32)?
             .ok_or("database is missing its own tip block")?;
         if db_rec.hash.to_hex() == core_hash {
+            // Core's chain can be shorter than the index (invalidateblock,
+            // manual rollback). Drop the blocks above Core's tip.
+            if (tip.height as u64) > core_tip {
+                if let Some(sh) = &self.shared {
+                    sh.set_state(state::REORG);
+                }
+                eprintln!(
+                    "[e-lite] reorg detected: Core tip {core_tip} is behind the index ({}); rewinding",
+                    tip.height
+                );
+                let _g = self.lock.write().map_err(|_| "lock poisoned")?;
+                rewind_to(&self.store, check_height as u32)?;
+                drop(_g);
+                if let Some(sh) = &self.shared {
+                    sh.set_state(state::READY);
+                }
+            }
             return Ok(());
         }
 

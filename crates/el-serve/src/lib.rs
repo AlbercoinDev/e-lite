@@ -471,24 +471,66 @@ fn param_u32(params: &Value, idx: usize) -> RpcResult<u32> {
         .ok_or_else(|| RpcError::invalid("expected an integer parameter"))
 }
 
+fn header_chain(shared: &Shared, cp_height: u32) -> RpcResult<Vec<Hash32>> {
+    let mut hashes = Vec::with_capacity(cp_height as usize + 1);
+    for h in 0..=cp_height {
+        let rec = shared
+            .store
+            .get_block(h)
+            .map_err(|e| RpcError::server(e.to_string()))?
+            .ok_or_else(|| RpcError::server(format!("height {h} not indexed")))?;
+        hashes.push(rec.hash);
+    }
+    Ok(hashes)
+}
+
+fn checkpoint_proof(
+    shared: &Shared,
+    leaf_height: u32,
+    cp_height: u32,
+) -> RpcResult<(Hash32, Vec<Hash32>)> {
+    if leaf_height > cp_height {
+        return Err(RpcError::invalid(
+            "height must be <= cp_height when cp_height is set",
+        ));
+    }
+    let hashes = header_chain(shared, cp_height)?;
+    merkle_branch(&hashes, leaf_height as usize)
+        .ok_or_else(|| RpcError::server("cannot compute checkpoint branch"))
+}
+
 fn block_header(shared: &Shared, params: &Value) -> RpcResult<Value> {
     let height = param_u32(params, 0)?;
-    if let Some(cp) = params.as_array().and_then(|a| a.get(1)) {
-        if !cp.is_null() {
-            return Err(RpcError::server("checkpoint proofs are not supported"));
-        }
-    }
+    let cp_height = params
+        .as_array()
+        .and_then(|a| a.get(1))
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
     let rec = shared
         .store
         .get_block(height)
         .map_err(|e| RpcError::server(e.to_string()))?
         .ok_or_else(|| RpcError::server(format!("height {height} not indexed")))?;
-    Ok(json!(hex::encode(rec.header)))
+    let header = hex::encode(rec.header);
+    if cp_height == 0 {
+        return Ok(json!(header));
+    }
+    let (root, branch) = checkpoint_proof(shared, height, cp_height as u32)?;
+    Ok(json!({
+        "header": header,
+        "branch": branch.iter().map(|h| h.to_hex()).collect::<Vec<_>>(),
+        "root": root.to_hex(),
+    }))
 }
 
 fn block_headers(shared: &Shared, params: &Value) -> RpcResult<Value> {
     let start = param_u32(params, 0)?;
     let count = param_u32(params, 1)?.min(MAX_HEADERS_CHUNK as u32);
+    let cp_height = params
+        .as_array()
+        .and_then(|a| a.get(2))
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
     let mut hexs = String::new();
     let mut got = 0u32;
     for h in start..start.saturating_add(count) {
@@ -504,11 +546,18 @@ fn block_headers(shared: &Shared, params: &Value) -> RpcResult<Value> {
             None => break,
         }
     }
-    Ok(json!({
+    let mut result = json!({
         "count": got,
         "hex": hexs,
         "max": MAX_HEADERS_CHUNK,
-    }))
+    });
+    if cp_height != 0 && got > 0 {
+        let last = start + got - 1;
+        let (root, branch) = checkpoint_proof(shared, last, cp_height as u32)?;
+        result["root"] = json!(root.to_hex());
+        result["branch"] = json!(branch.iter().map(|h| h.to_hex()).collect::<Vec<_>>());
+    }
+    Ok(result)
 }
 
 fn param_scripthash(params: &Value) -> RpcResult<ScriptHash> {
@@ -561,9 +610,22 @@ fn history_entries(shared: &Shared, script: ScriptHash) -> RpcResult<Vec<History
 fn scripthash_history(shared: &Shared, params: &Value) -> RpcResult<Value> {
     let script = param_scripthash(params)?;
     let entries = history_entries(shared, script)?;
-    let mut arr = Vec::with_capacity(entries.len());
+    let mem = shared
+        .mempool
+        .read()
+        .map_err(|_| RpcError::server("mempool lock poisoned"))?;
+    let mem_entries = mem.history(script);
+    let mut arr = Vec::with_capacity(entries.len() + mem_entries.len());
     for (height, _, txid, _, _) in entries {
         arr.push(json!({"tx_hash": txid, "height": height}));
+    }
+    // Electrum history appends mempool entries after the confirmed ones.
+    for (txid, fee, height) in mem_entries {
+        arr.push(json!({
+            "tx_hash": txid.to_hex(),
+            "height": height,
+            "fee": fee,
+        }));
     }
     Ok(Value::Array(arr))
 }
@@ -578,11 +640,9 @@ fn scripthash_balance(shared: &Shared, params: &Value) -> RpcResult<Value> {
         .mempool
         .read()
         .map_err(|_| RpcError::server("mempool lock poisoned"))?;
-    let confirmed: u64 = utxos
-        .iter()
-        .filter(|(op, _, _, _)| !mem.is_spent(op))
-        .map(|(_, v, _, _)| *v)
-        .sum();
+    // Confirmed balance ignores mempool events; the unconfirmed field carries
+    // the mempool delta (which already subtracts spent confirmed UTXOs).
+    let confirmed: u64 = utxos.iter().map(|(_, v, _, _)| *v).sum();
     Ok(json!({
         "confirmed": confirmed,
         "unconfirmed": mem.balance_delta(script),
@@ -636,8 +696,8 @@ fn script_status(shared: &Shared, script: ScriptHash) -> RpcResult<Option<String
     for (height, _, txid, _, _) in entries {
         hasher.update(format!("{txid}:{height}:").as_bytes());
     }
-    for (txid, _) in mem_entries {
-        hasher.update(format!("{}:0:", txid).as_bytes());
+    for (txid, _, height) in mem_entries {
+        hasher.update(format!("{txid}:{height}:").as_bytes());
     }
     Ok(Some(hex::encode(hasher.finalize())))
 }
@@ -830,10 +890,10 @@ fn scripthash_mempool(shared: &Shared, params: &Value) -> RpcResult<Value> {
     let arr: Vec<Value> = mem
         .history(script)
         .into_iter()
-        .map(|(txid, fee)| {
+        .map(|(txid, fee, height)| {
             json!({
                 "tx_hash": txid.to_hex(),
-                "height": 0,
+                "height": height,
                 "fee": fee,
             })
         })
