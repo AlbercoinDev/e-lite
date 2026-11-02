@@ -11,12 +11,17 @@ use el_rpc::CoreClient;
 use el_store::Store;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex, RwLock, RwLockReadGuard};
 use std::time::{Duration, Instant};
+
+/// Electrum clients ask for a script's full history. A script with millions of
+/// entries would hold the index lock for too long; keep a generous cap that
+/// still protects the server from pathological scripts.
+pub const MAX_HISTORY_ENTRIES: usize = 100_000;
 
 pub const PROTOCOL_MIN: &str = "1.4";
 pub const PROTOCOL_MAX: &str = "1.4";
@@ -32,6 +37,8 @@ pub mod state {
     pub const CORE_UNAVAILABLE: u8 = 5;
     pub const PAUSE_DOWNLOAD: u8 = 6;
     pub const PRUNING: u8 = 7;
+    pub const WAITING_FOR_CORE: u8 = 8;
+    pub const INITIALIZING: u8 = 9;
 
     pub fn name(v: u8) -> &'static str {
         match v {
@@ -43,6 +50,8 @@ pub mod state {
             CORE_UNAVAILABLE => "CORE_UNAVAILABLE",
             PAUSE_DOWNLOAD => "PAUSE_DOWNLOAD",
             PRUNING => "PRUNING",
+            WAITING_FOR_CORE => "WAITING_FOR_CORE",
+            INITIALIZING => "INITIALIZING",
             _ => "UNKNOWN",
         }
     }
@@ -51,6 +60,11 @@ pub mod state {
 pub struct Stats {
     pub indexed_height: AtomicU64,
     pub core_height: AtomicU64,
+    pub core_pruneheight: AtomicU64,
+    pub core_pruned: AtomicBool,
+    pub core_network_active: AtomicBool,
+    pub core_ibd: AtomicBool,
+    pub core_connections: AtomicU64,
     pub txnum: AtomicU64,
     pub requests_total: AtomicU64,
     pub errors_total: AtomicU64,
@@ -59,6 +73,10 @@ pub struct Stats {
     pub notifier_runs: AtomicU64,
     pub notifications_sent: AtomicU64,
     pub notifier_errors: AtomicU64,
+    pub blocks_applied: AtomicU64,
+    pub prune_requests: AtomicU64,
+    pub prune_failures: AtomicU64,
+    pub disk_low: AtomicBool,
     pub started: Instant,
 }
 
@@ -67,6 +85,11 @@ impl Default for Stats {
         Stats {
             indexed_height: AtomicU64::new(0),
             core_height: AtomicU64::new(0),
+            core_pruneheight: AtomicU64::new(0),
+            core_pruned: AtomicBool::new(false),
+            core_network_active: AtomicBool::new(true),
+            core_ibd: AtomicBool::new(false),
+            core_connections: AtomicU64::new(0),
             txnum: AtomicU64::new(0),
             requests_total: AtomicU64::new(0),
             errors_total: AtomicU64::new(0),
@@ -75,8 +98,97 @@ impl Default for Stats {
             notifier_runs: AtomicU64::new(0),
             notifications_sent: AtomicU64::new(0),
             notifier_errors: AtomicU64::new(0),
+            blocks_applied: AtomicU64::new(0),
+            prune_requests: AtomicU64::new(0),
+            prune_failures: AtomicU64::new(0),
+            disk_low: AtomicBool::new(false),
             started: Instant::now(),
         }
+    }
+}
+
+/// Cached header hashes for checkpoint proofs. Header hashes are immutable
+/// except across a reorg, which invalidates the cache from the fork point.
+#[derive(Default)]
+pub struct HeaderCache {
+    hashes: Mutex<Vec<Hash32>>,
+}
+
+impl HeaderCache {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn invalidate_from(&self, height: u32) {
+        if let Ok(mut v) = self.hashes.lock() {
+            v.truncate(height as usize);
+        }
+    }
+
+    pub fn chain(&self, store: &Store, cp_height: u32) -> Result<Vec<Hash32>, String> {
+        let need = cp_height as usize + 1;
+        let mut v = self
+            .hashes
+            .lock()
+            .map_err(|_| "header cache lock poisoned".to_string())?;
+        while v.len() < need {
+            let h = v.len() as u32;
+            let rec = store
+                .get_block(h)
+                .map_err(|e| e.to_string())?
+                .ok_or_else(|| format!("height {h} not indexed"))?;
+            v.push(rec.hash);
+        }
+        Ok(v[..need].to_vec())
+    }
+}
+
+#[derive(Default)]
+pub struct DbBytesCache {
+    bytes: u64,
+    at: Option<Instant>,
+}
+
+/// Scripts whose status changed since the notifier last ran. The indexer marks
+/// confirmed changes and the mempool marks overlay changes, so the notifier
+/// only recomputes the affected subscriptions.
+#[derive(Default)]
+pub struct DirtyScripts {
+    inner: Mutex<HashSet<ScriptHash>>,
+    force_all: AtomicBool,
+}
+
+impl DirtyScripts {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn mark(&self, script: ScriptHash) {
+        if let Ok(mut set) = self.inner.lock() {
+            set.insert(script);
+        }
+    }
+
+    pub fn mark_all(&self, scripts: impl IntoIterator<Item = ScriptHash>) {
+        if let Ok(mut set) = self.inner.lock() {
+            set.extend(scripts);
+        }
+    }
+
+    /// A reorg can change scripts that are not in the replayed blocks' dirty
+    /// set yet (for example, while the index is between rewind and replay).
+    pub fn mark_all_subscriptions(&self) {
+        self.force_all.store(true, Ordering::SeqCst);
+    }
+
+    pub fn take(&self) -> (HashSet<ScriptHash>, bool) {
+        let force = self.force_all.swap(false, Ordering::SeqCst);
+        let scripts = self
+            .inner
+            .lock()
+            .map(|mut set| std::mem::take(&mut *set))
+            .unwrap_or_default();
+        (scripts, force)
     }
 }
 
@@ -177,8 +289,12 @@ pub struct Shared {
     pub clients: Arc<ClientRegistry>,
     pub readers: Arc<ReaderTracker>,
     pub silent_payments_enabled: bool,
-    pub identity: NetworkIdentity,
+    pub identity: RwLock<NetworkIdentity>,
+    pub headers: HeaderCache,
+    pub db_bytes: Mutex<DbBytesCache>,
+    pub dirty_scripts: DirtyScripts,
     pub data_dir: std::path::PathBuf,
+    pub core_datadir: std::path::PathBuf,
     pub listen: String,
     pub max_clients: usize,
     pub state: AtomicU8,
@@ -195,25 +311,67 @@ impl Shared {
         self.state.load(Ordering::SeqCst)
     }
 
+    pub fn identity(&self) -> NetworkIdentity {
+        match self.identity.read() {
+            Ok(g) => g.clone(),
+            Err(e) => e.into_inner().clone(),
+        }
+    }
+
+    pub fn set_identity(&self, id: NetworkIdentity) {
+        match self.identity.write() {
+            Ok(mut g) => *g = id,
+            Err(e) => *e.into_inner() = id,
+        }
+    }
+
+    fn db_bytes_cached(&self) -> u64 {
+        if let Ok(mut cache) = self.db_bytes.lock() {
+            let fresh = cache
+                .at
+                .map(|at| at.elapsed() < Duration::from_secs(60))
+                .unwrap_or(false);
+            if !fresh {
+                cache.bytes = self.store.disk_usage_bytes();
+                cache.at = Some(Instant::now());
+            }
+            cache.bytes
+        } else {
+            0
+        }
+    }
+
     pub fn status_json(&self) -> Value {
         let (height, txnum, hash) = match self.store.committed_tip() {
             Ok(Some(t)) => (t.height as u64, t.txnum, t.block_hash.to_hex()),
             _ => (0, 0, String::new()),
         };
         let core_height = self.stats.core_height.load(Ordering::Relaxed);
+        let pruneheight = self.stats.core_pruneheight.load(Ordering::Relaxed);
         let rawtx = self.resolver.stats();
+        let id = self.identity();
+        let mem = self.mempool.read();
+        let mem_count = mem.as_ref().map(|m| m.len()).unwrap_or(0);
+        let mem_version = mem.as_ref().map(|m| m.version()).unwrap_or(0);
+        let mem_unresolved = mem.as_ref().map(|m| m.unresolved_inputs()).unwrap_or(0);
+        let mem_buckets = mem.as_ref().map(|m| m.fee_histogram().len()).unwrap_or(0);
+        drop(mem);
         json!({
             "version": VERSION,
-            "network": self.identity.chain.name(),
-            "genesis": self.identity.genesis.to_hex(),
+            "network": id.chain.name(),
+            "genesis": id.genesis.to_hex(),
             "state": state::name(self.get_state()),
             "indexed_height": height,
             "core_height": core_height,
             "lag_blocks": core_height.saturating_sub(height),
+            "retention_blocks": core_height.saturating_sub(pruneheight),
             "txnum": txnum,
             "tip_hash": hash,
-            "db_bytes": self.store.disk_usage_bytes(),
-            "disk_free_bytes": disk_free_bytes(&self.data_dir),
+            "db_bytes": self.db_bytes_cached(),
+            "disk_free_bytes": el_chain::disk_free_bytes(&self.data_dir).unwrap_or(0),
+            "core_disk_free_bytes": el_chain::disk_free_bytes(&self.core_datadir).unwrap_or(0),
+            "disk_low": self.stats.disk_low.load(Ordering::Relaxed),
+            "blocks_applied": self.stats.blocks_applied.load(Ordering::Relaxed),
             "clients": self.stats.clients.load(Ordering::Relaxed) as u64,
             "max_clients": self.max_clients as u64,
             "requests_total": self.stats.requests_total.load(Ordering::Relaxed),
@@ -222,16 +380,25 @@ impl Shared {
             "uptime_seconds": self.stats.started.elapsed().as_secs(),
             "listen": self.listen,
             "protocol": PROTOCOL_MAX,
+            "core": {
+                "pruneheight": pruneheight,
+                "pruned": self.stats.core_pruned.load(Ordering::Relaxed),
+                "network_active": self.stats.core_network_active.load(Ordering::Relaxed),
+                "initial_block_download": self.stats.core_ibd.load(Ordering::Relaxed),
+                "connections": self.stats.core_connections.load(Ordering::Relaxed),
+                "prune_requests": self.stats.prune_requests.load(Ordering::Relaxed),
+                "prune_failures": self.stats.prune_failures.load(Ordering::Relaxed),
+            },
             "notifier": {
                 "runs": self.stats.notifier_runs.load(Ordering::Relaxed),
                 "sent": self.stats.notifications_sent.load(Ordering::Relaxed),
                 "errors": self.stats.notifier_errors.load(Ordering::Relaxed),
             },
             "mempool": {
-                "count": self.mempool.read().map(|m| m.len()).unwrap_or(0),
-                "version": self.mempool.read().map(|m| m.version()).unwrap_or(0),
-                "unresolved_inputs": self.mempool.read().map(|m| m.unresolved_inputs()).unwrap_or(0),
-                "histogram_buckets": self.mempool.read().map(|m| m.fee_histogram().len()).unwrap_or(0),
+                "count": mem_count,
+                "version": mem_version,
+                "unresolved_inputs": mem_unresolved,
+                "histogram_buckets": mem_buckets,
             },
             "rawtx": {
                 "cache_hits": rawtx.cache_hits.load(Ordering::Relaxed),
@@ -247,23 +414,9 @@ impl Shared {
     }
 }
 
+/// Free bytes on the filesystem containing `path` (0 when it cannot be read).
 pub fn disk_free_bytes(path: &std::path::Path) -> u64 {
-    let out = std::process::Command::new("df")
-        .args(["-P", "-k"])
-        .arg(path)
-        .output();
-    if let Ok(out) = out {
-        let text = String::from_utf8_lossy(&out.stdout);
-        if let Some(line) = text.lines().nth(1) {
-            let cols: Vec<&str> = line.split_whitespace().collect();
-            if cols.len() >= 4 {
-                if let Ok(kb) = cols[3].parse::<u64>() {
-                    return kb.saturating_mul(1024);
-                }
-            }
-        }
-    }
-    0
+    el_chain::disk_free_bytes(path).unwrap_or(0)
 }
 
 #[derive(Debug)]
@@ -327,23 +480,41 @@ pub fn dispatch_for(
         ))),
         "server.donation_address" => Ok(json!("")),
         "server.peers.subscribe" => Ok(json!([])),
-        "server.features" => Ok(server_features(shared)),
+        "server.features" => server_features(shared),
         _ => {
             // Everything else reads the index: enforce a consistent tip and a
-            // non-misleading state.
-            let _guard = shared
-                .lock
-                .read()
-                .map_err(|_| RpcError::server("lock poisoned"))?;
+            // non-misleading state. The read lock is taken per method and is
+            // *never* held across Core or external network I/O.
             check_ready(shared)?;
             match method {
-                "blockchain.headers.subscribe" => headers_subscribe(shared, client),
-                "blockchain.block.header" => block_header(shared, params),
-                "blockchain.block.headers" => block_headers(shared, params),
-                "blockchain.scripthash.get_history" => scripthash_history(shared, params),
-                "blockchain.scripthash.get_balance" => scripthash_balance(shared, params),
-                "blockchain.scripthash.listunspent" => scripthash_listunspent(shared, params),
-                "blockchain.scripthash.subscribe" => scripthash_subscribe(shared, client, params),
+                "blockchain.headers.subscribe" => {
+                    let _g = read_guard(shared)?;
+                    headers_subscribe(shared, client)
+                }
+                "blockchain.block.header" => {
+                    let _g = read_guard(shared)?;
+                    block_header(shared, params)
+                }
+                "blockchain.block.headers" => {
+                    let _g = read_guard(shared)?;
+                    block_headers(shared, params)
+                }
+                "blockchain.scripthash.get_history" => {
+                    let _g = read_guard(shared)?;
+                    scripthash_history(shared, params)
+                }
+                "blockchain.scripthash.get_balance" => {
+                    let _g = read_guard(shared)?;
+                    scripthash_balance(shared, params)
+                }
+                "blockchain.scripthash.listunspent" => {
+                    let _g = read_guard(shared)?;
+                    scripthash_listunspent(shared, params)
+                }
+                "blockchain.scripthash.subscribe" => {
+                    let _g = read_guard(shared)?;
+                    scripthash_subscribe(shared, client, params)
+                }
                 "blockchain.scripthash.unsubscribe" => {
                     if let Some(c) = client {
                         if let Ok(script) = param_scripthash(params) {
@@ -364,21 +535,39 @@ pub fn dispatch_for(
                     silent_payments(shared, method)
                 }
                 "blockchain.transaction.get" => transaction_get(shared, params),
-                "blockchain.transaction.get_merkle" => transaction_merkle(shared, params),
-                "blockchain.transaction.id_from_pos" => transaction_id_from_pos(shared, params),
+                "blockchain.transaction.get_merkle" => {
+                    let _g = read_guard(shared)?;
+                    transaction_merkle(shared, params)
+                }
+                "blockchain.transaction.id_from_pos" => {
+                    let _g = read_guard(shared)?;
+                    transaction_id_from_pos(shared, params)
+                }
                 _ => Err(RpcError::method(format!("unknown method: {method}"))),
             }
         }
     }
 }
 
+fn read_guard(shared: &Shared) -> RpcResult<RwLockReadGuard<'_, ()>> {
+    shared
+        .lock
+        .read()
+        .map_err(|_| RpcError::server("lock poisoned"))
+}
+
 fn check_ready(shared: &Shared) -> RpcResult<()> {
+    let has_tip = shared.store.committed_tip().ok().flatten().is_some();
     match shared.get_state() {
-        state::READY
-        | state::DEGRADED
-        | state::CORE_UNAVAILABLE
-        | state::PAUSE_DOWNLOAD
-        | state::PRUNING => Ok(()),
+        state::READY => Ok(()),
+        state::DEGRADED | state::CORE_UNAVAILABLE | state::PAUSE_DOWNLOAD | state::PRUNING
+            if has_tip =>
+        {
+            Ok(())
+        }
+        state::DEGRADED | state::CORE_UNAVAILABLE | state::PAUSE_DOWNLOAD | state::PRUNING => Err(
+            RpcError::server("the index has no data yet; waiting for Bitcoin Core"),
+        ),
         state::BUILDING => {
             let tip = shared
                 .store
@@ -391,6 +580,12 @@ fn check_ready(shared: &Shared) -> RpcResult<()> {
                 "index is building (indexed height {tip}); retry later"
             )))
         }
+        state::WAITING_FOR_CORE => Err(RpcError::server(
+            "waiting for Bitcoin Core; the index is not initialized yet",
+        )),
+        state::INITIALIZING => Err(RpcError::server(
+            "initializing the index against Bitcoin Core; retry later",
+        )),
         state::REORG => Err(RpcError::server("reorg recovery in progress")),
         state::FATAL => Err(RpcError::server(
             "fatal integrity error; operator action required",
@@ -425,16 +620,25 @@ fn server_version(params: &Value) -> RpcResult<Value> {
     Ok(json!([format!("e-lite {VERSION}"), PROTOCOL_MAX]))
 }
 
-fn server_features(shared: &Shared) -> Value {
-    json!({
-        "genesis_hash": shared.identity.genesis.to_hex(),
+fn server_features(shared: &Shared) -> RpcResult<Value> {
+    if matches!(
+        shared.get_state(),
+        state::WAITING_FOR_CORE | state::INITIALIZING
+    ) {
+        return Err(RpcError::server(
+            "waiting for Bitcoin Core; the network identity is not initialized yet",
+        ));
+    }
+    let id = shared.identity();
+    Ok(json!({
+        "genesis_hash": id.genesis.to_hex(),
         "hash_function": "sha256",
         "server_version": format!("e-lite {VERSION}"),
         "protocol_min": PROTOCOL_MIN,
         "protocol_max": PROTOCOL_MAX,
         "pruning": Value::Null,
         "hosts": {},
-    })
+    }))
 }
 
 fn tip_block(shared: &Shared) -> RpcResult<el_model::BlockRecord> {
@@ -472,16 +676,10 @@ fn param_u32(params: &Value, idx: usize) -> RpcResult<u32> {
 }
 
 fn header_chain(shared: &Shared, cp_height: u32) -> RpcResult<Vec<Hash32>> {
-    let mut hashes = Vec::with_capacity(cp_height as usize + 1);
-    for h in 0..=cp_height {
-        let rec = shared
-            .store
-            .get_block(h)
-            .map_err(|e| RpcError::server(e.to_string()))?
-            .ok_or_else(|| RpcError::server(format!("height {h} not indexed")))?;
-        hashes.push(rec.hash);
-    }
-    Ok(hashes)
+    shared
+        .headers
+        .chain(&shared.store, cp_height)
+        .map_err(RpcError::server)
 }
 
 fn checkpoint_proof(
@@ -576,6 +774,13 @@ fn history_entries(shared: &Shared, script: ScriptHash) -> RpcResult<Vec<History
         .store
         .history_for_script(script)
         .map_err(|e| RpcError::server(e.to_string()))?;
+    if entries.len() > MAX_HISTORY_ENTRIES {
+        return Err(RpcError::server(format!(
+            "history for this script has {} entries (limit {}); use a script with fewer transactions",
+            entries.len(),
+            MAX_HISTORY_ENTRIES
+        )));
+    }
     let mut blocks: HashMap<u32, el_model::BlockRecord> = HashMap::new();
     let mut out = Vec::with_capacity(entries.len());
     for (height, tx_pos, effect) in entries {
@@ -732,12 +937,12 @@ fn transaction_get(shared: &Shared, params: &Value) -> RpcResult<Value> {
         .map(|v| v.as_bool().unwrap_or(false))
         .unwrap_or(false);
     let txid_hash = Hash32::from_hex(txid).map_err(RpcError::invalid)?;
-    let occ = shared
-        .store
-        .occurrences(txid_hash)
-        .map_err(|e| RpcError::server(e.to_string()))?;
-
-    if verbose {
+    let (occ, blockhash) = {
+        let _g = read_guard(shared)?;
+        let occ = shared
+            .store
+            .occurrences(txid_hash)
+            .map_err(|e| RpcError::server(e.to_string()))?;
         let blockhash = match occ.first() {
             Some((height, _)) => shared
                 .store
@@ -747,6 +952,26 @@ fn transaction_get(shared: &Shared, params: &Value) -> RpcResult<Value> {
                 .map(|r| r.hash.to_hex()),
             None => None,
         };
+        (occ, blockhash)
+    };
+
+    if verbose {
+        // For a confirmed transaction use the verified resolver and decode the
+        // raw bytes locally through Core. This works on a pruned node, where
+        // getrawtransaction(txid, true, blockhash) would fail.
+        if let Some((height, _)) = occ.first().copied() {
+            let raw = {
+                let _guard = shared.readers.enter(height);
+                shared
+                    .resolver
+                    .raw_tx(txid_hash, height)
+                    .map_err(|e| RpcError::server(e.to_string()))?
+            };
+            return shared
+                .core
+                .decode_raw_transaction(&raw)
+                .map_err(|e| RpcError::server(format!("rawtx decode: {e}")));
+        }
         return shared
             .core
             .raw_transaction_json(txid, blockhash.as_deref())
@@ -988,17 +1213,26 @@ pub fn start_mempool(shared: Arc<Shared>) -> std::thread::JoinHandle<()> {
                 std::thread::sleep(Duration::from_secs(1));
                 continue;
             }
-            let result = {
-                let mut mem = match shared.mempool.write() {
-                    Ok(m) => m,
-                    Err(_) => break,
-                };
-                mem.refresh(&shared.core, &shared.store)
+            // Build the candidate outside the write lock: Core RPC and the
+            // per-input UTXO lookups can take seconds on a large mempool, and
+            // holding `mempool.write()` would block every history/balance read.
+            let mut candidate = match shared.mempool.read() {
+                Ok(m) => m.clone(),
+                Err(_) => break,
             };
+            let result = candidate.refresh(&shared.core, &shared.store);
             last_tip = tip;
             last_refresh = Instant::now();
             match result {
-                Ok(_) => {
+                Ok(changed) => {
+                    if changed {
+                        let touched: Vec<ScriptHash> =
+                            candidate.last_touched().iter().copied().collect();
+                        if let Ok(mut mem) = shared.mempool.write() {
+                            *mem = candidate;
+                        }
+                        shared.dirty_scripts.mark_all(touched);
+                    }
                     if !last_err.is_empty() {
                         eprintln!("[e-lite] mempool refresh recovered");
                         last_err.clear();
@@ -1032,80 +1266,105 @@ pub fn start_mempool(shared: Arc<Shared>) -> std::thread::JoinHandle<()> {
 pub fn start_notifications(shared: Arc<Shared>) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
         let mut last_height = u64::MAX;
-        let mut last_mempool = u64::MAX;
+        let mut last_hash: Option<String> = None;
         loop {
             shared.stats.notifier_runs.fetch_add(1, Ordering::Relaxed);
-            let tip = shared.store.committed_tip().ok().flatten();
-            let (height, header) = match tip {
-                Some(t) => (
-                    t.height as u64,
-                    shared
-                        .store
-                        .get_block(t.height)
-                        .ok()
-                        .flatten()
-                        .map(|r| hex::encode(r.header)),
-                ),
-                None => (0, None),
+            let (height, hash, header) = {
+                let Ok(_g) = shared.lock.read() else {
+                    std::thread::sleep(Duration::from_secs(2));
+                    continue;
+                };
+                let tip = shared.store.committed_tip().ok().flatten();
+                match tip {
+                    Some(t) => (
+                        t.height as u64,
+                        Some(t.block_hash.to_hex()),
+                        shared
+                            .store
+                            .get_block(t.height)
+                            .ok()
+                            .flatten()
+                            .map(|r| hex::encode(r.header)),
+                    ),
+                    None => (0, None, None),
+                }
             };
-            let mem_version = shared.mempool.read().map(|m| m.version()).unwrap_or(0);
-            let new_block = height != last_height;
-            let mem_changed = mem_version != last_mempool;
-            if new_block || mem_changed {
-                for client in shared.clients.snapshot() {
-                    if !client.alive.load(Ordering::SeqCst) {
-                        continue;
-                    }
-                    if new_block && client.headers.load(Ordering::SeqCst) {
-                        if let Some(h) = &header {
-                            let notification = json!({
-                                "jsonrpc": "2.0",
-                                "method": "blockchain.headers.subscribe",
-                                "params": [{"height": height, "hex": h}],
-                            });
-                            if client.send(&notification) {
-                                shared
-                                    .stats
-                                    .notifications_sent
-                                    .fetch_add(1, Ordering::Relaxed);
-                                client.last_height.store(height, Ordering::SeqCst);
-                            } else {
-                                shared.stats.notifier_errors.fetch_add(1, Ordering::Relaxed);
-                            }
-                        }
-                    }
-                    let subs: Vec<(ScriptHash, Option<String>)> = client
-                        .subs
-                        .lock()
-                        .map(|s| s.iter().map(|(k, v)| (*k, v.clone())).collect())
-                        .unwrap_or_default();
-                    for (script, old) in subs {
-                        let Ok(new) = script_status(&shared, script) else {
-                            continue;
-                        };
-                        if new != old {
-                            let notification = json!({
-                                "jsonrpc": "2.0",
-                                "method": "blockchain.scripthash.subscribe",
-                                "params": [script.to_electrum_hex(), new],
-                            });
-                            if client.send(&notification) {
-                                shared
-                                    .stats
-                                    .notifications_sent
-                                    .fetch_add(1, Ordering::Relaxed);
-                                if let Ok(mut subs) = client.subs.lock() {
-                                    subs.insert(script, new);
-                                }
-                            } else {
-                                shared.stats.notifier_errors.fetch_add(1, Ordering::Relaxed);
-                            }
+            let new_block = height != last_height || hash != last_hash;
+            let (dirty, force_all) = shared.dirty_scripts.take();
+            // A rewind or a same-height fork can change scripts that are not in
+            // the new block's dirty set, so recompute every subscription.
+            let reorg =
+                (new_block && height < last_height) || (height == last_height && hash != last_hash);
+            let scan_scripts = force_all || reorg || !dirty.is_empty();
+            if !new_block && !scan_scripts {
+                std::thread::sleep(Duration::from_secs(2));
+                continue;
+            }
+            for client in shared.clients.snapshot() {
+                if !client.alive.load(Ordering::SeqCst) {
+                    continue;
+                }
+                if new_block && client.headers.load(Ordering::SeqCst) {
+                    if let Some(h) = &header {
+                        let notification = json!({
+                            "jsonrpc": "2.0",
+                            "method": "blockchain.headers.subscribe",
+                            "params": [{"height": height, "hex": h}],
+                        });
+                        if client.send(&notification) {
+                            shared
+                                .stats
+                                .notifications_sent
+                                .fetch_add(1, Ordering::Relaxed);
+                            client.last_height.store(height, Ordering::SeqCst);
+                        } else {
+                            shared.stats.notifier_errors.fetch_add(1, Ordering::Relaxed);
                         }
                     }
                 }
-                last_height = height;
-                last_mempool = mem_version;
+                if !scan_scripts {
+                    continue;
+                }
+                let subs: Vec<(ScriptHash, Option<String>)> = client
+                    .subs
+                    .lock()
+                    .map(|s| s.iter().map(|(k, v)| (*k, v.clone())).collect())
+                    .unwrap_or_default();
+                for (script, old) in subs {
+                    if !(force_all || reorg || dirty.contains(&script)) {
+                        continue;
+                    }
+                    let new = {
+                        let Ok(_g) = shared.lock.read() else {
+                            continue;
+                        };
+                        match script_status(&shared, script) {
+                            Ok(v) => v,
+                            Err(_) => continue,
+                        }
+                    };
+                    if new != old {
+                        let notification = json!({
+                            "jsonrpc": "2.0",
+                            "method": "blockchain.scripthash.subscribe",
+                            "params": [script.to_electrum_hex(), new],
+                        });
+                        if client.send(&notification) {
+                            shared
+                                .stats
+                                .notifications_sent
+                                .fetch_add(1, Ordering::Relaxed);
+                            if let Ok(mut subs) = client.subs.lock() {
+                                subs.insert(script, new);
+                            }
+                        } else {
+                            shared.stats.notifier_errors.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                }
             }
+            last_height = height;
+            last_hash = hash;
             std::thread::sleep(Duration::from_secs(2));
         }
     })
@@ -1289,6 +1548,34 @@ fn metrics_text(shared: &Shared) -> String {
         g("lag_blocks"),
     );
     line(
+        "e_lite_core_pruneheight",
+        "Lowest block still available in Core",
+        "gauge",
+        st["core"]["pruneheight"].as_u64().unwrap_or(0),
+    );
+    line(
+        "e_lite_core_retention_blocks",
+        "Blocks Core can still serve before pruning",
+        "gauge",
+        g("retention_blocks"),
+    );
+    line(
+        "e_lite_blocks_applied",
+        "Blocks applied to the index",
+        "counter",
+        g("blocks_applied"),
+    );
+    line(
+        "e_lite_disk_low",
+        "1 when the disk guard has paused indexing",
+        "gauge",
+        if st["disk_low"].as_bool().unwrap_or(false) {
+            1
+        } else {
+            0
+        },
+    );
+    line(
         "e_lite_txnum",
         "Indexed transaction occurrences",
         "counter",
@@ -1360,6 +1647,29 @@ mod tests {
         assert!(server_version(&json!(["client", ["1.4", "1.4"]])).is_ok());
         assert!(server_version(&json!(["client", "1.2"])).is_err());
         assert!(server_version(&json!(["client", ["1.0", "1.2"]])).is_err());
+    }
+
+    #[test]
+    fn dirty_scripts_dedupe_and_force_all() {
+        let dirty = DirtyScripts::new();
+        let a = ScriptHash::from_script(b"a");
+        let b = ScriptHash::from_script(b"b");
+        dirty.mark(a);
+        dirty.mark(a);
+        dirty.mark_all([b]);
+        let (set, force) = dirty.take();
+        assert_eq!(set.len(), 2);
+        assert!(set.contains(&a));
+        assert!(set.contains(&b));
+        assert!(!force);
+        let (set, force) = dirty.take();
+        assert!(set.is_empty());
+        assert!(!force);
+
+        dirty.mark_all_subscriptions();
+        let (set, force) = dirty.take();
+        assert!(set.is_empty());
+        assert!(force);
     }
 
     #[test]

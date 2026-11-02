@@ -145,6 +145,20 @@ pub struct TickInput {
     pub readers_min: Option<u32>,
 }
 
+/// Maximum index lag before pausing Core downloads. Core keeps at least
+/// `MIN_BLOCKS_TO_KEEP` (288) blocks behind its tip, so a configured value is
+/// capped by the real retention window with a 32-block safety margin.
+pub fn lag_limit(core_tip: u32, pruneheight: u32, configured: u32) -> u32 {
+    if configured == 0 {
+        return 0;
+    }
+    if core_tip == 0 || pruneheight == 0 || pruneheight >= core_tip {
+        return configured;
+    }
+    let retention = core_tip.saturating_sub(pruneheight);
+    configured.min(retention.saturating_sub(32)).max(1)
+}
+
 /// Conservative upper bound for `pruneblockchain`. Returns 0 when unsure.
 pub fn safe_prune_height(
     committed_height: u32,
@@ -198,29 +212,48 @@ impl Supervisor {
         self.last_prune
     }
 
-    pub fn tick(&mut self, input: &TickInput) -> Vec<Action> {
+    /// Disk backpressure with hysteresis. This is deliberately independent of
+    /// Core RPC: a full disk must pause the writers even when Core is slow or
+    /// temporarily unreachable.
+    pub fn disk_tick(&mut self, free: Option<u64>) -> Vec<Action> {
         let mut actions = Vec::new();
-        let mut resumed = false;
-
-        // Disk backpressure with hysteresis.
         if self.cfg.disk_enabled {
-            if let Some(free) = input.free_bytes {
+            if let Some(free) = free {
                 if !self.paused && free < self.cfg.disk_low_bytes {
                     self.paused = true;
                     self.state = State::PauseDownload;
                     actions.push(Action::PauseDownloads);
                 } else if self.paused && free >= self.cfg.disk_resume_bytes {
                     self.paused = false;
-                    resumed = true;
                     self.state = State::CatchUp;
                     actions.push(Action::ResumeDownloads);
                 }
             }
         }
+        actions
+    }
+
+    /// Force the supervisor into the paused state when the indexer detected a
+    /// low disk first. Returns `PauseDownloads` once, so the caller can pause
+    /// Core even if `disk_tick` would not emit it again.
+    pub fn force_disk_pause(&mut self) -> Vec<Action> {
+        if !self.cfg.disk_enabled || self.paused {
+            return Vec::new();
+        }
+        self.paused = true;
+        self.state = State::PauseDownload;
+        vec![Action::PauseDownloads]
+    }
+
+    pub fn tick(&mut self, input: &TickInput) -> Vec<Action> {
+        let mut actions = self.disk_tick(input.free_bytes);
+        if !actions.is_empty() {
+            return actions;
+        }
 
         // Prune gate: only manual-pruned Core, never while paused, only with a
         // durable index ahead of the cut, and with a minimum gain.
-        if self.cfg.prune_enabled && input.core_pruned && !self.paused && !resumed {
+        if self.cfg.prune_enabled && input.core_pruned && !self.paused {
             let safe = safe_prune_height(
                 input.committed_height,
                 input.readers_min,
@@ -288,6 +321,40 @@ mod tests {
             free_bytes: Some(1000),
             readers_min: None,
         }
+    }
+
+    #[test]
+    fn disk_tick_is_independent_of_core_input() {
+        let mut s = Supervisor::new(cfg());
+        assert_eq!(s.disk_tick(Some(50)), vec![Action::PauseDownloads]);
+        assert!(s.paused());
+        assert_eq!(s.disk_tick(Some(150)), Vec::new());
+        assert_eq!(s.disk_tick(Some(250)), vec![Action::ResumeDownloads]);
+        assert!(!s.paused());
+    }
+
+    #[test]
+    fn force_disk_pause_emits_once() {
+        let mut s = Supervisor::new(cfg());
+        assert_eq!(s.force_disk_pause(), vec![Action::PauseDownloads]);
+        assert!(s.paused());
+        assert!(s.force_disk_pause().is_empty());
+        assert_eq!(s.disk_tick(Some(250)), vec![Action::ResumeDownloads]);
+        assert!(!s.paused());
+    }
+
+    #[test]
+    fn lag_limit_respects_core_retention() {
+        // Core's normal 288-block retention caps a 256 configured lag.
+        assert_eq!(lag_limit(1_000, 712, 256), 256);
+        // A larger retention allows the configured value.
+        assert_eq!(lag_limit(1_000, 500, 256), 256);
+        // A smaller retention (regtest/fastprune) shrinks the limit.
+        assert_eq!(lag_limit(1_000, 950, 256), 18);
+        // Manual pruning (pruneheight 0) uses the configured value.
+        assert_eq!(lag_limit(1_000, 0, 256), 256);
+        // 0 disables the guard.
+        assert_eq!(lag_limit(1_000, 712, 0), 0);
     }
 
     #[test]

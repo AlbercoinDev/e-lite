@@ -9,6 +9,7 @@ members = [
     "crates/el-rawtx",
     "crates/el-mempool",
     "crates/el-chain",
+    "crates/el-blocks",
     "bin/e-lite",
 ]
 

@@ -1,11 +1,13 @@
 //! C7 — Electrum 1.4 fixtures exercised through the real JSON-RPC dispatcher.
 
+use bitcoin::blockdata::constants::genesis_block;
+use bitcoin::Network;
 use el_mempool::Mempool;
 use el_model::{
     BlockRecord, Chain, Hash32, HistoryEffect, IndexedTip, NetworkIdentity, Outpoint, ScriptHash,
     UtxoValue,
 };
-use el_rawtx::{RawtxConfig, Resolver};
+use el_rawtx::{BlockSource, RawtxConfig, RawtxError, Resolver};
 use el_rpc::{CoreClient, CoreConfig};
 use el_serve::{process_line, state, ClientRegistry, Shared, Stats};
 use el_store::Store;
@@ -101,6 +103,8 @@ fn fixture() -> (Fixture, ScriptHash, Hash32) {
         rpc_url: "http://127.0.0.1:1".to_string(),
         cookie_file: Some(cookie),
         core_datadir: None,
+        rpc_user: None,
+        rpc_password: None,
         chain,
         timeout: Duration::from_millis(200),
     })
@@ -110,7 +114,8 @@ fn fixture() -> (Fixture, ScriptHash, Hash32) {
         Resolver::new(
             Arc::clone(&store),
             &RawtxConfig {
-                cache_gib: 0,
+                enabled: true,
+                cache_mib: 0,
                 decoys: 0,
                 tor_socks: None,
                 allow_clearnet: true,
@@ -137,8 +142,12 @@ fn fixture() -> (Fixture, ScriptHash, Hash32) {
         clients: Arc::new(ClientRegistry::new()),
         readers: el_chain::ReaderTracker::new(),
         silent_payments_enabled: false,
-        identity,
+        identity: RwLock::new(identity),
+        headers: el_serve::HeaderCache::new(),
+        db_bytes: std::sync::Mutex::new(el_serve::DbBytesCache::default()),
+        dirty_scripts: el_serve::DirtyScripts::new(),
         data_dir: dir.clone(),
+        core_datadir: dir.clone(),
         listen: "127.0.0.1:0".to_string(),
         max_clients: 4,
         state: AtomicU8::new(state::READY),
@@ -243,6 +252,18 @@ fn electrum_14_fixtures() {
 }
 
 #[test]
+fn waiting_for_core_rejects_features() {
+    let (fx, _, _) = fixture();
+    fx.shared.set_state(state::WAITING_FOR_CORE);
+    let r = call(&fx.shared, 1, "server.features", json!([]));
+    assert_eq!(r["error"]["code"], -32000);
+    assert!(r["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("waiting for Bitcoin Core"));
+}
+
+#[test]
 fn building_state_is_not_an_empty_answer() {
     let (fx, script, _) = fixture();
     fx.shared.set_state(state::BUILDING);
@@ -296,6 +317,152 @@ fn silent_payments_are_gated_with_an_explicit_error() {
             "{r}"
         );
     }
+}
+
+struct SlowSource {
+    block: Vec<u8>,
+}
+
+impl BlockSource for SlowSource {
+    fn name(&self) -> &str {
+        "slow"
+    }
+
+    fn fetch_block(&self, _hash: &Hash32) -> std::result::Result<Vec<u8>, RawtxError> {
+        std::thread::sleep(Duration::from_millis(500));
+        Ok(self.block.clone())
+    }
+}
+
+#[test]
+fn slow_transaction_get_does_not_hold_the_index_lock() {
+    let dir = std::env::temp_dir().join(format!(
+        "e-lite-lock-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    let store = Arc::new(Store::open(&dir).unwrap());
+    let block = genesis_block(Network::Regtest);
+    let block_hash = Hash32::from_hex(&block.block_hash().to_string()).unwrap();
+    let header: [u8; 80] = bitcoin::consensus::serialize(&block.header)
+        .try_into()
+        .unwrap();
+    let txid = Hash32::from_hex(&block.txdata[0].compute_txid().to_string()).unwrap();
+    let identity = NetworkIdentity::new(Chain::Regtest, block_hash);
+    store.init_identity(&identity).unwrap();
+    let mut batch = Store::batch();
+    store
+        .put_block(
+            &mut batch,
+            &BlockRecord {
+                height: 0,
+                hash: block_hash,
+                header,
+                tx_count: 1,
+                txnum_base: 0,
+            },
+        )
+        .unwrap();
+    store.put_occurrence(&mut batch, txid, 0, 0).unwrap();
+    store
+        .commit(
+            batch,
+            &IndexedTip {
+                height: 0,
+                block_hash,
+                schema_version: el_model::codec::SCHEMA_VERSION,
+                txnum: 1,
+            },
+            &[txid],
+        )
+        .unwrap();
+
+    let cookie = dir.join("cookie");
+    std::fs::write(&cookie, "user:pass").unwrap();
+    let core = CoreClient::connect(&CoreConfig {
+        rpc_url: "http://127.0.0.1:1".to_string(),
+        cookie_file: Some(cookie),
+        core_datadir: None,
+        rpc_user: None,
+        rpc_password: None,
+        chain: Chain::Regtest,
+        timeout: Duration::from_millis(100),
+    })
+    .unwrap();
+    let resolver = Arc::new(
+        Resolver::new(
+            Arc::clone(&store),
+            &RawtxConfig {
+                enabled: false,
+                cache_mib: 0,
+                decoys: 0,
+                tor_socks: None,
+                allow_clearnet: true,
+                use_p2p: false,
+                use_esplora: false,
+                p2p_v2: false,
+                esplora_urls: Vec::new(),
+                p2p_peers: Vec::new(),
+                p2p_timeout: Duration::from_secs(1),
+                chain: Chain::Regtest,
+            },
+        )
+        .unwrap()
+        .with_external(Arc::new(SlowSource {
+            block: bitcoin::consensus::serialize(&block),
+        })),
+    );
+    let shared = Arc::new(Shared {
+        store,
+        core,
+        resolver,
+        mempool: Arc::new(RwLock::new(Mempool::new())),
+        relayfee: std::sync::Mutex::new(0.0),
+        fee_estimates: std::sync::Mutex::new(std::collections::HashMap::new()),
+        error_log: std::sync::Mutex::new(std::collections::HashMap::new()),
+        clients: Arc::new(ClientRegistry::new()),
+        readers: el_chain::ReaderTracker::new(),
+        silent_payments_enabled: false,
+        identity: RwLock::new(identity),
+        headers: el_serve::HeaderCache::new(),
+        db_bytes: std::sync::Mutex::new(el_serve::DbBytesCache::default()),
+        dirty_scripts: el_serve::DirtyScripts::new(),
+        data_dir: dir.clone(),
+        core_datadir: dir.clone(),
+        listen: "127.0.0.1:0".to_string(),
+        max_clients: 4,
+        state: AtomicU8::new(state::READY),
+        lock: Arc::new(RwLock::new(())),
+        stats: Stats::default(),
+    });
+
+    let worker = Arc::clone(&shared);
+    let call = std::thread::spawn(move || {
+        let line = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "blockchain.transaction.get",
+            "params": [txid.to_hex()]
+        })
+        .to_string();
+        process_line(&worker, &line)
+    });
+    std::thread::sleep(Duration::from_millis(80));
+    // The resolver is still fetching the block. The index commit lock must be
+    // free: a slow transaction.get must never stall indexing.
+    let guard = shared
+        .lock
+        .try_write()
+        .expect("index lock must not be held during resolver I/O");
+    drop(guard);
+    let response = call.join().unwrap();
+    assert!(response.get("error").is_none(), "{response}");
+    assert!(response["result"].as_str().unwrap().len() > 100);
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]

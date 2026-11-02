@@ -133,9 +133,10 @@ fn setup(dir: &PathBuf, height: u32) -> (Arc<Store>, Hash32, Hash32, Vec<u8>) {
     (store, hash, txid, bytes)
 }
 
-fn config(decoys: u32, cache_gib: u64) -> RawtxConfig {
+fn config(decoys: u32, cache_mib: u64) -> RawtxConfig {
     RawtxConfig {
-        cache_gib,
+        enabled: true,
+        cache_mib,
         decoys,
         tor_socks: None,
         allow_clearnet: true,

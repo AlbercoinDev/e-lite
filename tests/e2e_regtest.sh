@@ -33,7 +33,7 @@ ADDR=$($CLI -rpcwallet=e2e getnewaddress)
 $CLI -rpcwallet=e2e generatetoaddress 101 "$ADDR" >/dev/null
 HEIGHT=$($CLI getblockcount)
 
-COMMON=(--network regtest --core-datadir "$CORE" --core-rpc "http://127.0.0.1:$RPC_PORT" --data-dir "$DATA")
+COMMON=(--network regtest --core-datadir "$CORE" --core-rpc "http://127.0.0.1:$RPC_PORT" --data-dir "$DATA" --min-free-gib 1)
 "$BIN" init "${COMMON[@]}"
 "$BIN" doctor "${COMMON[@]}" --listen "127.0.0.1:$ELECTRUM_PORT" --metrics "127.0.0.1:$METRICS_PORT"
 "$BIN" index "${COMMON[@]}" --no-follow --batch 16 --reorg-window 8

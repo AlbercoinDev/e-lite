@@ -54,7 +54,8 @@ PY
 
 "$BIN" init --network regtest --core-datadir "$CORE" --core-rpc "http://127.0.0.1:$RPC" --data-dir "$DATA" >/dev/null
 "$BIN" run --network regtest --core-datadir "$CORE" --core-rpc "http://127.0.0.1:$RPC" \
-  --data-dir "$DATA" --listen "127.0.0.1:$ELECTRUM" --metrics "127.0.0.1:$METRICS" \
+  --data-dir "$DATA" --min-free-gib 1 --manage external \
+  --listen "127.0.0.1:$ELECTRUM" --metrics "127.0.0.1:$METRICS" \
   >"$RUN/serve.log" 2>&1 &
 echo $! >"$RUN/serve.pid"
 for _ in $(seq 1 60); do [ "$(status_state)" = READY ] && break; sleep 0.5; done
@@ -83,7 +84,8 @@ RC=$?
 set -e
 [ "$RC" -eq 0 ] || { echo "shutdown before offline start failed: $RC" >&2; tail -20 "$RUN/serve.log"; exit 1; }
 "$BIN" run --network regtest --core-datadir "$CORE" --core-rpc "http://127.0.0.1:$RPC" \
-  --data-dir "$DATA" --listen "127.0.0.1:$ELECTRUM" --metrics "127.0.0.1:$METRICS" \
+  --data-dir "$DATA" --min-free-gib 1 --manage external \
+  --listen "127.0.0.1:$ELECTRUM" --metrics "127.0.0.1:$METRICS" \
   >"$RUN/serve2.log" 2>&1 &
 echo $! >"$RUN/serve.pid"
 for _ in $(seq 1 60); do

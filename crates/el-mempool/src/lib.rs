@@ -52,7 +52,7 @@ pub struct MempoolTx {
     pub height: i32,
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct Mempool {
     txs: HashMap<Hash32, MempoolTx>,
     /// Raw transactions retained between polls so new entries are incremental.
@@ -62,6 +62,8 @@ pub struct Mempool {
     histogram: Vec<(f64, u64)>,
     version: u64,
     unresolved_inputs: u64,
+    /// Scripts whose mempool view changed in the last refresh.
+    last_touched: HashSet<ScriptHash>,
 }
 
 impl Mempool {
@@ -87,6 +89,12 @@ impl Mempool {
 
     pub fn unresolved_inputs(&self) -> u64 {
         self.unresolved_inputs
+    }
+
+    /// Scripts whose mempool history/balance changed in the last successful
+    /// refresh. Used by the notifier dirty-set.
+    pub fn last_touched(&self) -> &HashSet<ScriptHash> {
+        &self.last_touched
     }
 
     /// Confirmed UTXOs spent by a mempool transaction must not be listed as
@@ -155,6 +163,7 @@ impl Mempool {
         let wanted_set: HashSet<Hash32> = wanted.keys().copied().collect();
         let current: HashSet<Hash32> = self.txs.keys().copied().collect();
         if current == wanted_set {
+            self.last_touched.clear();
             return Ok(false);
         }
 
@@ -273,6 +282,8 @@ impl Mempool {
             v.dedup();
         }
 
+        self.last_touched = touched_scripts(&self.txs, &txs);
+
         self.txs = txs;
         self.by_script = by_script;
         self.spending = spending;
@@ -281,6 +292,33 @@ impl Mempool {
         self.version += 1;
         Ok(true)
     }
+}
+
+/// Scripts whose mempool view changed between two snapshots: transactions
+/// added/removed, and transactions whose Electrum height changed (an
+/// unconfirmed parent became confirmed).
+fn touched_scripts(
+    old: &HashMap<Hash32, MempoolTx>,
+    new: &HashMap<Hash32, MempoolTx>,
+) -> HashSet<ScriptHash> {
+    let mut touched = HashSet::new();
+    for (txid, old_tx) in old {
+        match new.get(txid) {
+            Some(new_tx) if old_tx.height != new_tx.height => {
+                touched.extend(new_tx.effects.keys().copied());
+            }
+            Some(_) => {}
+            None => {
+                touched.extend(old_tx.effects.keys().copied());
+            }
+        }
+    }
+    for (txid, new_tx) in new {
+        if !old.contains_key(txid) {
+            touched.extend(new_tx.effects.keys().copied());
+        }
+    }
+    touched
 }
 
 fn build_histogram(txs: &HashMap<Hash32, MempoolTx>) -> Vec<(f64, u64)> {
@@ -351,6 +389,45 @@ mod tests {
                 })
                 .collect(),
         }
+    }
+
+    fn fake_tx(txid: Hash32, scripts: &[ScriptHash], height: i32) -> MempoolTx {
+        let mut effects = HashMap::new();
+        for script in scripts {
+            effects.insert(*script, (1, 0));
+        }
+        MempoolTx {
+            txid,
+            fee_sat: 1,
+            vsize: 1,
+            effects,
+            outputs: Vec::new(),
+            height,
+        }
+    }
+
+    #[test]
+    fn dirty_set_tracks_add_remove_and_height_change() {
+        let a = ScriptHash::from_script(b"a");
+        let b = ScriptHash::from_script(b"b");
+        let c = ScriptHash::from_script(b"c");
+        let t1 = Hash32([1; 32]);
+        let t2 = Hash32([2; 32]);
+        let t3 = Hash32([3; 32]);
+
+        let old = HashMap::from([(t1, fake_tx(t1, &[a], 0)), (t2, fake_tx(t2, &[b], -1))]);
+        let new = HashMap::from([
+            (t1, fake_tx(t1, &[a], 0)),
+            (t2, fake_tx(t2, &[b], 0)),
+            (t3, fake_tx(t3, &[c], 0)),
+        ]);
+        let touched = touched_scripts(&old, &new);
+        assert!(touched.contains(&b), "height change must be dirty");
+        assert!(touched.contains(&c), "added tx must be dirty");
+        assert!(!touched.contains(&a), "unchanged tx must stay clean");
+
+        let removed = touched_scripts(&new, &old);
+        assert!(removed.contains(&c), "removed tx must be dirty");
     }
 
     #[test]

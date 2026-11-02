@@ -19,6 +19,7 @@ el-serve = { path = "../../crates/el-serve" }
 el-rawtx = { path = "../../crates/el-rawtx" }
 el-mempool = { path = "../../crates/el-mempool" }
 el-chain = { path = "../../crates/el-chain" }
+el-blocks = { path = "../../crates/el-blocks" }
 bitcoin.workspace = true
 rocksdb.workspace = true
 serde.workspace = true
@@ -26,5 +27,6 @@ serde_json.workspace = true
 toml.workspace = true
 hex.workspace = true
 signal-hook.workspace = true
+libc.workspace = true
 tar.workspace = true
 flate2.workspace = true

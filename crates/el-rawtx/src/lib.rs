@@ -84,7 +84,9 @@ pub struct RawtxStats {
 
 #[derive(Clone, Debug)]
 pub struct RawtxConfig {
-    pub cache_gib: u64,
+    /// When false, only the local Core block source and the disk cache are used.
+    pub enabled: bool,
+    pub cache_mib: u64,
     pub decoys: u32,
     pub tor_socks: Option<String>,
     pub allow_clearnet: bool,
@@ -114,35 +116,37 @@ impl Resolver {
         let mut external: Vec<Arc<dyn BlockSource>> = Vec::new();
         let tor = cfg.tor_socks.clone();
 
-        if cfg.use_p2p && !cfg.p2p_peers.is_empty() {
-            if tor.is_none() && !cfg.allow_clearnet {
-                // fail closed: no external P2P without Tor
-            } else {
-                external.push(Arc::new(P2pSource::new(
-                    cfg.p2p_peers.clone(),
-                    tor.clone(),
-                    cfg.p2p_timeout,
-                    cfg.chain,
-                    cfg.p2p_v2,
-                )));
+        if cfg.enabled {
+            if cfg.use_p2p && !cfg.p2p_peers.is_empty() {
+                if tor.is_none() && !cfg.allow_clearnet {
+                    // fail closed: no external P2P without Tor
+                } else {
+                    external.push(Arc::new(P2pSource::new(
+                        cfg.p2p_peers.clone(),
+                        tor.clone(),
+                        cfg.p2p_timeout,
+                        cfg.chain,
+                        cfg.p2p_v2,
+                    )));
+                }
             }
-        }
-        if cfg.use_esplora && !cfg.esplora_urls.is_empty() {
-            match EsploraSource::new(
-                cfg.esplora_urls.clone(),
-                tor.clone(),
-                cfg.allow_clearnet,
-                Duration::from_secs(60),
-            ) {
-                Ok(s) => external.push(Arc::new(s)),
-                Err(e) => eprintln!("[e-lite] esplora disabled: {e}"),
+            if cfg.use_esplora && !cfg.esplora_urls.is_empty() {
+                match EsploraSource::new(
+                    cfg.esplora_urls.clone(),
+                    tor.clone(),
+                    cfg.allow_clearnet,
+                    Duration::from_secs(60),
+                ) {
+                    Ok(s) => external.push(Arc::new(s)),
+                    Err(e) => eprintln!("[e-lite] esplora disabled: {e}"),
+                }
             }
         }
 
-        let cache = if cfg.cache_gib > 0 {
+        let cache = if cfg.cache_mib > 0 {
             Some(BlockCache::open(
                 &store.path().join("rawtx-cache"),
-                cfg.cache_gib.saturating_mul(1024 * 1024 * 1024),
+                cfg.cache_mib.saturating_mul(1024 * 1024),
             )?)
         } else {
             None

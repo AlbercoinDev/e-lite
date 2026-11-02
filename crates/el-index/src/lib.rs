@@ -4,8 +4,8 @@ pub mod synth;
 
 use el_model::codec::SCHEMA_VERSION;
 use el_model::{
-    BlockRecord, Hash32, HistoryEffect, IndexedTip, Outpoint, ScriptHash, UndoCreated, UndoHistory,
-    UndoRecord, UndoSpent, UtxoValue, HEADER_LEN,
+    merkle_root, BlockRecord, Hash32, HistoryEffect, IndexedTip, Outpoint, ScriptHash, UndoCreated,
+    UndoHistory, UndoRecord, UndoSpent, UtxoValue, HEADER_LEN,
 };
 use el_store::{Store, StoreError};
 use rocksdb::WriteBatch;
@@ -114,6 +114,34 @@ impl GroupOverlay {
         Ok(store.get_utxo(op)?)
     }
 
+    pub fn contains_created(&self, op: &Outpoint) -> bool {
+        self.created.contains_key(op)
+    }
+
+    pub fn contains_deleted(&self, op: &Outpoint) -> bool {
+        self.deleted.contains(op)
+    }
+
+    /// Same semantics as `get`, but consults the block's prefetched prevouts
+    /// before falling back to a single point lookup.
+    pub fn get_with(
+        &self,
+        store: &Store,
+        op: &Outpoint,
+        prefetched: &HashMap<Outpoint, UtxoValue>,
+    ) -> Result<Option<UtxoValue>> {
+        if let Some(v) = self.created.get(op) {
+            return Ok(Some(*v));
+        }
+        if self.deleted.contains(op) {
+            return Ok(None);
+        }
+        if let Some(v) = prefetched.get(op) {
+            return Ok(Some(*v));
+        }
+        Ok(store.get_utxo(op)?)
+    }
+
     fn insert(&mut self, op: Outpoint, v: UtxoValue) {
         self.deleted.remove(&op);
         self.created.insert(op, v);
@@ -134,6 +162,8 @@ pub struct ApplyOutcome {
     pub txids: Vec<Hash32>,
     pub txnum_base: u64,
     pub tip: IndexedTip,
+    /// Scripts whose confirmed history/UTXO view changed in this block.
+    pub touched_scripts: HashSet<ScriptHash>,
 }
 
 fn is_provably_unspendable(script: &[u8]) -> bool {
@@ -149,6 +179,7 @@ pub fn apply_block(
     prev_tip: Option<IndexedTip>,
     overlay: &mut GroupOverlay,
     batch: &mut WriteBatch,
+    store_undo: bool,
 ) -> Result<ApplyOutcome> {
     // --- continuity -------------------------------------------------------
     let block_hash = hash_from_blockhash(&block.block_hash())?;
@@ -176,11 +207,54 @@ pub fn apply_block(
         });
     }
 
-    // --- merkle -----------------------------------------------------------
-    match block.compute_merkle_root() {
-        Some(root) if root == block.header.merkle_root => {}
+    // --- txids and merkle -------------------------------------------------
+    // Compute every TXID once; the merkle root and the apply loop both use this
+    // list instead of re-serialising every transaction twice.
+    let txids: Vec<Hash32> = block
+        .txdata
+        .iter()
+        .map(|tx| hash_from_txid(&tx.compute_txid()))
+        .collect::<Result<Vec<_>>>()?;
+    let expected_merkle =
+        Hash32::from_hex(&block.header.merkle_root.to_string()).map_err(IndexError::Message)?;
+    match merkle_root(&txids) {
+        Some(root) if root == expected_merkle => {}
         _ => return Err(IndexError::MerkleMismatch { height }),
     }
+
+    // Prefetch every prevout that is not created inside this block in one
+    // RocksDB multi-get. Outputs created in this block are resolved through the
+    // group overlay, and outputs already spent in this group must stay missing.
+    let mut created_in_block: HashSet<Outpoint> = HashSet::new();
+    for (txid, tx) in txids.iter().zip(&block.txdata) {
+        for vout in 0..tx.output.len() {
+            created_in_block.insert(Outpoint {
+                txid: *txid,
+                vout: vout as u32,
+            });
+        }
+    }
+    let mut needed: HashSet<Outpoint> = HashSet::new();
+    for tx in &block.txdata {
+        for input in &tx.input {
+            if input.previous_output.is_null() {
+                continue;
+            }
+            let op = Outpoint {
+                txid: hash_from_txid(&input.previous_output.txid)?,
+                vout: input.previous_output.vout,
+            };
+            if created_in_block.contains(&op)
+                || overlay.contains_created(&op)
+                || overlay.contains_deleted(&op)
+            {
+                continue;
+            }
+            needed.insert(op);
+        }
+    }
+    let needed: Vec<Outpoint> = needed.into_iter().collect();
+    let prefetched = store.get_utxos(&needed)?;
 
     let txnum_base = prev_tip.map(|t| t.txnum).unwrap_or(0);
     let header_bytes: [u8; HEADER_LEN] = {
@@ -193,19 +267,19 @@ pub fn apply_block(
         h
     };
 
+    let mut touched_scripts: HashSet<ScriptHash> = HashSet::new();
     let mut undo = UndoRecord {
         height,
         block_hash,
         ..Default::default()
     };
-    let mut txids: Vec<Hash32> = Vec::with_capacity(block.txdata.len());
     // script -> (received, spent, flags)
     let mut effects: HashMap<ScriptHash, HistoryEffect> = HashMap::new();
     // outputs created inside this very block (for undo de-duplication)
     let mut created_here: HashMap<Outpoint, ScriptHash> = HashMap::new();
 
     for (pos, tx) in block.txdata.iter().enumerate() {
-        let txid = hash_from_txid(&tx.compute_txid())?;
+        let txid = txids[pos];
         let tx_pos = pos as u32;
         let coinbase = pos == 0 && tx.is_coinbase();
         let genesis_coinbase = height == 0 && coinbase;
@@ -219,25 +293,31 @@ pub fn apply_block(
                 txid: hash_from_txid(&input.previous_output.txid)?,
                 vout: input.previous_output.vout,
             };
-            let utxo = overlay
-                .get(store, &op)?
-                .ok_or_else(|| IndexError::PrevoutMissing {
+            let utxo = overlay.get_with(store, &op, &prefetched)?.ok_or_else(|| {
+                IndexError::PrevoutMissing {
                     txid: op.txid.to_hex(),
                     vout: op.vout,
                     height,
-                })?;
+                }
+            })?;
             // Remove from the live view.
-            let was_created_here = created_here.remove(&op).is_some();
+            let was_created_here = if store_undo {
+                created_here.remove(&op).is_some()
+            } else {
+                false
+            };
             overlay.remove(&op);
             store.delete_utxo(batch, &op, utxo.script_hash)?;
             let e = effects.entry(utxo.script_hash).or_default();
             e.spent_sat = e.spent_sat.saturating_add(utxo.value_sat);
-            if was_created_here {
-                // Created and spent inside this same block: after undo it simply
-                // does not exist, so drop it from the created list too.
-                undo.created.retain(|c| c.outpoint != op);
-            } else {
-                undo.spent.push(UndoSpent { outpoint: op, utxo });
+            if store_undo {
+                if was_created_here {
+                    // Created and spent inside this same block: after undo it
+                    // simply does not exist, so drop it from the created list.
+                    undo.created.retain(|c| c.outpoint != op);
+                } else {
+                    undo.spent.push(UndoSpent { outpoint: op, utxo });
+                }
             }
         }
 
@@ -266,27 +346,33 @@ pub fn apply_block(
             };
             store.put_utxo(batch, &op, &value)?;
             overlay.insert(op, value);
-            created_here.insert(op, script_hash);
-            undo.created.push(UndoCreated {
-                outpoint: op,
-                script_hash,
-            });
+            if store_undo {
+                created_here.insert(op, script_hash);
+                undo.created.push(UndoCreated {
+                    outpoint: op,
+                    script_hash,
+                });
+            }
         }
 
         let mut drained: Vec<(ScriptHash, HistoryEffect)> = effects.drain().collect();
         drained.sort_by_key(|e| e.0);
         for (script_hash, effect) in drained {
+            touched_scripts.insert(script_hash);
             store.put_history(batch, script_hash, height, tx_pos, &effect)?;
-            undo.history.push(UndoHistory {
-                script_hash,
-                height,
-                tx_pos,
-            });
+            if store_undo {
+                undo.history.push(UndoHistory {
+                    script_hash,
+                    height,
+                    tx_pos,
+                });
+            }
         }
 
         store.put_occurrence(batch, txid, height, tx_pos)?;
-        undo.txids.push(txid);
-        txids.push(txid);
+        if store_undo {
+            undo.txids.push(txid);
+        }
     }
 
     let rec = BlockRecord {
@@ -297,7 +383,9 @@ pub fn apply_block(
         txnum_base,
     };
     store.put_block(batch, &rec)?;
-    store.put_undo(batch, &undo)?;
+    if store_undo {
+        store.put_undo(batch, &undo)?;
+    }
 
     let tip = IndexedTip {
         height,
@@ -311,6 +399,7 @@ pub fn apply_block(
         txids,
         txnum_base,
         tip,
+        touched_scripts,
     })
 }
 
@@ -384,13 +473,10 @@ pub fn prune_undo(
         return Ok(());
     }
     let cutoff = tip_height - window;
-    let start = cutoff.saturating_sub(64);
-    // Old undo records are outside the reorg window by definition, so deleting
-    // them is idempotent and does not require decoding them. Parsing here used
-    // to turn a codec bug into a hard indexing stop.
-    for h in start..cutoff {
-        store.delete_undo(batch, h)?;
-    }
+    // The undo family is only recovery metadata. Delete every record below the
+    // window in one pass: batch sizes above 64 previously left a growing tail
+    // of stale records and made the canonical digest depend on commit timing.
+    store.delete_undo_below(cutoff, batch)?;
     Ok(())
 }
 
@@ -430,12 +516,54 @@ mod tests {
         let mut tip = store.committed_tip()?;
         for (i, block) in blocks.iter().enumerate() {
             let height = start_height + i as u32;
-            let out = apply_block(store, height, block, tip, &mut overlay, &mut batch)?;
+            let out = apply_block(store, height, block, tip, &mut overlay, &mut batch, true)?;
             all_txids.extend_from_slice(&out.txids);
             tip = Some(out.tip);
         }
         store.commit(batch, &tip.unwrap(), &all_txids)?;
         Ok(())
+    }
+
+    #[test]
+    fn apply_block_reports_touched_scripts() {
+        failpoints::set(failpoints::NONE);
+        let dir = tmp("touched");
+        let store = Store::open(&dir).unwrap();
+        let gen = ChainGen::new(ChainSpec {
+            seed: 3,
+            tx_per_block: 2,
+            script_pool: 4,
+        });
+        let blocks: Vec<_> = gen.take(2).collect();
+        let coinbase_script =
+            ScriptHash::from_script(blocks[0].txdata[0].output[0].script_pubkey.as_bytes());
+
+        let mut overlay = GroupOverlay::new();
+        let mut batch = WriteBatch::default();
+        let out = apply_block(&store, 0, &blocks[0], None, &mut overlay, &mut batch, true).unwrap();
+        assert!(
+            out.touched_scripts.contains(&coinbase_script),
+            "the coinbase output script must be marked dirty"
+        );
+        store.commit(batch, &out.tip, &out.txids).unwrap();
+
+        let mut overlay = GroupOverlay::new();
+        let mut batch = WriteBatch::default();
+        let out = apply_block(
+            &store,
+            1,
+            &blocks[1],
+            store.committed_tip().unwrap(),
+            &mut overlay,
+            &mut batch,
+            true,
+        )
+        .unwrap();
+        assert!(
+            out.touched_scripts.contains(&coinbase_script),
+            "a spent input script must be marked dirty"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -534,10 +662,52 @@ mod tests {
             store.committed_tip().unwrap(),
             &mut overlay,
             &mut batch,
+            true,
         );
         assert!(
             matches!(res, Err(IndexError::PrevoutMissing { .. })),
             "got {res:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn undo_is_optional_per_block() {
+        failpoints::set(failpoints::NONE);
+        let dir = tmp("undo-optional");
+        let store = Store::open(&dir).unwrap();
+        let gen = ChainGen::new(ChainSpec {
+            seed: 3,
+            tx_per_block: 2,
+            script_pool: 5,
+        });
+        let blocks: Vec<_> = gen.take(2).collect();
+        let mut overlay = GroupOverlay::new();
+        let mut batch = WriteBatch::default();
+        let out =
+            apply_block(&store, 0, &blocks[0], None, &mut overlay, &mut batch, false).unwrap();
+        store.commit(batch, &out.tip, &out.txids).unwrap();
+        assert!(
+            store.get_undo(0).unwrap().is_none(),
+            "historical block must not write undo"
+        );
+
+        let mut overlay = GroupOverlay::new();
+        let mut batch = WriteBatch::default();
+        let out = apply_block(
+            &store,
+            1,
+            &blocks[1],
+            store.committed_tip().unwrap(),
+            &mut overlay,
+            &mut batch,
+            true,
+        )
+        .unwrap();
+        store.commit(batch, &out.tip, &out.txids).unwrap();
+        assert!(
+            store.get_undo(1).unwrap().is_some(),
+            "window block must write undo"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -648,6 +818,46 @@ mod tests {
                 .unwrap()
                 .unwrap_or_else(|| panic!("height {h} kept"));
             assert_eq!(rec.spent.len(), 200);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn prune_undo_deletes_the_whole_tail_not_only_64_blocks() {
+        failpoints::set(failpoints::NONE);
+        let dir = tmp("prune-tail");
+        let store = Store::open(&dir).unwrap();
+        let mut batch = Store::batch();
+        for h in 0..200u32 {
+            let rec = UndoRecord {
+                height: h,
+                block_hash: Hash32([h as u8; 32]),
+                txids: vec![Hash32([0x55; 32])],
+                ..Default::default()
+            };
+            store.put_undo(&mut batch, &rec).unwrap();
+        }
+        let tip = IndexedTip {
+            height: 199,
+            block_hash: Hash32([199u8; 32]),
+            schema_version: SCHEMA_VERSION,
+            txnum: 0,
+        };
+        store.commit_tip_only(batch, &tip).unwrap();
+
+        let mut prune = Store::batch();
+        prune_undo(&store, 199, 5, &mut prune).unwrap();
+        store.commit_tip_only(prune, &tip).unwrap();
+
+        // Old implementation only removed cutoff-64..cutoff and left 0..129.
+        for h in 0..194 {
+            assert!(
+                store.get_undo(h).unwrap().is_none(),
+                "height {h} should be pruned"
+            );
+        }
+        for h in 194..200 {
+            assert!(store.get_undo(h).unwrap().is_some(), "height {h} kept");
         }
         let _ = std::fs::remove_dir_all(&dir);
     }

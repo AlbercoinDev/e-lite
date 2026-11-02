@@ -1,7 +1,21 @@
 use el_model::Chain;
 use std::path::PathBuf;
 
+/// How e-lite should treat the Bitcoin Core process.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum CoreManage {
+    /// Never start, stop or otherwise control Core.
+    External,
+    /// Use Core if it is already running; otherwise start and supervise it.
+    #[default]
+    Auto,
+    /// Always start Core; fail if another instance is already running.
+    Managed,
+}
+
 #[derive(Debug, Clone, serde::Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct Config {
     #[serde(default)]
     pub network: NetworkCfg,
@@ -24,7 +38,9 @@ pub struct Config {
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct NetworkCfg {
+    /// `auto`, `mainnet`, `testnet4`, `signet` or `regtest`.
     #[serde(default = "d_network")]
     pub name: String,
     #[serde(default)]
@@ -41,36 +57,83 @@ impl Default for NetworkCfg {
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CoreCfg {
     #[serde(default)]
+    pub manage: CoreManage,
+    #[serde(default = "d_bitcoind")]
+    pub bitcoind: String,
+    #[serde(default)]
     pub rpc_url: Option<String>,
+    #[serde(default)]
+    pub rpc_user: Option<String>,
+    #[serde(default)]
+    pub rpc_password: Option<String>,
     #[serde(default)]
     pub cookie_file: Option<String>,
     #[serde(default)]
     pub core_datadir: Option<String>,
+    /// Override Core's blocks directory (for `-blocksdir` or a custom layout).
+    #[serde(default)]
+    pub blocks_dir: Option<String>,
     #[serde(default = "d_timeout")]
     pub timeout_seconds: u64,
+    /// Core prune target in MiB. 550 is Core's minimum (maximum pruning);
+    /// 0 means a full node. Only applied when e-lite launches Core.
+    #[serde(default = "d_prune_mib")]
+    pub prune_mib: u64,
+    /// Extra arguments passed to bitcoind when e-lite launches it.
+    #[serde(default)]
+    pub extra_args: Vec<String>,
+    /// Restart a Core process launched by e-lite if it exits unexpectedly.
+    #[serde(default = "d_true")]
+    pub restart: bool,
+    /// Stop a Core process launched by e-lite when e-lite stops.
+    #[serde(default = "d_true")]
+    pub stop_on_exit: bool,
+    /// Log file for a Core process launched by e-lite.
+    #[serde(default)]
+    pub log_file: Option<String>,
 }
 
 impl Default for CoreCfg {
     fn default() -> Self {
         CoreCfg {
+            manage: CoreManage::Auto,
+            bitcoind: d_bitcoind(),
             rpc_url: None,
+            rpc_user: None,
+            rpc_password: None,
             cookie_file: None,
             core_datadir: None,
+            blocks_dir: None,
             timeout_seconds: d_timeout(),
+            prune_mib: d_prune_mib(),
+            extra_args: Vec::new(),
+            restart: true,
+            stop_on_exit: true,
+            log_file: None,
         }
     }
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct IndexCfg {
-    #[serde(default = "d_mode")]
-    pub mode: String,
-    #[serde(default = "d_batch")]
-    pub batch_blocks: u32,
+    /// `auto` (files if readable, else RPC), `rpc`, or `files`.
+    #[serde(default = "d_block_source")]
+    pub block_source: String,
+    /// Parallel block fetch/read workers. 0 selects a value from the CPU count.
+    #[serde(default)]
+    pub readers: usize,
+    /// Shared RocksDB block-cache size in MiB. 0 selects a value from RAM.
+    #[serde(default)]
+    pub cache_mib: u64,
     #[serde(default = "d_window")]
     pub reorg_window: u32,
+    /// Maximum blocks per atomic commit group.
+    #[serde(default = "d_batch")]
+    pub batch_blocks: u32,
     #[serde(default = "d_true")]
     pub follow: bool,
 }
@@ -78,15 +141,18 @@ pub struct IndexCfg {
 impl Default for IndexCfg {
     fn default() -> Self {
         IndexCfg {
-            mode: d_mode(),
-            batch_blocks: d_batch(),
+            block_source: d_block_source(),
+            readers: 0,
+            cache_mib: 0,
             reorg_window: d_window(),
+            batch_blocks: d_batch(),
             follow: true,
         }
     }
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ServerCfg {
     #[serde(default = "d_listen")]
     pub listen: String,
@@ -104,6 +170,7 @@ impl Default for ServerCfg {
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MetricsCfg {
     #[serde(default = "d_true")]
     pub enabled: bool,
@@ -121,6 +188,7 @@ impl Default for MetricsCfg {
 }
 
 #[derive(Debug, Clone, serde::Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct SilentPaymentsCfg {
     /// Opt-in gate. The BIP352 indexer is not included yet; when disabled the
     /// protocol methods return an explicit error instead of "unknown method".
@@ -129,19 +197,16 @@ pub struct SilentPaymentsCfg {
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PruningCfg {
-    #[serde(default = "d_true")]
-    pub enabled: bool,
-    #[serde(default = "d_disk_low")]
-    pub disk_low_free_gib: u64,
-    #[serde(default = "d_disk_resume")]
-    pub disk_resume_free_gib: u64,
-    #[serde(default = "d_undo_margin")]
-    pub undo_margin_blocks: u32,
-    #[serde(default = "d_core_margin")]
-    pub core_recent_blocks_margin: u32,
-    #[serde(default = "d_min_gain")]
-    pub min_gain_blocks: u32,
+    /// Pause Core downloads and the indexer when free space is below this.
+    #[serde(default = "d_min_free")]
+    pub min_free_gib: u64,
+    /// Pause Core when the index lags more than this. The effective value is
+    /// capped by Core's own retention window (`blocks - pruneheight`).
+    /// 0 disables the guard.
+    #[serde(default = "d_max_lag")]
+    pub max_core_lag_blocks: u32,
     #[serde(default = "d_poll")]
     pub poll_seconds: u64,
 }
@@ -149,40 +214,20 @@ pub struct PruningCfg {
 impl Default for PruningCfg {
     fn default() -> Self {
         PruningCfg {
-            enabled: true,
-            disk_low_free_gib: d_disk_low(),
-            disk_resume_free_gib: d_disk_resume(),
-            undo_margin_blocks: d_undo_margin(),
-            core_recent_blocks_margin: d_core_margin(),
-            min_gain_blocks: d_min_gain(),
+            min_free_gib: d_min_free(),
+            max_core_lag_blocks: d_max_lag(),
             poll_seconds: d_poll(),
         }
     }
 }
 
-fn d_disk_low() -> u64 {
-    5
-}
-fn d_disk_resume() -> u64 {
-    10
-}
-fn d_undo_margin() -> u32 {
-    288
-}
-fn d_core_margin() -> u32 {
-    288
-}
-fn d_min_gain() -> u32 {
-    288
-}
-fn d_poll() -> u64 {
-    15
-}
-
 #[derive(Debug, Clone, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RawtxCfg {
-    #[serde(default = "d_cache_gib")]
-    pub cache_gib: u64,
+    #[serde(default = "d_true")]
+    pub enabled: bool,
+    #[serde(default = "d_cache_mib")]
+    pub cache_mib: u64,
     #[serde(default = "d_decoys")]
     pub decoys: u32,
     #[serde(default = "d_tor_socks")]
@@ -195,67 +240,54 @@ pub struct RawtxCfg {
     pub use_esplora: bool,
     #[serde(default = "d_true")]
     pub p2p_v2: bool,
-    #[serde(default = "d_esplora_urls")]
+    /// Empty means per-network defaults.
+    #[serde(default)]
     pub esplora_urls: Vec<String>,
     #[serde(default)]
     pub p2p_peers: Vec<String>,
-    #[serde(default = "d_p2p_timeout")]
-    pub p2p_timeout_seconds: u64,
 }
 
 impl Default for RawtxCfg {
     fn default() -> Self {
         RawtxCfg {
-            cache_gib: d_cache_gib(),
+            enabled: true,
+            cache_mib: d_cache_mib(),
             decoys: d_decoys(),
             tor_socks: d_tor_socks(),
             allow_clearnet: false,
             use_p2p: true,
             use_esplora: true,
             p2p_v2: true,
-            esplora_urls: d_esplora_urls(),
+            esplora_urls: Vec::new(),
             p2p_peers: Vec::new(),
-            p2p_timeout_seconds: d_p2p_timeout(),
         }
     }
 }
 
-fn d_cache_gib() -> u64 {
-    10
-}
-fn d_decoys() -> u32 {
-    3
-}
-fn d_tor_socks() -> Option<String> {
-    Some("127.0.0.1:9050".to_string())
-}
-fn d_p2p_timeout() -> u64 {
-    20
-}
-fn d_esplora_urls() -> Vec<String> {
-    vec![
-        "http://mempoolhqx4isw62xs7abwphsq7ldayuidyx2v2oethdhhj6mlo2r6ad.onion/api".to_string(),
-        "https://blockstream.info/api".to_string(),
-    ]
-}
-
 #[derive(Debug, Clone, serde::Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct SafetyCfg {
     #[serde(default)]
     pub allow_mainnet: bool,
 }
 
 fn d_network() -> String {
-    "regtest".to_string()
+    "auto".to_string()
+}
+fn d_bitcoind() -> String {
+    "bitcoind".to_string()
 }
 fn d_timeout() -> u64 {
     30
 }
-fn d_mode() -> String {
-    "full-core".to_string()
+fn d_prune_mib() -> u64 {
+    550
 }
 fn d_batch() -> u32 {
-    32
+    256
+}
+fn d_block_source() -> String {
+    "auto".to_string()
 }
 fn d_window() -> u32 {
     288
@@ -272,6 +304,24 @@ fn d_clients() -> usize {
 fn d_metrics() -> String {
     "127.0.0.1:9184".to_string()
 }
+fn d_min_free() -> u64 {
+    10
+}
+fn d_max_lag() -> u32 {
+    256
+}
+fn d_poll() -> u64 {
+    10
+}
+fn d_cache_mib() -> u64 {
+    2048
+}
+fn d_decoys() -> u32 {
+    3
+}
+fn d_tor_socks() -> Option<String> {
+    Some("127.0.0.1:9050".to_string())
+}
 
 pub fn home() -> PathBuf {
     std::env::var("HOME")
@@ -279,19 +329,38 @@ pub fn home() -> PathBuf {
         .unwrap_or_else(|_| PathBuf::from("."))
 }
 
+fn default_config_paths() -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    if let Ok(x) = std::env::var("XDG_CONFIG_HOME") {
+        paths.push(PathBuf::from(x).join("e-lite/config.toml"));
+    }
+    paths.push(home().join(".config/e-lite/config.toml"));
+    paths.push(PathBuf::from("/etc/e-lite/config.toml"));
+    paths
+}
+
 impl Config {
     pub fn load(path: Option<&str>) -> Result<Config, String> {
+        let path = match path {
+            Some(p) => Some(PathBuf::from(p)),
+            None => default_config_paths().into_iter().find(|p| p.is_file()),
+        };
         match path {
             Some(p) => {
-                let text = std::fs::read_to_string(p)
-                    .map_err(|e| format!("cannot read config {p}: {e}"))?;
-                toml::from_str(&text).map_err(|e| format!("invalid config {p}: {e}"))
+                let text = std::fs::read_to_string(&p)
+                    .map_err(|e| format!("cannot read config {}: {e}", p.display()))?;
+                toml::from_str(&text).map_err(|e| format!("invalid config {}: {e}", p.display()))
             }
             None => Ok(Config::default()),
         }
     }
 
     pub fn chain(&self) -> Result<Chain, String> {
+        if self.network.name == "auto" {
+            return Err(
+                "network = auto must be resolved against Core or the database first".to_string(),
+            );
+        }
         Chain::from_name(&self.network.name)
             .ok_or_else(|| format!("unknown network: {}", self.network.name))
     }
@@ -319,5 +388,107 @@ impl Config {
 
     pub fn cookie_file(&self) -> Option<PathBuf> {
         self.core.cookie_file.as_ref().map(PathBuf::from)
+    }
+
+    /// Core's blocks directory: explicit override, or `<datadir>/<sub>/blocks`.
+    pub fn blocks_dir(&self, chain: Chain) -> PathBuf {
+        match &self.core.blocks_dir {
+            Some(d) => PathBuf::from(d),
+            None => el_blocks::default_blocks_dir(&self.core_datadir(), chain),
+        }
+    }
+
+    pub fn log_file(&self, chain: Chain) -> PathBuf {
+        match &self.core.log_file {
+            Some(p) => PathBuf::from(p),
+            None => self.data_dir(chain).join("bitcoind.log"),
+        }
+    }
+
+    pub fn pid_file(&self, chain: Chain) -> PathBuf {
+        self.data_dir(chain).join("core-child.pid")
+    }
+
+    pub fn validate(&self) -> Result<(), String> {
+        if self.index.batch_blocks == 0 {
+            return Err("[index] batch_blocks must be >= 1".to_string());
+        }
+        if self.index.reorg_window == 0 {
+            return Err("[index] reorg_window must be >= 1".to_string());
+        }
+        if self.server.max_clients == 0 {
+            return Err("[server] max_clients must be >= 1".to_string());
+        }
+        if self.pruning.min_free_gib == 0 {
+            return Err("[pruning] min_free_gib must be >= 1".to_string());
+        }
+        if self.core.manage == CoreManage::Managed && self.network.name == "auto" {
+            return Err(
+                "[core] manage = managed needs an explicit [network] name (not auto)".to_string(),
+            );
+        }
+        if !(self.core.prune_mib == 0 || self.core.prune_mib == 1 || self.core.prune_mib >= 550) {
+            return Err(
+                "[core] prune_mib must be 0 (full node), 1 (manual prune) or >= 550".to_string(),
+            );
+        }
+        if self.core.manage == CoreManage::Managed {
+            if let Some(url) = &self.core.rpc_url {
+                let local =
+                    url.contains("127.0.0.1") || url.contains("localhost") || url.contains("[::1]");
+                if !local {
+                    return Err(
+                        "[core] manage = managed requires a loopback rpc_url; a remote Core \
+                         must use manage = external or auto"
+                            .to_string(),
+                    );
+                }
+            }
+        }
+        if let Some(dir) = &self.network.data_dir {
+            let data = PathBuf::from(dir);
+            let core = self.core_datadir();
+            if data == core || data.starts_with(&core) {
+                return Err(format!(
+                    "[network] data_dir {} must not be inside the Core datadir {}",
+                    data.display(),
+                    core.display()
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn defaults_are_network_agnostic() {
+        let cfg = Config::default();
+        assert_eq!(cfg.network.name, "auto");
+        assert_eq!(cfg.core.manage, CoreManage::Auto);
+        assert_eq!(cfg.core.prune_mib, 550);
+        assert_eq!(cfg.index.reorg_window, 288);
+        assert_eq!(cfg.pruning.max_core_lag_blocks, 256);
+        assert_eq!(cfg.rawtx.cache_mib, 2048);
+        assert!(cfg.rawtx.esplora_urls.is_empty());
+    }
+
+    #[test]
+    fn rejects_data_dir_inside_core_datadir() {
+        let mut cfg = Config::default();
+        cfg.core.core_datadir = Some("/srv/bitcoin".to_string());
+        cfg.network.data_dir = Some("/srv/bitcoin/e-lite".to_string());
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn accepts_data_dir_next_to_core() {
+        let mut cfg = Config::default();
+        cfg.core.core_datadir = Some("/srv/bitcoin".to_string());
+        cfg.network.data_dir = Some("/srv/e-lite".to_string());
+        assert!(cfg.validate().is_ok());
     }
 }

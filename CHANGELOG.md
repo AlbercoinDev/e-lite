@@ -1,5 +1,108 @@
 # Changelog
 
+## Unreleased
+
+### Autonomous startup and Core lifecycle
+
+- **`run` waits for Core and auto-initializes.** With an empty database it binds
+  the ports, reports `WAITING_FOR_CORE` and initializes as soon as Core appears.
+  With an existing database it serves cached history while Core is down.
+- **`[core] manage = external | auto | managed`.** `auto` uses a running Core
+  read-only or starts it; `managed` always starts it. Only a Core started by
+  e-lite can be paused, pruned or stopped.
+- **Core launcher/supervisor**: `bitcoind`, `core_datadir`, `prune_mib`
+  (`550` max pruning, `1` manual, `0` full), `extra_args`, `restart`,
+  `stop_on_exit`, `log_file`, PID tracking and adoption after a crash.
+- **Local-only pruned IBD.** A pruned Core that e-lite did not start, or a
+  remote pruned Core, is rejected for a from-scratch index with instructions;
+  e-lite never pauses a node it does not own.
+- **Dynamic lag guard** based on `blocks - pruneheight` (default 256, resume at
+  75%) instead of a fixed 32. It is reader-aware and does not pause while
+  `pruneheight == 0`.
+- **Disk guard on both filesystems** (index and Core datadir): below
+  `min_free_gib` it pauses Core downloads and indexing, with adaptive
+  hysteresis. The check is independent of Core RPC (`disk_tick`) and the
+  indexer checks again before Core RPC and during block application; an
+  uncommitted group is discarded so the disk is not pushed further. A starting
+  warning reports free space below the threshold.
+- **Reorg safety:** after a rewind the indexer re-reads the committed tip
+  before replaying blocks.
+- **From-zero disk requirement:** signet needs ≥15 GiB free and testnet4 ≥20 GiB
+  for a full acceptance run; `tests/e2e_networks.sh` refuses to start below
+  `E_LITE_E2E_REQUIRED_FREE_GIB` and documents how to override it.
+- **Pause marker** so a crash while Core was paused is recovered on restart.
+- **Prune height** now records the height Core actually returns, not the
+  requested one.
+- **Error classification**: transient “pruned data”/Core outages are retried;
+  genesis/schema/txids/prune-gap failures are fatal.
+
+### Configuration and networks
+
+- `network = "auto"` detects the chain from Core or an existing database.
+- Per-network Esplora defaults (mainnet, signet, testnet4; none on regtest).
+- `rpc_user`/`rpc_password` for a remote Core; WAN is documented as HTTP over
+  SSH/VPN.
+- `parse_url` uses each network's default RPC port and supports IPv6 literals.
+- Simplified config: removed `[index] mode`, `[pruning] enabled`,
+  `undo_margin_blocks`, `core_recent_blocks_margin`, `min_gain_blocks`,
+  `resume_core_lag_blocks`, `max_group_txs`, `commit_interval_ms` and
+  `p2p_timeout_seconds`; renamed `bulk_readers`→`readers`,
+  `db_cache_mib`→`cache_mib`, `cache_gib`→`cache_mib`.
+- Validation: `prune_mib` must be `0`, `1` or `>= 550`; `data_dir` cannot be
+  inside the Core datadir; `managed` requires an explicit network and loopback
+  RPC.
+
+### Performance and correctness
+
+- The global index lock is no longer held across Core or external network I/O;
+  a slow `transaction.get` cannot block index commits.
+- Mempool refresh builds the candidate outside the write lock.
+- `db_bytes` is cached; header checkpoint proofs use a cached header chain;
+  history is capped at 100k entries per script.
+- Notifications use a dirty-set: the indexer marks scripts touched by each
+  confirmed block and the mempool marks additions/removals/height changes, so
+  only affected subscriptions are recomputed. Reorgs force a full refresh.
+- RocksDB tuning is automatic (`cache_mib = 0`, `readers = 0`) and open files are
+  bounded.
+- `family_digests` streams the flat TXID file instead of allocating it whole.
+
+### Bulk block ingest
+
+- **Bulk block ingest**: e-lite can read Core's `blk*.dat` directly
+  (`[index] block_source = "auto" | "rpc" | "files"`, `--block-source`,
+  `--blocks-dir`). Handles Core's default `-blocksxor` key (`blocks/xor.dat`),
+  preallocated files, partial tails and file pruning. A persistent locator
+  (`blockfiles.idx`) makes restarts cheap. RPC is always the fallback.
+- **Faster ingest**: one batched `getblockhash` per window instead of one RPC per
+  block; `readers` parallel fetch/read workers with an ordered writer;
+  adaptive group commits (`batch_blocks`, internal TX/time limits); no fixed 1 s
+  sleep between windows; TXIDs computed once and reused for the Merkle root.
+- **Undo only inside the reorg window**: historical blocks no longer write undo
+  records that would be deleted a few commits later. `prune_undo` now removes
+  every record below the window in one pass, so the canonical digest is
+  independent of the commit batch size.
+- **RocksDB tuning**: shared block cache (`cache_mib`), bloom filters, larger
+  write buffers and batched prevout reads (`multi_get_cf`).
+- **Prune/ingest guard**: with automatic pruning, e-lite pauses Core downloads
+  when the index lags more than the dynamic `max_core_lag_blocks` limit, then
+  resumes at 75% of that limit.
+- `doctor` reports the blocks directory, file count, XOR state and magic.
+- Verified: A/B digest parity (RPC vs files), crash/restart parity, existing
+  regtest and pruned-IBD E2E.
+
+### Documentation
+
+- New `scripts/e-lite-all-in-one.sh`: one command to install/update
+  dependencies, Rust, e-lite and Bitcoin Core; configure; run a regtest quick
+  test, the local e2e suite or the full signet/testnet4 acceptance; and write a
+  report (`~/e-lite-test/last-report.txt`).
+- New `docs/GETTING-STARTED.md`: prerequisites, disk planning, the one-command
+  flow, regtest quickstart, full signet/testnet4 acceptance, troubleshooting and
+  checklist.
+- `docs/benchmarks/F2.md` records the two full-sync attempts that filled the
+  disk, the root cause, the fix and the remaining manual acceptance.
+- `docs/ADR-020-CORE-LIFECYCLE.md` documents the Core lifecycle and guards.
+
 ## 0.1.0-alpha.10 — 2026-11-02
 
 - **Reorg both ways**: when Core's chain is shorter than the index

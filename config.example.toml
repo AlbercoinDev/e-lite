@@ -1,57 +1,65 @@
-# e-lite configuration (v0.1)
+# e-lite configuration (v0.2)
 # Every value shown is the default unless stated otherwise.
 
 [network]
-name = "regtest"                     # regtest | signet | testnet4 | mainnet
-# data_dir = "/home/USER/.local/share/e-lite/regtest"
+name = "auto"                       # auto | mainnet | testnet4 | signet | regtest
+# data_dir = "/home/USER/.local/share/e-lite"
 
 [core]
-# rpc_url = "http://127.0.0.1:18443"  # default port depends on the network
-# cookie_file = ""                    # explicit cookie; overrides core_datadir
-# core_datadir = "/home/USER/.bitcoin"
+manage = "auto"                     # external | auto | managed
+bitcoind = "bitcoind"
+core_datadir = "/home/USER/.bitcoin"
+# blocks_dir = "/srv/core/blocks"   # only for -blocksdir or a custom layout
+# rpc_url = "http://127.0.0.1:8332" # default port depends on the network
+# rpc_user = ""                     # remote Core credentials
+# rpc_password = ""
+# cookie_file = ""                  # explicit cookie; overrides core_datadir
 timeout_seconds = 30
+prune_mib = 550                     # 550 = Core's maximum pruning; 0 = full node
+extra_args = []                     # e.g. ["-dbcache=1024", "-fastprune"]
+restart = true                      # restart a Core launched by e-lite
+stop_on_exit = true                 # stop only a Core launched by e-lite
+# log_file = ""                     # default <data-dir>/bitcoind.log
 
 [index]
-mode = "full-core"                   # full-core | pruned-ibd (Core prune=1)
-batch_blocks = 32                    # blocks per atomic commit (WAL fsync)
-reorg_window = 288                   # undo records kept for reorgs
-follow = true                        # keep following the tip
+block_source = "auto"               # auto | rpc | files
+readers = 0                         # 0 = auto from CPU count
+cache_mib = 0                       # 0 = auto from RAM
+reorg_window = 288                  # undo records kept for reorgs
+batch_blocks = 256                  # blocks per atomic commit
+follow = true                       # keep following the tip
+
+[pruning]
+min_free_gib = 10                   # pause Core + indexing below this
+max_core_lag_blocks = 256           # capped by Core's retention window
+poll_seconds = 10
 
 [server]
-listen = "127.0.0.1:50001"           # loopback only by default
+listen = "127.0.0.1:50001"
 max_clients = 32
 
 [metrics]
 enabled = true
-listen = "127.0.0.1:9184"            # /status, /metrics, /healthz
-
-[pruning]
-enabled = true
-disk_low_free_gib = 5                # pause Core downloads below this
-disk_resume_free_gib = 10            # resume above this (hysteresis)
-undo_margin_blocks = 288             # safety behind the committed tip
-core_recent_blocks_margin = 300      # Core keeps at least 288 anyway
-min_gain_blocks = 288                # minimum progress between prune requests
-poll_seconds = 15
+listen = "127.0.0.1:9184"
 
 [rawtx]
-# Raw transactions for pruned blocks. Whole blocks only; verified before serving.
-cache_gib = 10                       # validated LRU cache (0 disables)
-decoys = 3                           # extra blocks fetched per real fetch
-tor_socks = "127.0.0.1:9050"         # empty requires allow_clearnet = true
-allow_clearnet = false               # fail closed without Tor
-use_p2p = true                       # minimal P2P client
-p2p_v2 = true                        # BIP324 encrypted transport, fallback to v1
-use_esplora = true                   # Esplora-compatible block endpoints
-p2p_peers = []                       # empty: discover from local Core
-p2p_timeout_seconds = 20
-esplora_urls = [
-  "http://mempoolhqx4isw62xs7abwphsq7ldayuidyx2v2oethdhhj6mlo2r6ad.onion/api",
-  "https://blockstream.info/api",
-]
+enabled = true
+cache_mib = 2048                    # validated LRU cache; 0 disables
+decoys = 3                          # extra blocks fetched per real fetch
+tor_socks = "127.0.0.1:9050"        # empty requires allow_clearnet = true
+allow_clearnet = false              # fail closed without Tor
+use_p2p = true                      # minimal P2P client
+use_esplora = true                  # Esplora-compatible block endpoints
+p2p_v2 = true                       # BIP324 encrypted transport, fallback to v1
+p2p_peers = []                      # empty: discover from local Core
+# esplora_urls = []                 # empty: per-network defaults
+#   mainnet: blockstream/mempool + onion
+#   signet:  https://mempool.space/signet/api
+#   testnet4:https://mempool.space/testnet4/api
+#   regtest: none
 
 [silent_payments]
-enabled = false                      # opt-in gate; BIP352 indexer not included yet
+enabled = false                     # opt-in gate; BIP352 indexer not included yet
 
 [safety]
-allow_mainnet = false                # mainnet requires explicit opt-in
+allow_mainnet = false               # mainnet requires explicit opt-in

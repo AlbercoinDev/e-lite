@@ -10,10 +10,11 @@ use el_model::{
     UndoRecord, UtxoValue,
 };
 use rocksdb::{
-    ColumnFamilyDescriptor, DBCompressionType, Direction, IteratorMode, Options, WriteBatch,
-    WriteOptions, DB,
+    BlockBasedOptions, Cache, ColumnFamilyDescriptor, DBCompressionType, Direction, IteratorMode,
+    Options, WriteBatch, WriteOptions, DB,
 };
 use sha2::{Digest, Sha256};
+use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io;
 use std::os::unix::fs::FileExt;
@@ -92,20 +93,63 @@ pub struct Store {
     txids: File,
 }
 
+/// Tunables for the RocksDB instance. `Store::open` uses conservative
+/// defaults; the daemon can raise them from the config.
+#[derive(Debug, Clone)]
+pub struct StoreOptions {
+    pub cache_bytes: usize,
+    pub write_buffer_bytes: usize,
+    pub max_open_files: i32,
+    pub background_jobs: i32,
+}
+
+impl Default for StoreOptions {
+    fn default() -> Self {
+        StoreOptions {
+            cache_bytes: 256 * 1024 * 1024,
+            write_buffer_bytes: 64 * 1024 * 1024,
+            max_open_files: 1024,
+            background_jobs: 4,
+        }
+    }
+}
+
 impl Store {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
+        Self::open_with(path, StoreOptions::default())
+    }
+
+    pub fn open_with(path: impl AsRef<Path>, store_opts: StoreOptions) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
         std::fs::create_dir_all(&path)?;
 
+        // One shared cache for every CF: the ingest path does point lookups on
+        // `utxo` and range scans on `history`, so an 8 MiB per-CF default is
+        // useless on mainnet.
+        let cache = Cache::new_lru_cache(store_opts.cache_bytes.max(8 * 1024 * 1024));
         let mut opts = Options::default();
         opts.create_if_missing(true);
         opts.create_missing_column_families(true);
         opts.set_compression_type(DBCompressionType::Lz4);
         opts.set_max_total_wal_size(256 * 1024 * 1024);
+        opts.set_max_open_files(store_opts.max_open_files.max(64));
+        opts.set_max_background_jobs(store_opts.background_jobs.max(1));
+        opts.set_bytes_per_sync(1024 * 1024);
+        opts.set_wal_bytes_per_sync(1024 * 1024);
+        opts.set_write_buffer_size(store_opts.write_buffer_bytes.max(8 * 1024 * 1024));
+        opts.set_max_write_buffer_number(3);
         let mut descriptors = Vec::new();
         for name in CF_NAMES {
             let mut cf_opts = Options::default();
             cf_opts.set_compression_type(DBCompressionType::Lz4);
+            cf_opts.set_write_buffer_size(store_opts.write_buffer_bytes.max(8 * 1024 * 1024));
+            cf_opts.set_max_write_buffer_number(3);
+            let mut table = BlockBasedOptions::default();
+            table.set_block_cache(&cache);
+            table.set_bloom_filter(10.0, true);
+            table.set_cache_index_and_filter_blocks(true);
+            table.set_pin_l0_filter_and_index_blocks_in_cache(true);
+            cf_opts.set_block_based_table_factory(&table);
             descriptors.push(ColumnFamilyDescriptor::new(name, cf_opts));
         }
         let db = DB::open_cf_descriptors(&opts, &path, descriptors)?;
@@ -404,6 +448,25 @@ impl Store {
         }
     }
 
+    /// Batch point lookup for all prevouts of a block. Missing outpoints are
+    /// simply absent from the map; the caller decides whether that is fatal.
+    pub fn get_utxos(&self, ops: &[Outpoint]) -> Result<HashMap<Outpoint, UtxoValue>> {
+        if ops.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let cf = self.cf("utxo")?;
+        let keys: Vec<(&rocksdb::ColumnFamily, [u8; 36])> =
+            ops.iter().map(|op| (cf, codec::utxo_key(op))).collect();
+        let values = self.db.multi_get_cf(keys);
+        let mut out = HashMap::with_capacity(ops.len());
+        for (op, value) in ops.iter().zip(values) {
+            if let Some(raw) = value? {
+                out.insert(*op, codec::parse_utxo_value(&raw)?);
+            }
+        }
+        Ok(out)
+    }
+
     pub fn utxos_for_script(&self, script: ScriptHash) -> Result<Vec<(Outpoint, u64, u32, bool)>> {
         let cf = self.cf("utxo_by_script")?;
         let prefix = script.0.as_bytes();
@@ -445,6 +508,30 @@ impl Store {
         Ok(())
     }
 
+    /// Delete every undo record below `cutoff`. Undo keys are 4-byte
+    /// big-endian heights, so the iterator stops at the first live height.
+    /// Returns the number of records queued for deletion.
+    pub fn delete_undo_below(&self, cutoff: u32, batch: &mut WriteBatch) -> Result<u32> {
+        if cutoff == 0 {
+            return Ok(0);
+        }
+        let cf = self.cf("undo")?;
+        let mut deleted = 0u32;
+        for item in self.db.iterator_cf(&cf, IteratorMode::Start) {
+            let (key, _) = item?;
+            if key.len() != 4 {
+                return err("undo key is not a u32 height");
+            }
+            let height = u32::from_be_bytes(key[..4].try_into().unwrap());
+            if height >= cutoff {
+                break;
+            }
+            batch.delete_cf(&cf, key);
+            deleted += 1;
+        }
+        Ok(deleted)
+    }
+
     // ------------------------------------------------------------- txids file
 
     pub fn append_txids(&self, start_txnum: u64, txids: &[Hash32]) -> Result<()> {
@@ -483,6 +570,13 @@ impl Store {
 
     /// Append txids (fsync), then atomically commit the batch plus the new tip.
     pub fn commit(&self, batch: WriteBatch, tip: &IndexedTip, txids: &[Hash32]) -> Result<()> {
+        if txids.len() as u64 > tip.txnum {
+            return err(format!(
+                "commit has {} txids but tip.txnum is {}",
+                txids.len(),
+                tip.txnum
+            ));
+        }
         let start = tip.txnum - txids.len() as u64;
         self.append_txids(start, txids)?;
 
@@ -580,10 +674,16 @@ impl Store {
             out.push((name.to_string(), hex::encode(hasher.finalize())));
         }
         let mut hasher = Sha256::new();
-        let txnum = self.committed_tip()?.map(|t| t.txnum).unwrap_or(0);
-        let mut buf = vec![0u8; (txnum * 32) as usize];
-        self.txids.read_exact_at(&mut buf, 0)?;
-        hasher.update(&buf);
+        let mut remaining = self.committed_tip()?.map(|t| t.txnum).unwrap_or(0) * 32;
+        let mut off = 0u64;
+        let mut buf = vec![0u8; 1 << 20];
+        while remaining > 0 {
+            let n = remaining.min(buf.len() as u64) as usize;
+            self.txids.read_exact_at(&mut buf[..n], off)?;
+            hasher.update(&buf[..n]);
+            remaining -= n as u64;
+            off += n as u64;
+        }
         out.push(("txids".to_string(), hex::encode(hasher.finalize())));
         Ok(out)
     }

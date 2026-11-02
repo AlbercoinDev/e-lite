@@ -338,6 +338,7 @@ name = "e-lite"
 version = "0.1.0-alpha.10"
 dependencies = [
  "bitcoin",
+ "el-blocks",
  "el-chain",
  "el-index",
  "el-mempool",
@@ -348,6 +349,7 @@ dependencies = [
  "el-store",
  "flate2",
  "hex",
+ "libc",
  "rocksdb",
  "serde",
  "serde_json",
@@ -361,6 +363,15 @@ name = "either"
 version = "1.19.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0e9c71c2167ca323c882b99918929403426e2373ea17242ff5653e0d5e1058be"
+
+[[package]]
+name = "el-blocks"
+version = "0.1.0-alpha.10"
+dependencies = [
+ "bitcoin",
+ "el-model",
+ "sha2",
+]
 
 [[package]]
 name = "el-chain"
@@ -431,6 +442,7 @@ dependencies = [
 name = "el-serve"
 version = "0.1.0-alpha.10"
 dependencies = [
+ "bitcoin",
  "el-chain",
  "el-mempool",
  "el-model",

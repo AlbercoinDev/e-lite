@@ -31,20 +31,20 @@ impl EsploraSource {
                 continue;
             }
             let is_onion = b.contains(".onion");
+            // Skip endpoints we cannot use instead of disabling the whole
+            // source (e.g. a mainnet onion URL with allow_clearnet but no Tor).
             if is_onion && tor_socks.is_none() {
-                return Err(RawtxError::Config(format!(
-                    "onion endpoint requires tor_socks: {b}"
-                )));
+                continue;
             }
             if !is_onion && tor_socks.is_none() && !allow_clearnet {
-                return Err(RawtxError::Config(format!(
-                    "clearnet endpoint refused without Tor (allow_clearnet=false): {b}"
-                )));
+                continue;
             }
             clean.push(b);
         }
         if clean.is_empty() {
-            return Err(RawtxError::Config("no esplora endpoints".into()));
+            return Err(RawtxError::Config(
+                "no usable esplora endpoints (need Tor or allow_clearnet=true)".into(),
+            ));
         }
 
         let mut builder = reqwest::blocking::Client::builder()
