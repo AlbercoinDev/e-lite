@@ -50,6 +50,27 @@ pub fn verify_block(
     Ok(block)
 }
 
+/// Decode and verify a block when only its expected hash is known (for
+/// example a block below Core's prune height). The hash commits to the header,
+/// so checking the hash, merkle root and (by the caller) witness commitment is
+/// sufficient to authenticate the bytes against Core's active chain.
+pub fn verify_block_by_hash(bytes: &[u8], expected_hash: &Hash32) -> Result<Block> {
+    let block: Block = bitcoin::consensus::deserialize(bytes)
+        .map_err(|e| RawtxError::Verify(format!("cannot decode block: {e}")))?;
+    let hash = Hash32::from_hex(&block.block_hash().to_string())
+        .map_err(|e| RawtxError::Verify(format!("bad block hash: {e}")))?;
+    if hash != *expected_hash {
+        return Err(RawtxError::Verify(format!(
+            "block hash mismatch: got {hash}, expected {expected_hash}"
+        )));
+    }
+    match block.compute_merkle_root() {
+        Some(root) if root == block.header.merkle_root => {}
+        _ => return Err(RawtxError::Verify("merkle root mismatch".into())),
+    }
+    Ok(block)
+}
+
 /// BIP141 witness commitment check. Required for every served transaction: the
 /// TXID commits to the non-witness data only.
 pub fn verify_witness_commitment(block: &Block) -> Result<()> {

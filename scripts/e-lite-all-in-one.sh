@@ -301,7 +301,7 @@ manage = "managed"
 bitcoind = "$(command -v bitcoind)"
 core_datadir = "$CORE_DIR"
 rpc_url = "http://127.0.0.1:$RPC_PORT"
-prune_mib = 550
+prune_mib = 1
 extra_args = ["-listen=0"]
 timeout_seconds = 30
 
@@ -312,7 +312,7 @@ batch_blocks = 256
 
 [pruning]
 min_free_gib = $min_free
-max_core_lag_blocks = 512
+max_core_lag_blocks = 192
 poll_seconds = 10
 
 [server]
@@ -480,7 +480,7 @@ run_acceptance() {
   [ "$free" -ge "$required" ] || die "not enough free space: ${free} GiB < ${required} GiB"
   prepare_dirs
   write_config
-  log "Running full $NETWORK acceptance (Core launched by e-lite, prune=550)"
+  log "Running full $NETWORK acceptance (Core launched by e-lite, manual prune=1)"
   local log="$RUN_ROOT/$NETWORK-acceptance.log"
   ACCEPTANCE_LOG="$log"
   if ( cd "$ROOT" && \

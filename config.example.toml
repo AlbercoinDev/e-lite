@@ -15,8 +15,9 @@ core_datadir = "/home/USER/.bitcoin"
 # rpc_password = ""
 # cookie_file = ""                  # explicit cookie; overrides core_datadir
 timeout_seconds = 30
-prune_mib = 550                     # 550 = Core's maximum pruning; 0 = full node
-extra_args = []                     # e.g. ["-dbcache=1024", "-fastprune"]
+prune_mib = 1                       # 1 = manual pruning (safe from zero); 0 = full node;
+                                    # >=550 = automatic pruning, requires allow_auto_prune
+extra_args = []                     # e.g. ["-dbcache=1024"]
 restart = true                      # restart a Core launched by e-lite
 stop_on_exit = true                 # stop only a Core launched by e-lite
 # log_file = ""                     # default <data-dir>/bitcoind.log
@@ -30,8 +31,13 @@ batch_blocks = 256                  # blocks per atomic commit
 follow = true                       # keep following the tip
 
 [pruning]
-min_free_gib = 10                   # pause Core + indexing below this
-max_core_lag_blocks = 512           # capped by Core's retention window
+min_free_gib = 10                   # pause Core downloads below this; indexing continues
+critical_free_gib = 1               # also pause indexing below this hard floor (0 = never)
+max_core_lag_blocks = 192           # automatic pruning only; hard-capped at 224
+allow_auto_prune = false            # required for prune_mib >= 550; not for from-zero
+min_gain_blocks = 288               # minimum safe-height gain between prune requests
+prune_interval_seconds = 30         # minimum time between prune requests (low disk bypasses)
+repair_max_gap_blocks = 2048        # auto-repair a prune gap from verified sources
 poll_seconds = 10
 
 [server]
@@ -47,9 +53,9 @@ enabled = true
 cache_mib = 2048                    # validated LRU cache; 0 disables
 decoys = 3                          # extra blocks fetched per real fetch
 tor_socks = "127.0.0.1:9050"        # empty requires allow_clearnet = true
-allow_clearnet = false              # fail closed without Tor
-use_p2p = true                      # minimal P2P client
-use_esplora = true                  # Esplora-compatible block endpoints
+allow_clearnet = false              # fail closed without Tor; also gates repair
+use_p2p = true                      # minimal P2P client; used for prune-gap repair
+use_esplora = true                  # Esplora block endpoints; used for repair too
 p2p_v2 = true                       # BIP324 encrypted transport, fallback to v1
 p2p_peers = []                      # empty: discover from local Core
 # esplora_urls = []                 # empty: per-network defaults

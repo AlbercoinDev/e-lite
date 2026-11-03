@@ -86,7 +86,7 @@ Installed to `${E_LITE_PREFIX:-$HOME/.local/bin}` by default, **no sudo**.
 ## Quickstart: e-lite starts and manages Core
 
 ```bash
-# From an empty datadir, with maximum Core pruning (550 MiB target).
+# From an empty datadir, with manual pruning (safe for a from-zero IBD).
 e-lite run --network signet --core-datadir ~/.bitcoin --data-dir ~/.local/share/e-lite/signet
 ```
 
@@ -125,8 +125,11 @@ manage = "auto"   # external | auto | managed
 A Core that was already running is never touched: e-lite does not call
 `setnetworkactive` or `pruneblockchain` on it.
 
-`prune_mib = 550` is Core's minimum (maximum pruning). `0` means a full node;
-`1` means manual pruning. e-lite passes `-prune`, `-rpcport` (taken from
+`prune_mib = 1` enables manual pruning and is the default for a from-zero pruned
+IBD: e-lite indexes each block before authorising its deletion. `0` means a full
+node. Values `>= 550` enable Core’s automatic pruning and require
+`[pruning] allow_auto_prune = true`; automatic pruning during IBD can race the
+index and is not the from-zero default. e-lite passes `-prune`, `-rpcport` (taken from
 `rpc_url`), `-rpcbind=127.0.0.1`, `-rpcallowip=127.0.0.1`, `-server=1` and
 `-daemon=0`, plus `extra_args`. It does not edit `bitcoin.conf` and does not
 disable indexes you have enabled.
@@ -139,16 +142,24 @@ A Core launched by e-lite is logged to `<data-dir>/bitcoind.log`, tracked in
 
 This is the supported path for “both start from zero”:
 
-1. e-lite starts Core with `-prune=550` (or `1` for manual pruning).
+1. e-lite starts Core with `-prune=1` (manual pruning; `0` for a full node).
 2. e-lite reads raw blocks directly from Core's `blk*.dat` files.
-3. Core keeps at least 288 blocks; the lag guard pauses its downloads only when
-   the index lag approaches that retention window.
-4. e-lite never lets the index fall below `pruneheight`.
+3. e-lite’s prune gate is the only pruning authority: it never requests a cut
+   above `index - 288`, so Core cannot delete a block the index still needs.
+4. If the disk runs low, Core downloads pause but indexing continues so the
+   prune gate can free space; only a critical floor pauses indexing too.
 
-The guard uses the real retention (`blocks - pruneheight`), not a fixed 32:
-the default `max_core_lag_blocks = 512` is capped by Core's window and resumes
-at 75%. It also pauses Core while a `transaction.get` is resolving a block near
-the prune boundary.
+The lag guard is only used for automatic pruning (`prune_mib >= 550` with
+`allow_auto_prune = true`), is hard-capped at 224 blocks and resumes at 50%.
+Manual pruning does not need it: the prune gate is the invariant. The guard also
+pauses Core while a `transaction.get` is resolving a block near the prune
+boundary.
+
+If automatic pruning still leaves a gap, or an existing index is behind an
+externally pruned Core, `run` fetches only the missing blocks from the validated
+rawtx cache, P2P or Esplora sources, verifies their hash and merkle root, and
+continues. `repair_max_gap_blocks` bounds the work. External repair respects the
+`[rawtx]` Tor/clearnet policy; no snapshot is created or required.
 
 **Not supported:** a pruned Core that e-lite did not start, or a remote pruned
 Core, with an empty index. e-lite fails with instructions instead of risking a
@@ -156,7 +167,7 @@ hole:
 
 ```
 Core is pruned and the index is empty, but e-lite did not start Core; stop Core
-and use [core] manage = "managed" (or use a full node/snapshot)
+and use [core] manage = "managed" with prune_mib = 1 (or use a full node)
 ```
 
 ## Remote Core (maintenance only)
@@ -177,7 +188,7 @@ rpc_url = "http://127.0.0.1:8332"   # forwarded by SSH: ssh -L 8332:127.0.0.1:83
 Core's RPC port to the Internet without TLS/VPN.
 
 If the remote Core is pruned and the index is behind `pruneheight`, e-lite
-fails and asks for a snapshot or a full node. It never pauses a shared node.
+fails and asks for a full node; it never pauses a shared node.
 
 ## Configuration
 
@@ -197,7 +208,7 @@ core_datadir = "/home/USER/.bitcoin"
 # rpc_password = ""
 # cookie_file = ""
 timeout_seconds = 30
-prune_mib = 550               # 550 = max pruning; 0 = full; 1 = manual
+prune_mib = 1                 # 1 = manual (from zero); 0 = full; >=550 = auto
 extra_args = []
 restart = true
 stop_on_exit = true
@@ -212,8 +223,13 @@ batch_blocks = 256
 follow = true
 
 [pruning]
-min_free_gib = 10             # pause Core + indexing below this
-max_core_lag_blocks = 512     # capped by Core retention
+min_free_gib = 10             # pause Core downloads below this; indexing continues
+critical_free_gib = 1         # also pause indexing below this hard floor
+max_core_lag_blocks = 192     # automatic pruning only; hard-capped at 224
+allow_auto_prune = false      # required for prune_mib >= 550
+min_gain_blocks = 288
+prune_interval_seconds = 30
+repair_max_gap_blocks = 2048  # verified cache/P2P/Esplora repair limit
 poll_seconds = 10
 
 [server]
@@ -398,11 +414,10 @@ available.
   index (large), and keep `min_free_gib` above the actual free space you want
   to preserve.
 - The disk guard reads both filesystems **before Core RPC** and the indexer
-  checks again while applying blocks. If either disk falls below
-  `min_free_gib`, indexing stops and Core downloads are paused; the current
-  uncommitted group is discarded and re-indexed after space is freed. A full
-  disk must not be allowed to reach Core: if Core prunes past the committed
-  index, the gap is unrecoverable and requires a snapshot or a full node.
+  checks again while applying blocks. Below `min_free_gib` Core downloads are
+  paused but indexing continues, so the prune gate can delete old block files
+  and free space. Below `critical_free_gib` indexing also stops. The current
+  uncommitted group is discarded and re-indexed after space is freed.
 - A full signet/testnet4 sync needs enough free space for the Core datadir
   (pruned) plus the index. A 2 GiB threshold on a nearly full disk is not
   enough for a multi-GB index: leave room or use a larger disk.
@@ -413,8 +428,8 @@ available.
 
 - Pruned IBD from scratch is local-only and requires a Core owned by e-lite.
 - Remote Core is for maintenance, not for the first pruned IBD.
-- The index must be built with a full node, a local pruned Core started by
-  e-lite, or restored from a snapshot.
+- The index must be built with a full node, or with a local Core started by
+  e-lite using `prune_mib = 1` (manual).
 - Raw transactions require the block to still exist in Core or in a configured
   external source; otherwise the error is explicit, never invented data.
 - External rawtx requires Tor by default, so a missing Tor daemon degrades
@@ -436,7 +451,7 @@ Requires Rust (stable), a C++ toolchain and libclang (RocksDB bindgen).
 ```bash
 tests/e2e_regtest.sh            # Electrum, mempool, reorg, snapshot
 tests/e2e_resilience.sh         # Core outage, offline serve, cookie rotation
-tests/e2e_launch_core.sh        # e-lite launches Core from scratch (prune=550)
+tests/e2e_launch_core.sh        # e-lite launches Core from scratch (prune=1)
 tests/e2e_wait_core.sh          # e-lite waits for Core, then auto-initializes
 tests/e2e_external_pruned.sh    # rejects an external pruned Core safely
 tests/e2e_pruned_ibd.sh         # local manual-prune IBD + prune gate

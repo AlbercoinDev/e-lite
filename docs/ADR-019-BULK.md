@@ -49,8 +49,9 @@ Implement a **read-only bulk reader** with RPC as the permanent fallback:
   digest does not depend on the commit batch size.
 - `doctor` reports the blocks directory, file count, XOR state and magic.
 - For automatic pruning (`-prune=NNN`), pause Core downloads when the index lag
-  exceeds the dynamic `max_core_lag_blocks` (configured 512, capped by Core's
-  `blocks - pruneheight` retention) and resume at 75%. See ADR-020.
+  exceeds the dynamic `max_core_lag_blocks` (default 192, hard-capped at 224)
+  and resume at 50%. Manual pruning (`prune_mib = 1`) does not use the guard.
+  See ADR-020.
 
 ## Consequences and risks
 

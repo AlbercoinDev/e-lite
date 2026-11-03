@@ -65,7 +65,7 @@ data_dir = "$DATA"
 manage = "managed"
 core_datadir = "$CORE"
 rpc_url = "http://127.0.0.1:$RPC"
-prune_mib = 550
+prune_mib = 1
 extra_args = ["-listen=0"]
 
 [index]
@@ -75,7 +75,7 @@ reorg_window = 288
 
 [pruning]
 min_free_gib = $MIN_FREE
-max_core_lag_blocks = 512
+max_core_lag_blocks = 192
 poll_seconds = 10
 
 [server]

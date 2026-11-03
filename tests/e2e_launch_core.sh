@@ -32,7 +32,7 @@ data_dir = "$DATA"
 manage = "managed"
 core_datadir = "$CORE"
 rpc_url = "http://127.0.0.1:$RPC"
-prune_mib = 550
+prune_mib = 1
 extra_args = ["-listen=0", "-fallbackfee=0.0002"]
 
 [index]

@@ -173,6 +173,28 @@ fn serves_from_external_source_and_then_cache() {
 }
 
 #[test]
+fn fetches_verified_block_by_hash_for_prune_repair() {
+    let dir = tmp("repair");
+    let store = Arc::new(Store::open(&dir).unwrap());
+    let block = test_block();
+    let bytes = bitcoin::consensus::serialize(&block);
+    let hash = Hash32::from_hex(&block.block_hash().to_string()).unwrap();
+    let src = MockSource::new("mock", bytes.clone(), false);
+    let resolver = Resolver::new(Arc::clone(&store), &config(0, 1))
+        .unwrap()
+        .with_external(src.clone());
+    assert!(resolver.has_repair_sources());
+    let got = resolver.fetch_block_by_hash(&hash).unwrap();
+    assert_eq!(got, bytes);
+    assert_eq!(src.calls.load(Ordering::SeqCst), 1);
+    // The repaired block is cached and reused without another network call.
+    let got2 = resolver.fetch_block_by_hash(&hash).unwrap();
+    assert_eq!(got2, bytes);
+    assert_eq!(src.calls.load(Ordering::SeqCst), 1);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn corrupt_source_alone_is_an_explicit_error() {
     let dir = tmp("corrupt-only");
     let (store, _hash, txid, bytes) = setup(&dir, 0);

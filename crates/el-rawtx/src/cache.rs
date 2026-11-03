@@ -54,6 +54,13 @@ impl BlockCache {
         self.dir.join(format!("{}.blk", hash.to_hex()))
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.state
+            .lock()
+            .map(|state| state.entries.is_empty())
+            .unwrap_or(true)
+    }
+
     pub fn get(&self, hash: &Hash32) -> Option<Vec<u8>> {
         let mut st = self.state.lock().ok()?;
         if !st.entries.contains_key(hash) {

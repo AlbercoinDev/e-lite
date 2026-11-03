@@ -24,7 +24,7 @@ pub use cache::BlockCache;
 pub use core_source::CoreBlockSource;
 pub use esplora::EsploraSource;
 pub use p2p::P2pSource;
-pub use verify::{extract_tx, verify_block, verify_witness_commitment};
+pub use verify::{extract_tx, verify_block, verify_block_by_hash, verify_witness_commitment};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RawtxError {
@@ -180,6 +180,86 @@ impl Resolver {
 
     pub fn external_sources(&self) -> usize {
         self.external.len()
+    }
+
+    /// Whether a pruned-index repair has any chance: a validated block cache
+    /// or at least one external whole-block source.
+    pub fn has_repair_sources(&self) -> bool {
+        !self.external.is_empty() || self.cache.as_ref().map(|c| !c.is_empty()).unwrap_or(false)
+    }
+
+    /// Fetch a whole block by hash for index repair, verifying its hash and
+    /// merkle root. This is only used for heights Core has already pruned; the
+    /// normal index path keeps using the local bulk source/RPC and never sends
+    /// block hashes to external sources.
+    pub fn fetch_block_by_hash(&self, hash: &Hash32) -> Result<Vec<u8>> {
+        if let Some(cache) = &self.cache {
+            if let Some(bytes) = cache.get(hash) {
+                match verify_block_by_hash(&bytes, hash) {
+                    Ok(_) => {
+                        self.stats.cache_hits.fetch_add(1, Ordering::Relaxed);
+                        return Ok(bytes);
+                    }
+                    Err(e) => {
+                        self.stats.verify_failures.fetch_add(1, Ordering::Relaxed);
+                        eprintln!(
+                            "[e-lite] cached repair block {} rejected: {e}",
+                            hash.to_hex()
+                        );
+                        let _ = cache.remove(hash);
+                    }
+                }
+            }
+        }
+
+        let mut errors = Vec::new();
+        if let Some(local) = &self.local {
+            match local.fetch_block(hash) {
+                Ok(bytes) => match verify_block_by_hash(&bytes, hash) {
+                    Ok(_) => {
+                        self.cache_store(hash, &bytes);
+                        return Ok(bytes);
+                    }
+                    Err(e) => errors.push(format!("{}: {e}", local.name())),
+                },
+                Err(e) => errors.push(format!("{}: {e}", local.name())),
+            }
+        }
+
+        let mut order: Vec<usize> = (0..self.external.len()).collect();
+        order.shuffle(&mut thread_rng());
+        for idx in order {
+            let source = &self.external[idx];
+            match source.fetch_block(hash) {
+                Ok(bytes) => {
+                    self.stats.fetches.fetch_add(1, Ordering::Relaxed);
+                    self.stats
+                        .bytes
+                        .fetch_add(bytes.len() as u64, Ordering::Relaxed);
+                    match verify_block_by_hash(&bytes, hash) {
+                        Ok(_) => {
+                            self.cache_store(hash, &bytes);
+                            return Ok(bytes);
+                        }
+                        Err(e) => {
+                            self.stats.verify_failures.fetch_add(1, Ordering::Relaxed);
+                            eprintln!(
+                                "[e-lite] {} returned an invalid repair block: {e}",
+                                source.name()
+                            );
+                            errors.push(format!("{}: {e}", source.name()));
+                        }
+                    }
+                }
+                Err(e) => errors.push(format!("{}: {e}", source.name())),
+            }
+        }
+        self.stats.unavailable.fetch_add(1, Ordering::Relaxed);
+        Err(RawtxError::Unavailable(if errors.is_empty() {
+            "no repair source configured (cache, P2P or Esplora)".to_string()
+        } else {
+            errors.join("; ")
+        }))
     }
 
     pub fn chain(&self) -> Chain {

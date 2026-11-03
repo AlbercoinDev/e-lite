@@ -18,17 +18,21 @@ be paused safely.
 2. **Only a Core started by e-lite can be controlled.** The process is tracked
    in `<data-dir>/core-child.pid`; a Core that was already running is treated as
    external for control purposes.
-3. **Pruned IBD from zero is local-only.** It requires `block_source` access to
-   Core's `blocks/` directory and a Core owned by e-lite. An external or remote
-   pruned Core with an empty index is rejected with instructions.
-4. **Lag guard uses the real retention window.** `lag_limit = min(configured,
-   (blocks - pruneheight) - 32)`, default 512, resume at 75%. While
-   `pruneheight == 0` nothing has been pruned, so the guard does not slow down
-   the initial index. Active rawtx readers below `pruneheight + 32` also pause
-   Core.
+3. **Pruned IBD from zero is local-only and manual.** It requires `block_source`
+   access to Core's `blocks/` directory and a Core owned by e-lite started with
+   `prune_mib = 1`. e-lite is then the only pruning authority: the prune gate
+   never requests a cut above `committed - 288`, so Core cannot delete a block
+   the index still needs. An external or remote pruned Core with an empty index
+   is rejected with instructions.
+4. **Lag guard is only for automatic pruning.** With `prune_mib >= 550` and
+   `allow_auto_prune = true`, `lag_limit = min(configured,
+   (blocks - pruneheight) - 32, 224)` and resumes at 50%. The hard 224 cap
+   leaves margin below Core's `MIN_BLOCKS_TO_KEEP` (288). Manual pruning does not
+   use the guard. Active rawtx readers below `pruneheight + 32` also pause Core.
 5. **Disk guard watches both filesystems.** Free space is the minimum of the
-   e-lite data dir and the Core datadir; below `min_free_gib` both Core downloads
-   and indexing stop, with a +5 GiB resume hysteresis.
+   e-lite data dir and the Core datadir. Below `min_free_gib` Core downloads are
+   paused but indexing continues, so the prune gate can free space. Below
+   `critical_free_gib` indexing also stops. Both resume with hysteresis.
 6. **Pause marker.** A pause writes `<data-dir>/core-paused-by-e-lite`; after a
    crash, the next start resumes `setnetworkactive(true)` and removes it.
 7. **Manual prune uses the height Core actually reports**, not the requested
@@ -42,9 +46,9 @@ be paused safely.
 ## Consequences
 
 - A user who already runs Core must either stop it and let e-lite start it
-  (`managed`) or keep `external` and use a full node/snapshot for the first
-  index. This is deliberate: e-lite cannot guarantee the prune race on a node
-  it does not own.
+  (`managed`) or keep `external` and use a full node for the first index. This
+  is deliberate: e-lite cannot guarantee the prune race on a node it does not
+  own.
 - `stop_on_exit = true` prevents Core from pruning while e-lite is down, but
   only for a Core e-lite started. An external Core can still advance; the
   288-block window is documented.

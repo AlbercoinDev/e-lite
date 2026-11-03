@@ -7,6 +7,7 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 // ----------------------------------------------------------------- disk space
 
@@ -119,6 +120,9 @@ pub struct SupervisorConfig {
     pub core_recent_margin: u32,
     /// Do not issue another prune request until the safe height advanced this much.
     pub min_gain: u32,
+    /// Minimum wall-clock interval between prune requests. Emergency pruning
+    /// on low disk bypasses this.
+    pub prune_interval: Duration,
 }
 
 impl Default for SupervisorConfig {
@@ -131,6 +135,7 @@ impl Default for SupervisorConfig {
             undo_margin: 288,
             core_recent_margin: 288,
             min_gain: 288,
+            prune_interval: Duration::from_secs(30),
         }
     }
 }
@@ -145,18 +150,25 @@ pub struct TickInput {
     pub readers_min: Option<u32>,
 }
 
+/// Maximum index lag allowed when Core is pruning automatically. Core always
+/// keeps at least `MIN_BLOCKS_TO_KEEP` (288) blocks, so a lag above
+/// `288 - margin` is a race: Core may delete a file that the index still needs.
+pub const MAX_SAFE_CORE_LAG: u32 = 224;
+
 /// Maximum index lag before pausing Core downloads. Core keeps at least
 /// `MIN_BLOCKS_TO_KEEP` (288) blocks behind its tip, so a configured value is
-/// capped by the real retention window with a 32-block safety margin.
+/// capped both by the real retention window and by `MAX_SAFE_CORE_LAG`.
 pub fn lag_limit(core_tip: u32, pruneheight: u32, configured: u32) -> u32 {
     if configured == 0 {
         return 0;
     }
     if core_tip == 0 || pruneheight == 0 || pruneheight >= core_tip {
-        return configured;
+        return configured.min(MAX_SAFE_CORE_LAG);
     }
     let retention = core_tip.saturating_sub(pruneheight);
-    configured.min(retention.saturating_sub(32)).max(1)
+    configured
+        .min(retention.saturating_sub(32))
+        .clamp(1, MAX_SAFE_CORE_LAG)
 }
 
 /// Conservative upper bound for `pruneblockchain`. Returns 0 when unsure.
@@ -188,6 +200,9 @@ pub struct Supervisor {
     /// granularity and can report a much lower height, so retries are
     /// throttled on the request, not on the reported result.
     last_attempt: Option<u32>,
+    /// Wall-clock time of the last prune request. Core may flush block files
+    /// when asked to prune, so no-op requests are rate-limited as well.
+    last_prune_at: Option<Instant>,
 }
 
 impl Supervisor {
@@ -202,6 +217,7 @@ impl Supervisor {
             paused: false,
             last_prune: None,
             last_attempt: None,
+            last_prune_at: None,
         }
     }
 
@@ -256,9 +272,11 @@ impl Supervisor {
             return actions;
         }
 
-        // Prune gate: only manual-pruned Core, never while paused, only with a
-        // durable index ahead of the cut, and with a minimum gain.
-        if self.cfg.prune_enabled && input.core_pruned && !self.paused {
+        // Prune gate: durable index ahead of the cut, with a minimum gain and
+        // a minimum wall-clock interval. It runs even while Core downloads are
+        // paused for disk pressure: draining the index and pruning is how we
+        // recover free space. Low disk bypasses the interval (emergency prune).
+        if self.cfg.prune_enabled && input.core_pruned {
             let safe = safe_prune_height(
                 input.committed_height,
                 input.readers_min,
@@ -266,14 +284,38 @@ impl Supervisor {
                 self.cfg.undo_margin,
                 self.cfg.core_recent_margin,
             );
+            let emergency = self.cfg.disk_enabled
+                && input
+                    .free_bytes
+                    .map(|free| free < self.cfg.disk_low_bytes)
+                    .unwrap_or(false);
+            let interval_elapsed = self
+                .last_prune_at
+                .map(|at| at.elapsed() >= self.cfg.prune_interval)
+                .unwrap_or(true);
+            // Emergency pruning may be more frequent, but still not once per
+            // supervisor tick: Core prunes whole files and a no-op request can
+            // force a flush.
+            let emergency_interval = Duration::from_secs(5).min(self.cfg.prune_interval);
+            let emergency_due = self
+                .last_prune_at
+                .map(|at| at.elapsed() >= emergency_interval)
+                .unwrap_or(true);
+            let last = [self.last_attempt, self.last_prune]
+                .into_iter()
+                .flatten()
+                .max()
+                .unwrap_or(0);
+            // Emergency pruning (low disk) bypasses the gain and the normal
+            // interval, but still requires some new safe height and a durable
+            // index ahead of the cut.
             let advanced = safe > input.core_pruneheight
-                && safe
-                    >= [self.last_attempt, self.last_prune]
-                        .into_iter()
-                        .flatten()
-                        .max()
-                        .unwrap_or(0)
-                        .saturating_add(self.cfg.min_gain);
+                && safe > last
+                && if emergency {
+                    emergency_due
+                } else {
+                    safe >= last.saturating_add(self.cfg.min_gain) && interval_elapsed
+                };
             if advanced && safe > 0 {
                 self.state = State::PruneEligible;
                 actions.push(Action::Prune(safe));
@@ -292,6 +334,7 @@ impl Supervisor {
 
     pub fn on_prune_requested(&mut self, height: u32) {
         self.last_attempt = Some(height);
+        self.last_prune_at = Some(Instant::now());
         self.state = State::Pruning;
     }
 
@@ -319,6 +362,7 @@ mod tests {
             undo_margin: 10,
             core_recent_margin: 10,
             min_gain: 5,
+            prune_interval: Duration::ZERO,
         }
     }
 
@@ -355,14 +399,17 @@ mod tests {
 
     #[test]
     fn lag_limit_respects_core_retention() {
-        // Core's normal 288-block retention caps a 256 configured lag.
-        assert_eq!(lag_limit(1_000, 712, 256), 256);
-        // A larger retention allows the configured value.
-        assert_eq!(lag_limit(1_000, 500, 256), 256);
+        // Huge retention still cannot exceed the hard 288-block floor margin.
+        assert_eq!(lag_limit(1_000, 200, 512), 224);
+        // Core's normal 288-block retention leaves 256 by retention alone,
+        // but the hard safety cap is 224.
+        assert_eq!(lag_limit(1_000, 712, 256), 224);
+        // A larger retention also stops at the hard cap.
+        assert_eq!(lag_limit(1_000, 500, 256), 224);
         // A smaller retention (regtest/fastprune) shrinks the limit.
         assert_eq!(lag_limit(1_000, 950, 256), 18);
-        // Manual pruning (pruneheight 0) uses the configured value.
-        assert_eq!(lag_limit(1_000, 0, 256), 256);
+        // No pruned blocks yet: still cap the automatic guard.
+        assert_eq!(lag_limit(1_000, 0, 256), 224);
         // 0 disables the guard.
         assert_eq!(lag_limit(1_000, 712, 0), 0);
     }
@@ -380,6 +427,7 @@ mod tests {
     fn disk_hysteresis_pauses_once_and_resumes_once() {
         let mut s = Supervisor::new(cfg());
         let mut i = input(100, 200);
+        i.core_pruned = false; // isolate the disk state from the prune gate
         i.free_bytes = Some(50);
         assert_eq!(s.tick(&i), vec![Action::PauseDownloads]);
         assert_eq!(s.state(), State::PauseDownload);
@@ -446,18 +494,45 @@ mod tests {
     }
 
     #[test]
-    fn pause_blocks_pruning() {
+    fn prune_runs_while_downloads_are_paused() {
         let mut s = Supervisor::new(cfg());
         let mut i = input(100, 200);
         i.free_bytes = Some(10);
         assert_eq!(s.tick(&i), vec![Action::PauseDownloads]);
         i.free_bytes = Some(150);
-        // Still paused until the resume watermark.
-        assert_eq!(s.tick(&i), vec![]);
+        // Downloads stay paused, but the prune gate still runs so indexing
+        // can free disk space.
+        assert_eq!(s.tick(&i), vec![Action::Prune(90)]);
+        s.on_pruned(90);
         i.free_bytes = Some(300);
         assert_eq!(s.tick(&i), vec![Action::ResumeDownloads]);
         i.free_bytes = Some(300);
+        assert!(s.tick(&i).is_empty());
+    }
+
+    #[test]
+    fn prune_interval_and_emergency() {
+        let mut c = cfg();
+        c.prune_interval = Duration::from_secs(3600);
+        let mut s = Supervisor::new(c);
+        let mut i = input(100, 200);
         assert_eq!(s.tick(&i), vec![Action::Prune(90)]);
+        s.on_prune_requested(90);
+        s.on_pruned(90);
+        i.committed_height = 110;
+        assert!(
+            s.tick(&i).is_empty(),
+            "time interval must throttle no-op prune requests"
+        );
+
+        // A fresh supervisor with low disk prunes on the next tick even though
+        // the download pause action was emitted first; there is no prior
+        // request to rate-limit.
+        let mut e = Supervisor::new(cfg());
+        let mut low = input(100, 200);
+        low.free_bytes = Some(50);
+        assert_eq!(e.tick(&low), vec![Action::PauseDownloads]);
+        assert_eq!(e.tick(&low), vec![Action::Prune(90)]);
     }
 
     #[test]

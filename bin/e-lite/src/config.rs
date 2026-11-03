@@ -78,8 +78,11 @@ pub struct CoreCfg {
     pub blocks_dir: Option<String>,
     #[serde(default = "d_timeout")]
     pub timeout_seconds: u64,
-    /// Core prune target in MiB. 550 is Core's minimum (maximum pruning);
-    /// 0 means a full node. Only applied when e-lite launches Core.
+    /// Core prune target in MiB. `1` enables manual pruning, where e-lite is
+    /// the only component allowed to call `pruneblockchain`; this is the safe
+    /// default for a from-zero pruned IBD. `0` is a full node. Values >= 550
+    /// enable Core's automatic pruning and require [pruning]
+    /// allow_auto_prune = true.
     #[serde(default = "d_prune_mib")]
     pub prune_mib: u64,
     /// Extra arguments passed to bitcoind when e-lite launches it.
@@ -199,14 +202,37 @@ pub struct SilentPaymentsCfg {
 #[derive(Debug, Clone, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PruningCfg {
-    /// Pause Core downloads and the indexer when free space is below this.
+    /// Pause Core downloads when free space is below this. The indexer keeps
+    /// draining already-downloaded blocks so it can prune and free space.
     #[serde(default = "d_min_free")]
     pub min_free_gib: u64,
-    /// Pause Core when the index lags more than this. The effective value is
-    /// capped by Core's own retention window (`blocks - pruneheight`).
-    /// 0 disables the guard.
+    /// Stop indexing as well when free space falls below this hard floor.
+    /// Must be lower than `min_free_gib`.
+    #[serde(default = "d_critical_free")]
+    pub critical_free_gib: u64,
+    /// Pause Core when the index lags more than this. Only used for automatic
+    /// pruning (`prune_mib >= 550`); manual pruning is bounded by the prune
+    /// gate instead. The effective value is capped at 224 blocks, below Core's
+    /// hard `MIN_BLOCKS_TO_KEEP` (288) floor.
     #[serde(default = "d_max_lag")]
     pub max_core_lag_blocks: u32,
+    /// Automatic pruning during IBD can delete a block before it is indexed.
+    /// It therefore requires this explicit opt-in. From zero, use
+    /// `prune_mib = 1` (manual) or `0` (full node).
+    #[serde(default)]
+    pub allow_auto_prune: bool,
+    /// Minimum safe-height gain between `pruneblockchain` requests. Core
+    /// prunes whole files, so a small value produces no-op calls and flushes.
+    #[serde(default = "d_min_gain")]
+    pub min_gain_blocks: u32,
+    /// Minimum wall-clock interval between prune requests. Low disk bypasses
+    /// this with an emergency prune.
+    #[serde(default = "d_prune_interval")]
+    pub prune_interval_seconds: u64,
+    /// Largest prune gap the indexer may repair from verified external block
+    /// sources (cache/P2P/Esplora). Larger gaps fail closed.
+    #[serde(default = "d_repair_max_gap")]
+    pub repair_max_gap_blocks: u32,
     #[serde(default = "d_poll")]
     pub poll_seconds: u64,
 }
@@ -215,7 +241,12 @@ impl Default for PruningCfg {
     fn default() -> Self {
         PruningCfg {
             min_free_gib: d_min_free(),
+            critical_free_gib: d_critical_free(),
             max_core_lag_blocks: d_max_lag(),
+            allow_auto_prune: false,
+            min_gain_blocks: d_min_gain(),
+            prune_interval_seconds: d_prune_interval(),
+            repair_max_gap_blocks: d_repair_max_gap(),
             poll_seconds: d_poll(),
         }
     }
@@ -281,7 +312,7 @@ fn d_timeout() -> u64 {
     30
 }
 fn d_prune_mib() -> u64 {
-    550
+    1
 }
 fn d_batch() -> u32 {
     256
@@ -307,8 +338,20 @@ fn d_metrics() -> String {
 fn d_min_free() -> u64 {
     10
 }
+fn d_critical_free() -> u64 {
+    1
+}
 fn d_max_lag() -> u32 {
-    512
+    192
+}
+fn d_min_gain() -> u32 {
+    288
+}
+fn d_prune_interval() -> u64 {
+    30
+}
+fn d_repair_max_gap() -> u32 {
+    2048
 }
 fn d_poll() -> u64 {
     10
@@ -422,6 +465,32 @@ impl Config {
         if self.pruning.min_free_gib == 0 {
             return Err("[pruning] min_free_gib must be >= 1".to_string());
         }
+        if self.pruning.min_gain_blocks == 0 {
+            return Err("[pruning] min_gain_blocks must be >= 1".to_string());
+        }
+        if self.pruning.prune_interval_seconds == 0 {
+            return Err("[pruning] prune_interval_seconds must be >= 1".to_string());
+        }
+        if self.pruning.repair_max_gap_blocks == 0 {
+            return Err("[pruning] repair_max_gap_blocks must be >= 1".to_string());
+        }
+        if self.core.prune_mib >= 550 {
+            if !self.pruning.allow_auto_prune {
+                return Err(
+                    "automatic pruning during IBD can delete blocks before they are indexed. \
+                     From zero use [core] prune_mib = 1 (manual) or 0 (full node); to opt in \
+                     anyway set [pruning] allow_auto_prune = true"
+                        .to_string(),
+                );
+            }
+            if self.pruning.max_core_lag_blocks == 0 {
+                return Err(
+                    "[pruning] max_core_lag_blocks = 0 disables the lag guard, which is not \
+                     allowed with automatic pruning"
+                        .to_string(),
+                );
+            }
+        }
         if self.core.manage == CoreManage::Managed && self.network.name == "auto" {
             return Err(
                 "[core] manage = managed needs an explicit [network] name (not auto)".to_string(),
@@ -469,9 +538,9 @@ mod tests {
         let cfg = Config::default();
         assert_eq!(cfg.network.name, "auto");
         assert_eq!(cfg.core.manage, CoreManage::Auto);
-        assert_eq!(cfg.core.prune_mib, 550);
+        assert_eq!(cfg.core.prune_mib, 1);
         assert_eq!(cfg.index.reorg_window, 288);
-        assert_eq!(cfg.pruning.max_core_lag_blocks, 512);
+        assert_eq!(cfg.pruning.max_core_lag_blocks, 192);
         assert_eq!(cfg.rawtx.cache_mib, 2048);
         assert!(cfg.rawtx.esplora_urls.is_empty());
     }
@@ -481,6 +550,17 @@ mod tests {
         let mut cfg = Config::default();
         cfg.core.core_datadir = Some("/srv/bitcoin".to_string());
         cfg.network.data_dir = Some("/srv/bitcoin/e-lite".to_string());
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn automatic_pruning_requires_explicit_opt_in() {
+        let mut cfg = Config::default();
+        cfg.core.prune_mib = 550;
+        assert!(cfg.validate().is_err());
+        cfg.pruning.allow_auto_prune = true;
+        assert!(cfg.validate().is_ok());
+        cfg.pruning.max_core_lag_blocks = 0;
         assert!(cfg.validate().is_err());
     }
 

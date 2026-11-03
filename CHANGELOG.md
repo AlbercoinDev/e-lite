@@ -1,5 +1,37 @@
 # Changelog
 
+## 0.1.0-alpha.13 — 2026-11-03
+
+### From-zero pruned IBD is manual by default
+
+- **`prune_mib` defaults to `1` (manual pruning).** Core no longer deletes block
+  files on its own during IBD. e-lite's prune gate is the only pruning
+  authority: it never requests a cut above `committed - 288`, so Core cannot
+  prune a block the index still needs. `0` remains a full node.
+- **Automatic pruning requires an explicit opt-in.** `prune_mib >= 550` is
+  rejected unless `[pruning] allow_auto_prune = true`. This prevents the
+  from-zero default from recreating the prune-gap race.
+- **Lag guard is manual-mode aware.** It is skipped for `prune_mib = 1`. For
+  automatic pruning, `lag_limit` is hard-capped at 224 blocks (64 below Core's
+  288-block floor), the default is 192, it resumes at 50 %, and the live check
+  runs every 100 ms instead of once per second.
+- **Disk backpressure keeps draining.** Below `min_free_gib` Core downloads
+  pause but indexing continues, so the prune gate can delete old block files and
+  free space. Only below `critical_free_gib` does indexing stop. This removes
+  the old all-stop deadlock.
+- **Prune requests are cheaper.** `min_gain_blocks` defaults to 288 and a new
+  `prune_interval_seconds` (default 30) throttles no-op `pruneblockchain` calls
+  that made Core flush during IBD. Low disk bypasses both as an emergency prune.
+- **Prune-gap repair.** If automatic pruning still leaves a gap (or an existing
+  index is behind an externally pruned Core), the indexer can fetch only the
+  missing blocks from the validated rawtx cache, P2P or Esplora sources,
+  verify hash/merkle, and continue. `repair_max_gap_blocks` (default 2048)
+  bounds the work. No snapshot or full-chain backup is created.
+- **Progress lines show live Core/prune height.** The per-call snapshot is no
+  longer used as live lag, so a stale `lag 0` cannot hide a prune race.
+- **Scripts and docs** use `prune_mib = 1` for from-zero signet/testnet4 runs.
+  No snapshot is required or created by the flow.
+
 ## 0.1.0-alpha.12 — 2026-11-02
 
 ### Download and prune fixes

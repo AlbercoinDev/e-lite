@@ -63,6 +63,8 @@ fn classify_error(msg: &str) -> ErrorClass {
         "index behind pruneheight",
         "core is pruned and the index is empty",
         "core is pruned from height",
+        "repair failed",
+        "no repair source",
         "database belongs to",
     ]
     .iter()
@@ -457,6 +459,17 @@ fn disk_low_bytes(cfg: &Config) -> u64 {
     cfg.pruning.min_free_gib.saturating_mul(GIB_BYTES)
 }
 
+fn disk_critical_bytes(cfg: &Config) -> u64 {
+    let configured = cfg.pruning.critical_free_gib.saturating_mul(GIB_BYTES);
+    if configured == 0 {
+        return 0;
+    }
+    // Keep at least a small drain window below the download pause threshold.
+    configured
+        .min(disk_low_bytes(cfg).saturating_sub(GIB_BYTES / 4))
+        .max(1)
+}
+
 /// Resume watermark: half the low threshold, clamped to 512 MiB..5 GiB. This
 /// avoids the "never resumes on a small disk" problem of a fixed +5 GiB.
 fn disk_resume_bytes(cfg: &Config) -> u64 {
@@ -846,7 +859,7 @@ fn cmd_doctor(cfg: &Config, chain: Chain) -> R<()> {
                     );
                 } else {
                     problems.push(
-                        "Core is pruned and the index is empty: build it with a full node or restore a snapshot"
+                        "Core is pruned and the index is empty: use a full node, or let e-lite own Core with [core] prune_mib = 1"
                             .to_string(),
                     );
                 }
@@ -1031,6 +1044,7 @@ struct Indexer {
     store: Arc<Store>,
     core: CoreClient,
     bulk: Option<Arc<el_blocks::BulkSource>>,
+    resolver: Option<Arc<Resolver>>,
     cfg: Config,
     lock: Arc<RwLock<()>>,
     shared: Option<Arc<Shared>>,
@@ -1038,6 +1052,11 @@ struct Indexer {
     readers: Option<Arc<ReaderTracker>>,
     can_control_core: bool,
     lag_paused: AtomicBool,
+    /// Core downloads are paused (disk pressure, lag guard or manual pause),
+    /// but indexing of already-downloaded blocks may continue.
+    downloads_paused: AtomicBool,
+    /// Indexing itself is paused. Only the critical disk floor or shutdown set
+    /// this; it is separate from pausing Core downloads.
     paused: AtomicBool,
     pause_marker: std::path::PathBuf,
     data_dir: std::path::PathBuf,
@@ -1048,7 +1067,10 @@ struct Indexer {
 impl Drop for Indexer {
     fn drop(&mut self) {
         // Never leave Core with P2P disabled after a clean e-lite shutdown.
-        if self.can_control_core && self.lag_paused.load(Ordering::Relaxed) {
+        if self.can_control_core
+            && (self.lag_paused.load(Ordering::Relaxed)
+                || self.downloads_paused.load(Ordering::Relaxed))
+        {
             let _ = self.core.set_network_active(true);
             self.mark_paused(false);
             if let Some(sh) = &self.shared {
@@ -1064,6 +1086,7 @@ impl Indexer {
         store: Arc<Store>,
         core: CoreClient,
         bulk: Option<Arc<el_blocks::BulkSource>>,
+        resolver: Option<Arc<Resolver>>,
         cfg: Config,
         lock: Arc<RwLock<()>>,
         shared: Option<Arc<Shared>>,
@@ -1079,6 +1102,7 @@ impl Indexer {
             store,
             core,
             bulk,
+            resolver,
             cfg,
             lock,
             shared,
@@ -1086,6 +1110,7 @@ impl Indexer {
             readers,
             can_control_core,
             lag_paused: AtomicBool::new(false),
+            downloads_paused: AtomicBool::new(false),
             paused: AtomicBool::new(false),
             pause_marker,
             data_dir,
@@ -1098,9 +1123,17 @@ impl Indexer {
         }
     }
 
-    /// Stop writing immediately when either the index disk or Core's disk is
-    /// nearly full. This check is independent of Core RPC so it still works
-    /// while Core is loading the block index or unreachable.
+    /// Disk backpressure with two levels:
+    ///
+    /// * below `min_free_gib`: pause Core downloads, but keep indexing the
+    ///   blocks already on disk. The index can then advance and the prune gate
+    ///   can delete old block files, which is what actually frees space.
+    /// * below `critical_free_gib`: also pause indexing, to avoid filling the
+    ///   index filesystem. Indexing resumes as soon as free space recovers
+    ///   above the critical floor, even while downloads remain paused.
+    ///
+    /// This check is independent of Core RPC so it still works while Core is
+    /// loading its block index or is unreachable.
     fn disk_guard(&self) -> bool {
         let low = disk_low_bytes(&self.cfg);
         if low == 0 {
@@ -1127,31 +1160,126 @@ impl Indexer {
         let Some(free) = free else {
             return false;
         };
+        let critical = disk_critical_bytes(&self.cfg);
         let resume = disk_resume_bytes(&self.cfg);
-        if self.is_paused() && free >= resume {
-            self.set_paused(false);
-            if let Some(sh) = &self.shared {
-                sh.stats.disk_low.store(false, Ordering::Relaxed);
+
+        // Enough space: resume indexing first, then downloads.
+        if free >= resume {
+            if self.is_paused() {
+                self.set_paused(false);
+                if !self.can_control_core {
+                    if let Some(sh) = &self.shared {
+                        sh.stats.disk_low.store(false, Ordering::Relaxed);
+                    }
+                }
+                eprintln!(
+                    "[e-lite] disk recovered: {} MiB free; resumed indexing",
+                    free / (1024 * 1024)
+                );
             }
+            if self.downloads_paused() {
+                self.resume_downloads("disk recovered");
+            }
+            return false;
+        }
+
+        // Hard floor: both writers stop.
+        if free < critical {
+            if !self.is_paused() {
+                self.set_paused(true);
+                if let Some(sh) = &self.shared {
+                    sh.stats.disk_low.store(true, Ordering::Relaxed);
+                    sh.set_state(state::PAUSE_DOWNLOAD);
+                }
+                eprintln!(
+                    "[e-lite] disk critical: {} MiB free (floor {} MiB); paused indexing",
+                    free / (1024 * 1024),
+                    critical / (1024 * 1024)
+                );
+            }
+            if self.can_control_core {
+                self.pause_downloads("disk critical");
+            }
+            return true;
+        }
+
+        // Between the critical floor and the low watermark: stop new blocks,
+        // keep draining the backlog so pruning can free space. An external
+        // Core cannot be paused, so indexing must stop instead.
+        if self.is_paused() && self.can_control_core {
+            self.set_paused(false);
             eprintln!(
-                "[e-lite] disk recovered: {} MiB free; resumed indexing",
+                "[e-lite] disk above critical floor: {} MiB free; resumed indexing while downloads stay paused",
                 free / (1024 * 1024)
             );
         }
-        if !self.is_paused() && free < low {
-            self.set_paused(true);
-            if let Some(sh) = &self.shared {
-                sh.stats.disk_low.store(true, Ordering::Relaxed);
-                sh.set_state(state::PAUSE_DOWNLOAD);
+        if !self.can_control_core {
+            if !self.is_paused() {
+                self.set_paused(true);
+                if let Some(sh) = &self.shared {
+                    sh.stats.disk_low.store(true, Ordering::Relaxed);
+                    sh.set_state(state::PAUSE_DOWNLOAD);
+                }
+                eprintln!(
+                    "[e-lite] disk low: {} MiB free (threshold {} MiB); paused indexing (Core is external)",
+                    free / (1024 * 1024),
+                    low / (1024 * 1024)
+                );
             }
-            eprintln!(
-                "[e-lite] disk low: {} MiB free (threshold {} MiB); paused indexing",
-                free / (1024 * 1024),
-                low / (1024 * 1024)
-            );
             return true;
         }
-        self.is_paused()
+        self.pause_downloads("disk low");
+        false
+    }
+
+    fn downloads_paused(&self) -> bool {
+        self.downloads_paused.load(Ordering::SeqCst)
+    }
+
+    /// Pause Core's P2P downloads without stopping indexing. The marker lets a
+    /// later e-lite run restore `networkactive` after a crash.
+    fn pause_downloads(&self, reason: &str) {
+        if self.downloads_paused.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        self.mark_paused(true);
+        if self.can_control_core {
+            if let Err(e) = self.core.set_network_active(false) {
+                eprintln!("[e-lite] cannot pause Core downloads: {e}");
+            }
+        }
+        if let Some(sh) = &self.shared {
+            sh.stats.core_network_active.store(false, Ordering::Relaxed);
+            sh.stats.disk_low.store(true, Ordering::Relaxed);
+            sh.set_state(state::PAUSE_DOWNLOAD);
+        }
+        eprintln!("[e-lite] {reason}: paused Core downloads");
+    }
+
+    fn resume_downloads(&self, reason: &str) {
+        if !self.downloads_paused.swap(false, Ordering::SeqCst) {
+            return;
+        }
+        if self.lag_paused.load(Ordering::SeqCst) {
+            // A live lag pause still owns the network; keep the marker.
+            if let Some(sh) = &self.shared {
+                sh.stats.disk_low.store(false, Ordering::Relaxed);
+            }
+            eprintln!("[e-lite] {reason}: disk pressure cleared; Core stays paused by lag guard");
+            return;
+        }
+        self.mark_paused(false);
+        if self.can_control_core {
+            if let Err(e) = self.core.set_network_active(true) {
+                eprintln!("[e-lite] cannot resume Core downloads: {e}");
+            }
+        }
+        if let Some(sh) = &self.shared {
+            sh.stats.core_network_active.store(true, Ordering::Relaxed);
+            sh.stats.disk_low.store(false, Ordering::Relaxed);
+            sh.set_state(state::BUILDING);
+        }
+        eprintln!("[e-lite] {reason}: resumed Core downloads");
     }
 
     fn mark_paused(&self, paused: bool) {
@@ -1167,9 +1295,6 @@ impl Indexer {
 
     fn set_paused(&self, paused: bool) {
         self.paused.store(paused, Ordering::SeqCst);
-        if let Some(sh) = &self.shared {
-            sh.stats.disk_low.store(paused, Ordering::Relaxed);
-        }
     }
 
     fn is_paused(&self) -> bool {
@@ -1180,6 +1305,19 @@ impl Indexer {
         if let Some(sh) = &self.shared {
             sh.stats.core_height.store(h, Ordering::Relaxed);
         }
+    }
+
+    /// Live Core tip and pruneheight for progress lines. Falls back to the
+    /// catch-up snapshot when Core is briefly unavailable.
+    fn live_core_and_prune(&self, fallback_core: u64, fallback_prune: u64) -> (u64, u64) {
+        let core = self.core.block_count().unwrap_or(fallback_core);
+        let prune = self
+            .shared
+            .as_ref()
+            .map(|sh| sh.stats.core_pruneheight.load(Ordering::Relaxed))
+            .filter(|h| *h > 0)
+            .unwrap_or(fallback_prune);
+        (core.max(fallback_core), prune)
     }
 
     fn refresh_core_height(&self) {
@@ -1307,12 +1445,16 @@ impl Indexer {
 
     /// Pause Core's P2P when automatic pruning would outrun the index. Core
     /// keeps at least `MIN_BLOCKS_TO_KEEP` (288) blocks, so the safe lag is
-    /// derived from the real retention window rather than a fixed 32.
+    /// capped well below that floor.
     ///
-    /// Only a Core owned by e-lite is ever paused. A Core that was already
-    /// running (external/remote) is never touched.
+    /// Manual pruning (`prune_mib = 1`) does not use this guard: Core cannot
+    /// delete a block on its own, and the prune gate already keeps the cut
+    /// below the committed index. Only a Core owned by e-lite is ever paused.
     fn lag_guard(&self, info: &BlockchainInfo, committed: u64) {
-        if !self.can_control_core || self.cfg.pruning.max_core_lag_blocks == 0 {
+        if !self.can_control_core
+            || self.cfg.pruning.max_core_lag_blocks == 0
+            || self.cfg.core.prune_mib == 1
+        {
             return;
         }
         let paused = self.lag_paused.load(Ordering::Relaxed);
@@ -1349,7 +1491,7 @@ impl Indexer {
             info.pruneheight.min(u32::MAX as u64) as u32,
             self.cfg.pruning.max_core_lag_blocks,
         ) as u64;
-        let resume = (limit * 3 / 4).max(1);
+        let resume = (limit / 2).max(1);
         let lag = info.blocks.saturating_sub(committed);
         let reader_pressure = self
             .readers
@@ -1375,6 +1517,11 @@ impl Indexer {
                 Err(e) => eprintln!("[e-lite] cannot pause Core downloads: {e}"),
             }
         } else if paused && lag <= resume && !reader_pressure {
+            if self.downloads_paused() {
+                // Keep Core paused: disk backpressure still owns the network.
+                self.lag_paused.store(false, Ordering::Relaxed);
+                return;
+            }
             match self.core.set_network_active(true) {
                 Ok(_) => {
                     self.lag_paused.store(false, Ordering::Relaxed);
@@ -1422,6 +1569,7 @@ impl Indexer {
         // must resume at its own watermark (75% of the limit).
         if self.can_control_core
             && !self.lag_paused.load(Ordering::Relaxed)
+            && !self.downloads_paused()
             && self.pause_marker.is_file()
             && self.core.set_network_active(true).is_ok()
         {
@@ -1435,20 +1583,25 @@ impl Indexer {
         if self.is_paused() {
             return Ok(tip_at_start.map(|t| t.height as u64).unwrap_or(0));
         }
-        check_pruned(&info, tip_at_start.as_ref())?;
+        let repair_limit = self
+            .resolver
+            .as_ref()
+            .filter(|r| r.has_repair_sources())
+            .map(|_| self.cfg.pruning.repair_max_gap_blocks as u64);
+        check_pruned(&info, tip_at_start.as_ref(), repair_limit)?;
         // Pruned IBD from scratch is local-only and requires a Core owned by
         // e-lite, so the lag guard can pause it before it prunes.
         if info.pruned && tip_at_start.is_none() {
             if self.bulk.is_none() {
                 return fail(
                     "Core is pruned and the index is empty: pruned IBD requires a local Core \
-                     blocks directory (run e-lite on the Core host) or a snapshot",
+                     blocks directory (run e-lite on the Core host) and [core] prune_mib = 1",
                 );
             }
             if !self.can_control_core {
                 return fail(
                     "Core is pruned and the index is empty, but e-lite did not start Core; \
-                     stop Core and use [core] manage = \"managed\" (or use a full node/snapshot)",
+                     stop Core and use [core] manage = \"managed\" with prune_mib = 1, or use a full node",
                 );
             }
         }
@@ -1489,6 +1642,8 @@ impl Indexer {
         for _ in 0..workers {
             let core = self.core.clone();
             let bulk = self.bulk.clone();
+            let resolver = self.resolver.clone();
+            let pruneheight = info.pruneheight;
             let hashes = Arc::clone(&hashes);
             let next_index = Arc::clone(&next_index);
             let stop_thread = Arc::clone(&stop);
@@ -1502,7 +1657,14 @@ impl Indexer {
                     break;
                 }
                 let h = start + i as u64;
-                let item = fetch_block(&core, &bulk, h, &hashes[i]);
+                let item = fetch_block(
+                    &core,
+                    &bulk,
+                    resolver.as_deref(),
+                    pruneheight,
+                    h,
+                    &hashes[i],
+                );
                 if tx.send((i, item)).is_err() {
                     break;
                 }
@@ -1592,9 +1754,32 @@ impl Indexer {
                     tip = Some(out.tip);
                     count += 1;
                     last_ms = t0.elapsed().as_millis() as u64;
-                    if info.pruned && last_lag_check.elapsed() >= Duration::from_secs(1) {
+                    if self.cfg.core.prune_mib >= 550
+                        && info.pruned
+                        && last_lag_check.elapsed() >= Duration::from_millis(100)
+                    {
                         if let Ok(live) = self.core.blockchain_info() {
+                            self.stats_core_height(live.blocks);
+                            if let Some(sh) = &self.shared {
+                                sh.stats
+                                    .core_pruneheight
+                                    .store(live.pruneheight, Ordering::Relaxed);
+                                sh.stats.core_pruned.store(live.pruned, Ordering::Relaxed);
+                                sh.stats
+                                    .core_ibd
+                                    .store(live.initialblockdownload, Ordering::Relaxed);
+                            }
                             let committed = tip.map(|t| t.height as u64).unwrap_or(0);
+                            if live.pruneheight > committed.saturating_add(1) {
+                                eprintln!(
+                                    "[e-lite] WARNING: Core pruned to {} but the index is at {}; \
+                                     blocks {}..{} are no longer available",
+                                    live.pruneheight,
+                                    committed,
+                                    committed + 1,
+                                    live.pruneheight.saturating_sub(1)
+                                );
+                            }
                             self.lag_guard(&live, committed);
                         }
                         last_lag_check = Instant::now();
@@ -1617,12 +1802,15 @@ impl Indexer {
                     break;
                 }
                 committed_height = current.height as u64;
+                let (live_core, live_prune) =
+                    self.live_core_and_prune(info.blocks, info.pruneheight);
                 print_progress(
                     &current,
                     started,
                     start_height,
                     start_txnum,
-                    info.blocks,
+                    live_core,
+                    live_prune,
                     info.initialblockdownload,
                 );
                 if let Some(sh) = &self.shared {
@@ -1643,12 +1831,14 @@ impl Indexer {
             let current = tip.expect("tip set");
             self.commit_group(std::mem::take(&mut batch), &current, &group_txids, last_ms)?;
             committed_height = current.height as u64;
+            let (live_core, live_prune) = self.live_core_and_prune(info.blocks, info.pruneheight);
             print_progress(
                 &current,
                 started,
                 start_height,
                 start_txnum,
-                info.blocks,
+                live_core,
+                live_prune,
                 info.initialblockdownload,
             );
             if let Some(sh) = &self.shared {
@@ -1680,11 +1870,32 @@ impl Indexer {
 fn fetch_block(
     core: &CoreClient,
     bulk: &Option<Arc<el_blocks::BulkSource>>,
+    resolver: Option<&Resolver>,
+    pruneheight: u64,
     height: u64,
     hash: &str,
 ) -> std::result::Result<(u64, String, Vec<u8>), String> {
+    let expected = Hash32::from_hex(hash).map_err(|e| e.to_string())?;
+
+    // A prune gap cannot be served by Core or the local block files. Fetch the
+    // missing block from a verified cache/P2P/Esplora source instead. This path
+    // is never used for heights Core can still serve.
+    let mut repair_error = None;
+    if height.saturating_add(1) <= pruneheight {
+        if let Some(resolver) = resolver {
+            match resolver.fetch_block_by_hash(&expected) {
+                Ok(bytes) => {
+                    eprintln!(
+                        "[e-lite] repaired pruned block {height} ({hash}) from a verified source"
+                    );
+                    return Ok((height, hash.to_string(), bytes));
+                }
+                Err(e) => repair_error = Some(e.to_string()),
+            }
+        }
+    }
+
     if let Some(bulk) = bulk {
-        let expected = Hash32::from_hex(hash).map_err(|e| e.to_string())?;
         if let Ok(Some(bytes)) = bulk.fetch(&expected) {
             return Ok((height, hash.to_string(), bytes));
         }
@@ -1701,9 +1912,20 @@ fn fetch_block(
             }
         }
     }
-    let raw = core.block_hex(hash).map_err(|e| e.to_string())?;
-    let bytes = hex::decode(&raw).map_err(|e| e.to_string())?;
-    Ok((height, hash.to_string(), bytes))
+    match core.block_hex(hash) {
+        Ok(raw) => {
+            let bytes = hex::decode(&raw).map_err(|e| e.to_string())?;
+            Ok((height, hash.to_string(), bytes))
+        }
+        Err(e) => {
+            let mut msg = e.to_string();
+            if let Some(repair) = repair_error {
+                msg.push_str("; repair failed: ");
+                msg.push_str(&repair);
+            }
+            Err(msg)
+        }
+    }
 }
 
 fn print_progress(
@@ -1712,6 +1934,7 @@ fn print_progress(
     start_height: u32,
     start_txnum: u64,
     core_height: u64,
+    pruneheight: u64,
     ibd: bool,
 ) {
     let secs = started.elapsed().as_secs_f64().max(0.001);
@@ -1719,11 +1942,12 @@ fn print_progress(
     let txs = tip.txnum.saturating_sub(start_txnum) as f64;
     let lag = core_height.saturating_sub(tip.height as u64);
     eprintln!(
-        "[e-lite] height {}  txnum {}  core {}  lag {}  {:.1} blocks/s  {:.0} tx/s  \
+        "[e-lite] height {}  txnum {}  core {}  prune {}  lag {}  {:.1} blocks/s  {:.0} tx/s  \
          elapsed {:.1}s{}",
         tip.height,
         tip.txnum,
         core_height,
+        pruneheight,
         lag,
         blocks / secs,
         txs / secs,
@@ -1737,12 +1961,14 @@ fn supervisor_config(cfg: &Config, can_control_core: bool) -> el_chain::Supervis
         disk_enabled: true,
         disk_low_bytes: disk_low_bytes(cfg),
         disk_resume_bytes: disk_resume_bytes(cfg),
-        // Only a Core owned by e-lite may be pruned manually. Automatic
-        // pruning (`-prune=NNN`) is handled by Core itself and the lag guard.
+        // Only a Core owned by e-lite may be pruned. With manual pruning
+        // (`prune_mib = 1`) this is the only pruning authority. With automatic
+        // pruning it is an additional, conservative gate.
         prune_enabled: can_control_core,
         undo_margin: cfg.index.reorg_window,
         core_recent_margin: 288,
-        min_gain: 64,
+        min_gain: cfg.pruning.min_gain_blocks,
+        prune_interval: Duration::from_secs(cfg.pruning.prune_interval_seconds),
     }
 }
 
@@ -1814,40 +2040,61 @@ fn apply_supervisor_actions(
         match action {
             el_chain::Action::PauseDownloads => {
                 if let Some(i) = idx {
-                    i.set_paused(true);
                     if can_control_core {
-                        i.mark_paused(true);
-                    }
-                }
-                if let Some(sh) = shared {
-                    sh.stats.disk_low.store(true, Ordering::Relaxed);
-                    sh.set_state(state::PAUSE_DOWNLOAD);
-                }
-                if can_control_core {
-                    match core.set_network_active(false) {
-                        Ok(_) => eprintln!("[e-lite] disk low: paused Core downloads and indexing"),
-                        Err(e) => eprintln!("[e-lite] cannot pause Core downloads: {e}"),
+                        // Pause Core only; keep indexing/probing so the prune
+                        // gate can free space.
+                        i.pause_downloads("disk low");
+                    } else if !i.is_paused() {
+                        // An external Core cannot be paused. Stop indexing to
+                        // protect the disk instead.
+                        i.set_paused(true);
+                        i.mark_paused(false);
+                        if let Some(sh) = shared {
+                            sh.stats.disk_low.store(true, Ordering::Relaxed);
+                            sh.set_state(state::PAUSE_DOWNLOAD);
+                        }
+                        eprintln!("[e-lite] disk low: paused indexing (Core is external)");
                     }
                 } else {
-                    eprintln!("[e-lite] disk low: paused indexing (Core is external)");
+                    if let Some(sh) = shared {
+                        sh.stats.disk_low.store(true, Ordering::Relaxed);
+                        sh.set_state(state::PAUSE_DOWNLOAD);
+                    }
+                    if can_control_core {
+                        match core.set_network_active(false) {
+                            Ok(_) => eprintln!("[e-lite] disk low: paused Core downloads"),
+                            Err(e) => eprintln!("[e-lite] cannot pause Core downloads: {e}"),
+                        }
+                    } else {
+                        eprintln!("[e-lite] disk low: paused indexing (Core is external)");
+                    }
                 }
             }
             el_chain::Action::ResumeDownloads => {
                 if let Some(i) = idx {
-                    i.set_paused(false);
-                    i.mark_paused(false);
-                }
-                if let Some(sh) = shared {
-                    sh.stats.disk_low.store(false, Ordering::Relaxed);
-                    sh.set_state(state::READY);
-                }
-                if can_control_core {
-                    match core.set_network_active(true) {
-                        Ok(_) => eprintln!("[e-lite] disk recovered: resumed Core downloads"),
-                        Err(e) => eprintln!("[e-lite] cannot resume Core downloads: {e}"),
+                    if can_control_core {
+                        i.resume_downloads("disk recovered");
+                    } else {
+                        i.set_paused(false);
+                        if let Some(sh) = shared {
+                            sh.stats.disk_low.store(false, Ordering::Relaxed);
+                            sh.set_state(state::READY);
+                        }
+                        eprintln!("[e-lite] disk recovered: resumed indexing");
                     }
                 } else {
-                    eprintln!("[e-lite] disk recovered: resumed indexing");
+                    if let Some(sh) = shared {
+                        sh.stats.disk_low.store(false, Ordering::Relaxed);
+                        sh.set_state(state::READY);
+                    }
+                    if can_control_core {
+                        match core.set_network_active(true) {
+                            Ok(_) => eprintln!("[e-lite] disk recovered: resumed Core downloads"),
+                            Err(e) => eprintln!("[e-lite] cannot resume Core downloads: {e}"),
+                        }
+                    } else {
+                        eprintln!("[e-lite] disk recovered: resumed indexing");
+                    }
                 }
             }
             el_chain::Action::Prune(height) => {
@@ -1910,6 +2157,7 @@ fn cmd_index(cfg: &Config, chain: Chain) -> R<()> {
         store,
         core,
         bulk,
+        None,
         cfg.clone(),
         Arc::new(RwLock::new(())),
         None,
@@ -2074,7 +2322,7 @@ fn index_loop(
                     .unwrap_or(false);
                 if let Some(sh) = &shared {
                     let caught_up = !core_ibd && height + 1 >= core_height;
-                    let next = if idx.is_paused() || supervisor.paused() {
+                    let next = if idx.is_paused() || idx.downloads_paused() || supervisor.paused() {
                         state::PAUSE_DOWNLOAD
                     } else if caught_up {
                         state::READY
@@ -2127,27 +2375,37 @@ fn index_loop(
             }
         }
         if idx.is_paused() {
-            // While paused, only the disk guard runs. Do not call Core RPC:
-            // Core may be busy or unreachable, and the disk is the priority.
-            let mut actions = Vec::new();
-            if !supervisor.paused() {
-                // The indexer may have paused first; make sure the supervisor
-                // will also pause Core and later resume at the same watermark.
-                actions.extend(supervisor.force_disk_pause());
-            }
-            actions.extend(supervisor.disk_tick(min_free_bytes(cfg, chain)));
-            if !actions.is_empty() {
-                apply_supervisor_actions(
+            // Indexing is stopped by the critical disk floor. Still run the
+            // supervisor so the prune gate can delete old Core block files and
+            // free space; without this the system cannot recover on its own.
+            // Check every second, not every poll, because the disk is critical.
+            if last_tick.elapsed() >= Duration::from_secs(1) {
+                match supervisor_tick(
                     &mut supervisor,
                     &idx.core,
-                    actions,
+                    &idx.store,
+                    idx.readers.as_deref(),
+                    &cfg.data_dir(chain),
+                    &cfg.core_datadir(),
                     shared.as_ref(),
-                    Some(&idx),
-                    can_control,
-                );
+                ) {
+                    Ok(actions) => apply_supervisor_actions(
+                        &mut supervisor,
+                        &idx.core,
+                        actions,
+                        shared.as_ref(),
+                        Some(&idx),
+                        can_control,
+                    ),
+                    Err(e) => eprintln!("[e-lite] supervisor: {e}"),
+                }
+                last_tick = Instant::now();
+            } else {
+                std::thread::sleep(Duration::from_millis(200));
             }
-            last_tick = Instant::now();
-        } else if last_tick.elapsed() >= poll {
+        } else if last_tick.elapsed() >= poll
+            || (idx.downloads_paused() && last_tick.elapsed() >= Duration::from_secs(1))
+        {
             match supervisor_tick(
                 &mut supervisor,
                 &idx.core,
@@ -2173,7 +2431,11 @@ fn index_loop(
 }
 
 /// A pruned Core can serve only if the local index already covers the gap.
-fn check_pruned(info: &BlockchainInfo, tip: Option<&IndexedTip>) -> R<()> {
+fn check_pruned(
+    info: &BlockchainInfo,
+    tip: Option<&IndexedTip>,
+    repair_max_gap: Option<u64>,
+) -> R<()> {
     if !info.pruned {
         return Ok(());
     }
@@ -2185,17 +2447,33 @@ fn check_pruned(info: &BlockchainInfo, tip: Option<&IndexedTip>) -> R<()> {
                 return Ok(());
             }
             return fail(
-                "Core is pruned and the index is empty: build the index with a full node or restore a snapshot",
+                "Core is pruned and the index is empty: use a full node, or let e-lite own Core \
+                 with [core] prune_mib = 1 (manual pruning) so it can index before pruning",
             );
         }
     };
     if (tip.height as u64) + 1 < info.pruneheight {
+        let first = tip.height as u64 + 1;
+        let gap = info.pruneheight.saturating_sub(first);
+        if let Some(max) = repair_max_gap {
+            if gap <= max {
+                eprintln!(
+                    "[e-lite] prune gap of {gap} blocks ({first}..{}): fetching verified blocks \
+                     from the repair sources",
+                    info.pruneheight.saturating_sub(1)
+                );
+                return Ok(());
+            }
+        }
         return fail(format!(
-            "Core is pruned from height {} but the index stops at {}; blocks {}..{} are unavailable. Use a full node to build the index or restore a snapshot.",
+            "Core is pruned from height {} but the index stops at {}; blocks {}..{} are unavailable \
+             (gap {}). Use a full node, enable a verified P2P/Esplora repair source, or use \
+             [core] prune_mib = 1 so Core cannot create this gap.",
             info.pruneheight,
             tip.height,
-            tip.height + 1,
-            info.pruneheight.saturating_sub(1)
+            first,
+            info.pruneheight.saturating_sub(1),
+            gap
         ));
     }
     Ok(())
@@ -2346,7 +2624,7 @@ fn cmd_serve(cfg: &Config, chain: Chain) -> R<()> {
     let mut core_reachable = false;
     let core_tip = match shared.core.blockchain_info() {
         Ok(info) => {
-            check_pruned(&info, shared.store.committed_tip()?.as_ref())?;
+            check_pruned(&info, shared.store.committed_tip()?.as_ref(), None)?;
             shared
                 .stats
                 .core_height
@@ -2438,6 +2716,7 @@ fn cmd_run(cfg: &Config, chain: Chain) -> R<()> {
         Arc::clone(&store),
         shared.core.clone(),
         bulk,
+        Some(Arc::clone(&shared.resolver)),
         cfg.clone(),
         Arc::clone(&shared.lock),
         Some(Arc::clone(&shared)),
@@ -2665,24 +2944,26 @@ mod tests {
 
     #[test]
     fn full_node_allows_any_tip() {
-        assert!(check_pruned(&info(false, 0), None).is_ok());
+        assert!(check_pruned(&info(false, 0), None, None).is_ok());
     }
 
     #[test]
     fn pruned_with_empty_index_is_rejected() {
-        assert!(check_pruned(&info(true, 100), None).is_err());
+        assert!(check_pruned(&info(true, 100), None, None).is_err());
     }
 
     #[test]
     fn pruned_gap_is_rejected() {
         // Index stops at 50, Core only has blocks from 100 onwards.
-        assert!(check_pruned(&info(true, 100), Some(&tip(50))).is_err());
-        assert!(check_pruned(&info(true, 100), Some(&tip(98))).is_err());
+        assert!(check_pruned(&info(true, 100), Some(&tip(50)), None).is_err());
+        assert!(check_pruned(&info(true, 100), Some(&tip(98)), None).is_err());
+        // The same gap is allowed when a verified repair source is available.
+        assert!(check_pruned(&info(true, 100), Some(&tip(98)), Some(2)).is_ok());
     }
 
     #[test]
     fn pruned_with_covered_tip_is_allowed() {
-        assert!(check_pruned(&info(true, 100), Some(&tip(99))).is_ok());
-        assert!(check_pruned(&info(true, 100), Some(&tip(150))).is_ok());
+        assert!(check_pruned(&info(true, 100), Some(&tip(99)), None).is_ok());
+        assert!(check_pruned(&info(true, 100), Some(&tip(150)), None).is_ok());
     }
 }
