@@ -86,12 +86,15 @@ pub struct Tunables {
     cache_mib: AtomicU64,
     prefetch_blocks: AtomicUsize,
     adaptive: AtomicBool,
+    readers_locked: AtomicBool,
+    cache_locked: AtomicBool,
+    commit_locked: AtomicBool,
+    batch_locked: AtomicBool,
     profile: AtomicU8,
     rotational: AtomicBool,
     background_jobs: AtomicUsize,
 
     min_readers: usize,
-    max_readers: usize,
     min_commit_ms: u64,
     max_commit_ms: u64,
     min_cache_mib: u64,
@@ -167,7 +170,12 @@ impl Tunables {
         let max_cache_mib = (ram_mib / 2).clamp(256, 16_384);
         // Keep a single hard ceiling; the profile only changes the starting
         // point. The controller never raises readers on a rotational disk.
-        let max_readers = 32usize;
+        let max_readers = match profile {
+            Profile::Hdd => 4,
+            Profile::Ssd => 8,
+            Profile::Nvme => 16,
+            Profile::Auto | Profile::Manual => 32,
+        };
         let readers = readers.clamp(1, max_readers);
         let cache_mib = cache_mib.clamp(64, max_cache_mib);
         let commit_ms = commit_ms.clamp(500, 10_000);
@@ -185,11 +193,16 @@ impl Tunables {
             cache_mib: AtomicU64::new(cache_mib),
             prefetch_blocks: AtomicUsize::new(cfg.index.prefetch_blocks.max(1)),
             adaptive: AtomicBool::new(cfg.index.adaptive),
+            readers_locked: AtomicBool::new(cfg.index.readers > 0),
+            cache_locked: AtomicBool::new(cfg.index.cache_mib > 0),
+            commit_locked: AtomicBool::new(cfg.index.commit_interval_ms > 0),
+            batch_locked: AtomicBool::new(
+                cfg.index.batch_blocks > 0 && cfg.index.batch_blocks != 256,
+            ),
             profile: AtomicU8::new(profile.code()),
             rotational: AtomicBool::new(rotational),
             background_jobs: AtomicUsize::new(jobs.clamp(1, 32)),
             min_readers: 1,
-            max_readers,
             min_commit_ms: 500,
             max_commit_ms: 10_000,
             min_cache_mib: 64,
@@ -254,6 +267,22 @@ impl Tunables {
         self.rotational.load(Ordering::Relaxed)
     }
 
+    fn profile_max_readers(&self) -> usize {
+        match self.profile() {
+            Profile::Hdd => 4,
+            Profile::Ssd => 8,
+            Profile::Nvme => 16,
+            Profile::Auto | Profile::Manual => 32,
+        }
+    }
+
+    fn memory_reader_cap(&self) -> usize {
+        // Leave memory for Core, RocksDB and the OS. 128 MiB per worker is a
+        // conservative allowance for a block buffer plus queue slack.
+        let avail = mem_available_mib().max(256);
+        ((avail / 128) as usize).max(1)
+    }
+
     pub fn record_read(&self, d: Duration) {
         ewma(&self.read_ms, d.as_millis() as u64);
     }
@@ -308,8 +337,21 @@ impl Tunables {
             changed.push("profile");
         }
         self.adaptive.store(cfg.index.adaptive, Ordering::Relaxed);
+        self.readers_locked
+            .store(cfg.index.readers > 0, Ordering::Relaxed);
+        self.cache_locked
+            .store(cfg.index.cache_mib > 0, Ordering::Relaxed);
+        self.commit_locked
+            .store(cfg.index.commit_interval_ms > 0, Ordering::Relaxed);
+        self.batch_locked.store(
+            cfg.index.batch_blocks > 0 && cfg.index.batch_blocks != 256,
+            Ordering::Relaxed,
+        );
         if cfg.index.readers > 0 {
-            let v = cfg.index.readers.clamp(self.min_readers, self.max_readers);
+            let v = cfg
+                .index
+                .readers
+                .clamp(self.min_readers, self.profile_max_readers());
             if v != self.readers() {
                 self.readers.store(v, Ordering::Relaxed);
                 changed.push("readers");
@@ -370,6 +412,36 @@ impl Tunables {
         let apply_ms = self.apply_ms.load(Ordering::Relaxed);
         let commit_ms = self.commit_ewma.load(Ordering::Relaxed);
         let mem_available = mem_available_mib();
+        if mem_available < 512 {
+            // Cache first: it is reclaimable and usually the cheapest thing to
+            // shrink. Do not collapse the indexer to one reader on a temporary
+            // dip; keep a floor unless memory is truly critical.
+            let mut c = self.cache_mib();
+            if !self.cache_locked.load(Ordering::Relaxed) {
+                c = (c * 3 / 4).max(128);
+            }
+            let mut r = self.readers();
+            if mem_available < 256 {
+                r = (r * 3 / 4).max(2).min(self.readers());
+            }
+            let changed = c != self.cache_mib() || r != self.readers();
+            if c != self.cache_mib() {
+                self.cache_mib.store(c, Ordering::Relaxed);
+                store.set_cache_bytes(c as usize * 1024 * 1024);
+            }
+            if r != self.readers() {
+                self.readers.store(r, Ordering::Relaxed);
+            }
+            if changed {
+                eprintln!(
+                    "[e-lite] adaptive tuning: memory pressure ({mem_available} MiB):                      readers -> {r}, cache -> {c} MiB"
+                );
+                if let Some(stats) = stats {
+                    self.publish(stats);
+                }
+                return Some("memory pressure".to_string());
+            }
+        }
         if let Some(pct) = store.cache_hit_pct() {
             self.record_cache_hit_pct(pct);
         }
@@ -377,7 +449,10 @@ impl Tunables {
         let mut action = None;
 
         // Commit/fsync pain: amortise with larger groups on slow storage.
-        if commit_ms > 500 && self.commit_ms() < self.max_commit_ms {
+        if !self.commit_locked.load(Ordering::Relaxed)
+            && commit_ms > 500
+            && self.commit_ms() < self.max_commit_ms
+        {
             let v = (self.commit_ms() * 3 / 2).min(self.max_commit_ms);
             self.commit_ms.store(v, Ordering::Relaxed);
             let b = (self.batch_blocks() * 3 / 2).min(self.max_batch);
@@ -385,32 +460,45 @@ impl Tunables {
             action = Some(format!(
                 "commit {commit_ms}ms: interval -> {v}ms, batch -> {b}"
             ));
-        } else if mode == Mode::Live && commit_ms < 100 && self.commit_ms() > 1_500 {
+        } else if !self.commit_locked.load(Ordering::Relaxed)
+            && mode == Mode::Live
+            && commit_ms < 100
+            && self.commit_ms() > 1_500
+        {
             let v = (self.commit_ms() / 2).max(1_500);
             self.commit_ms.store(v, Ordering::Relaxed);
             action = Some(format!("live mode: commit interval -> {v}ms"));
         }
 
         // Read/apply balance. On a rotational disk more readers usually hurt.
-        if action.is_none() && read_ms > 200 && apply_ms < read_ms {
+        // Only add readers when reads are actually slow; low read latency means
+        // the bottleneck is elsewhere (apply/commit/compaction).
+        let max_readers = self.profile_max_readers().min(self.memory_reader_cap());
+        if action.is_none()
+            && !self.readers_locked.load(Ordering::Relaxed)
+            && read_ms > 200
+            && apply_ms < read_ms
+        {
             let v = (self.readers() * 3 / 4).max(self.min_readers);
             if v != self.readers() {
                 self.readers.store(v, Ordering::Relaxed);
                 action = Some(format!("read latency {read_ms}ms: readers -> {v}"));
             }
         } else if action.is_none()
+            && !self.readers_locked.load(Ordering::Relaxed)
             && mode == Mode::Bulk
             && !self.rotational()
-            && read_ms < 30
-            && self.readers() < self.max_readers
+            && read_ms > 120
+            && apply_ms < read_ms
+            && self.readers() < max_readers
         {
-            let v = (self.readers() + 2).min(self.max_readers);
+            let v = (self.readers() + 1).min(max_readers);
             self.readers.store(v, Ordering::Relaxed);
             action = Some(format!("read latency {read_ms}ms: readers -> {v}"));
         }
 
         // Cache misses and memory headroom.
-        if action.is_none() {
+        if action.is_none() && !self.cache_locked.load(Ordering::Relaxed) {
             let hit = self.cache_hit_pct.load(Ordering::Relaxed);
             if hit > 0 && hit < 60 && mem_available > 1024 && self.cache_mib() < self.max_cache_mib
             {
@@ -493,27 +581,60 @@ fn ewma(slot: &AtomicU64, sample: u64) {
 }
 
 pub fn total_ram_mib() -> Option<u64> {
-    let text = std::fs::read_to_string("/proc/meminfo").ok()?;
-    let kb = text
-        .lines()
-        .find_map(|l| l.strip_prefix("MemTotal:"))?
-        .split_whitespace()
-        .next()?
-        .parse::<u64>()
-        .ok()?;
-    Some(kb / 1024)
+    let mem = meminfo_mib("MemTotal");
+    let cg = cgroup_limit_mib();
+    match (mem, cg) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (Some(a), None) => Some(a),
+        (None, Some(b)) => Some(b),
+        (None, None) => None,
+    }
 }
 
 pub fn mem_available_mib() -> u64 {
-    let Ok(text) = std::fs::read_to_string("/proc/meminfo") else {
-        return 0;
-    };
+    let mem = meminfo_mib("MemAvailable").unwrap_or(0);
+    let cg = cgroup_available_mib().unwrap_or(u64::MAX);
+    mem.min(cg)
+}
+
+fn meminfo_mib(key: &str) -> Option<u64> {
+    let text = std::fs::read_to_string("/proc/meminfo").ok()?;
     text.lines()
-        .find_map(|l| l.strip_prefix("MemAvailable:"))
+        .find_map(|l| l.strip_prefix(key))
         .and_then(|l| l.split_whitespace().next())
         .and_then(|v| v.parse::<u64>().ok())
         .map(|kb| kb / 1024)
-        .unwrap_or(0)
+}
+
+fn read_u64(path: &str) -> Option<u64> {
+    std::fs::read_to_string(path)
+        .ok()?
+        .trim()
+        .parse::<u64>()
+        .ok()
+}
+
+/// cgroup v2 or v1 memory limit in MiB. `max`/unlimited yields None.
+fn cgroup_limit_mib() -> Option<u64> {
+    if let Some(v) = read_u64("/sys/fs/cgroup/memory.max") {
+        return Some(v / 1024 / 1024);
+    }
+    let v = read_u64("/sys/fs/cgroup/memory/memory.limit_in_bytes")?;
+    // v1 uses a huge sentinel for unlimited.
+    if v >= (1u64 << 60) {
+        None
+    } else {
+        Some(v / 1024 / 1024)
+    }
+}
+
+fn cgroup_available_mib() -> Option<u64> {
+    let limit = cgroup_limit_mib()?;
+    let used = read_u64("/sys/fs/cgroup/memory.current")
+        .or_else(|| read_u64("/sys/fs/cgroup/memory/memory.usage_in_bytes"))?
+        / 1024
+        / 1024;
+    Some(limit.saturating_sub(used))
 }
 
 /// `rotational` hint for the device holding `path`. Falls back to false.
@@ -577,17 +698,17 @@ mod tests {
         let cfg = Config::default();
         let t = Tunables::new(&cfg, true);
         let mut next = cfg.clone();
-        next.index.readers = 5;
+        next.index.readers = 4;
         next.index.commit_interval_ms = 6000;
-        next.index.cache_mib = 1024;
+        next.index.cache_mib = 128;
         next.index.adaptive = false;
         let changed = t.reload(&next);
         assert!(changed.contains(&"readers"));
         assert!(changed.contains(&"commit_interval_ms"));
         assert!(changed.contains(&"cache_mib"));
-        assert_eq!(t.readers(), 5);
+        assert_eq!(t.readers(), 4);
         assert_eq!(t.commit_ms(), 6000);
-        assert_eq!(t.cache_mib(), 1024);
+        assert_eq!(t.cache_mib(), 128);
         assert!(!t.adaptive());
 
         let mut nvme = cfg.clone();

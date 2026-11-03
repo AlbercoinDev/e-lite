@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.1.0-alpha.15 — 2026-11-03
+
+### Container safety and conservative reader scaling
+
+- **Automatic readers are capped by profile and memory**: 4 (HDD), 8 (SSD),
+  16 (NVMe), never 28+ just because a read was fast. The controller now adds
+  readers only when read latency is high and the apply stage is not the
+  bottleneck.
+- **Explicit `readers`, `cache_mib` and `commit_interval_ms` are locked**: the
+  controller does not override them, except a critical memory floor.
+- **Container-aware memory accounting**: `MemTotal`/`MemAvailable` are min'd
+  with the cgroup v2/v1 limit and usage, so LXC/Docker do not over-allocate
+  cache or workers.
+- **Memory pressure backs off cache first**, keeps a reader floor of 2, and no
+  longer collapses to one reader/64 MiB on a transient dip.
+- **Docs**: `docs/TUNING.md` now documents the reader caps, locks and LXC
+  OOM troubleshooting.
+
 ## 0.1.0-alpha.14 — 2026-11-03
 
 ### Autotuning, profiles and hot reload

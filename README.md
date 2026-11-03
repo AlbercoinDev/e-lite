@@ -7,7 +7,7 @@ any `scriptPubKey` in the active chain — **without registering wallets**.
 loopback by default. Core remains the authority for consensus and the active
 chain; e-lite never invents data.
 
-> **Status: `v0.1.0-alpha.14` — experimental, no funds.**
+> **Status: `v0.1.0-alpha.15` — experimental, no funds.**
 > Use on test networks first.
 >
 > **Testing from scratch:** see [`docs/GETTING-STARTED.md`](docs/GETTING-STARTED.md)

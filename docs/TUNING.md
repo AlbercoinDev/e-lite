@@ -32,7 +32,10 @@ commit_interval_ms = 5000
 adaptive = true
 ```
 
-Set `adaptive = false` to keep the profile/config values fixed.
+Set `adaptive = false` to keep the profile/config values fixed. Explicit
+`readers`/`cache_mib`/`commit_interval_ms` are treated as locked: the controller
+will not change them, except a critical memory floor (<256 MiB) which reduces
+workers for safety.
 
 ## What the controller observes
 
@@ -51,8 +54,10 @@ They are exported in `/status` under `tuning` and in `/metrics` as
 
 Only these hot fields are adjusted automatically:
 
-- `readers`: less on a rotational disk when read latency is high; more on
-  non-rotational disks when reads are cheap.
+- `readers`: less on a rotational disk when read latency is high; more only on
+  non-rotational disks when reads are actually slow, never just because a read
+  was fast. Automatic readers are capped at 4 (HDD), 8 (SSD) or 16 (NVMe) and
+  by available memory.
 - `commit_interval_ms` and `batch_blocks`: larger groups when commit/fsync is
   slow.
 - `cache_mib`: grows when the cache hit rate is low and RAM is available;
@@ -60,7 +65,10 @@ Only these hot fields are adjusted automatically:
 
 The controller runs at most once every 30 seconds. It is inhibited while the
 disk guard is active, during a prune-gap repair, during a reorg and during
-shutdown. Every change is logged:
+shutdown. If `MemAvailable` (including the cgroup v2/v1 limit in LXC/containers)
+falls below 512 MiB, it reduces readers/cache before doing anything else.
+
+Every change is logged:
 
 ```text
 [e-lite] adaptive tuning: commit 620ms: interval -> 7500ms, batch -> 768
@@ -107,6 +115,17 @@ TOML file.
   bottleneck, more readers will not help until decode/prefetch is parallelized.
 - **Benchmark/fixed**: `profile = "manual"`, `adaptive = false`, explicit
   `readers`/`commit_interval_ms`/`cache_mib`.
+
+## Containers (LXC/Docker)
+
+Memory accounting uses the lower of `/proc/meminfo` and the cgroup limit
+(`/sys/fs/cgroup/memory.max` or cgroup v1 `memory.limit_in_bytes`). If a
+container still reports the host's memory, the controller also checks
+`memory.current` and backs off readers/cache when free memory is low.
+
+If the process is killed by the kernel (`Killed` in the shell), check
+`dmesg -T | tail` or `journalctl -k` for the OOM report. Reduce the container's
+`cache_mib`/`readers` or set `adaptive = false` while investigating.
 
 ## Safety and correctness
 
