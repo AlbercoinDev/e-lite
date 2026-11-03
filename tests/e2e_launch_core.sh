@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# e-lite starts Core from scratch with maximum pruning (prune=550) and indexes
+# e-lite starts Core from scratch with manual pruning (prune=1) and indexes
 # the chain. Regtest keeps the run small; the same path is used on mainnet.
 set -euo pipefail
 

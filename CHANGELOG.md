@@ -1,5 +1,30 @@
 # Changelog
 
+## 0.1.0-alpha.14 — 2026-11-03
+
+### Autotuning, profiles and hot reload
+
+- **Startup profiles**: `auto | hdd | ssd | nvme | manual`, selected from the
+  `rotational` hint and RAM. Profiles set readers, commit interval, batch size
+  and block-cache size.
+- **Event-driven controller**: only changes one knob every 30 s, with hard
+  bounds and no action while the disk/prune guards or reorg repair are active.
+  It adjusts readers, commit interval/batch and block cache from measured
+  read/apply/commit latency, tx/s and cache hit rate.
+- **Hot reload with `SIGUSR1`**: readers, cache, commit interval, batch,
+  profile, adaptive flag and pruning thresholds are applied to the running
+  process. Invalid files keep the previous config; cold fields are reported.
+- **Dynamic RocksDB cache**: the shared block cache is retained by `Store` and
+  resized with `Cache::set_capacity`; mutable `max_background_jobs` is applied
+  at runtime when RocksDB accepts it.
+- **Bigger automatic cache/jobs ceilings**: auto cache is no longer capped at
+  2 GiB, and background jobs are no longer capped at 4.
+- **Instrumentation**: `/status` exposes a `tuning` object with effective
+  readers/commit/batch/cache/profile and read/apply/commit/tx/cache EWMA
+  metrics; `/metrics` exports the same values.
+- **Documentation**: `docs/TUNING.md` and updated README/config examples.
+- **CLI help** corrected for the new manual-prune default.
+
 ## 0.1.0-alpha.13 — 2026-11-03
 
 ### From-zero pruned IBD is manual by default

@@ -77,6 +77,18 @@ pub struct Stats {
     pub prune_requests: AtomicU64,
     pub prune_failures: AtomicU64,
     pub disk_low: AtomicBool,
+    pub tuning_readers: AtomicU64,
+    pub tuning_commit_ms: AtomicU64,
+    pub tuning_batch_blocks: AtomicU64,
+    pub tuning_cache_mib: AtomicU64,
+    pub tuning_read_ms: AtomicU64,
+    pub tuning_apply_ms: AtomicU64,
+    pub tuning_commit_ms_ewma: AtomicU64,
+    pub tuning_tx_per_sec: AtomicU64,
+    pub tuning_cache_hit_pct: AtomicU64,
+    pub tuning_profile: AtomicU64,
+    pub tuning_adaptive: AtomicBool,
+    pub tuning_background_jobs: AtomicU64,
     pub started: Instant,
 }
 
@@ -102,6 +114,18 @@ impl Default for Stats {
             prune_requests: AtomicU64::new(0),
             prune_failures: AtomicU64::new(0),
             disk_low: AtomicBool::new(false),
+            tuning_readers: AtomicU64::new(0),
+            tuning_commit_ms: AtomicU64::new(0),
+            tuning_batch_blocks: AtomicU64::new(0),
+            tuning_cache_mib: AtomicU64::new(0),
+            tuning_read_ms: AtomicU64::new(0),
+            tuning_apply_ms: AtomicU64::new(0),
+            tuning_commit_ms_ewma: AtomicU64::new(0),
+            tuning_tx_per_sec: AtomicU64::new(0),
+            tuning_cache_hit_pct: AtomicU64::new(0),
+            tuning_profile: AtomicU64::new(0),
+            tuning_adaptive: AtomicBool::new(false),
+            tuning_background_jobs: AtomicU64::new(0),
             started: Instant::now(),
         }
     }
@@ -380,6 +404,22 @@ impl Shared {
             "uptime_seconds": self.stats.started.elapsed().as_secs(),
             "listen": self.listen,
             "protocol": PROTOCOL_MAX,
+            "tuning": {
+                "readers": self.stats.tuning_readers.load(Ordering::Relaxed),
+                "commit_interval_ms": self.stats.tuning_commit_ms.load(Ordering::Relaxed),
+                "batch_blocks": self.stats.tuning_batch_blocks.load(Ordering::Relaxed),
+                "cache_mib": self.stats.tuning_cache_mib.load(Ordering::Relaxed),
+                "read_ms_ewma": self.stats.tuning_read_ms.load(Ordering::Relaxed),
+                "apply_ms_ewma": self.stats.tuning_apply_ms.load(Ordering::Relaxed),
+                "commit_ms_ewma": self.stats.tuning_commit_ms_ewma.load(Ordering::Relaxed),
+                "tx_per_sec": self.stats.tuning_tx_per_sec.load(Ordering::Relaxed),
+                "cache_hit_pct": self.stats.tuning_cache_hit_pct.load(Ordering::Relaxed),
+                "profile": match self.stats.tuning_profile.load(Ordering::Relaxed) {
+                    1 => "hdd", 2 => "ssd", 3 => "nvme", 4 => "manual", _ => "auto"
+                },
+                "adaptive": self.stats.tuning_adaptive.load(Ordering::Relaxed),
+                "background_jobs": self.stats.tuning_background_jobs.load(Ordering::Relaxed),
+            },
             "core": {
                 "pruneheight": pruneheight,
                 "pruned": self.stats.core_pruned.load(Ordering::Relaxed),
@@ -1564,6 +1604,36 @@ fn metrics_text(shared: &Shared) -> String {
         "Blocks applied to the index",
         "counter",
         g("blocks_applied"),
+    );
+    line(
+        "e_lite_tuning_readers",
+        "Effective parallel fetch readers",
+        "gauge",
+        st["tuning"]["readers"].as_u64().unwrap_or(0),
+    );
+    line(
+        "e_lite_tuning_commit_interval_ms",
+        "Effective commit interval",
+        "gauge",
+        st["tuning"]["commit_interval_ms"].as_u64().unwrap_or(0),
+    );
+    line(
+        "e_lite_tuning_cache_mib",
+        "Effective RocksDB block cache",
+        "gauge",
+        st["tuning"]["cache_mib"].as_u64().unwrap_or(0),
+    );
+    line(
+        "e_lite_tx_per_sec",
+        "Indexed transactions per second (EWMA)",
+        "gauge",
+        st["tuning"]["tx_per_sec"].as_u64().unwrap_or(0),
+    );
+    line(
+        "e_lite_commit_ms",
+        "Commit latency (EWMA)",
+        "gauge",
+        st["tuning"]["commit_ms_ewma"].as_u64().unwrap_or(0),
     );
     line(
         "e_lite_disk_low",

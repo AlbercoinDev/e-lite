@@ -24,10 +24,14 @@ stop_on_exit = true                 # stop only a Core launched by e-lite
 
 [index]
 block_source = "auto"               # auto | rpc | files
-readers = 0                         # 0 = auto from CPU count
-cache_mib = 0                       # 0 = auto from RAM
+readers = 0                         # 0 = profile/adaptive
+cache_mib = 0                       # 0 = profile/adaptive
 reorg_window = 288                  # undo records kept for reorgs
-batch_blocks = 256                  # blocks per atomic commit
+batch_blocks = 256                  # blocks per atomic commit (initial; adaptive may change)
+profile = "auto"                    # auto | hdd | ssd | nvme | manual
+adaptive = true                     # event-driven readers/commit/cache tuning
+commit_interval_ms = 0              # 0 = profile default (500..10000 when set)
+prefetch_blocks = 0                 # reserved for the UTXO prefetch pipeline
 follow = true                       # keep following the tip
 
 [pruning]

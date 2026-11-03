@@ -7,7 +7,7 @@ any `scriptPubKey` in the active chain — **without registering wallets**.
 loopback by default. Core remains the authority for consensus and the active
 chain; e-lite never invents data.
 
-> **Status: `v0.1.0-alpha.12` — experimental, no funds.**
+> **Status: `v0.1.0-alpha.14` — experimental, no funds.**
 > Use on test networks first.
 >
 > **Testing from scratch:** see [`docs/GETTING-STARTED.md`](docs/GETTING-STARTED.md)
@@ -216,10 +216,14 @@ stop_on_exit = true
 
 [index]
 block_source = "auto"         # auto | rpc | files
-readers = 0                   # 0 = auto
-cache_mib = 0                 # 0 = auto
+readers = 0                   # 0 = profile/adaptive
+cache_mib = 0                 # 0 = profile/adaptive
 reorg_window = 288
 batch_blocks = 256
+profile = "auto"             # auto | hdd | ssd | nvme | manual
+adaptive = true
+commit_interval_ms = 0       # 0 = profile default
+prefetch_blocks = 0
 follow = true
 
 [pruning]
@@ -264,6 +268,55 @@ Per-network Esplora defaults:
 - signet: `https://mempool.space/signet/api`;
 - testnet4: `https://mempool.space/testnet4/api`;
 - regtest: none.
+
+## Autotuning and hot reload
+
+See [`docs/TUNING.md`](docs/TUNING.md) for the full design, profiles and
+controller rules.
+
+`e-lite` selects a conservative startup profile from the data disk
+(`rotational` hint) and RAM, then adjusts a small set of knobs while running:
+
+| Profile | readers | commit | batch | cache |
+|---|---:|---:|---:|---:|
+| `hdd` | 2 | 5 s | 512 | RAM/4, max 4 GiB |
+| `ssd` | 8 | 2 s | 256 | RAM/4, max 8 GiB |
+| `nvme` | 16 | 2 s | 256 | RAM/3, max 16 GiB |
+| `manual` | config | config | config | config |
+
+The controller only changes one knob at a time, with a 30 s cooldown and hard
+bounds. It is inhibited while the disk guard, a prune-gap repair, a reorg or
+shutdown is active. Set `[index] adaptive = false` to keep the profile/static
+values.
+
+Hot reload (no restart):
+
+```bash
+kill -USR1 "$(pgrep -f 'e-lite run')"
+```
+
+The process reloads the same config file. `readers`, `cache_mib`,
+`commit_interval_ms`, `batch_blocks`, `profile`, `adaptive` and the pruning
+thresholds are hot. `prune_mib`, `block_source`, `reorg_window`, the data
+directory and the network require a restart and are only logged.
+
+Inspect the effective values and the EWMA latencies:
+
+```bash
+curl -s http://127.0.0.1:9184/status | python3 -m json.tool | grep -A20 '"tuning"'
+curl -s http://127.0.0.1:9184/metrics | grep e_lite_tuning
+```
+
+Useful manual overrides:
+
+```toml
+[index]
+profile = "hdd"       # force the slow-disk profile
+readers = 2           # explicit value; adaptive=false if you do not want changes
+cache_mib = 4096
+commit_interval_ms = 5000
+adaptive = false
+```
 
 ## Commands
 
@@ -405,7 +458,7 @@ available.
 
 ## Disk expectations
 
-- Core with `-prune=550` is **not** 550 MiB total: the chainstate is still
+- Core with `-prune=1` (manual) or `-prune=550` still needs the chainstate: it is
   ~10–15 GB on mainnet, plus ~550 MiB of blocks and the current block file.
 - e-lite stores full history. On mainnet this can be hundreds of GB
   (`tx_occurrences`, `history`, `txids.dat`, UTXO set). This is the cost of

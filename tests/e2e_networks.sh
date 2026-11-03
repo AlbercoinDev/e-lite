@@ -6,7 +6,7 @@
 #   E_LITE_NETWORK=testnet4 E_LITE_CORE_DATADIR=/srv/core-t4 tests/e2e_networks.sh
 #
 # If E_LITE_CORE_DATADIR is not set, a temporary datadir is used and e-lite
-# launches Core with pruned IBD (prune=550). The sync can take a long time.
+# launches Core with manual pruned IBD (prune=1). The sync can take a long time.
 # If you provide a datadir, stop any Core using it first: the script runs with
 # manage = "managed", so e-lite must own the process.
 #
@@ -97,7 +97,7 @@ if [ "$FREE_GIB" -lt "$REQUIRED_FREE" ]; then
   exit 1
 fi
 
-echo "== $NETWORK: e-lite launches Core with prune=550 =="
+echo "== $NETWORK: e-lite launches Core with prune=1 =="
 "$BIN" run --config "$CONF" >"$RUN/serve.log" 2>&1 &
 echo $! >"$RUN/serve.pid"
 

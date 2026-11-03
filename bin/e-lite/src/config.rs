@@ -137,6 +137,18 @@ pub struct IndexCfg {
     /// Maximum blocks per atomic commit group.
     #[serde(default = "d_batch")]
     pub batch_blocks: u32,
+    /// Startup tuning profile: auto | hdd | ssd | nvme | manual.
+    #[serde(default = "d_profile")]
+    pub profile: String,
+    /// Let the event-driven controller adjust readers/commit/cache.
+    #[serde(default = "d_true")]
+    pub adaptive: bool,
+    /// Commit interval in milliseconds. 0 selects the profile/default.
+    #[serde(default)]
+    pub commit_interval_ms: u64,
+    /// Future UTXO prefetch depth. 0 selects the profile/default.
+    #[serde(default)]
+    pub prefetch_blocks: usize,
     #[serde(default = "d_true")]
     pub follow: bool,
 }
@@ -149,6 +161,10 @@ impl Default for IndexCfg {
             cache_mib: 0,
             reorg_window: d_window(),
             batch_blocks: d_batch(),
+            profile: d_profile(),
+            adaptive: d_true(),
+            commit_interval_ms: 0,
+            prefetch_blocks: 0,
             follow: true,
         }
     }
@@ -317,6 +333,9 @@ fn d_prune_mib() -> u64 {
 fn d_batch() -> u32 {
     256
 }
+fn d_profile() -> String {
+    "auto".to_string()
+}
 fn d_block_source() -> String {
     "auto".to_string()
 }
@@ -383,11 +402,16 @@ fn default_config_paths() -> Vec<PathBuf> {
 }
 
 impl Config {
-    pub fn load(path: Option<&str>) -> Result<Config, String> {
-        let path = match path {
+    /// Resolve an explicit config path or the first default path that exists.
+    pub fn resolve_path(path: Option<&str>) -> Option<PathBuf> {
+        match path {
             Some(p) => Some(PathBuf::from(p)),
             None => default_config_paths().into_iter().find(|p| p.is_file()),
-        };
+        }
+    }
+
+    pub fn load(path: Option<&str>) -> Result<Config, String> {
+        let path = Self::resolve_path(path);
         match path {
             Some(p) => {
                 let text = std::fs::read_to_string(&p)
@@ -458,6 +482,14 @@ impl Config {
         }
         if self.index.reorg_window == 0 {
             return Err("[index] reorg_window must be >= 1".to_string());
+        }
+        if crate::tuning::Profile::parse(&self.index.profile).is_none() {
+            return Err("[index] profile must be auto, hdd, ssd, nvme or manual".to_string());
+        }
+        if self.index.commit_interval_ms != 0
+            && !(500..=10_000).contains(&self.index.commit_interval_ms)
+        {
+            return Err("[index] commit_interval_ms must be 0 or 500..10000".to_string());
         }
         if self.server.max_clients == 0 {
             return Err("[server] max_clients must be >= 1".to_string());

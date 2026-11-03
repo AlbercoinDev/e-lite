@@ -88,6 +88,8 @@ fn err<T>(msg: impl Into<String>) -> Result<T> {
 
 pub struct Store {
     db: DB,
+    /// Kept so the block-cache capacity can be changed at runtime.
+    cache: Cache,
     path: PathBuf,
     txids_path: PathBuf,
     txids: File,
@@ -164,6 +166,7 @@ impl Store {
 
         let store = Store {
             db,
+            cache,
             path,
             txids_path,
             txids,
@@ -175,6 +178,46 @@ impl Store {
 
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// Change the shared RocksDB block-cache capacity without reopening.
+    pub fn set_cache_bytes(&self, bytes: usize) {
+        let mut cache = self.cache.clone();
+        cache.set_capacity(bytes.max(8 * 1024 * 1024));
+    }
+
+    /// Change mutable DB options at runtime. RocksDB rejects options it
+    /// considers immutable; the caller logs and keeps the old value.
+    pub fn set_db_option(&self, name: &str, value: &str) -> Result<()> {
+        self.db
+            .set_options(&[(name, value)])
+            .map_err(|e| StoreError(format!("rocksdb set_options {name}: {e}")))
+    }
+
+    pub fn set_background_jobs(&self, jobs: usize) -> Result<()> {
+        let jobs = jobs.clamp(1, 32);
+        self.set_db_option("max_background_jobs", &jobs.to_string())
+    }
+
+    pub fn property(&self, name: &str) -> Option<String> {
+        self.db.property_value(name).ok().flatten()
+    }
+
+    /// Approximate cache hit percentage from RocksDB counters.
+    pub fn cache_hit_pct(&self) -> Option<u64> {
+        let hit = self
+            .property("rocksdb.block.cache.hit")?
+            .parse::<u64>()
+            .ok()?;
+        let miss = self
+            .property("rocksdb.block.cache.miss")?
+            .parse::<u64>()
+            .ok()?;
+        let total = hit.saturating_add(miss);
+        if total == 0 {
+            return None;
+        }
+        Some(hit.saturating_mul(100) / total)
     }
 
     fn cf(&self, name: &str) -> Result<&rocksdb::ColumnFamily> {

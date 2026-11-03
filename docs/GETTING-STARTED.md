@@ -38,7 +38,7 @@ El script hace todo:
    con `--no-core`).
 3. Compila e-lite en release y lo instala en `~/.local/bin/e-lite`.
 4. Escribe una configuración en `~/e-lite-test/` (o `--run-root`).
-5. Arranca e-lite, deja que e-lite lance Core con `prune=550`, indexa y prueba.
+5. Arranca e-lite, deja que e-lite lance Core con `prune=1` (manual), indexa y prueba.
 6. Informa versiones, estado, altura, `pruneheight`, disco, resultado y logs en
    `~/e-lite-test/last-report.txt`.
 
@@ -57,8 +57,8 @@ Opciones habituales:
 | `--yes` | no preguntar |
 
 > El script rechaza `acceptance` si no hay 15 GiB (signet) o 20 GiB (testnet4)
-> libres. Este host tiene ~11 GiB; usa otro disco/host o libera espacio. Para
-> forzar en un disco pequeño (bajo tu riesgo):
+> libres. Usa otro disco/host o libera espacio. Para forzar en un disco pequeño
+> (bajo tu riesgo):
 > `E_LITE_E2E_REQUIRED_FREE_GIB=0 E_LITE_E2E_MIN_FREE_GIB=1`.
 
 ---
@@ -73,15 +73,16 @@ Opciones habituales:
 
 ### Espacio en disco (aproximado)
 
-| Red | Core con `prune=550` | Índice e-lite | Total recomendado |
+| Red | Core con `prune=1` | Índice e-lite | Total recomendado |
 |---|---|---|---|
 | regtest | < 100 MB | < 100 MB | 1 GB |
 | signet | ~3–4 GB | ~6–8 GB | **≥ 15 GB libres** |
 | testnet4 | ~3–5 GB | ~10–15 GB | **≥ 20 GB libres** |
 | mainnet | ~15 GB | cientos de GB | disco separado para el índice |
 
-> El guard de disco pausa Core y el indexador si cualquiera de los dos
-> filesystems baja de `[pruning] min_free_gib`. Si Core llega a podar por delante
+> El guard de disco pausa las descargas de Core si cualquiera de los dos
+> filesystems baja de `[pruning] min_free_gib`; el indexado sigue drenando.
+> Por debajo de `critical_free_gib` también se pausa el indexado. Si Core llega a podar por delante
 > del índice, el hueco es irrecuperable: hay que restaurar un snapshot o usar un
 > nodo completo. No ejecutes la aceptación completa en un disco casi lleno.
 
@@ -151,7 +152,7 @@ e-lite run \
 
 Qué debe pasar:
 
-- e-lite arranca Core con `-prune=550`, `-rpcbind=127.0.0.1` y el puerto 18443.
+- e-lite arranca Core con `-prune=1` (manual), `-rpcbind=127.0.0.1` y el puerto 18443.
 - Log de Core: `$DATA/bitcoind.log`.
 - Estado inicial: `WAITING_FOR_CORE` → `BUILDING_INDEX` → `READY`.
 - No hace falta `e-lite init`.
@@ -233,7 +234,7 @@ E_LITE_BIN="$PWD/target/release/e-lite" tests/e2e_launch_core.sh
 ## 5. Aceptación completa signet / testnet4
 
 Esta es la prueba que falta por ejecutar. Hace un IBD real desde cero, con Core
-lanzado por e-lite (`prune=550`), sigue hasta el tip, comprueba que no hay huecos
+lanzado por e-lite (`prune=1` manual), sigue hasta el tip, comprueba que no hay huecos
 respecto a `pruneheight` y consulta Electrum en `READY`.
 
 ### 5.1 Signet — requiere ≥15 GiB libres
@@ -267,7 +268,7 @@ tests/e2e_networks.sh
 
 ### 5.3 Qué comprueba el script
 
-- Core arranca con `-prune=550` y el índice se construye desde 0.
+- Core arranca con `-prune=1` y el índice se construye desde 0.
 - El estado pasa por `BUILDING_INDEX` (IBD) y termina en `READY` cuando
   `initialblockdownload=false` y el índice alcanza el tip.
 - `indexed_height >= pruneheight` (sin hueco de poda).
@@ -352,7 +353,15 @@ Campos útiles de `/status`:
 - `core.pruneheight`, `core.pruned`, `core.network_active`,
   `core.initial_block_download`;
 - `db_bytes`, `disk_free_bytes`, `core_disk_free_bytes`, `disk_low`;
+- `tuning`: perfil, readers, commit, batch, caché y latencias EWMA;
 - `rawtx` y `mempool`.
+
+Autotuning y recarga en caliente: [`docs/TUNING.md`](TUNING.md). Para recargar
+la configuración sin reiniciar:
+
+```bash
+kill -USR1 "$(pgrep -f 'e-lite run')"
+```
 
 ---
 

@@ -229,6 +229,15 @@ impl Supervisor {
         self.paused
     }
 
+    /// Replace the tunable parts without losing the current state/hysteresis.
+    pub fn update_config(&mut self, cfg: SupervisorConfig) {
+        let mut cfg = cfg;
+        if cfg.disk_resume_bytes <= cfg.disk_low_bytes {
+            cfg.disk_resume_bytes = cfg.disk_low_bytes.saturating_add(1024 * 1024 * 1024);
+        }
+        self.cfg = cfg;
+    }
+
     pub fn last_prune(&self) -> Option<u32> {
         self.last_prune
     }

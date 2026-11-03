@@ -1,6 +1,7 @@
 mod config;
 mod core_supervisor;
 mod snapshot;
+mod tuning;
 
 use bitcoin::consensus::deserialize;
 use bitcoin::Block;
@@ -21,6 +22,7 @@ use std::net::TcpStream;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::{Duration, Instant};
+use tuning::{Mode, Tunables};
 
 type E = Box<dyn std::error::Error + Send + Sync>;
 type R<T> = std::result::Result<T, E>;
@@ -39,6 +41,24 @@ fn shutdown_flag() -> Arc<AtomicBool> {
         flag
     })
     .clone()
+}
+
+/// SIGUSR1 asks the running daemon to reload the hot `[index]`/`[pruning]`
+/// settings from the same config file. Cold fields are logged, not applied.
+fn reload_flag() -> Arc<AtomicBool> {
+    static FLAG: OnceLock<Arc<AtomicBool>> = OnceLock::new();
+    FLAG.get_or_init(|| {
+        let flag = Arc::new(AtomicBool::new(false));
+        let _ = signal_hook::flag::register(signal_hook::consts::SIGUSR1, Arc::clone(&flag));
+        flag
+    })
+    .clone()
+}
+
+static CONFIG_PATH: OnceLock<Option<std::path::PathBuf>> = OnceLock::new();
+
+fn config_path() -> Option<std::path::PathBuf> {
+    CONFIG_PATH.get().cloned().flatten()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -428,17 +448,8 @@ fn effective_cache_mib(cfg: &Config) -> u64 {
         return cfg.index.cache_mib.clamp(16, 16384);
     }
     total_ram_mib()
-        .map(|ram| (ram / 4).clamp(64, 2048))
+        .map(|ram| (ram / 4).clamp(64, 16_384))
         .unwrap_or(256)
-}
-
-fn effective_readers(cfg: &Config) -> usize {
-    if cfg.index.readers > 0 {
-        return cfg.index.readers.clamp(1, 32);
-    }
-    std::thread::available_parallelism()
-        .map(|n| n.get().clamp(1, 8))
-        .unwrap_or(4)
 }
 
 fn min_free_bytes(cfg: &Config, chain: Chain) -> Option<u64> {
@@ -492,12 +503,15 @@ fn warn_if_disk_low(cfg: &Config, chain: Chain) {
     }
 }
 
-fn open_store(cfg: &Config, chain: Chain) -> R<Arc<Store>> {
+fn open_store_with(
+    cfg: &Config,
+    chain: Chain,
+    cache_mib: u64,
+    background_jobs: usize,
+) -> R<Arc<Store>> {
     let dir = cfg.data_dir(chain);
-    let cache_bytes = (effective_cache_mib(cfg) as usize) * 1024 * 1024;
-    let jobs = std::thread::available_parallelism()
-        .map(|n| n.get().clamp(1, 4) as i32)
-        .unwrap_or(2);
+    let cache_bytes = (cache_mib as usize) * 1024 * 1024;
+    let jobs = background_jobs.clamp(1, 32) as i32;
     let opts = el_store::StoreOptions {
         cache_bytes,
         write_buffer_bytes: (cache_bytes / 4).clamp(8 * 1024 * 1024, 64 * 1024 * 1024),
@@ -507,10 +521,18 @@ fn open_store(cfg: &Config, chain: Chain) -> R<Arc<Store>> {
     Ok(Arc::new(Store::open_with(dir, opts)?))
 }
 
+fn open_store(cfg: &Config, chain: Chain) -> R<Arc<Store>> {
+    let jobs = std::thread::available_parallelism()
+        .map(|n| n.get().clamp(1, 8))
+        .unwrap_or(4);
+    open_store_with(cfg, chain, effective_cache_mib(cfg), jobs)
+}
+
 fn build_bulk(
     cfg: &Config,
     chain: Chain,
     genesis: Hash32,
+    readers: usize,
 ) -> R<Option<Arc<el_blocks::BulkSource>>> {
     if cfg.index.block_source == "rpc" {
         return Ok(None);
@@ -537,7 +559,7 @@ fn build_bulk(
                 blocks_dir.display(),
                 source.entries(),
                 if source.xor_present() { "on" } else { "off" },
-                effective_readers(cfg)
+                readers
             );
             Ok(Some(Arc::new(source)))
         }
@@ -596,6 +618,7 @@ fn main() {
 
 fn run() -> R<()> {
     let args = parse_args()?;
+    let _ = CONFIG_PATH.set(Config::resolve_path(args.config.as_deref()));
     let cmd = args.command.unwrap_or(Command::Help);
     if cmd == Command::Help {
         print_help();
@@ -654,8 +677,8 @@ OPTIONS:
     --readers <n>           parallel fetch workers (0 = auto)
     --cookie-file <path>    explicit Core cookie
     --manage <mode>         external | auto | managed (default auto)
-    --prune-mib <n>         Core prune target when e-lite launches it (550 = max)
-    --min-free-gib <n>      pause Core/indexing below this free space
+    --prune-mib <n>         Core prune mode: 1 manual (default), 0 full, >=550 auto (needs opt-in)
+    --min-free-gib <n>      pause Core downloads below this free space
     --listen <addr>         Electrum listen address (default 127.0.0.1:50001)
     --metrics <addr>        status/metrics listen address (default 127.0.0.1:9184)
     --batch <n>             blocks per atomic commit (default 256)
@@ -1033,8 +1056,6 @@ fn bind_ok(addr: &str) -> bool {
 
 // ------------------------------------------------------------------- indexing
 
-const MAX_GROUP_TXS: usize = 250_000;
-const COMMIT_INTERVAL: Duration = Duration::from_secs(2);
 const CATCH_UP_BLOCKS: u64 = 512;
 
 type FetchResult = std::result::Result<(u64, String, Vec<u8>), String>;
@@ -1045,6 +1066,7 @@ struct Indexer {
     core: CoreClient,
     bulk: Option<Arc<el_blocks::BulkSource>>,
     resolver: Option<Arc<Resolver>>,
+    tunables: Arc<Tunables>,
     cfg: Config,
     lock: Arc<RwLock<()>>,
     shared: Option<Arc<Shared>>,
@@ -1087,6 +1109,7 @@ impl Indexer {
         core: CoreClient,
         bulk: Option<Arc<el_blocks::BulkSource>>,
         resolver: Option<Arc<Resolver>>,
+        tunables: Arc<Tunables>,
         cfg: Config,
         lock: Arc<RwLock<()>>,
         shared: Option<Arc<Shared>>,
@@ -1103,6 +1126,7 @@ impl Indexer {
             core,
             bulk,
             resolver,
+            tunables,
             cfg,
             lock,
             shared,
@@ -1431,7 +1455,10 @@ impl Indexer {
         )?;
         {
             let _g = self.lock.write().map_err(|_| "lock poisoned")?;
-            if let Err(e) = self.store.commit(batch, tip, txids) {
+            let commit_started = Instant::now();
+            let result = self.store.commit(batch, tip, txids);
+            self.tunables.record_commit(commit_started.elapsed());
+            if let Err(e) = result {
                 // Whatever happened, keep the flat file aligned with the DB.
                 if let Ok(Some(t)) = self.store.committed_tip() {
                     self.store.truncate_txids(t.txnum)?;
@@ -1633,7 +1660,7 @@ impl Indexer {
         let start_height = tip.map(|t| t.height).unwrap_or(0);
         let start_txnum = tip.map(|t| t.txnum).unwrap_or(0);
 
-        let workers = effective_readers(&self.cfg);
+        let workers = self.tunables.readers();
         let hashes = Arc::new(hashes);
         let next_index = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let (tx, rx) = std::sync::mpsc::sync_channel::<(usize, FetchResult)>(workers * 2);
@@ -1643,6 +1670,7 @@ impl Indexer {
             let core = self.core.clone();
             let bulk = self.bulk.clone();
             let resolver = self.resolver.clone();
+            let tunables = Arc::clone(&self.tunables);
             let pruneheight = info.pruneheight;
             let hashes = Arc::clone(&hashes);
             let next_index = Arc::clone(&next_index);
@@ -1657,6 +1685,7 @@ impl Indexer {
                     break;
                 }
                 let h = start + i as u64;
+                let read_started = Instant::now();
                 let item = fetch_block(
                     &core,
                     &bulk,
@@ -1665,6 +1694,7 @@ impl Indexer {
                     h,
                     &hashes[i],
                 );
+                tunables.record_read(read_started.elapsed());
                 if tx.send((i, item)).is_err() {
                     break;
                 }
@@ -1754,6 +1784,7 @@ impl Indexer {
                     tip = Some(out.tip);
                     count += 1;
                     last_ms = t0.elapsed().as_millis() as u64;
+                    self.tunables.record_apply(t0.elapsed());
                     if self.cfg.core.prune_mib >= 550
                         && info.pruned
                         && last_lag_check.elapsed() >= Duration::from_millis(100)
@@ -1790,9 +1821,9 @@ impl Indexer {
                     break;
                 }
             }
-            let commit_due = count >= self.cfg.index.batch_blocks.max(1)
-                || group_txids.len() >= MAX_GROUP_TXS
-                || group_started.elapsed() >= COMMIT_INTERVAL;
+            let commit_due = count >= self.tunables.batch_blocks().max(1)
+                || group_txids.len() >= self.tunables.max_group_txs()
+                || group_started.elapsed() >= self.tunables.commit_interval();
             if commit_due {
                 let current = tip.expect("tip set");
                 if let Err(e) =
@@ -1804,6 +1835,13 @@ impl Indexer {
                 committed_height = current.height as u64;
                 let (live_core, live_prune) =
                     self.live_core_and_prune(info.blocks, info.pruneheight);
+                let rate_secs = started.elapsed().as_secs_f64().max(0.001);
+                self.tunables.record_tx_rate(
+                    ((current.txnum.saturating_sub(start_txnum)) as f64 / rate_secs) as u64,
+                );
+                if let Some(sh) = &self.shared {
+                    self.tunables.publish(&sh.stats);
+                }
                 print_progress(
                     &current,
                     started,
@@ -1832,6 +1870,13 @@ impl Indexer {
             self.commit_group(std::mem::take(&mut batch), &current, &group_txids, last_ms)?;
             committed_height = current.height as u64;
             let (live_core, live_prune) = self.live_core_and_prune(info.blocks, info.pruneheight);
+            let rate_secs = started.elapsed().as_secs_f64().max(0.001);
+            self.tunables.record_tx_rate(
+                ((current.txnum.saturating_sub(start_txnum)) as f64 / rate_secs) as u64,
+            );
+            if let Some(sh) = &self.shared {
+                self.tunables.publish(&sh.stats);
+            }
             print_progress(
                 &current,
                 started,
@@ -2140,7 +2185,10 @@ fn apply_supervisor_actions(
 }
 
 fn cmd_index(cfg: &Config, chain: Chain) -> R<()> {
-    let store = open_store(cfg, chain)?;
+    let rotational = tuning::is_rotational(&cfg.data_dir(chain));
+    let tunables = Arc::new(Tunables::new(cfg, rotational));
+    let store = open_store_with(cfg, chain, tunables.cache_mib(), tunables.background_jobs())?;
+    tunables.apply_store(&store);
     warn_if_disk_low(cfg, chain);
     let core = core_client(cfg, chain)?;
     let flag = shutdown_flag();
@@ -2151,13 +2199,14 @@ fn cmd_index(cfg: &Config, chain: Chain) -> R<()> {
         println!("shutdown requested; index stopped");
         return Ok(());
     };
-    let bulk = build_bulk(cfg, chain, identity.genesis)?;
+    let bulk = build_bulk(cfg, chain, identity.genesis, tunables.readers())?;
     let can_control = core_sup.can_control_core();
     let idx = Indexer::new(
         store,
         core,
         bulk,
         None,
+        Arc::clone(&tunables),
         cfg.clone(),
         Arc::new(RwLock::new(())),
         None,
@@ -2281,6 +2330,63 @@ fn ensure_identity_blocking(
     }
 }
 
+/// Reload the hot subset of the config. Cold fields are reported but require a
+/// restart; the last valid config stays in effect on parse/validation errors.
+fn reload_hot(
+    old: &Config,
+    idx: &Indexer,
+    supervisor: &mut el_chain::Supervisor,
+    shared: Option<&Arc<Shared>>,
+    can_control_core: bool,
+) {
+    let Some(path) = config_path() else {
+        eprintln!("[e-lite] reload requested but no config file was resolved");
+        return;
+    };
+    let path_str = path.to_string_lossy().to_string();
+    match Config::load(Some(&path_str)) {
+        Ok(new) => {
+            if let Err(e) = new.validate() {
+                eprintln!("[e-lite] reload rejected ({e}); keeping the previous config");
+                return;
+            }
+            let changed = idx.tunables.reload(&new);
+            idx.tunables.apply_store(&idx.store);
+            if changed.contains(&"profile") {
+                if let Err(e) = idx
+                    .store
+                    .set_background_jobs(idx.tunables.background_jobs())
+                {
+                    eprintln!("[e-lite] reload: cannot set RocksDB background jobs: {e}");
+                }
+            }
+            supervisor.update_config(supervisor_config(&new, can_control_core));
+            if let Some(sh) = shared {
+                idx.tunables.publish(&sh.stats);
+            }
+            if new.core.prune_mib != old.core.prune_mib
+                || new.index.block_source != old.index.block_source
+                || new.index.reorg_window != old.index.reorg_window
+                || new.network.data_dir != old.network.data_dir
+            {
+                eprintln!(
+                    "[e-lite] reload: cold fields changed (prune_mib/block_source/                     reorg_window/data_dir); restart required for those"
+                );
+            }
+            eprintln!(
+                "[e-lite] reloaded {} hot field(s): {}",
+                changed.len(),
+                if changed.is_empty() {
+                    "no changes".to_string()
+                } else {
+                    changed.join(", ")
+                }
+            );
+        }
+        Err(e) => eprintln!("[e-lite] reload failed ({e}); keeping the previous config"),
+    }
+}
+
 /// Shared index loop for `index` and `run`. `stop_at_tip` implements
 /// `--no-follow`; `run` always follows.
 fn index_loop(
@@ -2301,8 +2407,25 @@ fn index_loop(
     let mut last_height = u64::MAX;
     let mut was_ready = false;
     let mut backoff = 1u64;
+    eprintln!(
+        "[e-lite] tuning profile={} readers={} commit={}ms batch={} cache={}MiB jobs={} prefetch={} adaptive={}",
+        idx.tunables.profile().name(),
+        idx.tunables.readers(),
+        idx.tunables.commit_ms(),
+        idx.tunables.batch_blocks(),
+        idx.tunables.cache_mib(),
+        idx.tunables.background_jobs(),
+        idx.tunables.prefetch_blocks(),
+        idx.tunables.adaptive()
+    );
+    if let Some(sh) = &shared {
+        idx.tunables.publish(&sh.stats);
+    }
 
     loop {
+        if reload_flag().swap(false, Ordering::SeqCst) {
+            reload_hot(cfg, &idx, &mut supervisor, shared.as_ref(), can_control);
+        }
         if flag.load(Ordering::SeqCst) {
             if shared.is_none() {
                 println!("shutdown requested; index stopped");
@@ -2320,6 +2443,19 @@ fn index_loop(
                     .as_ref()
                     .map(|s| s.stats.core_ibd.load(Ordering::Relaxed))
                     .unwrap_or(false);
+                let lag = core_height.saturating_sub(height);
+                let mode = if core_ibd || lag > 1_000 {
+                    Mode::Bulk
+                } else {
+                    Mode::Live
+                };
+                if idx
+                    .tunables
+                    .maybe_adapt(mode, lag, &idx.store, shared.as_ref().map(|s| &s.stats))
+                    .is_some()
+                {
+                    idx.tunables.apply_store(&idx.store);
+                }
                 if let Some(sh) = &shared {
                     let caught_up = !core_ibd && height + 1 >= core_height;
                     let next = if idx.is_paused() || idx.downloads_paused() || supervisor.paused() {
@@ -2680,7 +2816,10 @@ fn cmd_serve(cfg: &Config, chain: Chain) -> R<()> {
 }
 
 fn cmd_run(cfg: &Config, chain: Chain) -> R<()> {
-    let store = open_store(cfg, chain)?;
+    let rotational = tuning::is_rotational(&cfg.data_dir(chain));
+    let tunables = Arc::new(Tunables::new(cfg, rotational));
+    let store = open_store_with(cfg, chain, tunables.cache_mib(), tunables.background_jobs())?;
+    tunables.apply_store(&store);
     warn_if_disk_low(cfg, chain);
     let stored = stored_identity(&store, chain)?;
     let identity = placeholder_identity(chain, stored);
@@ -2710,13 +2849,14 @@ fn cmd_run(cfg: &Config, chain: Chain) -> R<()> {
         println!("[e-lite] shutdown requested; stopped cleanly");
         return Ok(());
     };
-    let bulk = build_bulk(cfg, chain, live.genesis)?;
+    let bulk = build_bulk(cfg, chain, live.genesis, tunables.readers())?;
     let can_control = core_sup.can_control_core();
     let idx = Indexer::new(
         Arc::clone(&store),
         shared.core.clone(),
         bulk,
         Some(Arc::clone(&shared.resolver)),
+        Arc::clone(&tunables),
         cfg.clone(),
         Arc::clone(&shared.lock),
         Some(Arc::clone(&shared)),
