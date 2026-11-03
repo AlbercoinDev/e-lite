@@ -30,7 +30,11 @@ impl EsploraSource {
             if b.is_empty() {
                 continue;
             }
-            let is_onion = b.contains(".onion");
+            let lower = b.to_ascii_lowercase();
+            if !lower.starts_with("http://") && !lower.starts_with("https://") {
+                continue;
+            }
+            let is_onion = lower.contains(".onion");
             // Skip endpoints we cannot use instead of disabling the whole
             // source (e.g. a mainnet onion URL with allow_clearnet but no Tor).
             if is_onion && tor_socks.is_none() {
@@ -147,6 +151,17 @@ mod tests {
             vec!["https://blockstream.info/api".into()],
             None,
             false,
+            Duration::from_secs(5),
+        );
+        assert!(err.is_err());
+    }
+
+    #[test]
+    fn refuses_non_http_endpoints() {
+        let err = EsploraSource::new(
+            vec!["file:///tmp".into()],
+            None,
+            true,
             Duration::from_secs(5),
         );
         assert!(err.is_err());

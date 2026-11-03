@@ -1,0 +1,87 @@
+# Current functionality
+
+Status values: **stable** (tested and supported), **experimental** (works but
+not production-hardened), **gate** (explicit error, not implemented), **not
+available**.
+
+## Core and ingest
+
+| Feature | Status | Notes |
+|---|---|---|
+| Networks: regtest, signet, testnet4, mainnet | experimental | mainnet requires explicit opt-in |
+| Core `external`, `auto`, `managed` | experimental | only owned Core can be paused/pruned/stopped |
+| Local Core, LAN Core, WAN via SSH/VPN | experimental | RPC-only for LAN/WAN; no remote block files |
+| Block source `files`, `rpc`, `auto` | experimental | files reads `blk*.dat`, XOR aware, read-only |
+| From-zero pruned IBD with `prune_mib=1` | experimental | manual prune gate; default |
+| Full node `prune_mib=0` | experimental | no pruning |
+| Automatic pruning `>=550` + opt-in | experimental | hard lag cap + verified gap repair |
+| Disk guard with download/index split | experimental | cgroup/LXC aware |
+| Adaptive profiles and hot reload | experimental | `auto/hdd/ssd/nvme/manual`, `SIGUSR1` |
+| Reorg recovery within undo window | experimental | deeper reorg fails clearly |
+| Snapshots export/import | experimental | optional; not required from zero |
+
+## Index and Electrum 1.4
+
+| Feature | Status | Notes |
+|---|---|---|
+| Headers and header subscription | experimental | checkpoint proof support |
+| Script history, balance, UTXOs | experimental | history capped at 100k entries/script |
+| Scripthash subscribe/unsubscribe | experimental | dirty-set notifications |
+| Mempool history/UTXOs/fees | experimental | overlay from Core; fee histogram |
+| Merkle proofs, tx id-from-pos | experimental | local index |
+| Block stats | experimental | local |
+| Broadcast | experimental | via Core |
+| Raw transaction get | experimental | local Core -> cache -> P2P/Esplora |
+| Electrum 1.4 negotiation | experimental | 1.7 not implemented |
+| TLS Electrum | **not available** | plain TCP only |
+| Silent payments BIP352 | **gate** | explicit error; no indexer |
+
+### Electrum methods currently implemented
+
+`server.version`, `server.features`, `server.ping`, `server.banner`,
+`server.donation_address`, `server.peers.subscribe`,
+`blockchain.headers.subscribe`, `blockchain.block.header`,
+`blockchain.block.headers`, `blockchain.scripthash.get_history`,
+`blockchain.scripthash.get_balance`, `blockchain.scripthash.listunspent`,
+`blockchain.scripthash.subscribe`, `blockchain.scripthash.unsubscribe`,
+`blockchain.scripthash.get_mempool`, `mempool.get_fee_histogram`,
+`blockchain.relayfee`, `blockchain.estimatefee`, `blockchain.block.stats`,
+`blockchain.transaction.get`, `blockchain.transaction.get_merkle`,
+`blockchain.transaction.id_from_pos`, `blockchain.transaction.broadcast`,
+`blockchain.silentpayments.subscribe`/`unsubscribe` (explicit gate error).
+
+## Privacy and external data
+
+| Feature | Status | Notes |
+|---|---|---|
+| Local-first rawtx | experimental | Core/cache before external |
+| Whole-block external fetch | experimental | by hash, never txid |
+| Tor SOCKS5h, fail closed | experimental | `tor_socks`, `allow_clearnet` |
+| Decoys and random source order | experimental | `decoys=3` default |
+| Block hash/header/Merkle/witness validation | experimental | before serving/caching |
+| Configurable Esplora endpoints | experimental | `esplora_urls` |
+| P2P peers auto/config | experimental | BIP324 v2 + v1 fallback |
+| Prune-gap repair from verified sources | experimental | bounded by `repair_max_gap_blocks` |
+| Silent payments privacy | **not available** | gate only |
+
+## Operations and packaging
+
+| Feature | Status | Notes |
+|---|---|---|
+| `/status`, `/metrics`, `/healthz` | experimental | loopback by default |
+| One-line install/update | stable | installer verifies SHA256SUMS |
+| Optional official Core install/update | stable | `--with-core` |
+| `.deb`, tarball, release checksums | stable | GitHub Releases |
+| All-in-one test harness | experimental | `scripts/e-lite-all-in-one.sh` |
+| Systemd unit / container image | **not available** | roadmap |
+
+## Compatibility
+
+| Item | Status |
+|---|---|
+| Debian 12+/LMDE 6+, x86_64 | supported |
+| Bitcoin Core 28+ | supported; tested with 32.x |
+| Electrum protocol 1.4 | supported |
+| Electrum/Sparrow wallets | tested on regtest; broader matrix pending |
+| ARM64 | not published |
+| Windows/macOS | not supported |

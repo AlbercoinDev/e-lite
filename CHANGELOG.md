@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.1.0-alpha.16 — 2026-11-03
+
+### Security audit and documentation rewrite
+
+- **Electrum request lines are capped at 1 MiB** before allocation; a client can
+  no longer grow a per-connection buffer indefinitely without a newline.
+- **`max_clients` is reserved atomically before spawning a client thread**, so a
+  burst cannot exceed the configured limit.
+- **Snapshot import rejects symlinks, hardlinks and special files**, preventing
+  archive extraction outside the target or special-file creation.
+- **Esplora endpoints must be http/https**; invalid schemes are skipped.
+- **Non-loopback Electrum/metrics listeners log a startup warning** (no TLS or
+  authentication is implemented).
+- **Project memory added**: `AGENTS.md` and `docs/PROJECT_MEMORY.md` lock the
+  one-line install/update UX, Core variant, documentation contract, current/
+  future feature sections and audit rules.
+- **Documentation regenerated** around `INSTALL`, `ARCHITECTURE`, `OPERATIONS`,
+  `PRIVACY`, `FEATURES`, `ROADMAP`, `TUNING`, `AUDIT` and `GETTING-STARTED`.
+- **Audit report** added in `docs/AUDIT.md` with fixed findings and residual
+  risks (TLS/auth, Core RPC TLS, snapshot archive limits, provider trust).
+
 ## 0.1.0-alpha.15 — 2026-11-03
 
 ### Container safety and conservative reader scaling

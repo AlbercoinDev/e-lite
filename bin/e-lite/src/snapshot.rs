@@ -145,6 +145,13 @@ pub fn import(input: &Path, target: &Path, chain: Chain) -> Result<SnapshotInfo,
     let mut archive = tar::Archive::new(GzDecoder::new(file));
     for entry in archive.entries()? {
         let mut entry = entry?;
+        let kind = entry.header().entry_type();
+        // Symlinks/hardlinks and device nodes would let a malicious archive
+        // escape the target directory or create special files. Snapshots only
+        // contain regular files and directories.
+        if !kind.is_file() && !kind.is_dir() {
+            return Err(format!("unsafe snapshot entry type: {kind:?}").into());
+        }
         let path = entry.path()?.to_path_buf();
         if path.is_absolute()
             || path
@@ -209,4 +216,43 @@ pub fn import(input: &Path, target: &Path, chain: Chain) -> Result<SnapshotInfo,
         digest: digest.to_hex(),
         bytes,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs::File;
+
+    #[test]
+    fn import_rejects_symlink_entries() {
+        let dir = std::env::temp_dir().join(format!(
+            "e-lite-snapshot-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let archive_path = dir.join("evil.tar.gz");
+        {
+            let file = File::create(&archive_path).unwrap();
+            let enc = GzEncoder::new(file, Compression::default());
+            let mut tar = tar::Builder::new(enc);
+            let mut header = tar::Header::new_gnu();
+            header.set_entry_type(tar::EntryType::Symlink);
+            header.set_size(0);
+            header.set_mode(0o777);
+            header.set_mtime(0);
+            header.set_link_name("/tmp").unwrap();
+            header.set_cksum();
+            tar.append_data(&mut header, "evil", std::io::empty())
+                .unwrap();
+            tar.into_inner().unwrap().finish().unwrap();
+        }
+        let target = dir.join("target");
+        let err = import(&archive_path, &target, Chain::Regtest).unwrap_err();
+        assert!(err.to_string().contains("unsafe snapshot entry type"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

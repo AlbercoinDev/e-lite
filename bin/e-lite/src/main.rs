@@ -2715,7 +2715,24 @@ fn build_shared(
     Ok(shared)
 }
 
+fn is_loopback_listen(addr: &str) -> bool {
+    let host = addr.rsplit_once(':').map(|(h, _)| h).unwrap_or(addr);
+    host == "localhost" || host == "[::1]" || host == "::1" || host.starts_with("127.")
+}
+
+fn warn_public_listen(what: &str, addr: &str) {
+    if !is_loopback_listen(addr) {
+        eprintln!(
+            "[e-lite] WARNING: {what} is listening on {addr}, not loopback. \
+             It has no TLS/authentication; use an SSH/VPN tunnel, a reverse proxy \
+             with TLS, or firewall it explicitly."
+        );
+    }
+}
+
 fn start_transports(shared: &Arc<Shared>, cfg: &Config) -> R<()> {
+    warn_public_listen("Electrum", &cfg.server.listen);
+    warn_public_listen("metrics", &cfg.metrics.listen);
     let server = Arc::clone(shared);
     el_serve::start_server(server).map_err(|e| format!("cannot bind {}: {e}", shared.listen))?;
     if cfg.metrics.enabled {

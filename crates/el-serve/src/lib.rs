@@ -27,6 +27,9 @@ pub const PROTOCOL_MIN: &str = "1.4";
 pub const PROTOCOL_MAX: &str = "1.4";
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const MAX_HEADERS_CHUNK: usize = 2016;
+/// Hard limit for a single Electrum JSON-RPC line. Prevents an unauthenticated
+/// client from growing the per-connection buffer without bound.
+pub const MAX_REQUEST_BYTES: usize = 1024 * 1024;
 
 pub mod state {
     pub const BUILDING: u8 = 0;
@@ -1420,23 +1423,65 @@ pub fn start_server(shared: Arc<Shared>) -> std::io::Result<std::thread::JoinHan
                 Ok(s) => s,
                 Err(_) => continue,
             };
-            if shared.stats.clients.load(Ordering::SeqCst) >= shared.max_clients {
+            // Reserve the slot before spawning: checking and incrementing
+            // inside the child thread lets a burst exceed max_clients.
+            let before = shared.stats.clients.fetch_add(1, Ordering::SeqCst);
+            if before >= shared.max_clients {
+                shared.stats.clients.fetch_sub(1, Ordering::SeqCst);
                 let _ = stream.shutdown(std::net::Shutdown::Both);
                 continue;
             }
             let shared = Arc::clone(&shared);
             let Ok(writer) = stream.try_clone() else {
+                shared.stats.clients.fetch_sub(1, Ordering::SeqCst);
                 continue;
             };
             let client = shared.clients.register(writer);
             std::thread::spawn(move || {
-                shared.stats.clients.fetch_add(1, Ordering::SeqCst);
                 let _ = handle_client(&shared, stream, client);
                 shared.stats.clients.fetch_sub(1, Ordering::SeqCst);
             });
         }
     });
     Ok(handle)
+}
+
+/// Read one newline-terminated line without allowing the buffer to exceed
+/// `max` bytes. `Ok(false)` means clean EOF.
+fn read_line_limited<R: BufRead>(
+    reader: &mut R,
+    buf: &mut Vec<u8>,
+    max: usize,
+) -> std::io::Result<bool> {
+    loop {
+        let available = reader.fill_buf()?;
+        if available.is_empty() {
+            return Ok(!buf.is_empty());
+        }
+        if let Some(pos) = available.iter().position(|b| *b == b'\n') {
+            let take = pos + 1;
+            if buf.len().saturating_add(take) > max {
+                reader.consume(take);
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "request line too large",
+                ));
+            }
+            buf.extend_from_slice(&available[..take]);
+            reader.consume(take);
+            return Ok(true);
+        }
+        let take = available.len();
+        if buf.len().saturating_add(take) > max {
+            reader.consume(take);
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "request line too large",
+            ));
+        }
+        buf.extend_from_slice(available);
+        reader.consume(take);
+    }
 }
 
 fn handle_client(
@@ -1450,18 +1495,18 @@ fn handle_client(
     let mut buf = Vec::new();
     loop {
         buf.clear();
-        match reader.read_until(b'\n', &mut buf) {
-            Ok(0) => break,
-            Ok(_) => {}
+        match read_line_limited(&mut reader, &mut buf, MAX_REQUEST_BYTES) {
+            Ok(true) => {}
+            Ok(false) => break,
+            Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
+                let _ = client.send(&json!({
+                    "jsonrpc": "2.0",
+                    "id": Value::Null,
+                    "error": {"code": -32600, "message": "request too large"},
+                }));
+                break;
+            }
             Err(_) => break,
-        }
-        if buf.len() > 1024 * 1024 {
-            let _ = client.send(&json!({
-                "jsonrpc": "2.0",
-                "id": Value::Null,
-                "error": {"code": -32600, "message": "request too large"},
-            }));
-            break;
         }
         let line = String::from_utf8_lossy(&buf);
         if line.trim().is_empty() {
@@ -1740,6 +1785,22 @@ mod tests {
         let (set, force) = dirty.take();
         assert!(set.is_empty());
         assert!(force);
+    }
+
+    #[test]
+    fn request_line_is_bounded() {
+        use std::io::Cursor;
+        let mut r = Cursor::new(b"{\"a\":1}\nnext\n".to_vec());
+        let mut buf = Vec::new();
+        assert!(read_line_limited(&mut r, &mut buf, 64).unwrap());
+        assert_eq!(buf, b"{\"a\":1}\n");
+        buf.clear();
+        assert!(read_line_limited(&mut r, &mut buf, 64).unwrap());
+        assert_eq!(buf, b"next\n");
+
+        let mut r = Cursor::new(vec![b'x'; 100]);
+        let mut buf = Vec::new();
+        assert!(read_line_limited(&mut r, &mut buf, 16).is_err());
     }
 
     #[test]

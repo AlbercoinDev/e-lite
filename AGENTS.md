@@ -1,0 +1,68 @@
+# AGENTS.md — e-lite project memory
+
+This file is the operational memory for agents and maintainers. It is not a
+historical design document; the ADRs under `docs/` remain the decision log.
+
+## Product invariants
+
+1. **One-line install/update is mandatory.** The primary command is:
+   ```bash
+   curl -fsSL https://github.com/AlbercoinDev/e-lite/releases/latest/download/install.sh | sh
+   ```
+   The same command installs or updates e-lite without touching configuration,
+   databases or Core's datadir.
+2. **A second one-line variant must install/update the latest official Bitcoin
+   Core together with e-lite.** It is the recommended path for a working setup:
+   ```bash
+   curl -fsSL https://github.com/AlbercoinDev/e-lite/releases/latest/download/install.sh | sh -s -- --with-core --yes
+   ```
+   Keep both commands in `README.md` and `docs/INSTALL.md`; do not replace them
+   with multi-step instructions.
+3. Documentation must always explain:
+   - how e-lite can run (all-in-one, split index/serve, offline serve, local,
+     LAN and WAN Core, full and pruned Core);
+   - what is served from the local index and what requires external sources;
+   - which public servers are used, whether they are configurable, and how
+     privacy is preserved (Tor, clearnet, whole-block requests, decoys,
+     validation, cache).
+4. Maintain two explicit documentation sections:
+   - current functionality (`docs/FEATURES.md`);
+   - future functionality and proposed improvements (`docs/ROADMAP.md`).
+   Never describe an unimplemented feature as available. TLS is currently not
+   implemented.
+5. Every behaviour change updates documentation, `config.example.toml` and
+   `CHANGELOG.md`.
+6. Pruning, snapshots, network exposure, privacy and data-loss questions require
+   evidence in `docs/AUDIT.md`; do not guess.
+
+## Current defaults worth remembering
+
+- From-zero pruned IBD uses `prune_mib = 1` (manual pruning). Core never prunes
+  on its own; the prune gate keeps the cut below `index - 288`.
+- `prune_mib >= 550` requires `[pruning] allow_auto_prune = true`.
+- Snapshots are optional; they are never required by the from-zero flow.
+- Electrum listens on `127.0.0.1:50001` without TLS by default. Do not expose it
+  publicly without a tunnel/authentication plan.
+- Core RPC is HTTP; LAN/WAN use requires SSH/VPN.
+- Raw transactions are local-first. External fallback requests whole blocks by
+  hash, validates them, uses Tor by default and never sends wallet txids/scripts.
+
+## Quality gates
+
+Before claiming completion:
+
+```bash
+cargo fmt --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace
+```
+
+Plus the relevant integration tests (`tests/e2e_*.sh`) and the install/update
+commands on a clean environment.
+
+## Code review rule
+
+Audit before rewriting. Record findings in `docs/AUDIT.md` with severity,
+file:line, impact, reproduction/test, status and fix commit. Fix P0
+(data-loss/security/crash) and P1 (functional/race) before publishing docs that
+depend on the affected behaviour.

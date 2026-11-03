@@ -1,527 +1,94 @@
 # e-lite
 
-**Electrum 1.4 server for Bitcoin Core.** Query the history, balance and UTXOs of
-any `scriptPubKey` in the active chain — **without registering wallets**.
+**Electrum 1.4 server for Bitcoin Core.** Query history, balances and UTXOs of
+any `scriptPubKey` in the active chain without registering wallets. Core remains
+the authority for consensus and the active chain; e-lite never invents data.
 
-`e-lite` indexes the chain from Bitcoin Core and serves Electrum JSON-RPC on
-loopback by default. Core remains the authority for consensus and the active
-chain; e-lite never invents data.
+> **Status: `v0.1.0-alpha.16` — experimental, no funds.**
+> Test on regtest/signet/testnet4 before mainnet.
+> TLS is **not implemented**; Electrum is plain TCP and loopback by default.
 
-> **Status: `v0.1.0-alpha.15` — experimental, no funds.**
-> Use on test networks first.
->
-> **Testing from scratch:** see [`docs/GETTING-STARTED.md`](docs/GETTING-STARTED.md)
-> for prerequisites, disk requirements, the regtest quickstart, the full
-> signet/testnet4 acceptance and troubleshooting.
-
-## One command: install/update, test and report
-
-From a checkout (uses your working tree):
+## Install or update (one line)
 
 ```bash
-# Regtest end-to-end: installs/updates, starts Core, mines, queries and reports
-bash scripts/e-lite-all-in-one.sh --network regtest --quick --with-core --yes
-
-# Full signet acceptance (needs >=15 GiB free)
-bash scripts/e-lite-all-in-one.sh --network signet --acceptance --with-core --yes
-
-# Full testnet4 acceptance (needs >=20 GiB free)
-bash scripts/e-lite-all-in-one.sh --network testnet4 --acceptance --with-core --yes
-```
-
-From GitHub (published `main`):
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/AlbercoinDev/e-lite/main/scripts/e-lite-all-in-one.sh \
-  | bash -s -- --network signet --acceptance --with-core --yes
-```
-
-The script installs dependencies and Rust if missing, installs/updates Bitcoin
-Core, builds and installs e-lite, writes a config under `~/e-lite-test/`, starts
-Core through e-lite, runs the selected test, and writes a report to
-`~/e-lite-test/last-report.txt`.
-
-## Supported networks
-
-`regtest` · `signet` · `testnet4` · `mainnet` (explicit opt-in).
-Testnet3 is intentionally not supported.
-
-## Requirements
-
-- Linux **Debian 12+ / LMDE 6+**, x86_64, glibc ≥ 2.36.
-- Bitcoin Core 28+ (official binary from bitcoincore.org). `txindex` is **not** needed.
-- For a first pruned IBD, e-lite and Core must be on the **same host**, with
-  **read** access to Core's `blocks/` directory (including `xor.dat`). This is
-  the only supported way to index from scratch against a pruned Core.
-- The index lives in its own directory; e-lite never writes to the Core datadir.
-- Mainnet production is usually restored from a snapshot; a from-scratch mainnet
-  index is possible but I/O-heavy (see “Disk expectations”).
-
-## Install (one line, also updates)
-
-```bash
+# e-lite only (configuration, database and Core datadir untouched)
 curl -fsSL https://github.com/AlbercoinDev/e-lite/releases/latest/download/install.sh | sh
 ```
 
-The installer needs `curl` and `ca-certificates` (present on standard Debian
-desktops). The same command installs or **updates** e-lite (atomic binary
-replacement, config and database untouched) and **asks** whether to install or
-update the latest official Bitcoin Core. Without a terminal it defaults to *no*.
-
-Non-interactive variants:
-
 ```bash
-# e-lite + Bitcoin Core, no questions
+# e-lite + the latest official Bitcoin Core (recommended for a working setup)
 curl -fsSL https://github.com/AlbercoinDev/e-lite/releases/latest/download/install.sh | sh -s -- --with-core --yes
-
-# only e-lite
-curl -fsSL https://github.com/AlbercoinDev/e-lite/releases/latest/download/install.sh | sh -s -- --no-core
-
-# system-wide .deb (root)
-curl -fsSL https://github.com/AlbercoinDev/e-lite/releases/latest/download/e-lite_amd64.deb -o /tmp/e-lite.deb && sudo dpkg -i /tmp/e-lite.deb
 ```
 
-Installed to `${E_LITE_PREFIX:-$HOME/.local/bin}` by default, **no sudo**.
+Both commands install **or update**; they are intentionally one line. More
+variants (pinned version, `.deb`, from source) are in
+[`docs/INSTALL.md`](docs/INSTALL.md).
 
-## Quickstart: e-lite starts and manages Core
+## First run from zero
 
 ```bash
-# From an empty datadir, with manual pruning (safe for a from-zero IBD).
-e-lite run --network signet --core-datadir ~/.bitcoin --data-dir ~/.local/share/e-lite/signet
+export PATH="$HOME/.local/bin:$PATH"
+
+CORE="$HOME/.bitcoin-signet"
+DATA="$HOME/.local/share/e-lite/signet"
+
+e-lite doctor --network signet --core-datadir "$CORE" --data-dir "$DATA"
+e-lite run    --network signet --manage managed \
+  --core-datadir "$CORE" --data-dir "$DATA" --prune-mib 1
 ```
 
-With the default `[core] manage = "auto"`:
-- if Core is already running, e-lite uses it read-only;
-- if Core is not running, e-lite starts it, waits for its RPC and indexes;
-- `init` is **not required**: `run` auto-initializes the database when Core is
-  available;
-- if Core is down, e-lite binds the ports, shows `WAITING_FOR_CORE` and retries;
-- if the database already exists, e-lite serves cached history while Core is down.
+Electrum/Sparrow: `127.0.0.1:50001` (no SSL). Status and metrics:
+`http://127.0.0.1:9184/status` and `/metrics`.
 
-For explicit one-shot setup:
+## Documentation
 
-```bash
-e-lite doctor --network signet --core-datadir ~/.bitcoin
-e-lite init   --network signet --core-datadir ~/.bitcoin --data-dir ~/.local/share/e-lite/signet
-e-lite run    --network signet --core-datadir ~/.bitcoin --data-dir ~/.local/share/e-lite/signet
-```
-
-Connect Electrum or Sparrow to `127.0.0.1:50001` (no SSL).
-
-## Core management
-
-```toml
-[core]
-manage = "auto"   # external | auto | managed
-```
-
-| Mode | Behaviour |
+| Document | Contents |
 |---|---|
-| `external` | e-lite never starts, stops, pauses or prunes Core. It waits for Core and serves cached data. |
-| `auto` | If Core is running, use it read-only. If not, start and supervise it. |
-| `managed` | Always start Core; fail if another instance is already running. |
+| [`docs/INSTALL.md`](docs/INSTALL.md) | Install/update, Core, `.deb`, source, first run |
+| [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) | Components, execution modes, local/LAN/WAN Core |
+| [`docs/OPERATIONS.md`](docs/OPERATIONS.md) | Pruning, disks, remote Core, monitoring, troubleshooting |
+| [`docs/PRIVACY.md`](docs/PRIVACY.md) | Local vs external data, Tor/clearnet, providers |
+| [`docs/FEATURES.md`](docs/FEATURES.md) | What exists today, with status |
+| [`docs/ROADMAP.md`](docs/ROADMAP.md) | Future features and proposed improvements |
+| [`docs/TUNING.md`](docs/TUNING.md) | HDD/SSD/NVMe profiles, adaptive tuning, hot reload |
+| [`docs/AUDIT.md`](docs/AUDIT.md) | Code audit findings and residual risks |
+| [`docs/GETTING-STARTED.md`](docs/GETTING-STARTED.md) | Acceptance tests from scratch |
+| [`docs/PROJECT_MEMORY.md`](docs/PROJECT_MEMORY.md) | Project invariants and documentation rules |
 
-**Only a Core started by e-lite can be paused, pruned or stopped by e-lite.**
-A Core that was already running is never touched: e-lite does not call
-`setnetworkactive` or `pruneblockchain` on it.
+## Networks and requirements
 
-`prune_mib = 1` enables manual pruning and is the default for a from-zero pruned
-IBD: e-lite indexes each block before authorising its deletion. `0` means a full
-node. Values `>= 550` enable Core’s automatic pruning and require
-`[pruning] allow_auto_prune = true`; automatic pruning during IBD can race the
-index and is not the from-zero default. e-lite passes `-prune`, `-rpcport` (taken from
-`rpc_url`), `-rpcbind=127.0.0.1`, `-rpcallowip=127.0.0.1`, `-server=1` and
-`-daemon=0`, plus `extra_args`. It does not edit `bitcoin.conf` and does not
-disable indexes you have enabled.
+- Networks: `regtest`, `signet`, `testnet4`, `mainnet` (explicit opt-in).
+  Testnet3 is not supported.
+- Linux Debian 12+/LMDE 6+, x86_64, glibc ≥ 2.36.
+- Bitcoin Core 28+; `txindex` is not needed.
+- From-zero **pruned** IBD requires a local Core owned by e-lite and read access
+  to its `blocks/` directory.
+- The index lives in its own directory; e-lite never writes to Core's datadir.
 
-A Core launched by e-lite is logged to `<data-dir>/bitcoind.log`, tracked in
-`<data-dir>/core-child.pid` and stopped on clean shutdown when
-`stop_on_exit = true`.
+## Security notes
 
-## From-zero pruned IBD (local only)
+- Electrum listens on `127.0.0.1:50001` by default, without TLS or
+  authentication. Do not expose it publicly without a tunnel/reverse proxy.
+- Core RPC is HTTP. LAN/WAN use requires SSH/VPN; never expose the RPC port.
+- External rawtx lookup is local-first and Tor-first; it requests whole blocks by
+  hash and validates them. See [`docs/PRIVACY.md`](docs/PRIVACY.md).
 
-This is the supported path for “both start from zero”:
-
-1. e-lite starts Core with `-prune=1` (manual pruning; `0` for a full node).
-2. e-lite reads raw blocks directly from Core's `blk*.dat` files.
-3. e-lite’s prune gate is the only pruning authority: it never requests a cut
-   above `index - 288`, so Core cannot delete a block the index still needs.
-4. If the disk runs low, Core downloads pause but indexing continues so the
-   prune gate can free space; only a critical floor pauses indexing too.
-
-The lag guard is only used for automatic pruning (`prune_mib >= 550` with
-`allow_auto_prune = true`), is hard-capped at 224 blocks and resumes at 50%.
-Manual pruning does not need it: the prune gate is the invariant. The guard also
-pauses Core while a `transaction.get` is resolving a block near the prune
-boundary.
-
-If automatic pruning still leaves a gap, or an existing index is behind an
-externally pruned Core, `run` fetches only the missing blocks from the validated
-rawtx cache, P2P or Esplora sources, verifies their hash and merkle root, and
-continues. `repair_max_gap_blocks` bounds the work. External repair respects the
-`[rawtx]` Tor/clearnet policy; no snapshot is created or required.
-
-**Not supported:** a pruned Core that e-lite did not start, or a remote pruned
-Core, with an empty index. e-lite fails with instructions instead of risking a
-hole:
-
-```
-Core is pruned and the index is empty, but e-lite did not start Core; stop Core
-and use [core] manage = "managed" with prune_mib = 1 (or use a full node)
-```
-
-## Remote Core (maintenance only)
-
-Core remote is supported for **keeping an existing index up to date**, not for
-the first pruned IBD. Use an SSH or VPN tunnel; e-lite speaks plain HTTP to Core:
-
-```toml
-[core]
-manage = "external"
-rpc_url = "http://127.0.0.1:8332"   # forwarded by SSH: ssh -L 8332:127.0.0.1:8332 host
-# rpc_user = "..."
-# rpc_password = "..."
-```
-
-`cookie_file` also works if you copy Core's cookie. For a LAN Core, point
-`rpc_url` at its address and use `rpc_user`/`rpc_password`. Do **not** expose
-Core's RPC port to the Internet without TLS/VPN.
-
-If the remote Core is pruned and the index is behind `pruneheight`, e-lite
-fails and asks for a full node; it never pauses a shared node.
-
-## Configuration
-
-Every value shown is the default. The full file is `config.example.toml`.
-
-```toml
-[network]
-name = "auto"                 # auto | mainnet | testnet4 | signet | regtest
-# data_dir = "/home/USER/.local/share/e-lite"
-
-[core]
-manage = "auto"               # external | auto | managed
-bitcoind = "bitcoind"
-core_datadir = "/home/USER/.bitcoin"
-# rpc_url = "http://127.0.0.1:8332"
-# rpc_user = ""
-# rpc_password = ""
-# cookie_file = ""
-timeout_seconds = 30
-prune_mib = 1                 # 1 = manual (from zero); 0 = full; >=550 = auto
-extra_args = []
-restart = true
-stop_on_exit = true
-# log_file = ""
-
-[index]
-block_source = "auto"         # auto | rpc | files
-readers = 0                   # 0 = profile/adaptive
-cache_mib = 0                 # 0 = profile/adaptive
-reorg_window = 288
-batch_blocks = 256
-profile = "auto"             # auto | hdd | ssd | nvme | manual
-adaptive = true
-commit_interval_ms = 0       # 0 = profile default
-prefetch_blocks = 0
-follow = true
-
-[pruning]
-min_free_gib = 10             # pause Core downloads below this; indexing continues
-critical_free_gib = 1         # also pause indexing below this hard floor
-max_core_lag_blocks = 192     # automatic pruning only; hard-capped at 224
-allow_auto_prune = false      # required for prune_mib >= 550
-min_gain_blocks = 288
-prune_interval_seconds = 30
-repair_max_gap_blocks = 2048  # verified cache/P2P/Esplora repair limit
-poll_seconds = 10
-
-[server]
-listen = "127.0.0.1:50001"
-max_clients = 32
-
-[metrics]
-enabled = true
-listen = "127.0.0.1:9184"
-
-[rawtx]
-enabled = true
-cache_mib = 2048
-decoys = 3
-tor_socks = "127.0.0.1:9050"
-allow_clearnet = false
-use_p2p = true
-use_esplora = true
-p2p_v2 = true
-esplora_urls = []             # empty = per-network defaults
-
-[silent_payments]
-enabled = false
-
-[safety]
-allow_mainnet = false
-```
-
-Per-network Esplora defaults:
-- mainnet: `https://blockstream.info/api`, `https://mempool.space/api` and the
-  mempool.space onion endpoint;
-- signet: `https://mempool.space/signet/api`;
-- testnet4: `https://mempool.space/testnet4/api`;
-- regtest: none.
-
-## Autotuning and hot reload
-
-See [`docs/TUNING.md`](docs/TUNING.md) for the full design, profiles and
-controller rules.
-
-`e-lite` selects a conservative startup profile from the data disk
-(`rotational` hint) and RAM, then adjusts a small set of knobs while running:
-
-| Profile | readers | commit | batch | cache |
-|---|---:|---:|---:|---:|
-| `hdd` | 2 | 5 s | 512 | RAM/4, max 4 GiB |
-| `ssd` | 8 | 2 s | 256 | RAM/4, max 8 GiB |
-| `nvme` | 16 | 2 s | 256 | RAM/3, max 16 GiB |
-| `manual` | config | config | config | config |
-
-The controller only changes one knob at a time, with a 30 s cooldown and hard
-bounds. It is inhibited while the disk guard, a prune-gap repair, a reorg or
-shutdown is active. Set `[index] adaptive = false` to keep the profile/static
-values.
-
-Hot reload (no restart):
+## Tests and release
 
 ```bash
-kill -USR1 "$(pgrep -f 'e-lite run')"
-```
-
-The process reloads the same config file. `readers`, `cache_mib`,
-`commit_interval_ms`, `batch_blocks`, `profile`, `adaptive` and the pruning
-thresholds are hot. `prune_mib`, `block_source`, `reorg_window`, the data
-directory and the network require a restart and are only logged.
-
-Inspect the effective values and the EWMA latencies:
-
-```bash
-curl -s http://127.0.0.1:9184/status | python3 -m json.tool | grep -A20 '"tuning"'
-curl -s http://127.0.0.1:9184/metrics | grep e_lite_tuning
-```
-
-Useful manual overrides:
-
-```toml
-[index]
-profile = "hdd"       # force the slow-disk profile
-readers = 2           # explicit value; adaptive=false if you do not want changes
-cache_mib = 4096
-commit_interval_ms = 5000
-adaptive = false
-```
-
-## Commands
-
-| Command | Description |
-|---|---|
-| `e-lite init` | Validate network/genesis against Core and create the database |
-| `e-lite doctor` | Check config, Core, prune, disk, ports and DB integrity |
-| `e-lite index` | Index the active chain (`--no-follow` to stop at tip) |
-| `e-lite serve` | Serve queries from an indexed database |
-| `e-lite run` | Index and serve; waits for Core and auto-initializes (recommended) |
-| `e-lite status [--json]` | Health summary (HTTP if running, DB if stopped) |
-| `e-lite core status` | Show the Core supervisor state and RPC reachability |
-| `e-lite core logs` | Print the last 50 lines of a Core launched by e-lite |
-| `e-lite export-snapshot` | Print the tip and canonical digest, or write a backup |
-| `e-lite import-snapshot` | Restore a backup (target must be empty) |
-| `e-lite version` | Print version |
-
-Useful flags: `--config`, `--network`, `--data-dir`, `--core-rpc`,
-`--rpc-user`, `--rpc-password`, `--core-datadir`, `--blocks-dir`,
-`--block-source`, `--cookie-file`, `--manage`, `--prune-mib`,
-`--min-free-gib`, `--listen`, `--metrics`, `--batch`, `--reorg-window`,
-`--allow-mainnet`, `--allow-clearnet`, `--no-rawtx`, `--no-follow`.
-
-## Monitoring
-
-- `GET http://127.0.0.1:9184/status` — JSON with index height, Core height,
-  `retention_blocks`, `pruneheight`, `network_active`, disk, clients and rawtx.
-- `GET http://127.0.0.1:9184/metrics` — Prometheus text.
-- `GET http://127.0.0.1:9184/healthz` — `ok`.
-- Logs to stderr; `SIGTERM` stops cleanly at a commit boundary.
-
-States: `WAITING_FOR_CORE`, `INITIALIZING`, `BUILDING_INDEX`, `READY`,
-`DEGRADED_RAWTX`, `CORE_UNAVAILABLE`, `PAUSE_DOWNLOAD`, `PRUNING`,
-`REORG_RECOVERY`, `FATAL_INTEGRITY`. Queries return an explicit temporary error
-while building; they never return a misleading empty result.
-
-## Electrum methods (1.4)
-
-`server.version`, `server.features`, `server.ping`, `server.banner`,
-`server.donation_address`, `server.peers.subscribe`,
-`blockchain.headers.subscribe`, `blockchain.block.header`,
-`blockchain.block.headers`, `blockchain.scripthash.get_history`,
-`get_balance`, `listunspent`, `subscribe`/`unsubscribe`,
-`blockchain.transaction.get`, `get_merkle`, `id_from_pos`,
-`blockchain.scripthash.get_mempool`, `mempool.get_fee_histogram`,
-`blockchain.relayfee`, `blockchain.estimatefee`, `blockchain.block.stats`,
-`blockchain.transaction.broadcast`.
-
-`blockchain.block.header`/`block.headers` support `cp_height` checkpoint proofs
-with a cached header chain. History is capped at 100,000 entries per script.
-
-## Bulk block ingest (local Core)
-
-When Core runs on the same machine, e-lite reads raw blocks directly from
-Core's `blk*.dat` files instead of asking RPC for hex. This is the fast path.
-
-```toml
-[index]
-block_source = "auto"    # auto | rpc | files
-readers = 0              # 0 = auto
-```
-
-- `auto` uses the block files when they are readable and falls back to RPC.
-- `files` requires them; it fails at startup if the directory is unusable.
-- `rpc` keeps the RPC-only behaviour.
-
-The reader is **read-only**. It builds a locator sidecar
-(`<data-dir>/blockfiles.idx`) with `hash -> (file, offset, size)`, handles Core's
-default `-blocksxor` obfuscation (8-byte key in `blocks/xor.dat`, XORed at the
-absolute file offset), and verifies every block hash and Merkle root before it is
-applied. Core remains the authority for the active chain: heights are always
-resolved with `getblockhash`.
-
-On a local regtest the ingest path exceeds 20,000 blocks/s for small blocks.
-
-## Pruned Core and external raw transactions
-
-Once the index exists, e-lite can keep running against a pruned Core:
-
-- History, balance, UTXOs, headers and Merkle proofs come from the local index.
-- `transaction.get` resolves raw data in this order:
-  1. local Core block (zero external requests),
-  2. validated on-disk cache,
-  3. **whole-block** fetch from P2P peers and/or Esplora-compatible endpoints,
-  4. verify header hash, Merkle root, TXID and witness commitment, then cache.
-- External traffic goes through **Tor** (`tor_socks`, stream isolation). Without
-  Tor it fails closed unless `allow_clearnet = true`.
-- Each external fetch is padded with `decoys` additional blocks, and requests
-  never mention a TXID.
-- `transaction.get(..., true)` resolves the raw transaction through the same
-  resolver and asks Core to decode it, so it also works on a pruned node.
-
-## Mempool, fees and notifications
-
-- The mempool overlay is rebuilt from Core (`getrawmempool` plus batched raw
-  transaction fetches), refreshed every 3 s and immediately after each block.
-- The overlay is built outside the write lock, so history/balance queries are not
-  blocked by a slow Core RPC.
-- Notifications use a dirty-set: the indexer marks the scripts touched by each
-  confirmed block and the mempool marks additions/removals/height changes, so a
-  cycle only recomputes the affected subscriptions. Reorgs force a full refresh.
-- `scripthash.get_history` appends mempool entries (`height` 0, or `-1` for
-  chained transactions); `get_mempool`, `listunspent` and status subscriptions
-  include them too.
-- `get_balance` follows Electrum semantics: `confirmed` ignores mempool events
-  and `unconfirmed` carries the net delta.
-- Reorganisations are handled both ways: a longer Core chain and a shorter one
-  (`invalidateblock`) rewind the index to the common ancestor; deep reorgs beyond
-  `reorg_window` stop with `NEEDS_RECOVERY`.
-
-## Backup and restore
-
-Stop e-lite first: RocksDB holds an exclusive lock.
-
-```bash
-e-lite export-snapshot --config e-lite.toml --output e-lite-backup.tar.gz
-# restore into a new, empty data directory (can be another machine)
-e-lite import-snapshot --config e-lite.toml --input e-lite-backup.tar.gz \
-  --data-dir /var/lib/e-lite/restored
-```
-
-The archive contains the database plus a manifest with network, genesis, tip,
-txnum and the canonical digest. Import verifies the network and recomputes the
-digest; it refuses a non-empty target or a mismatched snapshot. The rawtx cache
-is not included (it is rebuildable).
-
-## Starting without Core
-
-The database identity is pinned at `init` (or at the first successful `run`).
-If Core is down when e-lite starts, `run` still binds the Electrum and metrics
-ports and serves confirmed history/balances from the local index. The Core
-cookie is loaded lazily (Core removes it on shutdown and writes a new one on
-start), so when Core comes back the indexer re-verifies the chain and resumes
-without a restart.
-
-If the database is empty and Core is down, e-lite stays in `WAITING_FOR_CORE`
-and retries. With `manage = "auto"`, it starts Core as soon as `bitcoind` is
-available.
-
-## Disk expectations
-
-- Core with `-prune=1` (manual) or `-prune=550` still needs the chainstate: it is
-  ~10–15 GB on mainnet, plus ~550 MiB of blocks and the current block file.
-- e-lite stores full history. On mainnet this can be hundreds of GB
-  (`tx_occurrences`, `history`, `txids.dat`, UTXO set). This is the cost of
-  serving an Electrum server without a full node.
-- For production, use separate disks for Core (small, pruned) and the e-lite
-  index (large), and keep `min_free_gib` above the actual free space you want
-  to preserve.
-- The disk guard reads both filesystems **before Core RPC** and the indexer
-  checks again while applying blocks. Below `min_free_gib` Core downloads are
-  paused but indexing continues, so the prune gate can delete old block files
-  and free space. Below `critical_free_gib` indexing also stops. The current
-  uncommitted group is discarded and re-indexed after space is freed.
-- A full signet/testnet4 sync needs enough free space for the Core datadir
-  (pruned) plus the index. A 2 GiB threshold on a nearly full disk is not
-  enough for a multi-GB index: leave room or use a larger disk.
-- A from-scratch mainnet index is I/O-bound. For mainnet production, restoring a
-  snapshot and then following the tip is the practical path.
-
-## Limitations (v0.1)
-
-- Pruned IBD from scratch is local-only and requires a Core owned by e-lite.
-- Remote Core is for maintenance, not for the first pruned IBD.
-- The index must be built with a full node, or with a local Core started by
-  e-lite using `prune_mib = 1` (manual).
-- Raw transactions require the block to still exist in Core or in a configured
-  external source; otherwise the error is explicit, never invented data.
-- External rawtx requires Tor by default, so a missing Tor daemon degrades
-  `transaction.get` for pruned blocks (history/balances still work).
-- A deep reorganization beyond `reorg_window` stops with `NEEDS_RECOVERY`.
-- No systemd unit, no aarch64 build, no testnet3.
-
-## Build from source
-
-```bash
-cargo build --release -p e-lite
+cargo fmt --check
+cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
+tests/e2e_launch_core.sh
+tests/e2e_pruned_ibd.sh
+tests/e2e_regtest.sh
 ```
 
-Requires Rust (stable), a C++ toolchain and libclang (RocksDB bindgen).
-
-## End-to-end tests
-
-```bash
-tests/e2e_regtest.sh            # Electrum, mempool, reorg, snapshot
-tests/e2e_resilience.sh         # Core outage, offline serve, cookie rotation
-tests/e2e_launch_core.sh        # e-lite launches Core from scratch (prune=1)
-tests/e2e_wait_core.sh          # e-lite waits for Core, then auto-initializes
-tests/e2e_external_pruned.sh    # rejects an external pruned Core safely
-tests/e2e_pruned_ibd.sh         # local manual-prune IBD + prune gate
-
-# Signet/testnet4 (real network sync, opt-in; needs >=15/20 GiB free)
-E_LITE_NETWORK=signet tests/e2e_networks.sh
-E_LITE_NETWORK=testnet4 E_LITE_CORE_DATADIR=/srv/core-t4 tests/e2e_networks.sh
-# On a smaller disk, override the preflight at your own risk:
-E_LITE_E2E_REQUIRED_FREE_GIB=0 E_LITE_E2E_MIN_FREE_GIB=1 tests/e2e_networks.sh
-```
-
-## Reproducible Debian package
-
-```bash
-scripts/package.sh          # builds inside debian:12 via docker, writes dist/
-```
+The all-in-one harness is in
+[`scripts/e-lite-all-in-one.sh`](scripts/e-lite-all-in-one.sh); it can install,
+run and write a report. The installer and artifacts are published in GitHub
+Releases with `SHA256SUMS`.
 
 ## License
 
-MIT. See [LICENSE](LICENSE).
+MIT.
