@@ -1849,6 +1849,7 @@ impl Indexer {
         let mut bulk_resume = None;
 
         if bulk_limit == 0 && !auto_enabled {
+            self.bulk_lag_baseline.store(u64::MAX, Ordering::Relaxed);
             if paused && self.core.set_network_active(true).is_ok() {
                 self.lag_paused.store(false, Ordering::Relaxed);
                 self.mark_paused(false);
@@ -1863,6 +1864,7 @@ impl Indexer {
 
         let limit = if bulk_limit > 0 {
             if !info.initialblockdownload {
+                self.bulk_lag_baseline.store(u64::MAX, Ordering::Relaxed);
                 if paused && self.core.set_network_active(true).is_ok() {
                     self.lag_paused.store(false, Ordering::Relaxed);
                     self.mark_paused(false);
@@ -1880,7 +1882,8 @@ impl Indexer {
             // for the whole catch-up. The baseline follows the lowest lag seen
             // while Core is downloading, so Core works in phases.
             let baseline = self.bulk_lag_baseline.load(Ordering::Relaxed);
-            let (new_baseline, pause_at, resume_at) = bulk_lag_window(lag, baseline, bulk_limit);
+            let (new_baseline, pause_at, resume_at) =
+                bulk_lag_window(lag, baseline, bulk_limit, paused);
             self.bulk_lag_baseline
                 .store(new_baseline, Ordering::Relaxed);
             bulk_resume = Some(resume_at);
@@ -2532,10 +2535,17 @@ fn milestone_due(
 }
 
 /// Bulk lag guard window. `u64::MAX` means "no baseline yet". The baseline
-/// follows the lowest lag seen, so `limit` bounds *additional* separation
-/// instead of freezing Core for a whole 300k-block catch-up.
-fn bulk_lag_window(lag: u64, baseline: u64, limit: u64) -> (u64, u64, u64) {
-    let base = if baseline == u64::MAX || lag < baseline {
+/// follows the lowest lag seen **while Core is downloading**. While paused it
+/// must stay fixed; otherwise every block indexed would lower the resume
+/// threshold and Core would resume immediately.
+fn bulk_lag_window(lag: u64, baseline: u64, limit: u64, paused: bool) -> (u64, u64, u64) {
+    let base = if paused {
+        if baseline == u64::MAX {
+            lag
+        } else {
+            baseline
+        }
+    } else if baseline == u64::MAX || lag < baseline {
         lag
     } else {
         baseline
@@ -3924,17 +3934,24 @@ mod tests {
     fn bulk_lag_window_bounds_additional_growth() {
         // First call on a 317k backlog: pause only after 20k more.
         assert_eq!(
-            bulk_lag_window(317_000, u64::MAX, 20_000),
+            bulk_lag_window(317_000, u64::MAX, 20_000, false),
             (317_000, 337_000, 327_000)
         );
-        // If the index catches up below the baseline, the window follows down.
+        // If the index catches up below the baseline while downloading, the
+        // window follows down.
         assert_eq!(
-            bulk_lag_window(300_000, 317_000, 20_000),
+            bulk_lag_window(300_000, 317_000, 20_000, false),
             (300_000, 320_000, 310_000)
         );
-        // A paused Core resumes at half the growth window.
+        // While paused the baseline must NOT follow the lag down, otherwise
+        // the resume threshold drops below the current lag and Core resumes
+        // immediately.
         assert_eq!(
-            bulk_lag_window(326_999, 317_000, 20_000),
+            bulk_lag_window(330_000, 317_000, 20_000, true),
+            (317_000, 337_000, 327_000)
+        );
+        assert_eq!(
+            bulk_lag_window(326_999, 317_000, 20_000, true),
             (317_000, 337_000, 327_000)
         );
     }

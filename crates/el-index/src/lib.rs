@@ -174,9 +174,9 @@ fn is_provably_unspendable(script: &[u8]) -> bool {
 /// thread. The apply thread only performs continuity, UTXO work and batch
 /// writes, which overlaps the CPU-heavy decode with the previous block.
 pub struct PreparedBlock {
-    pub block: bitcoin::Block,
-    pub block_hash: Hash32,
-    pub txids: Vec<Hash32>,
+    block: bitcoin::Block,
+    block_hash: Hash32,
+    txids: Vec<Hash32>,
 }
 
 fn compute_txids(block: &bitcoin::Block) -> Result<Vec<Hash32>> {

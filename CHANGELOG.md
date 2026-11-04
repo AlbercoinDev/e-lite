@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.1.0-alpha.20 — 2026-11-04
+
+### Fixes for alpha.19
+
+- **Bulk lag guard no longer resumes immediately**: while Core was paused, the
+  relative window was following the decreasing lag down, so the resume
+  threshold dropped below the current lag and Core resumed on the next check.
+  The baseline now stays fixed while paused and only follows the lag down while
+  Core is downloading.
+- **Explicit readers are no longer CPU-capped on hot reload**: `--readers`
+  continues to win over the `2 × CPUs` automatic cap.
+- **Log path without a parent directory** (`--log-file e-lite.log`) no longer
+  fails while creating an empty parent path.
+- `PreparedBlock` fields are private so only validated blocks can be applied.
+
 ## 0.1.0-alpha.19 — 2026-11-04
 
 ### Logging, indexing throughput and pruning cadence

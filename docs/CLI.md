@@ -121,9 +121,9 @@ e-lite run --network mainnet --allow-mainnet \
 | `--restart` / `--no-restart` | `core.restart` | `true` |
 
 `--max-bulk-lag-blocks` pauses Core's P2P when a managed, pruned Core is in IBD
-and the index lags more than N blocks **beyond the lag seen when the guard
-started**; it resumes at half that growth. It bounds additional separation and
-disk contention without freezing Core for an entire large catch-up. `0`
+and the index lags more than N blocks **beyond the lowest lag seen while Core was
+downloading**; it resumes at half that growth. It bounds additional separation
+and disk contention without freezing Core for an entire large catch-up. `0`
 disables it. It is independent of the automatic-pruning safety limit.
 
 Low-RAM Core example:

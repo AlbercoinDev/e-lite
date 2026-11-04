@@ -19,8 +19,10 @@ pub fn init(path: &Path, max_mib: u64) -> Result<(), String> {
         return Ok(());
     }
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| format!("cannot create log directory {}: {e}", parent.display()))?;
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| format!("cannot create log directory {}: {e}", parent.display()))?;
+        }
     }
     let file = OpenOptions::new()
         .create(true)

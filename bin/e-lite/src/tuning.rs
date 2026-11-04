@@ -295,17 +295,20 @@ impl Tunables {
         self.rotational.load(Ordering::Relaxed)
     }
 
-    fn profile_max_readers(&self) -> usize {
-        let cpus = std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(4);
-        let base = match self.profile() {
+    fn profile_ceiling(&self) -> usize {
+        match self.profile() {
             Profile::Hdd => 4,
             Profile::Ssd => 8,
             Profile::Nvme => 16,
             Profile::Auto | Profile::Manual => 32,
-        };
-        base.min(cpus.saturating_mul(2).max(2))
+        }
+    }
+
+    fn auto_max_readers(&self) -> usize {
+        let cpus = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4);
+        self.profile_ceiling().min(cpus.saturating_mul(2).max(2))
     }
 
     fn memory_reader_cap(&self) -> usize {
@@ -409,7 +412,7 @@ impl Tunables {
             let v = cfg
                 .index
                 .readers
-                .clamp(self.min_readers, self.profile_max_readers());
+                .clamp(self.min_readers, self.profile_ceiling());
             if v != self.readers() {
                 self.readers.store(v, Ordering::Relaxed);
                 changed.push("readers");
@@ -549,7 +552,7 @@ impl Tunables {
         // Read/apply balance. On a rotational disk more readers usually hurt.
         // Only add readers when reads are actually slow; low read latency means
         // the bottleneck is elsewhere (apply/commit/compaction).
-        let max_readers = self.profile_max_readers().min(self.memory_reader_cap());
+        let max_readers = self.auto_max_readers().min(self.memory_reader_cap());
         if action.is_none()
             && !self.readers_locked.load(Ordering::Relaxed)
             && read_ms > 200
@@ -945,5 +948,15 @@ mod tests {
             .map(|n| n.get())
             .unwrap_or(4);
         assert!(t.background_jobs() <= cpus.max(1));
+    }
+
+    #[test]
+    fn explicit_readers_are_not_cpu_capped() {
+        let mut cfg = Config::default();
+        cfg.index.readers = 6;
+        let t = Tunables::new(&cfg, false);
+        assert_eq!(t.readers(), 6);
+        let _ = t.reload(&cfg);
+        assert_eq!(t.readers(), 6);
     }
 }

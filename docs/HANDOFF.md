@@ -3,7 +3,8 @@
 **Updated:** 2026-11-04
 **Latest published release:** `0.1.0-alpha.19`
 **Release:** https://github.com/AlbercoinDev/e-lite/releases/tag/v0.1.0-alpha.19
-**Main commit at handoff:** `084b974` (`alpha.19: e-lite.log, parallel decode, prune cadence and relative bulk guard`)
+**Working version:** `0.1.0-alpha.20` (unreleased: bulk guard fix)
+**Main commit at handoff:** `PENDING`
 
 This file is the short “where we are” for a new session. The invariants live in
 [`AGENTS.md`](../AGENTS.md) and [`PROJECT_MEMORY.md`](PROJECT_MEMORY.md); the
@@ -54,6 +55,18 @@ no repitas contexto ni rehagas decisiones ya documentadas.
 - `docs/FEATURES.md` is the current-feature source of truth.
 - `docs/ROADMAP.md` contains future features/improvements. Do not present them as
   available.
+
+## Last audit/fixes (alpha.20)
+
+- **Bulk lag guard fix (AUD-026)**: the relative baseline was following the lag
+  down while Core was paused, so the resume threshold dropped every block and
+  Core resumed immediately. The baseline is now frozen while paused; the guard
+  holds until the lag reaches half the growth window.
+- **Explicit readers survive hot reload**: the `2 × CPUs` cap only applies to
+  automatic reader counts.
+- **`--log-file` without a parent directory** works.
+- **`PreparedBlock` fields are private**; only Merkle/hash-validated prepared
+  blocks can be applied.
 
 ## Last audit/fixes (alpha.19)
 

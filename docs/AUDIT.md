@@ -1,7 +1,7 @@
 # Code audit
 
-**Base:** `0.1.0-alpha.18` → published `0.1.0-alpha.19` · **Scope:** `bin/e-lite`, `crates/*` (25 Rust files,
-~16.8k lines) · **Status:** findings fixed in `0.1.0-alpha.19` where noted.
+**Base:** `0.1.0-alpha.19` → published `0.1.0-alpha.20` · **Scope:** `bin/e-lite`, `crates/*` (25 Rust files,
+~16.9k lines) · **Status:** findings fixed in `0.1.0-alpha.20` where noted.
 
 This audit is not a claim of formal verification. It records static checks,
 manual review areas, concrete findings and residual risks.
@@ -44,6 +44,7 @@ Additional checks performed:
 | AUD-023 | P2 | Prune churn | `bin/e-lite/src/config.rs`, `el-chain` supervisor | Manual pruning evaluated every 288 safe blocks, causing frequent prune I/O during a long catch-up. | Default `min_gain_blocks = 10000`; emergency low-disk pruning still bypasses it. |
 | AUD-024 | P2 | Indexing throughput | `bin/e-lite/src/main.rs`, `crates/el-index` | Deserialize/hash and txid/Merkle work ran in the single apply thread, leaving reader threads idle and the second CPU core unused. | Reader threads prepare blocks (`prepare_block_bytes`), apply uses `apply_prepared`; block hash computed once; `decode_ms`/`wait_ms` exposed. |
 | AUD-025 | P2 | Bulk lag guard | `bin/e-lite/src/main.rs` | Absolute `max_bulk_lag_blocks` paused Core immediately on a 300k backlog and kept it paused until lag ≤10k, freezing Core's own sync for hours. | Window is relative to the lag baseline and follows it; resumes at half the growth window. |
+| AUD-026 | P1 | Bulk lag guard | `bin/e-lite/src/main.rs` | While paused, the relative baseline also followed the decreasing lag, so every indexed block lowered the resume threshold and Core resumed on the next check. The guard effectively never held. | `bulk_lag_window` takes `paused`; the baseline is frozen while paused and only follows the lag down while downloading. Unit test `bulk_lag_window_bounds_additional_growth`. |
 
 ## Residual risks and intentional limits
 
