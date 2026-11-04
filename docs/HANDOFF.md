@@ -1,10 +1,9 @@
 # Session handoff
 
 **Updated:** 2026-11-04
-**Latest published release:** `0.1.0-alpha.16`
-**Release:** https://github.com/AlbercoinDev/e-lite/releases/tag/v0.1.0-alpha.16
-**Working version:** `0.1.0-alpha.18` (unreleased: TLS, memory/performance, CLI, progress)
-**Main commit at handoff:** `PENDING`
+**Latest published release:** `0.1.0-alpha.18`
+**Release:** https://github.com/AlbercoinDev/e-lite/releases/tag/v0.1.0-alpha.18
+**Main commit at handoff:** `9198fe2` (`alpha.18: fix memory accounting and RocksDB budget, ordered lifecycle, CLI and progress`)
 
 This file is the short “where we are” for a new session. The invariants live in
 [`AGENTS.md`](../AGENTS.md) and [`PROJECT_MEMORY.md`](PROJECT_MEMORY.md); the
@@ -133,6 +132,8 @@ kill -USR1 "$(pgrep -f 'e-lite run')"
 ## Known working test baseline at handoff
 
 `cargo fmt --check`, clippy, workspace tests and the local regtest e2e
-(`launch_core`, `pruned_ibd`, `regtest` with plain + TLS Electrum) passed on the
-alpha.17 code. Full signet/testnet4 acceptance is still operator-run; results
-belong in `docs/GETTING-STARTED.md`/release notes when available.
+(`launch_core`, `pruned_ibd`, `regtest` with plain + TLS Electrum and clean
+startup/shutdown/memory assertions) passed on the alpha.18 code. Release
+artifacts and `SHA256SUMS` for alpha.18 were verified. Full signet/testnet4
+acceptance is still operator-run; results belong in
+`docs/GETTING-STARTED.md`/release notes when available.
