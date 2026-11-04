@@ -74,9 +74,9 @@ no repitas contexto ni rehagas decisiones ya documentadas.
   catch-up.
 - **Readers capped by `2 × CPUs`** unless explicitly overridden.
 
-Evidence: `CHANGELOG.md`, `docs/CLI.md`, `docs/TUNING.md`,
-`cargo test --workspace`, `tests/e2e_regtest.sh` (log file + startup/shutdown),
-`tests/e2e_pruned_ibd.sh` (prune gate with explicit 288 gain).
+Evidence: `docs/AUDIT.md` (AUD-022..025), `CHANGELOG.md`, `docs/CLI.md`,
+`docs/TUNING.md`, `cargo test --workspace`, `tests/e2e_regtest.sh` (log file +
+startup/shutdown), `tests/e2e_pruned_ibd.sh` (prune gate with explicit 288 gain).
 
 ## Last audit/fixes (alpha.18)
 
@@ -98,7 +98,7 @@ Evidence: `CHANGELOG.md`, `docs/CLI.md`, `docs/TUNING.md`,
 
 Evidence: `docs/AUDIT.md` (AUD-018..021), `CHANGELOG.md`,
 `cargo test --workspace` and `tests/e2e_regtest.sh` (plain + TLS + clean
-startup/shutdown assertions).
+startup/shutdown + log assertions).
 
 ## Open risks / next priorities
 
@@ -112,10 +112,10 @@ P1 (before any public exposure or mainnet production claim):
 
 Performance/storage (P2, benchmark first):
 
-- Parallel decode/txid/Merkle in reader threads.
 - UTXO prefetch pipeline.
 - HDD sequential/readahead mode.
 - History compaction/refs/compression experiments.
+- Adaptive controller v2 (queue/compaction signals).
 
 Compatibility (P2/P3):
 
