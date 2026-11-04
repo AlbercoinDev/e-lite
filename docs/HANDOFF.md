@@ -1,10 +1,9 @@
 # Session handoff
 
 **Updated:** 2026-11-05
-**Latest published release:** `0.1.0-alpha.20`
-**Release:** https://github.com/AlbercoinDev/e-lite/releases/tag/v0.1.0-alpha.20
-**Working version:** `0.1.0-alpha.21` (unreleased: deterministic store tests)
-**Main commit at handoff:** `PENDING`
+**Latest published release:** `0.1.0-alpha.21`
+**Release:** https://github.com/AlbercoinDev/e-lite/releases/tag/v0.1.0-alpha.21
+**Main commit at handoff:** `b49be46` (`alpha.21: serialize failpoint store tests`)
 
 This file is the short “where we are” for a new session. The invariants live in
 [`AGENTS.md`](../AGENTS.md) and [`PROJECT_MEMORY.md`](PROJECT_MEMORY.md); the
@@ -175,6 +174,6 @@ kill -USR1 "$(pgrep -f 'e-lite run')"
 `cargo fmt --check`, clippy, workspace tests and the local regtest e2e
 (`launch_core`, `pruned_ibd`, `regtest` with plain + TLS Electrum, clean
 startup/shutdown/memory assertions, `e-lite.log` presence and milestone checks)
-passed on the alpha.20 code. Release artifacts and `SHA256SUMS` for alpha.20
+passed on the alpha.21 code. Release artifacts and `SHA256SUMS` for alpha.21
 were verified. Full signet/testnet4 acceptance is still operator-run; results
 belong in `docs/GETTING-STARTED.md`/release notes when available.
