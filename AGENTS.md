@@ -3,6 +3,19 @@
 This file is the operational memory for agents and maintainers. It is not a
 historical design document; the ADRs under `docs/` remain the decision log.
 
+## Start here in a new session
+
+1. Read [`docs/HANDOFF.md`](docs/HANDOFF.md) for the current state, release,
+   open risks and next priorities.
+2. Read [`docs/README.md`](docs/README.md) for the documentation map.
+3. Read [`docs/PROJECT_MEMORY.md`](docs/PROJECT_MEMORY.md) for the human
+   companion of the invariants below.
+4. Check `CHANGELOG.md` and the latest git tag before assuming a version.
+
+Do not re-ask the user to paste the whole history. The durable context is in the
+repo. If the handoff is stale, update it in the same change that changes state.
+Never treat a version number in this file as authoritative over the code/tag.
+
 ## Product invariants
 
 1. **One-line install/update is mandatory.** The primary command is:

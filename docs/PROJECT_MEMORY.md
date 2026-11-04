@@ -2,6 +2,7 @@
 
 This is the human-readable companion to [`AGENTS.md`](../AGENTS.md). It records
 the rules that must survive refactors, releases and documentation rewrites.
+For the current state and next priorities, read [`HANDOFF.md`](HANDOFF.md).
 
 ## Non-negotiable install/update UX
 

@@ -20,6 +20,8 @@
   `PRIVACY`, `FEATURES`, `ROADMAP`, `TUNING`, `AUDIT` and `GETTING-STARTED`.
 - **Audit report** added in `docs/AUDIT.md` with fixed findings and residual
   risks (TLS/auth, Core RPC TLS, snapshot archive limits, provider trust).
+- **Session handoff** added in `docs/HANDOFF.md` (current state, open risks,
+  next priorities) and linked from `AGENTS.md`; new sessions should start there.
 
 ## 0.1.0-alpha.15 — 2026-11-03
 

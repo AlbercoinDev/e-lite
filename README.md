@@ -44,6 +44,7 @@ Electrum/Sparrow: `127.0.0.1:50001` (no SSL). Status and metrics:
 
 | Document | Contents |
 |---|---|
+| [`docs/HANDOFF.md`](docs/HANDOFF.md) | Current state, release, open risks, next steps |
 | [`docs/INSTALL.md`](docs/INSTALL.md) | Install/update, Core, `.deb`, source, first run |
 | [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) | Components, execution modes, local/LAN/WAN Core |
 | [`docs/OPERATIONS.md`](docs/OPERATIONS.md) | Pruning, disks, remote Core, monitoring, troubleshooting |
