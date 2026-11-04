@@ -9,10 +9,11 @@ Start here:
 5. [`PRIVACY.md`](PRIVACY.md) — local vs external data, Tor/clearnet, providers.
 6. [`FEATURES.md`](FEATURES.md) — what exists today.
 7. [`ROADMAP.md`](ROADMAP.md) — future features/improvements.
-8. [`TUNING.md`](TUNING.md) — HDD/SSD/NVMe profiles and hot reload.
-9. [`AUDIT.md`](AUDIT.md) — code audit findings and residual risks.
-10. [`GETTING-STARTED.md`](GETTING-STARTED.md) — acceptance tests from scratch.
-11. [`PROJECT_MEMORY.md`](PROJECT_MEMORY.md) — project invariants.
+8. [`CLI.md`](CLI.md) — every command-line flag, `--set` and tuning examples.
+9. [`TUNING.md`](TUNING.md) — HDD/SSD/NVMe profiles and hot reload.
+10. [`AUDIT.md`](AUDIT.md) — code audit findings and residual risks.
+11. [`GETTING-STARTED.md`](GETTING-STARTED.md) — acceptance tests from scratch.
+12. [`PROJECT_MEMORY.md`](PROJECT_MEMORY.md) — project invariants.
 
 Historical decision records remain in `ADR-*.md`; they describe past context and
 may contain values that were later superseded (for example prune defaults). The

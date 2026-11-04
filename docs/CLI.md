@@ -1,0 +1,181 @@
+# Command-line reference
+
+Every configuration field can be set from the command line. Explicit flags are
+convenience aliases; `--set section.key=value` is the universal escape hatch and
+works for any TOML field, including arrays.
+
+Precedence: config file → `--set` (in order) → explicit flags. Validation runs
+after all overrides.
+
+All options apply to every network (`regtest`, `signet`, `testnet4`, `mainnet`).
+Values scale with the real hardware (RAM, CPUs, disk hint); the examples below
+are just starting points.
+
+## Commands
+
+```text
+init             validate network/genesis against Core and create the database
+doctor           check config, Core, disk, ports, database and memory
+index            index the active chain (--no-follow stops at tip)
+serve            serve Electrum from an already indexed database (works offline)
+run              index and serve in one process; waits for Core RPC
+status           print health (HTTP if running, database if stopped)
+core status      show the Core supervisor state and RPC reachability
+core logs        print the last 50 lines of a Core launched by e-lite
+export-snapshot  print the canonical digest or write --output
+import-snapshot  restore --input into an empty target
+version          print version
+```
+
+## Common options
+
+| Flag | Meaning |
+|---|---|
+| `--config <path>` | TOML file (default `~/.config/e-lite/config.toml`) |
+| `--network <name>` | `auto`, `regtest`, `signet`, `testnet4`, `mainnet` |
+| `--data-dir <path>` | index directory |
+| `--core-rpc <url>` | Core RPC URL (HTTP; use SSH/VPN for WAN) |
+| `--rpc-user`, `--rpc-password`, `--cookie-file` | Core credentials |
+| `--core-datadir <path>`, `--blocks-dir <path>` | Core datadir / block files |
+| `--block-source <src>` | `auto`, `rpc`, `files` |
+| `--manage <mode>` | `external`, `auto`, `managed` |
+| `--prune-mib <n>` | `1` manual (default), `0` full, `>=550` auto + opt-in |
+| `--min-free-gib <n>`, `--critical-free-gib <n>` | disk guards |
+| `--listen <addr>`, `--metrics <addr>` | Electrum / metrics listeners |
+| `--tls-listen <addr>`, `--tls-cert`, `--tls-key` | optional Electrum TLS |
+| `--json` | JSON output for `status` |
+| `--allow-mainnet` | required for mainnet |
+| `--set <key=value>` | override any TOML field |
+
+## Tuning and performance
+
+| Flag | TOML field | Default |
+|---|---|---|
+| `--profile <name>` | `index.profile` | `auto` |
+| `--adaptive` / `--no-adaptive` | `index.adaptive` | `true` |
+| `--readers <n>` | `index.readers` | `0` (profile/auto) |
+| `--cache-mib <n>` | `index.cache_mib` | `0` (RAM/4) |
+| `--write-buffer-mib <n>` | `index.write_buffer_mib` | `0` (RAM/16) |
+| `--background-jobs <n>` | `index.background_jobs` | `0` (profile, capped by CPUs) |
+| `--commit-interval-ms <n>` | `index.commit_interval_ms` | `0` (profile) |
+| `--prefetch-blocks <n>` | `index.prefetch_blocks` | `0` (reserved) |
+| `--batch <n>` | `index.batch_blocks` | `256`/profile |
+| `--reorg-window <n>` | `index.reorg_window` | `288` |
+| `--milestone-blocks <n>` | `index.milestone_blocks` | `10000` |
+| `--milestone-seconds <n>` | `index.milestone_seconds` | `21600` |
+
+`auto` uses the disk `rotational` hint. Virtual disks and some RAID/USB devices
+report it incorrectly; set `--profile ssd` or `--profile nvme` when you know the
+real hardware.
+
+Explicit numeric overrides lock that knob so the adaptive controller does not
+change it.
+
+### Examples
+
+Normal PC with NVMe and 16-32 GiB RAM:
+
+```bash
+e-lite run --network mainnet --allow-mainnet --profile nvme
+```
+
+Normal PC with SATA SSD:
+
+```bash
+e-lite run --network mainnet --allow-mainnet --profile ssd
+```
+
+Laptop/HDD or a disk that reports `rotational=1`:
+
+```bash
+e-lite run --network signet --profile hdd
+```
+
+Low-RAM machine or container (1-4 GiB):
+
+```bash
+e-lite run --network signet --profile hdd \
+  --cache-mib 256 --write-buffer-mib 128 --background-jobs 2
+```
+
+Fixed values, no controller:
+
+```bash
+e-lite run --network mainnet --allow-mainnet \
+  --profile ssd --no-adaptive --readers 4 --cache-mib 1024 --commit-interval-ms 3000
+```
+
+## Pruning and Core
+
+| Flag | TOML field | Default |
+|---|---|---|
+| `--max-core-lag-blocks <n>` | `pruning.max_core_lag_blocks` | `192` (auto-prune only) |
+| `--max-bulk-lag-blocks <n>` | `pruning.max_bulk_lag_blocks` | `0` (off) |
+| `--min-gain-blocks <n>` | `pruning.min_gain_blocks` | `288` |
+| `--prune-interval-seconds <n>` | `pruning.prune_interval_seconds` | `30` |
+| `--poll-seconds <n>` | `pruning.poll_seconds` | `10` |
+| `--repair-max-gap-blocks <n>` | `pruning.repair_max_gap_blocks` | `2048` |
+| `--allow-auto-prune` | `pruning.allow_auto_prune` | `false` |
+| `--core-arg <arg>` | `core.extra_args` (appended) | none |
+| `--stop-on-exit` / `--no-stop-on-exit` | `core.stop_on_exit` | `true` |
+| `--restart` / `--no-restart` | `core.restart` | `true` |
+
+`--max-bulk-lag-blocks` pauses Core's P2P when a managed, pruned Core is in IBD
+and the index lags more than N blocks; it resumes at half the limit. It bounds
+the gap and disk contention, at the cost of a longer total sync. `0` disables it.
+It is independent of the automatic-pruning safety limit.
+
+Low-RAM Core example:
+
+```bash
+e-lite run --network mainnet --allow-mainnet \
+  --core-arg=-dbcache=128 --core-arg=-maxmempool=64
+```
+
+## Rawtx, server and TLS
+
+| Flag | TOML field | Default |
+|---|---|---|
+| `--max-clients <n>` | `server.max_clients` | `32` |
+| `--p2p-peers <a,b>` | `rawtx.p2p_peers` | discovered from Core |
+| `--no-p2p` | `rawtx.use_p2p=false` | enabled |
+| `--no-esplora` | `rawtx.use_esplora=false` | enabled |
+| `--decoys <n>` | `rawtx.decoys` | `3` |
+| `--rawtx-cache-mib <n>` | `rawtx.cache_mib` | `2048` |
+| `--tor-socks <addr>` | `rawtx.tor_socks` | `127.0.0.1:9050` |
+| `--allow-clearnet` | `rawtx.allow_clearnet` | `false` |
+| `--no-rawtx` | `rawtx.enabled=false` | enabled |
+| `--tls-listen <addr>` | `server.tls_listen` | disabled |
+| `--tls-cert`, `--tls-key` | `server.tls_cert`, `server.tls_key` | none |
+
+## `--set` examples
+
+```bash
+# Any tuning field
+e-lite run --set index.profile=nvme --set index.cache_mib=4096
+
+# Arrays and nested values (TOML syntax)
+e-lite run --set 'rawtx.p2p_peers=["203.0.113.10:8333","[2001:db8::1]:8333"]'
+e-lite run --set 'core.extra_args=["-dbcache=256","-maxmempool=128"]'
+
+# Pruning and server fields
+e-lite run --set pruning.max_bulk_lag_blocks=20000
+e-lite serve --set server.max_clients=64
+```
+
+Bare words are treated as strings (`--set index.profile=ssd`); `true`, numbers
+and TOML arrays are parsed as TOML.
+
+## Progress output
+
+`run`/`index` print a line after each commit with:
+
+- indexed height and percentage of Core's `headers`;
+- Core blocks/headers and percentage, plus verification progress during IBD;
+- lag, blocks/s, tx/s, elapsed time and read/apply/commit/cache metrics;
+- a milestone line every `milestone_blocks` or `milestone_seconds` (whichever
+  happens first) with interval throughput and disk usage for e-lite and Core.
+
+Start and stop timestamps are printed in local time. `SIGTERM`/`Ctrl+C` stops
+mempool and notification threads before stopping Core, so the shutdown log has
+no connection errors.

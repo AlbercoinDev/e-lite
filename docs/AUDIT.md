@@ -1,7 +1,7 @@
 # Code audit
 
-**Base:** `0.1.0-alpha.16` → published `0.1.0-alpha.17` · **Scope:** `bin/e-lite`, `crates/*` (25 Rust files,
-~16k lines) · **Status:** findings fixed in `0.1.0-alpha.17` where noted.
+**Base:** `0.1.0-alpha.17` → published `0.1.0-alpha.18` · **Scope:** `bin/e-lite`, `crates/*` (25 Rust files,
+~16.4k lines) · **Status:** findings fixed in `0.1.0-alpha.18` where noted.
 
 This audit is not a claim of formal verification. It records static checks,
 manual review areas, concrete findings and residual risks.
@@ -37,6 +37,9 @@ Additional checks performed:
 | AUD-006 | P2 | Public listener | `bin/e-lite/src/main.rs` | `listen` could be set to `0.0.0.0`/LAN without TLS or auth; only documentation warned. | Startup warning for Electrum and metrics listeners that are not loopback; optional TLS since alpha.17 (AUD-018). |
 | AUD-007 | P1 | LXC memory | `bin/e-lite/src/tuning.rs` | alpha.14 raised readers to 28 on low read latency and used host `MemTotal`, causing OOM kills in LXC. | Reader caps 4/8/16, cgroup v2/v1 memory accounting, memory-pressure backoff and explicit overrides. |
 | AUD-018 | P1 | Electrum transport | `crates/el-serve/src/lib.rs` | Electrum could only be plain TCP; LAN/WAN traffic had no encryption in e-lite. | Optional TLS listener (rustls, TLS 1.2+) with PEM cert/key, 10 s handshake timeout, same 1 MiB line cap and mtime-based certificate reload. Tests `tls_listener_completes_handshake_and_serves`, `tls_watcher_reloads_changed_pem_and_keeps_old_on_error`, `e2e_regtest.sh`. |
+| AUD-019 | P1 | Memory accounting | `bin/e-lite/src/tuning.rs` | `/proc/meminfo` was parsed with `strip_prefix` without consuming the colon, so `MemTotal`/`MemAvailable` always returned `None`. The daemon fell back to 1 GiB and 0 MiB available, shrank cache/readers and logged false `memory pressure (0 MiB)` on every machine. | Parse with `split_once(':')`, add tests, cgroup-aware available memory and reclaimable `inactive_file`; `doctor`/`/status` expose the values. |
+| AUD-020 | P1 | RocksDB memory | `crates/el-store/src/lib.rs` | `write_buffer_bytes` was applied per column family: 7 CFs × 3 memtables × 64 MiB ≈ 1.3 GiB, plus the block cache. On low-RAM hosts this caused reclaim stalls and slow indexing. | Global memtable budget (`RAM/16`, 64 MiB..1 GiB) split across CFs, capped per CF; background jobs capped by CPU count; tests for the budget. |
+| AUD-021 | P2 | Lifecycle | `bin/e-lite/src/main.rs`, `crates/el-serve/src/lib.rs` | P2P discovery/mempool started before Core; shutdown stopped Core while detached mempool/notification threads were still running, logging `Connection refused` and post-shutdown tuning lines. | `run` waits for Core RPC before starting dependants; `serve` stays offline; shutdown flag + joined threads before Core stop; e2e asserts clean startup/shutdown logs. |
 
 ## Residual risks and intentional limits
 

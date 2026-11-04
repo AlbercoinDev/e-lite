@@ -3,8 +3,8 @@
 **Updated:** 2026-11-04
 **Latest published release:** `0.1.0-alpha.16`
 **Release:** https://github.com/AlbercoinDev/e-lite/releases/tag/v0.1.0-alpha.16
-**Working version:** `0.1.0-alpha.17` (unreleased: optional Electrum TLS)
-**Main commit at handoff:** `e9d4152` (`alpha.17: optional Electrum TLS listener with certificate reload`)
+**Working version:** `0.1.0-alpha.18` (unreleased: TLS, memory/performance, CLI, progress)
+**Main commit at handoff:** `PENDING`
 
 This file is the short “where we are” for a new session. The invariants live in
 [`AGENTS.md`](../AGENTS.md) and [`PROJECT_MEMORY.md`](PROJECT_MEMORY.md); the
@@ -20,7 +20,7 @@ wins; update this file.
 4. `docs/HANDOFF.md` (this file)
 5. `docs/FEATURES.md` and `docs/ROADMAP.md`
 6. `docs/AUDIT.md`
-7. The specific docs for the task (`INSTALL`, `ARCHITECTURE`, `OPERATIONS`,
+7. The specific docs for the task (`CLI`, `INSTALL`, `ARCHITECTURE`, `OPERATIONS`,
    `PRIVACY`, `TUNING`, `GETTING-STARTED`).
 
 Suggested prompt:
@@ -46,29 +46,37 @@ no repitas contexto ni rehagas decisiones ya documentadas.
   Tor-first, decoys, verified).
 - Adaptive profiles and `SIGUSR1` hot reload are implemented:
   `auto|hdd|ssd|nvme|manual`, readers capped at 4/8/16, cgroup memory aware,
-  explicit overrides locked.
+  explicit overrides locked. Every knob is also available via CLI and `--set`
+  (see `docs/CLI.md`).
+- RocksDB memory is budgeted globally (`RAM/16`, 64 MiB..1 GiB) across the 7 CFs;
+  background jobs are capped by the CPU count.
+- `run` waits for Core RPC before starting P2P/mempool/listeners; `serve` is the
+  offline mode. Shutdown joins background threads before stopping Core.
 - `docs/FEATURES.md` is the current-feature source of truth.
 - `docs/ROADMAP.md` contains future features/improvements. Do not present them as
   available.
 
-## Last audit/fixes (alpha.17)
+## Last audit/fixes (alpha.18)
 
-- **Optional Electrum TLS listener** (`tls_listen`, `tls_cert`, `tls_key`):
-  rustls 0.23 with TLS 1.2+, PEM chains (public CA certificates can be reused),
-  10 s handshake timeout, same 1 MiB request-line cap.
-- **Certificate reload on change**: the TLS listener checks the PEM files every
-  60 s and swaps the rustls configuration without restarting the indexer; an
-  invalid renewal keeps the previous certificate and logs a warning.
-- **Transport refactor**: plain and TLS share one `Wire` path, so scripthash
-  notifications can write to the same TLS connection. Idle timeout stays 600 s;
-  notification latency is bounded by a 250 ms read poll.
-- **`/status` and `/metrics`** expose `tls_listen`, `tls_handshakes` and
-  `tls_handshake_failures`.
-- **Docs**: TLS setup, Let's Encrypt reuse, split-DNS, permissions, renewal and
-  the nginx `stream` alternative are in `docs/OPERATIONS.md`.
+- **`/proc/meminfo` parser fixed** (the colon was left attached). This was the
+  real cause of `memory pressure (0 MiB)` and the 1 GiB/0 MiB fallback on every
+  machine; cache/readers were being throttled unnecessarily.
+- **Global RocksDB memtable budget** instead of 64 MiB per CF × 3 memtables.
+  Jobs capped by CPU count.
+- **Ordered startup/shutdown** (AUD-021): no pre-Core P2P/mempool errors, no
+  post-shutdown `Connection refused` or tuning lines.
+- **Progress**: height/Core percentages over `headers`, verification progress,
+  read/apply/commit/cache metrics, start/stop local times, milestones every
+  10,000 blocks or 6 h with e-lite/Core disk usage.
+- **Opt-in bulk lag guard** (`--max-bulk-lag-blocks`, default 0) for managed
+  pruned Core during IBD.
+- **TLS listener** (AUD-018): rustls, PEM cert/key, mtime reload, 10 s handshake
+  timeout, no client authentication.
+- **CLI/`--set`**: every TOML field can be overridden without a config file.
 
-Evidence: `docs/AUDIT.md` (AUD-018), `CHANGELOG.md`, `cargo test --workspace`
-and `tests/e2e_regtest.sh` (plain + TLS).
+Evidence: `docs/AUDIT.md` (AUD-018..021), `CHANGELOG.md`,
+`cargo test --workspace` and `tests/e2e_regtest.sh` (plain + TLS + clean
+startup/shutdown assertions).
 
 ## Open risks / next priorities
 

@@ -41,7 +41,10 @@ COMMON=(--network regtest --core-datadir "$CORE" --core-rpc "http://127.0.0.1:$R
 "$BIN" init "${COMMON[@]}"
 "$BIN" doctor "${COMMON[@]}" --listen "127.0.0.1:$ELECTRUM_PORT" --metrics "127.0.0.1:$METRICS_PORT" \
   --tls-listen "127.0.0.1:$TLS_PORT" --tls-cert "$TLS_DIR/cert.pem" --tls-key "$TLS_DIR/key.pem"
-"$BIN" index "${COMMON[@]}" --no-follow --batch 16 --reorg-window 8
+"$BIN" index "${COMMON[@]}" --no-follow --batch 16 --reorg-window 8 --milestone-blocks 50 \
+  >"$RUN/index.log" 2>&1
+grep -q "milestone" "$RUN/index.log" || { cat "$RUN/index.log"; exit 1; }
+grep -q "%" "$RUN/index.log" || { cat "$RUN/index.log"; exit 1; }
 
 "$BIN" run "${COMMON[@]}" --no-follow --reorg-window 8 \
   --listen "127.0.0.1:$ELECTRUM_PORT" --metrics "127.0.0.1:$METRICS_PORT" \
@@ -52,11 +55,26 @@ for _ in $(seq 1 100); do
   curl -sf "http://127.0.0.1:$METRICS_PORT/healthz" >/dev/null 2>&1 && break
   sleep 0.2
 done
+grep -q "started at" "$RUN/serve.log"
+if grep -qE "p2p discovery failed|Connection refused|memory pressure" "$RUN/serve.log"; then
+  echo "unexpected startup error in serve.log:" >&2
+  cat "$RUN/serve.log" >&2
+  exit 1
+fi
 
 curl -sf "http://127.0.0.1:$METRICS_PORT/status" >"$RUN/status.json"
 curl -sf "http://127.0.0.1:$METRICS_PORT/metrics" >"$RUN/metrics.txt"
 grep -q '"state":"READY"' "$RUN/status.json"
 grep -q 'e_lite_indexed_height' "$RUN/metrics.txt"
+python3 - "$RUN/status.json" <<'PY'
+import json, sys
+st = json.load(open(sys.argv[1]))
+mem = st["memory"]
+assert mem["total_mib"] > 0, mem
+assert mem["available_mib"] > 0, mem
+assert st["tuning"]["cache_mib"] >= 128, st["tuning"]
+print("memory accounting OK:", mem["total_mib"], mem["available_mib"], "MiB")
+PY
 
 SCRIPT_HEX=$($CLI -rpcwallet=e2e getaddressinfo "$ADDR" \
   | python3 -c 'import json,sys; print(json.load(sys.stdin)["scriptPubKey"])')
@@ -143,7 +161,12 @@ RC=$?
 set -e
 echo "shutdown exit=$RC"
 [ "$RC" -eq 0 ] || { cat "$RUN/serve.log"; exit 1; }
-grep -q "shutdown requested" "$RUN/serve.log" || { cat "$RUN/serve.log"; exit 1; }
+grep -q "stopped at" "$RUN/serve.log" || { cat "$RUN/serve.log"; exit 1; }
+if tail -n 5 "$RUN/serve.log" | grep -qE "Connection refused|mempool refresh"; then
+  echo "unexpected shutdown error in serve.log:" >&2
+  cat "$RUN/serve.log" >&2
+  exit 1
+fi
 "$BIN" status --network regtest --data-dir "$DATA" --metrics "127.0.0.1:$METRICS_PORT" --json \
   | grep -q '"state": "STOPPED"'
 

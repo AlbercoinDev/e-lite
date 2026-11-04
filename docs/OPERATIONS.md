@@ -86,6 +86,26 @@ rpc_url = "http://127.0.0.1:38332"
 
 Maintenance only; never expose Core RPC directly to the Internet.
 
+## Startup and shutdown
+
+`e-lite run` starts (or adopts) Core, waits for its RPC to answer (including the
+`Loading block index…`/`Verifying blocks…` phase), and only then starts peer
+discovery, mempool, notifications and the Electrum listeners. This avoids the
+old `Connection refused` / `p2p discovery failed` noise. `e-lite serve` is the
+offline mode: it serves an existing index even when Core is down, and it never
+starts or stops Core.
+
+`Ctrl+C`/`SIGTERM` stops mempool and notification threads, flushes the index and
+then stops a Core owned by e-lite. The log ends with a local-time
+`stopped at … (uptime …)` line.
+
+Progress is printed after each commit: indexed height and percentage of Core's
+`headers`, Core blocks/headers and percentage, lag, throughput and tuning
+metrics. Every `[index] milestone_blocks` (default 10,000) or
+`milestone_seconds` (default 6 h), whichever comes first, a line reports the
+interval throughput and the disk usage of the e-lite index and Core datadir.
+This works on every network, including small regtest/signet chains.
+
 ## Electrum TLS (optional)
 
 The plain listener (`[server] listen`, default `127.0.0.1:50001`) keeps working.

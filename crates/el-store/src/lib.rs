@@ -100,7 +100,11 @@ pub struct Store {
 #[derive(Debug, Clone)]
 pub struct StoreOptions {
     pub cache_bytes: usize,
-    pub write_buffer_bytes: usize,
+    /// Total memtable budget across every column family (not per CF).
+    pub write_buffer_total_bytes: usize,
+    /// Memtables per column family.
+    pub max_write_buffer_number: usize,
+    pub max_total_wal_bytes: usize,
     pub max_open_files: i32,
     pub background_jobs: i32,
 }
@@ -109,11 +113,27 @@ impl Default for StoreOptions {
     fn default() -> Self {
         StoreOptions {
             cache_bytes: 256 * 1024 * 1024,
-            write_buffer_bytes: 64 * 1024 * 1024,
+            write_buffer_total_bytes: 256 * 1024 * 1024,
+            max_write_buffer_number: 3,
+            max_total_wal_bytes: 256 * 1024 * 1024,
             max_open_files: 1024,
             background_jobs: 4,
         }
     }
+}
+
+/// Per-column-family memtable size for a total budget. RocksDB applies the
+/// write-buffer size to each CF, so multiplying by the number of families and
+/// memtables is what actually consumes memory.
+pub fn per_cf_write_buffer_bytes(
+    total_bytes: usize,
+    cf_count: usize,
+    max_write_buffer_number: usize,
+) -> usize {
+    let slots = cf_count
+        .max(1)
+        .saturating_mul(max_write_buffer_number.max(1));
+    (total_bytes / slots).clamp(8 * 1024 * 1024, 64 * 1024 * 1024)
 }
 
 impl Store {
@@ -133,19 +153,25 @@ impl Store {
         opts.create_if_missing(true);
         opts.create_missing_column_families(true);
         opts.set_compression_type(DBCompressionType::Lz4);
-        opts.set_max_total_wal_size(256 * 1024 * 1024);
+        let max_buffers = store_opts.max_write_buffer_number.clamp(1, 6);
+        let per_cf_write = per_cf_write_buffer_bytes(
+            store_opts.write_buffer_total_bytes,
+            CF_NAMES.len(),
+            max_buffers,
+        );
+        opts.set_max_total_wal_size(store_opts.max_total_wal_bytes.max(32 * 1024 * 1024) as u64);
         opts.set_max_open_files(store_opts.max_open_files.max(64));
         opts.set_max_background_jobs(store_opts.background_jobs.max(1));
         opts.set_bytes_per_sync(1024 * 1024);
         opts.set_wal_bytes_per_sync(1024 * 1024);
-        opts.set_write_buffer_size(store_opts.write_buffer_bytes.max(8 * 1024 * 1024));
-        opts.set_max_write_buffer_number(3);
+        opts.set_write_buffer_size(per_cf_write);
+        opts.set_max_write_buffer_number(max_buffers as i32);
         let mut descriptors = Vec::new();
         for name in CF_NAMES {
             let mut cf_opts = Options::default();
             cf_opts.set_compression_type(DBCompressionType::Lz4);
-            cf_opts.set_write_buffer_size(store_opts.write_buffer_bytes.max(8 * 1024 * 1024));
-            cf_opts.set_max_write_buffer_number(3);
+            cf_opts.set_write_buffer_size(per_cf_write);
+            cf_opts.set_max_write_buffer_number(max_buffers as i32);
             let mut table = BlockBasedOptions::default();
             table.set_block_cache(&cache);
             table.set_bloom_filter(10.0, true);
@@ -765,6 +791,23 @@ impl Store {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn write_buffer_budget_is_split_across_column_families() {
+        // 1 GiB total over 7 CFs and 3 memtables = ~48 MiB per CF.
+        let per_cf = per_cf_write_buffer_bytes(1024 * 1024 * 1024, 7, 3);
+        assert_eq!(per_cf, 1024 * 1024 * 1024 / 21);
+        // Small budgets never go below the 8 MiB floor.
+        assert_eq!(
+            per_cf_write_buffer_bytes(64 * 1024 * 1024, 7, 3),
+            8 * 1024 * 1024
+        );
+        // Large budgets are capped at 64 MiB per CF.
+        assert_eq!(
+            per_cf_write_buffer_bytes(64 * 1024 * 1024 * 1024, 7, 3),
+            64 * 1024 * 1024
+        );
+    }
 
     fn tmp(name: &str) -> PathBuf {
         let p = std::env::temp_dir().join(format!(

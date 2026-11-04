@@ -107,6 +107,11 @@ or `adaptive` in the TOML, send `SIGUSR1` and verify the values in `/status`.
 - [ ] No `NEEDS_RECOVERY` / prune gap.
 - [ ] Electrum history/balance/UTXO/mempool/fees/broadcast work.
 - [ ] Optional Electrum TLS works and a renewed PEM is picked up without restart.
+- [ ] Startup log has no pre-Core `Connection refused`, `p2p discovery failed` or `memory pressure` lines.
+- [ ] Ctrl+C logs `stopped at …` with no post-shutdown Core/mempool errors.
+- [ ] `/status` shows real RAM/cgroup figures and the configured cache, not a false 0 MiB.
+- [ ] Progress shows height/Core percentages and a milestone every 10k blocks or 6 h.
+- [ ] `--profile hdd|ssd|nvme|manual` and `--set` work without a config file.
 - [ ] Raw tx works from Core/cache; pruned fallback is explicit if unavailable.
 - [ ] Disk-low pauses downloads; indexing continues until the critical floor.
 - [ ] `SIGUSR1` applies hot fields; cold fields are logged.

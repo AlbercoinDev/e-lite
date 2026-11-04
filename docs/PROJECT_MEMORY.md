@@ -40,6 +40,8 @@ a separate listener is implemented; authentication and rate limiting are not.
 - Electrum is plain TCP and loopback by default; TLS is an optional separate
   listener and does not authenticate clients.
 - Core RPC is HTTP; use SSH/VPN for LAN/WAN.
+- RocksDB memtables use a global `RAM/16` budget; cache and readers scale with
+  real RAM, and every knob can be overridden from the CLI or `--set`.
 - Rawtx external lookup is block-based, validated, Tor-first and decoy-enhanced.
 
 ## Audit and release

@@ -17,6 +17,7 @@ available**.
 | Automatic pruning `>=550` + opt-in | experimental | hard lag cap + verified gap repair |
 | Disk guard with download/index split | experimental | cgroup/LXC aware |
 | Adaptive profiles and hot reload | experimental | `auto/hdd/ssd/nvme/manual`, `SIGUSR1` |
+| Global RocksDB memory budget | experimental | `RAM/16` memtables, `RAM/4` cache, CPU-capped jobs |
 | Reorg recovery within undo window | experimental | deeper reorg fails clearly |
 | Snapshots export/import | experimental | optional; not required from zero |
 
@@ -68,7 +69,10 @@ available**.
 
 | Feature | Status | Notes |
 |---|---|---|
-| `/status`, `/metrics`, `/healthz` | experimental | loopback by default |
+| `/status`, `/metrics`, `/healthz` | experimental | loopback by default; memory and TLS counters |
+| Ordered startup/shutdown | experimental | `run` waits for Core; threads joined before Core stop |
+| CLI overrides and `--set` | stable | every TOML field; see `docs/CLI.md` |
+| Progress percentages and milestones | experimental | height/Core %, 10k blocks or 6 h; disk usage |
 | One-line install/update | stable | installer verifies SHA256SUMS |
 | Optional official Core install/update | stable | `--with-core` |
 | `.deb`, tarball, release checksums | stable | GitHub Releases |

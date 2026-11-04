@@ -152,6 +152,7 @@ fn fixture() -> (Fixture, ScriptHash, Hash32) {
         tls_listen: None,
         max_clients: 4,
         state: AtomicU8::new(state::READY),
+        shutdown: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         lock: Arc::new(RwLock::new(())),
         stats: Stats::default(),
     });
@@ -438,6 +439,7 @@ fn slow_transaction_get_does_not_hold_the_index_lock() {
         tls_listen: None,
         max_clients: 4,
         state: AtomicU8::new(state::READY),
+        shutdown: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         lock: Arc::new(RwLock::new(())),
         stats: Stats::default(),
     });

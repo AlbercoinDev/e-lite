@@ -1,6 +1,42 @@
 # Changelog
 
-## 0.1.0-alpha.17 — 2026-11-04
+## 0.1.0-alpha.18 — 2026-11-04
+
+### Startup, shutdown and memory/performance
+
+- **Fixed `/proc/meminfo` parsing** (the colon was left in the value). This was
+  the real cause of `memory pressure (0 MiB)`: e-lite always fell back to 1 GiB
+  total and 0 MiB available, shrinking the cache to 128 MiB and capping readers
+  on machines with plenty of RAM. `doctor`/`/status` now show total, available,
+  cgroup limit/usage and reclaimable cache.
+- **RocksDB memtable budget is global, not per column family**. The old
+  `cache/4` per CF could reserve ~1.3 GiB of write buffers plus the block cache.
+  The budget is now `RAM/16` (64 MiB..1 GiB) split across the 7 CFs, and
+  background jobs are capped by the CPU count.
+- **Ordered startup**: `run` starts/adopts Core, waits for RPC (including block
+  index loading) and only then builds the resolver, discovers P2P peers and
+  starts mempool, notifications and listeners. `serve` remains the offline mode.
+  This removes `p2p discovery failed`, `mempool refresh: Connection refused` and
+  transient `Loading block index` noise.
+- **Ordered shutdown**: mempool/notification threads observe a shutdown flag and
+  are joined before Core is stopped. `Ctrl+C` ends with a local-time
+  `stopped at … (uptime …)` line and no post-shutdown errors/tuning lines.
+- **Progress**: height and Core now show percentages over Core `headers`, plus
+  verification progress during IBD and read/apply/commit/cache metrics. A
+  milestone line is logged every `milestone_blocks` (default 10,000) or
+  `milestone_seconds` (default 6 h) with interval throughput and disk usage for
+  e-lite and Core. Works on all networks.
+- **Monotonic Core height** in the progress line (no more 615734 → 613288).
+- **Optional bulk lag guard** (`--max-bulk-lag-blocks`, default 0/off): pauses
+  Core P2P when a managed pruned Core is in IBD and the index lags more than the
+  threshold, resuming at half. Bounds the gap and disk contention.
+- **CLI coverage**: `--profile`, `--adaptive/--no-adaptive`, `--cache-mib`,
+  `--write-buffer-mib`, `--background-jobs`, `--commit-interval-ms`,
+  `--prefetch-blocks`, `--milestone-blocks/seconds`, pruning thresholds,
+  `--core-arg`, rawtx/server flags, and `--set section.key=value` for any TOML
+  field. See `docs/CLI.md`.
+- **Tests**: memory/cgroup parsers, RocksDB budget, milestone timing, CLI
+  overrides, TLS, and e2e startup/shutdown log assertions.
 
 ### Optional Electrum TLS
 

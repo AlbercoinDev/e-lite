@@ -116,5 +116,5 @@ RC=$?
 set -e
 echo "shutdown exit: $RC"
 [ "$RC" -eq 0 ] || { tail -20 "$RUN/serve.log"; exit 1; }
-grep -q "shutdown requested" "$RUN/serve.log"
+grep -q "stopped at" "$RUN/serve.log"
 echo "resilience OK"

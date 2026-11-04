@@ -3,6 +3,8 @@
 //! Each request reads the index through a shared read lock; the indexer commits
 //! under the write lock, so no response mixes two tips.
 
+#![recursion_limit = "256"]
+
 use el_chain::ReaderTracker;
 use el_mempool::Mempool;
 use el_model::{merkle_branch, Hash32, NetworkIdentity, ScriptHash};
@@ -79,6 +81,8 @@ pub mod state {
 pub struct Stats {
     pub indexed_height: AtomicU64,
     pub core_height: AtomicU64,
+    pub core_headers: AtomicU64,
+    pub core_verification_bps: AtomicU64,
     pub core_pruneheight: AtomicU64,
     pub core_pruned: AtomicBool,
     pub core_network_active: AtomicBool,
@@ -110,6 +114,11 @@ pub struct Stats {
     pub tuning_background_jobs: AtomicU64,
     pub tls_handshakes: AtomicU64,
     pub tls_handshake_failures: AtomicU64,
+    pub mem_total_mib: AtomicU64,
+    pub mem_available_mib: AtomicU64,
+    pub mem_cgroup_limit_mib: AtomicU64,
+    pub mem_cgroup_used_mib: AtomicU64,
+    pub mem_reclaimable_mib: AtomicU64,
     pub started: Instant,
 }
 
@@ -118,6 +127,8 @@ impl Default for Stats {
         Stats {
             indexed_height: AtomicU64::new(0),
             core_height: AtomicU64::new(0),
+            core_headers: AtomicU64::new(0),
+            core_verification_bps: AtomicU64::new(0),
             core_pruneheight: AtomicU64::new(0),
             core_pruned: AtomicBool::new(false),
             core_network_active: AtomicBool::new(true),
@@ -149,6 +160,11 @@ impl Default for Stats {
             tuning_background_jobs: AtomicU64::new(0),
             tls_handshakes: AtomicU64::new(0),
             tls_handshake_failures: AtomicU64::new(0),
+            mem_total_mib: AtomicU64::new(0),
+            mem_available_mib: AtomicU64::new(0),
+            mem_cgroup_limit_mib: AtomicU64::new(0),
+            mem_cgroup_used_mib: AtomicU64::new(0),
+            mem_reclaimable_mib: AtomicU64::new(0),
             started: Instant::now(),
         }
     }
@@ -536,6 +552,7 @@ pub struct Shared {
     pub tls_listen: Option<String>,
     pub max_clients: usize,
     pub state: AtomicU8,
+    pub shutdown: Arc<AtomicBool>,
     pub lock: Arc<RwLock<()>>,
     pub stats: Stats,
 }
@@ -601,6 +618,9 @@ impl Shared {
             "state": state::name(self.get_state()),
             "indexed_height": height,
             "core_height": core_height,
+            "core_headers": self.stats.core_headers.load(Ordering::Relaxed),
+            "core_verification_progress": self.stats.core_verification_bps.load(Ordering::Relaxed) as f64
+                / 10_000.0,
             "lag_blocks": core_height.saturating_sub(height),
             "retention_blocks": core_height.saturating_sub(pruneheight),
             "txnum": txnum,
@@ -624,6 +644,13 @@ impl Shared {
                 .tls_handshake_failures
                 .load(Ordering::Relaxed),
             "protocol": PROTOCOL_MAX,
+            "memory": {
+                "total_mib": self.stats.mem_total_mib.load(Ordering::Relaxed),
+                "available_mib": self.stats.mem_available_mib.load(Ordering::Relaxed),
+                "cgroup_limit_mib": self.stats.mem_cgroup_limit_mib.load(Ordering::Relaxed),
+                "cgroup_used_mib": self.stats.mem_cgroup_used_mib.load(Ordering::Relaxed),
+                "reclaimable_mib": self.stats.mem_reclaimable_mib.load(Ordering::Relaxed),
+            },
             "tuning": {
                 "readers": self.stats.tuning_readers.load(Ordering::Relaxed),
                 "commit_interval_ms": self.stats.tuning_commit_ms.load(Ordering::Relaxed),
@@ -1459,7 +1486,11 @@ pub fn start_mempool(shared: Arc<Shared>) -> std::thread::JoinHandle<()> {
         let mut last_refresh = Instant::now()
             .checked_sub(Duration::from_secs(60))
             .unwrap_or_else(Instant::now);
+        let mut ever_ok = false;
         loop {
+            if shared.shutdown.load(Ordering::Relaxed) {
+                break;
+            }
             // Reconcile immediately after a new block; otherwise poll every 3 s.
             let tip = shared
                 .store
@@ -1485,6 +1516,7 @@ pub fn start_mempool(shared: Arc<Shared>) -> std::thread::JoinHandle<()> {
             last_refresh = Instant::now();
             match result {
                 Ok(changed) => {
+                    ever_ok = true;
                     if changed {
                         let touched: Vec<ScriptHash> =
                             candidate.last_touched().iter().copied().collect();
@@ -1500,10 +1532,23 @@ pub fn start_mempool(shared: Arc<Shared>) -> std::thread::JoinHandle<()> {
                 }
                 Err(e) => {
                     let msg = e.to_string();
-                    if msg != last_err {
+                    let starting = matches!(
+                        shared.get_state(),
+                        state::WAITING_FOR_CORE | state::INITIALIZING
+                    );
+                    let connection_noise = msg.contains("Connection refused")
+                        || msg.contains("io:")
+                        || msg.contains("Loading block index")
+                        || msg.contains("Verifying blocks");
+                    // Before the first successful refresh (serve offline, Core
+                    // still loading), connection errors are expected and must
+                    // not look like failures. After a successful refresh they
+                    // are logged once, so a real outage is visible.
+                    let expected = !ever_ok && connection_noise;
+                    if msg != last_err && !starting && !expected {
                         eprintln!("[e-lite] mempool refresh: {msg}");
-                        last_err = msg;
                     }
+                    last_err = msg;
                 }
             }
             if last_fee.elapsed() >= Duration::from_secs(60) {
@@ -1528,6 +1573,9 @@ pub fn start_notifications(shared: Arc<Shared>) -> std::thread::JoinHandle<()> {
         let mut last_height = u64::MAX;
         let mut last_hash: Option<String> = None;
         loop {
+            if shared.shutdown.load(Ordering::Relaxed) {
+                break;
+            }
             shared.stats.notifier_runs.fetch_add(1, Ordering::Relaxed);
             let (height, hash, header) = {
                 let Ok(_g) = shared.lock.read() else {
@@ -1974,6 +2022,18 @@ fn metrics_text(shared: &Shared) -> String {
         "Effective RocksDB block cache",
         "gauge",
         st["tuning"]["cache_mib"].as_u64().unwrap_or(0),
+    );
+    line(
+        "e_lite_memory_available_mib",
+        "Memory available to e-lite (cgroup aware)",
+        "gauge",
+        st["memory"]["available_mib"].as_u64().unwrap_or(0),
+    );
+    line(
+        "e_lite_memory_total_mib",
+        "Memory visible to e-lite (cgroup aware)",
+        "gauge",
+        st["memory"]["total_mib"].as_u64().unwrap_or(0),
     );
     line(
         "e_lite_tx_per_sec",

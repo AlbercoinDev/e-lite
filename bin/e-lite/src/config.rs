@@ -149,6 +149,18 @@ pub struct IndexCfg {
     /// Future UTXO prefetch depth. 0 selects the profile/default.
     #[serde(default)]
     pub prefetch_blocks: usize,
+    /// RocksDB write-buffer budget in MiB across all column families. 0 = auto.
+    #[serde(default)]
+    pub write_buffer_mib: u64,
+    /// RocksDB background jobs. 0 = profile default, capped by CPU count.
+    #[serde(default)]
+    pub background_jobs: usize,
+    /// Log a progress milestone every N blocks. 0 disables block milestones.
+    #[serde(default = "d_milestone_blocks")]
+    pub milestone_blocks: u64,
+    /// Log a progress milestone every N seconds. 0 disables time milestones.
+    #[serde(default = "d_milestone_seconds")]
+    pub milestone_seconds: u64,
     #[serde(default = "d_true")]
     pub follow: bool,
 }
@@ -165,6 +177,10 @@ impl Default for IndexCfg {
             adaptive: d_true(),
             commit_interval_ms: 0,
             prefetch_blocks: 0,
+            write_buffer_mib: 0,
+            background_jobs: 0,
+            milestone_blocks: d_milestone_blocks(),
+            milestone_seconds: d_milestone_seconds(),
             follow: true,
         }
     }
@@ -256,6 +272,11 @@ pub struct PruningCfg {
     /// `prune_mib = 1` (manual) or `0` (full node).
     #[serde(default)]
     pub allow_auto_prune: bool,
+    /// Opt-in download throttle for manual pruning / bulk catch-up. When the
+    /// index lags Core by more than this many blocks during IBD, e-lite pauses
+    /// Core's P2P until the index halves the gap. 0 disables it.
+    #[serde(default)]
+    pub max_bulk_lag_blocks: u32,
     /// Minimum safe-height gain between `pruneblockchain` requests. Core
     /// prunes whole files, so a small value produces no-op calls and flushes.
     #[serde(default = "d_min_gain")]
@@ -279,6 +300,7 @@ impl Default for PruningCfg {
             critical_free_gib: d_critical_free(),
             max_core_lag_blocks: d_max_lag(),
             allow_auto_prune: false,
+            max_bulk_lag_blocks: 0,
             min_gain_blocks: d_min_gain(),
             prune_interval_seconds: d_prune_interval(),
             repair_max_gap_blocks: d_repair_max_gap(),
@@ -355,6 +377,12 @@ fn d_batch() -> u32 {
 fn d_profile() -> String {
     "auto".to_string()
 }
+fn d_milestone_blocks() -> u64 {
+    10_000
+}
+fn d_milestone_seconds() -> u64 {
+    21_600
+}
 fn d_block_source() -> String {
     "auto".to_string()
 }
@@ -430,15 +458,50 @@ impl Config {
     }
 
     pub fn load(path: Option<&str>) -> Result<Config, String> {
-        let path = Self::resolve_path(path);
-        match path {
-            Some(p) => {
-                let text = std::fs::read_to_string(&p)
-                    .map_err(|e| format!("cannot read config {}: {e}", p.display()))?;
-                toml::from_str(&text).map_err(|e| format!("invalid config {}: {e}", p.display()))
-            }
-            None => Ok(Config::default()),
+        Self::load_with_overrides(path, &[])
+    }
+
+    /// Load the TOML file and apply `section.key=value` overrides. Values are
+    /// parsed as TOML when possible (`true`, `42`, `["a","b"]`); otherwise they
+    /// are treated as strings. This is the generic escape hatch for every
+    /// configuration field without requiring a config file.
+    pub fn load_with_overrides(path: Option<&str>, overrides: &[String]) -> Result<Config, String> {
+        let resolved = Self::resolve_path(path);
+        let text = match &resolved {
+            Some(p) => std::fs::read_to_string(p)
+                .map_err(|e| format!("cannot read config {}: {e}", p.display()))?,
+            None => String::new(),
+        };
+        if overrides.is_empty() {
+            return if text.trim().is_empty() {
+                Ok(Config::default())
+            } else {
+                toml::from_str(&text).map_err(|e| {
+                    let where_ = resolved
+                        .as_ref()
+                        .map(|p| p.display().to_string())
+                        .unwrap_or_else(|| "<defaults>".to_string());
+                    format!("invalid config {where_}: {e}")
+                })
+            };
         }
+        let mut value: toml::Value = if text.trim().is_empty() {
+            toml::Value::Table(Default::default())
+        } else {
+            toml::from_str(&text).map_err(|e| {
+                let where_ = resolved
+                    .as_ref()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|| "<defaults>".to_string());
+                format!("invalid config {where_}: {e}")
+            })?
+        };
+        for item in overrides {
+            apply_override(&mut value, item)?;
+        }
+        value
+            .try_into()
+            .map_err(|e| format!("invalid config after --set: {e}"))
     }
 
     pub fn chain(&self) -> Result<Chain, String> {
@@ -598,6 +661,40 @@ impl Config {
     }
 }
 
+fn apply_override(root: &mut toml::Value, item: &str) -> Result<(), String> {
+    let (key, raw) = item
+        .split_once('=')
+        .ok_or_else(|| format!("--set expects section.key=value, got {item:?}"))?;
+    let key = key.trim();
+    let raw = raw.trim();
+    if key.is_empty() {
+        return Err(format!("--set key is empty in {item:?}"));
+    }
+    let parsed = match toml::from_str::<toml::Value>(&format!("v = {raw}")) {
+        Ok(toml::Value::Table(mut table)) => table
+            .remove("v")
+            .unwrap_or_else(|| toml::Value::String(raw.to_string())),
+        _ => toml::Value::String(raw.to_string()),
+    };
+    let parts: Vec<&str> = key.split('.').filter(|p| !p.is_empty()).collect();
+    if parts.is_empty() {
+        return Err(format!("--set key is empty in {item:?}"));
+    }
+    let mut table = root
+        .as_table_mut()
+        .ok_or_else(|| "--set cannot replace the root table".to_string())?;
+    for part in &parts[..parts.len() - 1] {
+        let entry = table
+            .entry((*part).to_string())
+            .or_insert_with(|| toml::Value::Table(Default::default()));
+        table = entry
+            .as_table_mut()
+            .ok_or_else(|| format!("--set path {key:?} conflicts with a scalar value"))?;
+    }
+    table.insert((*parts.last().expect("non-empty")).to_string(), parsed);
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -659,5 +756,28 @@ mod tests {
         cfg.server.tls_cert = "/etc/e-lite/tls/cert.pem".to_string();
         cfg.server.tls_key = "/etc/e-lite/tls/key.pem".to_string();
         assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn set_overrides_apply_to_nested_keys() {
+        let cfg = Config::load_with_overrides(
+            None,
+            &[
+                "index.profile=ssd".to_string(),
+                "index.readers=6".to_string(),
+                "pruning.max_bulk_lag_blocks=20000".to_string(),
+                "rawtx.p2p_peers=[\"1.2.3.4:8333\"]".to_string(),
+            ],
+        )
+        .unwrap();
+        assert_eq!(cfg.index.profile, "ssd");
+        assert_eq!(cfg.index.readers, 6);
+        assert_eq!(cfg.pruning.max_bulk_lag_blocks, 20_000);
+        assert_eq!(cfg.rawtx.p2p_peers, vec!["1.2.3.4:8333"]);
+    }
+
+    #[test]
+    fn set_override_without_equals_is_rejected() {
+        assert!(Config::load_with_overrides(None, &["index.profile".to_string()]).is_err());
     }
 }

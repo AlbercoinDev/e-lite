@@ -127,26 +127,34 @@ impl Tunables {
             .map(|n| n.get())
             .unwrap_or(4);
 
-        let (mut readers, default_commit, default_batch, default_cache, jobs) = match profile {
-            Profile::Hdd => (2usize, 5_000u64, 512u32, (ram_mib / 4).min(4096), 4usize),
-            Profile::Ssd => (8, 2_000, 256, (ram_mib / 4).min(8192), cpus.min(8)),
-            Profile::Nvme => (16, 2_000, 256, (ram_mib / 3).min(16_384), cpus.min(12)),
-            Profile::Manual | Profile::Auto => (
-                if cfg.index.readers > 0 {
-                    cfg.index.readers
-                } else {
-                    cpus.min(8)
-                },
-                2_000,
-                256,
-                if cfg.index.cache_mib > 0 {
-                    cfg.index.cache_mib
-                } else {
-                    (ram_mib / 4).clamp(64, 2048)
-                },
-                cpus.min(4),
-            ),
+        let (mut readers, default_commit, default_batch, default_cache, profile_jobs) =
+            match profile {
+                Profile::Hdd => (2usize, 5_000u64, 512u32, (ram_mib / 4).min(4096), 4usize),
+                Profile::Ssd => (8, 2_000, 256, (ram_mib / 4).min(8192), cpus.min(8)),
+                Profile::Nvme => (16, 2_000, 256, (ram_mib / 3).min(16_384), cpus.min(12)),
+                Profile::Manual | Profile::Auto => (
+                    if cfg.index.readers > 0 {
+                        cfg.index.readers
+                    } else {
+                        cpus.min(8)
+                    },
+                    2_000,
+                    256,
+                    if cfg.index.cache_mib > 0 {
+                        cfg.index.cache_mib
+                    } else {
+                        (ram_mib / 4).clamp(64, 2048)
+                    },
+                    cpus.min(4),
+                ),
+            };
+        let requested_jobs = if cfg.index.background_jobs > 0 {
+            cfg.index.background_jobs
+        } else {
+            profile_jobs
         };
+        // Never over-subscribe a small machine with RocksDB workers.
+        let jobs = requested_jobs.clamp(1, 32).min(cpus.max(1));
 
         if cfg.index.readers > 0 {
             readers = cfg.index.readers;
@@ -300,27 +308,33 @@ impl Tunables {
     }
 
     fn apply_profile_defaults(&self, profile: Profile) {
+        let cpus = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4);
         match profile {
             Profile::Hdd => {
                 self.readers.store(2, Ordering::Relaxed);
                 self.commit_ms.store(5_000, Ordering::Relaxed);
                 self.batch_blocks.store(512, Ordering::Relaxed);
                 self.max_group_txs.store(500_000, Ordering::Relaxed);
-                self.background_jobs.store(4, Ordering::Relaxed);
+                self.background_jobs
+                    .store(4usize.min(cpus.max(1)), Ordering::Relaxed);
             }
             Profile::Ssd => {
                 self.readers.store(8, Ordering::Relaxed);
                 self.commit_ms.store(2_000, Ordering::Relaxed);
                 self.batch_blocks.store(256, Ordering::Relaxed);
                 self.max_group_txs.store(250_000, Ordering::Relaxed);
-                self.background_jobs.store(8, Ordering::Relaxed);
+                self.background_jobs
+                    .store(8usize.min(cpus.max(1)), Ordering::Relaxed);
             }
             Profile::Nvme => {
                 self.readers.store(16, Ordering::Relaxed);
                 self.commit_ms.store(2_000, Ordering::Relaxed);
                 self.batch_blocks.store(256, Ordering::Relaxed);
                 self.max_group_txs.store(250_000, Ordering::Relaxed);
-                self.background_jobs.store(12, Ordering::Relaxed);
+                self.background_jobs
+                    .store(12usize.min(cpus.max(1)), Ordering::Relaxed);
             }
             Profile::Auto | Profile::Manual => {}
         }
@@ -347,6 +361,16 @@ impl Tunables {
             cfg.index.batch_blocks > 0 && cfg.index.batch_blocks != 256,
             Ordering::Relaxed,
         );
+        if cfg.index.background_jobs > 0 {
+            let cpus = std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(4);
+            let v = cfg.index.background_jobs.clamp(1, 32).min(cpus.max(1));
+            if v != self.background_jobs() {
+                self.background_jobs.store(v, Ordering::Relaxed);
+                changed.push("background_jobs");
+            }
+        }
         if cfg.index.readers > 0 {
             let v = cfg
                 .index
@@ -567,6 +591,22 @@ impl Tunables {
         stats
             .tuning_background_jobs
             .store(self.background_jobs() as u64, Ordering::Relaxed);
+        let mem = memory_info();
+        stats
+            .mem_total_mib
+            .store(mem.total_mib.unwrap_or(0), Ordering::Relaxed);
+        stats
+            .mem_available_mib
+            .store(mem.available_mib, Ordering::Relaxed);
+        stats
+            .mem_cgroup_limit_mib
+            .store(mem.cgroup_limit_mib.unwrap_or(0), Ordering::Relaxed);
+        stats
+            .mem_cgroup_used_mib
+            .store(mem.cgroup_used_mib.unwrap_or(0), Ordering::Relaxed);
+        stats
+            .mem_reclaimable_mib
+            .store(mem.reclaimable_mib.unwrap_or(0), Ordering::Relaxed);
     }
 }
 
@@ -580,46 +620,103 @@ fn ewma(slot: &AtomicU64, sample: u64) {
     slot.store(next, Ordering::Relaxed);
 }
 
+/// Memory figures used for cache/reader decisions and diagnostics.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct MemoryInfo {
+    pub total_mib: Option<u64>,
+    /// Memory that can actually be used before reclaim/OOM.
+    pub available_mib: u64,
+    /// `/proc/meminfo` value before applying a cgroup limit.
+    pub host_available_mib: u64,
+    pub cgroup_limit_mib: Option<u64>,
+    pub cgroup_used_mib: Option<u64>,
+    /// Page cache in the cgroup that the kernel can reclaim under pressure.
+    pub reclaimable_mib: Option<u64>,
+}
+
 pub fn total_ram_mib() -> Option<u64> {
-    let mem = meminfo_mib("MemTotal");
-    let cg = cgroup_limit_mib();
-    match (mem, cg) {
+    memory_info().total_mib
+}
+
+pub fn mem_available_mib() -> u64 {
+    memory_info().available_mib
+}
+
+pub fn memory_info() -> MemoryInfo {
+    let host_total = meminfo_mib("MemTotal");
+    let cg_limit = cgroup_limit_mib();
+    let total = match (host_total, cg_limit) {
         (Some(a), Some(b)) => Some(a.min(b)),
         (Some(a), None) => Some(a),
         (None, Some(b)) => Some(b),
         (None, None) => None,
+    };
+    let host_available = meminfo_mib("MemAvailable")
+        .or_else(|| meminfo_mib("MemFree"))
+        .unwrap_or(0);
+    let cg_used = cgroup_used_mib();
+    let reclaimable = cgroup_reclaimable_mib();
+    let cg_available = cgroup_available_mib();
+    let available = match cg_available {
+        Some(cg) => host_available.min(cg),
+        None => host_available,
+    };
+    MemoryInfo {
+        total_mib: total,
+        available_mib: available,
+        host_available_mib: host_available,
+        cgroup_limit_mib: cg_limit,
+        cgroup_used_mib: cg_used,
+        reclaimable_mib: reclaimable,
     }
 }
 
-pub fn mem_available_mib() -> u64 {
-    let mem = meminfo_mib("MemAvailable").unwrap_or(0);
-    let cg = cgroup_available_mib().unwrap_or(u64::MAX);
-    mem.min(cg)
+/// Parse a `/proc/meminfo` line such as `MemAvailable:    7677888 kB`.
+/// The colon is part of the format; leaving it in the value is what made
+/// older versions report 0 MiB available on every machine.
+fn meminfo_from(text: &str, key: &str) -> Option<u64> {
+    text.lines().find_map(|line| {
+        let (name, rest) = line.split_once(':')?;
+        if name.trim() != key {
+            return None;
+        }
+        rest.split_whitespace()
+            .next()?
+            .parse::<u64>()
+            .ok()
+            .map(|kb| kb / 1024)
+    })
 }
 
 fn meminfo_mib(key: &str) -> Option<u64> {
     let text = std::fs::read_to_string("/proc/meminfo").ok()?;
-    text.lines()
-        .find_map(|l| l.strip_prefix(key))
-        .and_then(|l| l.split_whitespace().next())
-        .and_then(|v| v.parse::<u64>().ok())
-        .map(|kb| kb / 1024)
+    meminfo_from(&text, key)
 }
 
-fn read_u64(path: &str) -> Option<u64> {
-    std::fs::read_to_string(path)
-        .ok()?
-        .trim()
-        .parse::<u64>()
-        .ok()
+fn read_trim(path: &str) -> Option<String> {
+    Some(std::fs::read_to_string(path).ok()?.trim().to_string())
+}
+
+fn parse_mib(value: &str) -> Option<u64> {
+    value.parse::<u64>().ok().map(|v| v / 1024 / 1024)
+}
+
+fn cgroup_file(name: &str) -> Option<String> {
+    read_trim(&format!("/sys/fs/cgroup/{name}"))
+        .or_else(|| read_trim(&format!("/sys/fs/cgroup/memory/{name}")))
 }
 
 /// cgroup v2 or v1 memory limit in MiB. `max`/unlimited yields None.
 fn cgroup_limit_mib() -> Option<u64> {
-    if let Some(v) = read_u64("/sys/fs/cgroup/memory.max") {
-        return Some(v / 1024 / 1024);
+    if let Some(raw) = read_trim("/sys/fs/cgroup/memory.max") {
+        if raw != "max" {
+            return parse_mib(&raw);
+        }
+        return None;
     }
-    let v = read_u64("/sys/fs/cgroup/memory/memory.limit_in_bytes")?;
+    let v = read_trim("/sys/fs/cgroup/memory/memory.limit_in_bytes")?
+        .parse::<u64>()
+        .ok()?;
     // v1 uses a huge sentinel for unlimited.
     if v >= (1u64 << 60) {
         None
@@ -628,13 +725,41 @@ fn cgroup_limit_mib() -> Option<u64> {
     }
 }
 
+fn cgroup_used_mib() -> Option<u64> {
+    cgroup_file("memory.current")
+        .and_then(|v| parse_mib(&v))
+        .or_else(|| cgroup_file("memory.usage_in_bytes").and_then(|v| parse_mib(&v)))
+}
+
+/// Reclaimable page cache from `memory.stat`. `memory.current` includes this
+/// cache, so subtracting it avoids false "0 MiB available" pressure on hosts
+/// with a cgroup limit.
+fn cgroup_reclaimable_mib() -> Option<u64> {
+    let text = std::fs::read_to_string("/sys/fs/cgroup/memory.stat")
+        .or_else(|_| std::fs::read_to_string("/sys/fs/cgroup/memory/memory.stat"))
+        .ok()?;
+    cgroup_stat_from(&text, "inactive_file")
+}
+
+fn cgroup_stat_from(text: &str, key: &str) -> Option<u64> {
+    text.lines().find_map(|line| {
+        let (name, value) = line.split_once(' ')?;
+        if name.trim() != key {
+            return None;
+        }
+        value
+            .trim()
+            .parse::<u64>()
+            .ok()
+            .map(|bytes| bytes / 1024 / 1024)
+    })
+}
+
 fn cgroup_available_mib() -> Option<u64> {
     let limit = cgroup_limit_mib()?;
-    let used = read_u64("/sys/fs/cgroup/memory.current")
-        .or_else(|| read_u64("/sys/fs/cgroup/memory/memory.usage_in_bytes"))?
-        / 1024
-        / 1024;
-    Some(limit.saturating_sub(used))
+    let used = cgroup_used_mib()?;
+    let reclaimable = cgroup_reclaimable_mib().unwrap_or(0);
+    Some(limit.saturating_sub(used.saturating_sub(reclaimable)))
 }
 
 /// `rotational` hint for the device holding `path`. Falls back to false.
@@ -694,6 +819,24 @@ mod tests {
     }
 
     #[test]
+    fn meminfo_parser_handles_the_colon() {
+        let text = "MemTotal:        8131584 kB\nMemAvailable:    7677888 kB\nMemFree:  2048 kB\n";
+        assert_eq!(meminfo_from(text, "MemTotal"), Some(7941));
+        assert_eq!(meminfo_from(text, "MemAvailable"), Some(7497));
+        assert_eq!(meminfo_from(text, "MemFree"), Some(2));
+        assert_eq!(meminfo_from(text, "Missing"), None);
+    }
+
+    #[test]
+    fn cgroup_stat_parser_reads_reclaimable_cache() {
+        let text =
+            "anon 35291136\nfile 5722951680\ninactive_file 1931116544\nactive_file 3787128832\n";
+        assert_eq!(cgroup_stat_from(text, "inactive_file"), Some(1841));
+        assert_eq!(cgroup_stat_from(text, "active_file"), Some(3611));
+        assert_eq!(cgroup_stat_from(text, "missing"), None);
+    }
+
+    #[test]
     fn reload_applies_hot_fields_and_profile() {
         let cfg = Config::default();
         let t = Tunables::new(&cfg, true);
@@ -728,5 +871,18 @@ mod tests {
         assert!(t.readers() >= 1);
         assert!(t.commit_ms() >= 500);
         assert!(t.cache_mib() <= t.max_cache_mib);
+    }
+
+    #[test]
+    fn explicit_profile_and_jobs_are_applied() {
+        let mut cfg = Config::default();
+        cfg.index.profile = "nvme".to_string();
+        cfg.index.background_jobs = 64;
+        let t = Tunables::new(&cfg, false);
+        assert_eq!(t.profile(), Profile::Nvme);
+        let cpus = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4);
+        assert!(t.background_jobs() <= cpus.max(1));
     }
 }

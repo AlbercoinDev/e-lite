@@ -1,5 +1,7 @@
 # e-lite configuration (v0.2)
 # Every value shown is the default unless stated otherwise.
+# Any field can be overridden without this file: see `e-lite --help` and
+# docs/CLI.md (`--profile`, `--cache-mib`, `--set section.key=value`, ...).
 
 [network]
 name = "auto"                       # auto | mainnet | testnet4 | signet | regtest
@@ -32,6 +34,10 @@ profile = "auto"                    # auto | hdd | ssd | nvme | manual
 adaptive = true                     # event-driven readers/commit/cache tuning
 commit_interval_ms = 0              # 0 = profile default (500..10000 when set)
 prefetch_blocks = 0                 # reserved for the UTXO prefetch pipeline
+write_buffer_mib = 0                # total RocksDB memtable budget; 0 = RAM/16
+background_jobs = 0                 # RocksDB jobs; 0 = profile, capped by CPU count
+milestone_blocks = 10000            # progress report every N blocks (0 = off)
+milestone_seconds = 21600           # or every N seconds (0 = off; 6 h default)
 follow = true                       # keep following the tip
 
 [pruning]
@@ -39,6 +45,8 @@ min_free_gib = 10                   # pause Core downloads below this; indexing 
 critical_free_gib = 1               # also pause indexing below this hard floor (0 = never)
 max_core_lag_blocks = 192           # automatic pruning only; hard-capped at 224
 allow_auto_prune = false            # required for prune_mib >= 550; not for from-zero
+max_bulk_lag_blocks = 0             # opt-in: pause Core downloads when the index lags
+                                    # more than this during IBD (0 = disabled)
 min_gain_blocks = 288               # minimum safe-height gain between prune requests
 prune_interval_seconds = 30         # minimum time between prune requests (low disk bypasses)
 repair_max_gap_blocks = 2048        # auto-repair a prune gap from verified sources

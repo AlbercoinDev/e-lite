@@ -21,7 +21,7 @@ use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 use tuning::{Mode, Tunables};
 
 type E = Box<dyn std::error::Error + Send + Sync>;
@@ -29,6 +29,39 @@ type R<T> = std::result::Result<T, E>;
 
 fn fail<T>(msg: impl Into<String>) -> R<T> {
     Err(msg.into().into())
+}
+
+fn format_local_time(t: SystemTime) -> String {
+    let secs = t
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as libc::time_t;
+    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    if unsafe { libc::localtime_r(&secs, &mut tm) }.is_null() {
+        return format!("{secs}");
+    }
+    format!(
+        "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
+        tm.tm_year + 1900,
+        tm.tm_mon + 1,
+        tm.tm_mday,
+        tm.tm_hour,
+        tm.tm_min,
+        tm.tm_sec
+    )
+}
+
+fn format_uptime(d: Duration) -> String {
+    if d.as_secs() < 60 {
+        return format!("{:.1}s", d.as_secs_f64());
+    }
+    let secs = d.as_secs();
+    format!(
+        "{}h {:02}m {:02}s",
+        secs / 3600,
+        (secs % 3600) / 60,
+        secs % 60
+    )
 }
 
 /// Set once; SIGTERM/SIGINT request a clean stop at a commit boundary.
@@ -140,9 +173,37 @@ struct Args {
     prune_mib: Option<u64>,
     min_free_gib: Option<u64>,
     allow_clearnet: bool,
+    allow_auto_prune: bool,
     no_rawtx: bool,
     output: Option<String>,
     input: Option<String>,
+    set: Vec<String>,
+    profile: Option<String>,
+    adaptive: Option<bool>,
+    cache_mib: Option<u64>,
+    commit_interval_ms: Option<u64>,
+    prefetch_blocks: Option<usize>,
+    write_buffer_mib: Option<u64>,
+    background_jobs: Option<usize>,
+    milestone_blocks: Option<u64>,
+    milestone_seconds: Option<u64>,
+    max_core_lag_blocks: Option<u32>,
+    max_bulk_lag_blocks: Option<u32>,
+    min_gain_blocks: Option<u32>,
+    prune_interval_seconds: Option<u64>,
+    poll_seconds: Option<u64>,
+    repair_max_gap_blocks: Option<u32>,
+    critical_free_gib: Option<u64>,
+    max_clients: Option<usize>,
+    core_args: Vec<String>,
+    p2p_peers: Option<String>,
+    no_p2p: bool,
+    no_esplora: bool,
+    decoys: Option<u32>,
+    rawtx_cache_mib: Option<u64>,
+    tor_socks: Option<String>,
+    stop_on_exit: Option<bool>,
+    restart: Option<bool>,
 }
 
 fn parse_args() -> R<Args> {
@@ -186,8 +247,65 @@ fn parse_args() -> R<Args> {
             "--min-free-gib" => args.min_free_gib = Some(value("--min-free-gib")?.parse()?),
             "--output" => args.output = Some(value("--output")?),
             "--input" => args.input = Some(value("--input")?),
+            "--set" => args.set.push(value("--set")?),
+            "--profile" => args.profile = Some(value("--profile")?),
+            "--cache-mib" => args.cache_mib = Some(value("--cache-mib")?.parse()?),
+            "--commit-interval-ms" => {
+                args.commit_interval_ms = Some(value("--commit-interval-ms")?.parse()?)
+            }
+            "--prefetch-blocks" => {
+                args.prefetch_blocks = Some(value("--prefetch-blocks")?.parse()?)
+            }
+            "--write-buffer-mib" => {
+                args.write_buffer_mib = Some(value("--write-buffer-mib")?.parse()?)
+            }
+            "--background-jobs" => {
+                args.background_jobs = Some(value("--background-jobs")?.parse()?)
+            }
+            "--milestone-blocks" => {
+                args.milestone_blocks = Some(value("--milestone-blocks")?.parse()?)
+            }
+            "--milestone-seconds" => {
+                args.milestone_seconds = Some(value("--milestone-seconds")?.parse()?)
+            }
+            "--max-core-lag-blocks" => {
+                args.max_core_lag_blocks = Some(value("--max-core-lag-blocks")?.parse()?)
+            }
+            "--max-bulk-lag-blocks" => {
+                args.max_bulk_lag_blocks = Some(value("--max-bulk-lag-blocks")?.parse()?)
+            }
+            "--min-gain-blocks" => {
+                args.min_gain_blocks = Some(value("--min-gain-blocks")?.parse()?)
+            }
+            "--prune-interval-seconds" => {
+                args.prune_interval_seconds = Some(value("--prune-interval-seconds")?.parse()?)
+            }
+            "--poll-seconds" => args.poll_seconds = Some(value("--poll-seconds")?.parse()?),
+            "--repair-max-gap-blocks" => {
+                args.repair_max_gap_blocks = Some(value("--repair-max-gap-blocks")?.parse()?)
+            }
+            "--critical-free-gib" => {
+                args.critical_free_gib = Some(value("--critical-free-gib")?.parse()?)
+            }
+            "--max-clients" => args.max_clients = Some(value("--max-clients")?.parse()?),
+            "--core-arg" => args.core_args.push(value("--core-arg")?),
+            "--p2p-peers" => args.p2p_peers = Some(value("--p2p-peers")?),
+            "--decoys" => args.decoys = Some(value("--decoys")?.parse()?),
+            "--rawtx-cache-mib" => {
+                args.rawtx_cache_mib = Some(value("--rawtx-cache-mib")?.parse()?)
+            }
+            "--tor-socks" => args.tor_socks = Some(value("--tor-socks")?),
+            "--adaptive" => args.adaptive = Some(true),
+            "--no-adaptive" => args.adaptive = Some(false),
+            "--no-p2p" => args.no_p2p = true,
+            "--no-esplora" => args.no_esplora = true,
+            "--stop-on-exit" => args.stop_on_exit = Some(true),
+            "--no-stop-on-exit" => args.stop_on_exit = Some(false),
+            "--restart" => args.restart = Some(true),
+            "--no-restart" => args.restart = Some(false),
             "--allow-mainnet" => args.allow_mainnet = true,
             "--allow-clearnet" => args.allow_clearnet = true,
+            "--allow-auto-prune" => args.allow_auto_prune = true,
             "--no-rawtx" => args.no_rawtx = true,
             "--json" => args.json = true,
             "--no-follow" => args.no_follow = true,
@@ -221,7 +339,7 @@ fn parse_args() -> R<Args> {
 }
 
 fn effective_config(args: &Args) -> R<(Config, Chain)> {
-    let mut cfg = Config::load(args.config.as_deref())?;
+    let mut cfg = Config::load_with_overrides(args.config.as_deref(), &args.set)?;
     if let Some(n) = &args.network {
         cfg.network.name = n.clone();
     }
@@ -294,6 +412,9 @@ fn effective_config(args: &Args) -> R<(Config, Chain)> {
     if args.allow_clearnet {
         cfg.rawtx.allow_clearnet = true;
     }
+    if args.allow_auto_prune {
+        cfg.pruning.allow_auto_prune = true;
+    }
     if args.no_rawtx {
         cfg.rawtx.enabled = false;
     }
@@ -302,6 +423,88 @@ fn effective_config(args: &Args) -> R<(Config, Chain)> {
     }
     if args.allow_mainnet {
         cfg.safety.allow_mainnet = true;
+    }
+    if let Some(p) = &args.profile {
+        cfg.index.profile = p.clone();
+    }
+    if let Some(a) = args.adaptive {
+        cfg.index.adaptive = a;
+    }
+    if let Some(v) = args.cache_mib {
+        cfg.index.cache_mib = v;
+    }
+    if let Some(v) = args.commit_interval_ms {
+        cfg.index.commit_interval_ms = v;
+    }
+    if let Some(v) = args.prefetch_blocks {
+        cfg.index.prefetch_blocks = v;
+    }
+    if let Some(v) = args.write_buffer_mib {
+        cfg.index.write_buffer_mib = v;
+    }
+    if let Some(v) = args.background_jobs {
+        cfg.index.background_jobs = v;
+    }
+    if let Some(v) = args.milestone_blocks {
+        cfg.index.milestone_blocks = v;
+    }
+    if let Some(v) = args.milestone_seconds {
+        cfg.index.milestone_seconds = v;
+    }
+    if let Some(v) = args.max_core_lag_blocks {
+        cfg.pruning.max_core_lag_blocks = v;
+    }
+    if let Some(v) = args.max_bulk_lag_blocks {
+        cfg.pruning.max_bulk_lag_blocks = v;
+    }
+    if let Some(v) = args.min_gain_blocks {
+        cfg.pruning.min_gain_blocks = v;
+    }
+    if let Some(v) = args.prune_interval_seconds {
+        cfg.pruning.prune_interval_seconds = v;
+    }
+    if let Some(v) = args.poll_seconds {
+        cfg.pruning.poll_seconds = v;
+    }
+    if let Some(v) = args.repair_max_gap_blocks {
+        cfg.pruning.repair_max_gap_blocks = v;
+    }
+    if let Some(v) = args.critical_free_gib {
+        cfg.pruning.critical_free_gib = v;
+    }
+    if let Some(v) = args.max_clients {
+        cfg.server.max_clients = v;
+    }
+    if !args.core_args.is_empty() {
+        cfg.core.extra_args.extend(args.core_args.iter().cloned());
+    }
+    if let Some(v) = &args.p2p_peers {
+        cfg.rawtx.p2p_peers = v
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+    }
+    if args.no_p2p {
+        cfg.rawtx.use_p2p = false;
+    }
+    if args.no_esplora {
+        cfg.rawtx.use_esplora = false;
+    }
+    if let Some(v) = args.decoys {
+        cfg.rawtx.decoys = v;
+    }
+    if let Some(v) = args.rawtx_cache_mib {
+        cfg.rawtx.cache_mib = v;
+    }
+    if let Some(v) = &args.tor_socks {
+        cfg.rawtx.tor_socks = Some(v.clone());
+    }
+    if let Some(v) = args.stop_on_exit {
+        cfg.core.stop_on_exit = v;
+    }
+    if let Some(v) = args.restart {
+        cfg.core.restart = v;
     }
     if cfg.index.block_source != "auto"
         && cfg.index.block_source != "rpc"
@@ -447,15 +650,7 @@ fn core_identity(core: &CoreClient, chain: Chain) -> R<NetworkIdentity> {
 }
 
 fn total_ram_mib() -> Option<u64> {
-    let text = std::fs::read_to_string("/proc/meminfo").ok()?;
-    let kb = text
-        .lines()
-        .find(|l| l.starts_with("MemTotal:"))?
-        .split_whitespace()
-        .nth(1)?
-        .parse::<u64>()
-        .ok()?;
-    Some(kb / 1024)
+    tuning::total_ram_mib()
 }
 
 fn effective_cache_mib(cfg: &Config) -> u64 {
@@ -526,10 +721,27 @@ fn open_store_with(
 ) -> R<Arc<Store>> {
     let dir = cfg.data_dir(chain);
     let cache_bytes = (cache_mib as usize) * 1024 * 1024;
-    let jobs = background_jobs.clamp(1, 32) as i32;
+    let ram_mib = total_ram_mib().unwrap_or(cache_mib.max(512));
+    let write_mib = if cfg.index.write_buffer_mib > 0 {
+        cfg.index.write_buffer_mib
+    } else {
+        (ram_mib / 16).clamp(64, 1024)
+    };
+    let max_buffers = if ram_mib <= 2048 { 2 } else { 3 };
+    let cpus = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4);
+    let requested_jobs = if cfg.index.background_jobs > 0 {
+        cfg.index.background_jobs
+    } else {
+        background_jobs
+    };
+    let jobs = requested_jobs.clamp(1, 32).min(cpus.max(1)) as i32;
     let opts = el_store::StoreOptions {
         cache_bytes,
-        write_buffer_bytes: (cache_bytes / 4).clamp(8 * 1024 * 1024, 64 * 1024 * 1024),
+        write_buffer_total_bytes: (write_mib as usize) * 1024 * 1024,
+        max_write_buffer_number: max_buffers,
+        max_total_wal_bytes: ((write_mib / 2).clamp(32, 256) as usize) * 1024 * 1024,
         background_jobs: jobs,
         ..Default::default()
     };
@@ -601,14 +813,6 @@ fn stored_identity(store: &Store, chain: Chain) -> R<Option<NetworkIdentity>> {
         id.check_known_genesis()?;
     }
     Ok(stored)
-}
-
-fn placeholder_identity(chain: Chain, stored: Option<NetworkIdentity>) -> NetworkIdentity {
-    stored.unwrap_or_else(|| NetworkIdentity {
-        chain,
-        genesis: chain.known_genesis().unwrap_or(Hash32::ZERO),
-        signet_challenge: None,
-    })
 }
 
 fn verify_identity(stored: &NetworkIdentity, live: &NetworkIdentity) -> R<()> {
@@ -708,6 +912,42 @@ OPTIONS:
     --json                  JSON output for status
     --output <path>         snapshot file for export-snapshot
     --input <path>          snapshot file for import-snapshot
+    --set <key=value>       override any TOML field, e.g. index.profile=ssd
+                            (values: true, 42, ["a","b"], or a bare string)
+
+TUNING (all networks):
+    --profile <name>        auto | hdd | ssd | nvme | manual
+    --adaptive              enable the controller (default)
+    --no-adaptive           freeze the configured/derived values
+    --cache-mib <n>         RocksDB block cache (0 = profile/RAM)
+    --write-buffer-mib <n>  total RocksDB memtable budget (0 = RAM/16)
+    --background-jobs <n>   RocksDB jobs (0 = profile, capped by CPUs)
+    --commit-interval-ms <n> commit/fsync interval (0 = profile; 500..10000)
+    --prefetch-blocks <n>   UTXO prefetch depth (reserved; 0 = default)
+    --milestone-blocks <n>  progress report every N blocks (0 = off)
+    --milestone-seconds <n> progress report every N seconds (0 = off)
+
+PRUNING AND CORE:
+    --max-core-lag-blocks <n>   auto-prune download limit (0 = off)
+    --max-bulk-lag-blocks <n>   opt-in manual/bulk limit (0 = off)
+    --min-gain-blocks <n>       minimum safe-height gain between prunes
+    --prune-interval-seconds <n> minimum time between prunes
+    --poll-seconds <n>          supervisor poll interval
+    --repair-max-gap-blocks <n> largest external prune-gap repair
+    --critical-free-gib <n>     pause indexing below this free space
+    --allow-auto-prune          opt in to prune_mib >= 550 (automatic pruning)
+    --core-arg <arg>            extra bitcoind argument (repeatable)
+    --stop-on-exit / --no-stop-on-exit
+    --restart / --no-restart
+
+RAWTX, SERVER AND TLS:
+    --max-clients <n>       Electrum client limit
+    --p2p-peers <a,b>       comma-separated P2P peers for rawtx/repair
+    --no-p2p                disable the P2P rawtx/repair source
+    --no-esplora            disable the Esplora rawtx/repair source
+    --decoys <n>            extra blocks fetched per external lookup
+    --rawtx-cache-mib <n>   validated rawtx cache size (0 = disabled)
+    --tor-socks <addr>      SOCKS5h proxy (empty requires --allow-clearnet)
 "#
     );
 }
@@ -982,6 +1222,16 @@ fn cmd_doctor(cfg: &Config, chain: Chain) -> R<()> {
             "disk note: free space is below the guard; indexing and Core downloads will pause"
         );
     }
+    let mem = tuning::memory_info();
+    println!(
+        "memory: total {} MiB, available {} MiB (host {} MiB), cgroup limit {} MiB, used {} MiB, reclaimable {} MiB",
+        mem.total_mib.unwrap_or(0),
+        mem.available_mib,
+        mem.host_available_mib,
+        mem.cgroup_limit_mib.unwrap_or(0),
+        mem.cgroup_used_mib.unwrap_or(0),
+        mem.reclaimable_mib.unwrap_or(0)
+    );
     let core_sup = CoreSupervisor::new(cfg, chain);
     println!(
         "core manage: {}",
@@ -1101,6 +1351,12 @@ const CATCH_UP_BLOCKS: u64 = 512;
 type FetchResult = std::result::Result<(u64, String, Vec<u8>), String>;
 type PendingMap = std::collections::BTreeMap<usize, FetchResult>;
 
+struct MilestoneState {
+    last_height: u64,
+    last_txnum: u64,
+    last_at: Instant,
+}
+
 struct Indexer {
     store: Arc<Store>,
     core: CoreClient,
@@ -1124,6 +1380,11 @@ struct Indexer {
     data_dir: std::path::PathBuf,
     core_datadir: std::path::PathBuf,
     last_disk_check: Mutex<Instant>,
+    progress_started: Instant,
+    progress_start_height: u64,
+    progress_start_txnum: u64,
+    milestone: Mutex<MilestoneState>,
+    milestone_sizes_running: Arc<AtomicBool>,
 }
 
 impl Drop for Indexer {
@@ -1161,6 +1422,10 @@ impl Indexer {
         let data_dir = cfg.data_dir(chain);
         let core_datadir = cfg.core_datadir();
         let pause_marker = data_dir.join("core-paused-by-e-lite");
+        let tip = store.committed_tip().ok().flatten();
+        let start_height = tip.as_ref().map(|t| t.height as u64).unwrap_or(0);
+        let start_txnum = tip.as_ref().map(|t| t.txnum).unwrap_or(0);
+        let now = Instant::now();
         Indexer {
             store,
             core,
@@ -1184,6 +1449,15 @@ impl Indexer {
                     .checked_sub(Duration::from_secs(60))
                     .unwrap_or_else(Instant::now),
             ),
+            progress_started: now,
+            progress_start_height: start_height,
+            progress_start_txnum: start_txnum,
+            milestone: Mutex::new(MilestoneState {
+                last_height: start_height,
+                last_txnum: start_txnum,
+                last_at: now,
+            }),
+            milestone_sizes_running: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -1374,14 +1648,24 @@ impl Indexer {
     /// Live Core tip and pruneheight for progress lines. Falls back to the
     /// catch-up snapshot when Core is briefly unavailable.
     fn live_core_and_prune(&self, fallback_core: u64, fallback_prune: u64) -> (u64, u64) {
-        let core = self.core.block_count().unwrap_or(fallback_core);
+        let cached = self
+            .shared
+            .as_ref()
+            .map(|sh| sh.stats.core_height.load(Ordering::Relaxed))
+            .unwrap_or(0);
+        let core = self
+            .core
+            .block_count()
+            .unwrap_or(fallback_core)
+            .max(fallback_core)
+            .max(cached);
         let prune = self
             .shared
             .as_ref()
             .map(|sh| sh.stats.core_pruneheight.load(Ordering::Relaxed))
             .filter(|h| *h > 0)
             .unwrap_or(fallback_prune);
-        (core.max(fallback_core), prune)
+        (core, prune)
     }
 
     fn refresh_core_height(&self) {
@@ -1510,22 +1794,27 @@ impl Indexer {
         Ok(())
     }
 
-    /// Pause Core's P2P when automatic pruning would outrun the index. Core
-    /// keeps at least `MIN_BLOCKS_TO_KEEP` (288) blocks, so the safe lag is
-    /// capped well below that floor.
+    /// Pause Core's P2P when automatic pruning would outrun the index, or when
+    /// the opt-in bulk guard is enabled for manual pruning. Core keeps at least
+    /// `MIN_BLOCKS_TO_KEEP` (288) blocks, so the auto limit is capped below it.
     ///
-    /// Manual pruning (`prune_mib = 1`) does not use this guard: Core cannot
-    /// delete a block on its own, and the prune gate already keeps the cut
-    /// below the committed index. Only a Core owned by e-lite is ever paused.
+    /// Manual pruning (`prune_mib = 1`) does not pause by default: Core cannot
+    /// delete a block on its own and the prune gate keeps the cut below the
+    /// committed index. `max_bulk_lag_blocks` is an explicit opt-in to bound
+    /// the gap (and the disk contention) during a long catch-up.
     fn lag_guard(&self, info: &BlockchainInfo, committed: u64) {
-        if !self.can_control_core
-            || self.cfg.pruning.max_core_lag_blocks == 0
-            || self.cfg.core.prune_mib == 1
-        {
+        if !self.can_control_core {
             return;
         }
         let paused = self.lag_paused.load(Ordering::Relaxed);
-        if !info.pruned {
+        let bulk_limit = if self.cfg.core.prune_mib == 1 {
+            self.cfg.pruning.max_bulk_lag_blocks as u64
+        } else {
+            0
+        };
+        let auto_enabled = self.cfg.core.prune_mib != 1 && self.cfg.pruning.max_core_lag_blocks > 0;
+
+        if bulk_limit == 0 && !auto_enabled {
             if paused && self.core.set_network_active(true).is_ok() {
                 self.lag_paused.store(false, Ordering::Relaxed);
                 self.mark_paused(false);
@@ -1533,31 +1822,56 @@ impl Indexer {
                     sh.stats.core_network_active.store(true, Ordering::Relaxed);
                     sh.set_state(state::READY);
                 }
-                eprintln!("[e-lite] Core is no longer pruned: resumed downloads");
-            }
-            return;
-        }
-        // `pruneheight == 0` means Core has not pruned anything yet (manual
-        // prune or a brand-new automatic node). There is no block to lose, so
-        // do not slow the initial index down.
-        if info.pruneheight == 0 {
-            if paused && self.core.set_network_active(true).is_ok() {
-                self.lag_paused.store(false, Ordering::Relaxed);
-                self.mark_paused(false);
-                if let Some(sh) = &self.shared {
-                    sh.stats.core_network_active.store(true, Ordering::Relaxed);
-                    sh.set_state(state::READY);
-                }
-                eprintln!("[e-lite] Core has no pruned blocks: resumed downloads");
+                eprintln!("[e-lite] resumed Core downloads");
             }
             return;
         }
 
-        let limit = el_chain::lag_limit(
-            info.blocks.min(u32::MAX as u64) as u32,
-            info.pruneheight.min(u32::MAX as u64) as u32,
-            self.cfg.pruning.max_core_lag_blocks,
-        ) as u64;
+        let limit = if bulk_limit > 0 {
+            if !info.initialblockdownload {
+                if paused && self.core.set_network_active(true).is_ok() {
+                    self.lag_paused.store(false, Ordering::Relaxed);
+                    self.mark_paused(false);
+                    if let Some(sh) = &self.shared {
+                        sh.stats.core_network_active.store(true, Ordering::Relaxed);
+                        sh.set_state(state::READY);
+                    }
+                    eprintln!("[e-lite] resumed Core downloads after IBD");
+                }
+                return;
+            }
+            bulk_limit
+        } else {
+            if !info.pruned {
+                if paused && self.core.set_network_active(true).is_ok() {
+                    self.lag_paused.store(false, Ordering::Relaxed);
+                    self.mark_paused(false);
+                    if let Some(sh) = &self.shared {
+                        sh.stats.core_network_active.store(true, Ordering::Relaxed);
+                        sh.set_state(state::READY);
+                    }
+                    eprintln!("[e-lite] Core is no longer pruned: resumed downloads");
+                }
+                return;
+            }
+            if info.pruneheight == 0 {
+                if paused && self.core.set_network_active(true).is_ok() {
+                    self.lag_paused.store(false, Ordering::Relaxed);
+                    self.mark_paused(false);
+                    if let Some(sh) = &self.shared {
+                        sh.stats.core_network_active.store(true, Ordering::Relaxed);
+                        sh.set_state(state::READY);
+                    }
+                    eprintln!("[e-lite] Core has no pruned blocks: resumed downloads");
+                }
+                return;
+            }
+            el_chain::lag_limit(
+                info.blocks.min(u32::MAX as u64) as u32,
+                info.pruneheight.min(u32::MAX as u64) as u32,
+                self.cfg.pruning.max_core_lag_blocks,
+            ) as u64
+        };
         let resume = (limit / 2).max(1);
         let lag = info.blocks.saturating_sub(committed);
         let reader_pressure = self
@@ -1611,7 +1925,6 @@ impl Indexer {
     /// Index at most `max_blocks` before returning, so the supervisor can act
     /// between steps (disk backpressure, pruning).
     fn catch_up_limited(&self, max_blocks: u64) -> R<u64> {
-        let started = Instant::now();
         let tip_at_start = self.store.committed_tip()?;
         // Check the disks before any Core RPC or block write. If Core is slow
         // or unreachable, this still stops the indexer before the disk fills.
@@ -1697,8 +2010,6 @@ impl Indexer {
             return Ok(committed_height);
         }
         let hashes_len = hashes.len();
-        let start_height = tip.map(|t| t.height).unwrap_or(0);
-        let start_txnum = tip.map(|t| t.txnum).unwrap_or(0);
 
         let workers = self.tunables.readers();
         let hashes = Arc::new(hashes);
@@ -1825,7 +2136,9 @@ impl Indexer {
                     count += 1;
                     last_ms = t0.elapsed().as_millis() as u64;
                     self.tunables.record_apply(t0.elapsed());
-                    if self.cfg.core.prune_mib >= 550
+                    if (self.cfg.core.prune_mib >= 550
+                        || (self.cfg.core.prune_mib == 1
+                            && self.cfg.pruning.max_bulk_lag_blocks > 0))
                         && info.pruned
                         && last_lag_check.elapsed() >= Duration::from_millis(100)
                     {
@@ -1875,22 +2188,23 @@ impl Indexer {
                 committed_height = current.height as u64;
                 let (live_core, live_prune) =
                     self.live_core_and_prune(info.blocks, info.pruneheight);
-                let rate_secs = started.elapsed().as_secs_f64().max(0.001);
+                let rate_secs = self.progress_started.elapsed().as_secs_f64().max(0.001);
                 self.tunables.record_tx_rate(
-                    ((current.txnum.saturating_sub(start_txnum)) as f64 / rate_secs) as u64,
+                    ((current.txnum.saturating_sub(self.progress_start_txnum)) as f64 / rate_secs)
+                        as u64,
                 );
                 if let Some(sh) = &self.shared {
                     self.tunables.publish(&sh.stats);
                 }
-                print_progress(
+                self.print_progress(
                     &current,
-                    started,
-                    start_height,
-                    start_txnum,
                     live_core,
                     live_prune,
+                    info.headers,
+                    info.verificationprogress,
                     info.initialblockdownload,
                 );
+                self.maybe_milestone(&current);
                 if let Some(sh) = &self.shared {
                     for script in group_scripts.drain() {
                         sh.dirty_scripts.mark(script);
@@ -1910,22 +2224,23 @@ impl Indexer {
             self.commit_group(std::mem::take(&mut batch), &current, &group_txids, last_ms)?;
             committed_height = current.height as u64;
             let (live_core, live_prune) = self.live_core_and_prune(info.blocks, info.pruneheight);
-            let rate_secs = started.elapsed().as_secs_f64().max(0.001);
+            let rate_secs = self.progress_started.elapsed().as_secs_f64().max(0.001);
             self.tunables.record_tx_rate(
-                ((current.txnum.saturating_sub(start_txnum)) as f64 / rate_secs) as u64,
+                ((current.txnum.saturating_sub(self.progress_start_txnum)) as f64 / rate_secs)
+                    as u64,
             );
             if let Some(sh) = &self.shared {
                 self.tunables.publish(&sh.stats);
             }
-            print_progress(
+            self.print_progress(
                 &current,
-                started,
-                start_height,
-                start_txnum,
                 live_core,
                 live_prune,
+                info.headers,
+                info.verificationprogress,
                 info.initialblockdownload,
             );
+            self.maybe_milestone(&current);
             if let Some(sh) = &self.shared {
                 for script in group_scripts.drain() {
                     sh.dirty_scripts.mark(script);
@@ -2013,32 +2328,149 @@ fn fetch_block(
     }
 }
 
-fn print_progress(
-    tip: &IndexedTip,
-    started: Instant,
-    start_height: u32,
-    start_txnum: u64,
-    core_height: u64,
-    pruneheight: u64,
-    ibd: bool,
-) {
-    let secs = started.elapsed().as_secs_f64().max(0.001);
-    let blocks = tip.height.saturating_sub(start_height) as f64;
-    let txs = tip.txnum.saturating_sub(start_txnum) as f64;
-    let lag = core_height.saturating_sub(tip.height as u64);
-    eprintln!(
-        "[e-lite] height {}  txnum {}  core {}  prune {}  lag {}  {:.1} blocks/s  {:.0} tx/s  \
-         elapsed {:.1}s{}",
-        tip.height,
-        tip.txnum,
-        core_height,
-        pruneheight,
-        lag,
-        blocks / secs,
-        txs / secs,
-        secs,
-        if ibd { "  (core in IBD)" } else { "" }
-    );
+impl Indexer {
+    fn print_progress(
+        &self,
+        tip: &IndexedTip,
+        core_height: u64,
+        pruneheight: u64,
+        core_headers: u64,
+        verification: f64,
+        ibd: bool,
+    ) {
+        let secs = self.progress_started.elapsed().as_secs_f64().max(0.001);
+        let blocks = (tip.height as u64).saturating_sub(self.progress_start_height) as f64;
+        let txs = tip.txnum.saturating_sub(self.progress_start_txnum) as f64;
+        let lag = core_height.saturating_sub(tip.height as u64);
+        let pct = |value: u64, total: u64| {
+            if total == 0 {
+                "?".to_string()
+            } else {
+                format!("{:.1}%", (value as f64 / total as f64 * 100.0).min(100.0))
+            }
+        };
+        let read_ms = self.tunables.read_ms.load(Ordering::Relaxed);
+        let apply_ms = self.tunables.apply_ms.load(Ordering::Relaxed);
+        let commit_ms = self.tunables.commit_ewma.load(Ordering::Relaxed);
+        let cache = self.tunables.cache_hit_pct.load(Ordering::Relaxed);
+        eprintln!(
+            "[e-lite] height {} ({})  txnum {}  core {}/{} ({})  prune {}  lag {}  \
+             {:.1} blocks/s  {:.0} tx/s  elapsed {}  read {}ms apply {}ms commit {}ms cache {}%{}",
+            tip.height,
+            pct(tip.height as u64, core_headers),
+            tip.txnum,
+            core_height,
+            core_headers,
+            pct(core_height, core_headers),
+            pruneheight,
+            lag,
+            blocks / secs,
+            txs / secs,
+            format_uptime(self.progress_started.elapsed()),
+            read_ms,
+            apply_ms,
+            commit_ms,
+            cache,
+            if ibd {
+                format!("  (core in IBD, verify {:.1}%)", verification * 100.0)
+            } else {
+                String::new()
+            }
+        );
+    }
+
+    /// One line every N blocks or N seconds, whichever happens first. Disk
+    /// sizes are walked in a background thread so a huge Core datadir does not
+    /// stall the indexer.
+    fn maybe_milestone(&self, tip: &IndexedTip) {
+        let Some((from_height, from_txnum, elapsed)) = (|| {
+            let mut state = match self.milestone.lock() {
+                Ok(g) => g,
+                Err(e) => e.into_inner(),
+            };
+            let due = milestone_due(
+                state.last_height,
+                tip.height as u64,
+                state.last_at.elapsed(),
+                self.cfg.index.milestone_blocks,
+                self.cfg.index.milestone_seconds,
+            );
+            if !due {
+                return None;
+            }
+            let out = (state.last_height, state.last_txnum, state.last_at.elapsed());
+            state.last_height = tip.height as u64;
+            state.last_txnum = tip.txnum;
+            state.last_at = Instant::now();
+            Some(out)
+        })() else {
+            return;
+        };
+        if self.milestone_sizes_running.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let store = Arc::clone(&self.store);
+        let data_dir = self.data_dir.clone();
+        let core_datadir = self.core_datadir.clone();
+        let running = Arc::clone(&self.milestone_sizes_running);
+        let height = tip.height as u64;
+        let txnum = tip.txnum;
+        std::thread::spawn(move || {
+            let lite = store.disk_usage_bytes();
+            let core = dir_usage_bytes(&core_datadir);
+            let free = el_chain::disk_free_bytes(&data_dir).unwrap_or(0);
+            let secs = elapsed.as_secs_f64().max(0.001);
+            let blocks = height.saturating_sub(from_height) as f64;
+            let txs = txnum.saturating_sub(from_txnum) as f64;
+            eprintln!(
+                "[e-lite] milestone {}..{}: {:.0} blocks in {:.1}s ({:.1} blocks/s, {:.0} tx/s); \
+                 lite {:.1} GiB, core {:.1} GiB, free {:.1} GiB",
+                from_height,
+                height,
+                blocks,
+                secs,
+                blocks / secs,
+                txs / secs,
+                lite as f64 / 1024.0 / 1024.0 / 1024.0,
+                core as f64 / 1024.0 / 1024.0 / 1024.0,
+                free as f64 / 1024.0 / 1024.0 / 1024.0,
+            );
+            running.store(false, Ordering::SeqCst);
+        });
+    }
+}
+
+fn milestone_due(
+    last_height: u64,
+    height: u64,
+    elapsed: Duration,
+    blocks: u64,
+    seconds: u64,
+) -> bool {
+    let by_blocks = blocks > 0 && height >= last_height.saturating_add(blocks);
+    let by_time = seconds > 0 && elapsed >= Duration::from_secs(seconds);
+    by_blocks || by_time
+}
+
+fn dir_usage_bytes(path: &std::path::Path) -> u64 {
+    fn walk(p: &std::path::Path, acc: &mut u64) {
+        let Ok(rd) = std::fs::read_dir(p) else {
+            return;
+        };
+        for entry in rd.flatten() {
+            let Ok(meta) = entry.metadata() else {
+                continue;
+            };
+            if meta.is_dir() {
+                walk(&entry.path(), acc);
+            } else if meta.is_file() {
+                *acc = acc.saturating_add(meta.len());
+            }
+        }
+    }
+    let mut acc = 0;
+    walk(path, &mut acc);
+    acc
 }
 
 fn supervisor_config(cfg: &Config, can_control_core: bool) -> el_chain::SupervisorConfig {
@@ -2085,6 +2517,11 @@ fn supervisor_tick(
     };
     if let Some(sh) = shared {
         sh.stats.core_height.store(info.blocks, Ordering::Relaxed);
+        sh.stats.core_headers.store(info.headers, Ordering::Relaxed);
+        sh.stats.core_verification_bps.store(
+            (info.verificationprogress.clamp(0.0, 1.0) * 10_000.0) as u64,
+            Ordering::Relaxed,
+        );
         sh.stats
             .core_pruneheight
             .store(info.pruneheight, Ordering::Relaxed);
@@ -2225,6 +2662,8 @@ fn apply_supervisor_actions(
 }
 
 fn cmd_index(cfg: &Config, chain: Chain) -> R<()> {
+    let started_at = SystemTime::now();
+    let started = Instant::now();
     let rotational = tuning::is_rotational(&cfg.data_dir(chain));
     let tunables = Arc::new(Tunables::new(cfg, rotational));
     let store = open_store_with(cfg, chain, tunables.cache_mib(), tunables.background_jobs())?;
@@ -2240,6 +2679,12 @@ fn cmd_index(cfg: &Config, chain: Chain) -> R<()> {
         return Ok(());
     };
     let bulk = build_bulk(cfg, chain, identity.genesis, tunables.readers())?;
+    println!(
+        "e-lite {}: indexing started at {} (network {})",
+        VERSION,
+        format_local_time(started_at),
+        chain.name()
+    );
     let can_control = core_sup.can_control_core();
     let idx = Indexer::new(
         store,
@@ -2255,7 +2700,24 @@ fn cmd_index(cfg: &Config, chain: Chain) -> R<()> {
         can_control,
         chain,
     );
-    index_loop(cfg, chain, None, idx, core_sup, flag, !cfg.index.follow)
+    let result = index_loop(
+        cfg,
+        chain,
+        None,
+        idx,
+        &mut core_sup,
+        flag,
+        !cfg.index.follow,
+    );
+    core_sup.stop();
+    if result.is_ok() {
+        println!(
+            "[e-lite] stopped at {} (uptime {})",
+            format_local_time(SystemTime::now()),
+            format_uptime(started.elapsed())
+        );
+    }
+    result
 }
 
 fn sleep_with_flag(seconds: u64, flag: &Arc<AtomicBool>) -> bool {
@@ -2302,16 +2764,12 @@ fn ensure_identity_blocking(
                 }
                 return Ok(Some(live));
             }
-            Err(e) if !require_core => {
-                eprintln!(
-                    "[e-lite] Core unavailable at startup ({e}); using the pinned database identity"
-                );
+            Err(_) if !require_core => {
+                // Offline serve: keep the pinned identity and let the caller
+                // print a single "serving cached index" line.
                 if let Some(sh) = shared {
                     sh.set_state(state::CORE_UNAVAILABLE);
                 }
-                // Start Core in the background when e-lite owns it; the index
-                // loop will keep retrying even if the start is still in progress.
-                let _ = core_sup.ensure_started(core);
                 return Ok(Some(id.clone()));
             }
             Err(_) => {}
@@ -2319,6 +2777,7 @@ fn ensure_identity_blocking(
     }
 
     let mut backoff = 1u64;
+    let mut loading_logged = false;
     loop {
         if shutdown.load(Ordering::SeqCst) {
             return Ok(None);
@@ -2343,6 +2802,10 @@ fn ensure_identity_blocking(
                 return Ok(Some(live));
             }
             Err(e) => {
+                let msg = e.to_string();
+                let loading = msg.contains("Loading block index")
+                    || msg.contains("Verifying blocks")
+                    || msg.contains("(code -28)");
                 if let Some(sh) = shared {
                     sh.set_state(if stored.is_some() {
                         state::CORE_UNAVAILABLE
@@ -2360,7 +2823,17 @@ fn ensure_identity_blocking(
                     }
                     Err(se) => eprintln!("[e-lite] Core start: {se}"),
                 }
-                eprintln!("[e-lite] waiting for Bitcoin Core ({e}); retrying in {backoff}s");
+                if loading {
+                    if !loading_logged {
+                        eprintln!(
+                            "[e-lite] Core is loading its block index; waiting for RPC readiness"
+                        );
+                        loading_logged = true;
+                    }
+                } else {
+                    eprintln!("[e-lite] waiting for Bitcoin Core ({msg}); retrying in {backoff}s");
+                    loading_logged = false;
+                }
                 if !sleep_with_flag(backoff, shutdown) {
                     return Ok(None);
                 }
@@ -2412,10 +2885,16 @@ fn reload_hot(
                 || new.server.tls_listen != old.server.tls_listen
                 || new.server.tls_cert != old.server.tls_cert
                 || new.server.tls_key != old.server.tls_key
+                || new.index.write_buffer_mib != old.index.write_buffer_mib
+                || new.index.milestone_blocks != old.index.milestone_blocks
+                || new.index.milestone_seconds != old.index.milestone_seconds
+                || new.pruning.max_core_lag_blocks != old.pruning.max_core_lag_blocks
+                || new.pruning.max_bulk_lag_blocks != old.pruning.max_bulk_lag_blocks
             {
                 eprintln!(
                     "[e-lite] reload: cold fields changed (prune_mib, block_source, \
-                     reorg_window, data_dir, server listeners/TLS); restart required"
+                     reorg_window, data_dir, server listeners/TLS, write buffers, \
+                     milestones, lag limits); restart required"
                 );
             }
             eprintln!(
@@ -2439,7 +2918,7 @@ fn index_loop(
     chain: Chain,
     shared: Option<Arc<Shared>>,
     idx: Indexer,
-    mut core_sup: CoreSupervisor,
+    core_sup: &mut CoreSupervisor,
     flag: Arc<AtomicBool>,
     stop_at_tip: bool,
 ) -> R<()> {
@@ -2452,6 +2931,7 @@ fn index_loop(
     let mut last_height = u64::MAX;
     let mut was_ready = false;
     let mut backoff = 1u64;
+    let mut loading_logged = false;
     eprintln!(
         "[e-lite] tuning profile={} readers={} commit={}ms batch={} cache={}MiB jobs={} prefetch={} adaptive={}",
         idx.tunables.profile().name(),
@@ -2479,7 +2959,11 @@ fn index_loop(
         }
         match idx.catch_up_limited(CATCH_UP_BLOCKS) {
             Ok(height) => {
+                if flag.load(Ordering::SeqCst) {
+                    return Ok(());
+                }
                 backoff = 1;
+                loading_logged = false;
                 let core_height = shared
                     .as_ref()
                     .map(|s| s.stats.core_height.load(Ordering::Relaxed))
@@ -2542,10 +3026,23 @@ fn index_loop(
                             sh.set_state(state::CORE_UNAVAILABLE);
                         }
                         let _ = core_sup.ensure_started(&idx.core);
-                        eprintln!(
-                            "[e-lite] transient error: {msg}; retrying in {backoff}s \
-                             (serving cached index if available)"
-                        );
+                        let loading = msg.contains("Loading block index")
+                            || msg.contains("Verifying blocks")
+                            || msg.contains("(code -28)");
+                        if loading {
+                            if !loading_logged {
+                                eprintln!(
+                                    "[e-lite] Core is loading its block index; waiting for RPC readiness"
+                                );
+                                loading_logged = true;
+                            }
+                        } else {
+                            eprintln!(
+                                "[e-lite] transient error: {msg}; retrying in {backoff}s \
+                                 (serving cached index if available)"
+                            );
+                            loading_logged = false;
+                        }
                         if !sleep_with_flag(backoff, &flag) {
                             return Ok(());
                         }
@@ -2697,7 +3194,11 @@ fn build_resolver(
                     .collect();
                 println!("p2p peers discovered from Core: {}", peers.len());
             }
-            Err(e) => eprintln!("[e-lite] p2p discovery failed: {e}"),
+            Err(_) => {
+                // Core may be offline (serve mode) or still starting. P2P
+                // discovery is optional; do not print a startup error. The
+                // operator can configure [rawtx] p2p_peers explicitly.
+            }
         }
     }
     let tor = cfg.rawtx.tor_socks.clone().filter(|s| !s.trim().is_empty());
@@ -2759,10 +3260,36 @@ fn build_shared(
         },
         max_clients: cfg.server.max_clients,
         state: std::sync::atomic::AtomicU8::new(state::WAITING_FOR_CORE),
+        shutdown: shutdown_flag(),
         lock: Arc::new(RwLock::new(())),
         stats: Stats::default(),
     });
+    publish_memory(&shared);
     Ok(shared)
+}
+
+fn publish_memory(shared: &Shared) {
+    let mem = tuning::memory_info();
+    shared
+        .stats
+        .mem_total_mib
+        .store(mem.total_mib.unwrap_or(0), Ordering::Relaxed);
+    shared
+        .stats
+        .mem_available_mib
+        .store(mem.available_mib, Ordering::Relaxed);
+    shared
+        .stats
+        .mem_cgroup_limit_mib
+        .store(mem.cgroup_limit_mib.unwrap_or(0), Ordering::Relaxed);
+    shared
+        .stats
+        .mem_cgroup_used_mib
+        .store(mem.cgroup_used_mib.unwrap_or(0), Ordering::Relaxed);
+    shared
+        .stats
+        .mem_reclaimable_mib
+        .store(mem.reclaimable_mib.unwrap_or(0), Ordering::Relaxed);
 }
 
 fn is_loopback_listen(addr: &str) -> bool {
@@ -2806,7 +3333,13 @@ fn start_tls_transport(shared: &Arc<Shared>, cfg: &Config) -> R<()> {
     Ok(())
 }
 
-fn start_transports(shared: &Arc<Shared>, cfg: &Config) -> R<()> {
+struct Transports {
+    mempool: std::thread::JoinHandle<()>,
+    notifications: std::thread::JoinHandle<()>,
+    memory: std::thread::JoinHandle<()>,
+}
+
+fn start_transports(shared: &Arc<Shared>, cfg: &Config) -> R<Transports> {
     warn_public_listen("Electrum", &cfg.server.listen);
     warn_public_listen("metrics", &cfg.metrics.listen);
     let server = Arc::clone(shared);
@@ -2819,34 +3352,56 @@ fn start_transports(shared: &Arc<Shared>, cfg: &Config) -> R<()> {
         el_serve::start_metrics(m, cfg.metrics.listen.clone())
             .map_err(|e| format!("cannot bind metrics {}: {e}", cfg.metrics.listen))?;
     }
-    el_serve::start_mempool(Arc::clone(shared));
-    el_serve::start_notifications(Arc::clone(shared));
-    Ok(())
+    let mempool = el_serve::start_mempool(Arc::clone(shared));
+    let notifications = el_serve::start_notifications(Arc::clone(shared));
+    let memory = {
+        let shared = Arc::clone(shared);
+        std::thread::spawn(move || loop {
+            publish_memory(&shared);
+            if shared.shutdown.load(Ordering::Relaxed) {
+                break;
+            }
+            for _ in 0..30 {
+                if shared.shutdown.load(Ordering::Relaxed) {
+                    return;
+                }
+                std::thread::sleep(Duration::from_secs(1));
+            }
+        })
+    };
+    Ok(Transports {
+        mempool,
+        notifications,
+        memory,
+    })
 }
 
 fn cmd_serve(cfg: &Config, chain: Chain) -> R<()> {
+    let started_at = SystemTime::now();
+    let started = Instant::now();
     let store = open_store(cfg, chain)?;
-    let stored = stored_identity(&store, chain)?;
-    let identity = placeholder_identity(chain, stored.clone());
-    let shared = build_shared(cfg, chain, Arc::clone(&store), identity)?;
-    start_transports(&shared, cfg)?;
+    let core = core_client(cfg, chain)?;
     let flag = shutdown_flag();
-    let mut core_sup = CoreSupervisor::new(cfg, chain);
-    if ensure_identity_blocking(
-        cfg,
+    // `serve` is the offline mode: never start or stop Core.
+    let mut serve_cfg = cfg.clone();
+    serve_cfg.core.manage = CoreManage::External;
+    let mut core_sup = CoreSupervisor::new(&serve_cfg, chain);
+    let Some(identity) = ensure_identity_blocking(
+        &serve_cfg,
         chain,
         &store,
-        &shared.core,
+        &core,
         &mut core_sup,
         &flag,
         false,
-        Some(&shared),
+        None,
     )?
-    .is_none()
-    {
+    else {
         println!("[e-lite] shutdown requested; serving stopped");
         return Ok(());
-    }
+    };
+    let shared = build_shared(cfg, chain, Arc::clone(&store), identity)?;
+    let transports = start_transports(&shared, cfg)?;
     let tip = shared
         .store
         .committed_tip()?
@@ -2861,6 +3416,14 @@ fn cmd_serve(cfg: &Config, chain: Chain) -> R<()> {
                 .stats
                 .core_height
                 .store(info.blocks, Ordering::Relaxed);
+            shared
+                .stats
+                .core_headers
+                .store(info.headers, Ordering::Relaxed);
+            shared.stats.core_verification_bps.store(
+                (info.verificationprogress.clamp(0.0, 1.0) * 10_000.0) as u64,
+                Ordering::Relaxed,
+            );
             shared
                 .stats
                 .core_ibd
@@ -2898,7 +3461,7 @@ fn cmd_serve(cfg: &Config, chain: Chain) -> R<()> {
         );
     }
     println!(
-        "serving Electrum {} on {} (network {}, indexed height {}, TLS {})",
+        "serving Electrum {} on {} (network {}, indexed height {}, TLS {}, started {})",
         el_serve::PROTOCOL_MAX,
         cfg.server.listen,
         chain.name(),
@@ -2907,50 +3470,67 @@ fn cmd_serve(cfg: &Config, chain: Chain) -> R<()> {
             cfg.server.tls_listen.as_str()
         } else {
             "disabled"
-        }
+        },
+        format_local_time(started_at)
     );
     while !flag.load(Ordering::SeqCst) {
         std::thread::sleep(Duration::from_secs(1));
     }
-    println!("[e-lite] shutdown requested; serving stopped");
+    shared.shutdown.store(true, Ordering::SeqCst);
+    let _ = transports.mempool.join();
+    let _ = transports.notifications.join();
+    let _ = transports.memory.join();
+    core_sup.stop();
+    println!(
+        "[e-lite] stopped at {} (uptime {})",
+        format_local_time(SystemTime::now()),
+        format_uptime(started.elapsed())
+    );
     Ok(())
 }
 
 fn cmd_run(cfg: &Config, chain: Chain) -> R<()> {
+    let started_at = SystemTime::now();
+    let started = Instant::now();
     let rotational = tuning::is_rotational(&cfg.data_dir(chain));
     let tunables = Arc::new(Tunables::new(cfg, rotational));
     let store = open_store_with(cfg, chain, tunables.cache_mib(), tunables.background_jobs())?;
     tunables.apply_store(&store);
     warn_if_disk_low(cfg, chain);
-    let stored = stored_identity(&store, chain)?;
-    let identity = placeholder_identity(chain, stored);
-    let shared = build_shared(cfg, chain, Arc::clone(&store), identity)?;
-    start_transports(&shared, cfg)?;
+    let flag = shutdown_flag();
+    let mut core_sup = CoreSupervisor::new(cfg, chain);
+    // `run` waits for Core. Building Shared only after RPC is ready means peer
+    // discovery, mempool and the index loop never see a half-started Core.
+    let Some(live) = ensure_identity_blocking(
+        cfg,
+        chain,
+        &store,
+        &core_client(cfg, chain)?,
+        &mut core_sup,
+        &flag,
+        true,
+        None,
+    )?
+    else {
+        println!(
+            "[e-lite] stopped at {} (uptime {})",
+            format_local_time(SystemTime::now()),
+            format_uptime(started.elapsed())
+        );
+        return Ok(());
+    };
+    let shared = build_shared(cfg, chain, Arc::clone(&store), live)?;
+    let transports = start_transports(&shared, cfg)?;
     println!(
-        "e-lite {}: indexing and serving on {} (network {}, core {}, manage {:?})",
+        "e-lite {}: started at {} — indexing and serving on {} (network {}, core {}, manage {:?})",
         VERSION,
+        format_local_time(started_at),
         cfg.server.listen,
         chain.name(),
         cfg.rpc_url(chain),
         cfg.core.manage
     );
-    let flag = shutdown_flag();
-    let mut core_sup = CoreSupervisor::new(cfg, chain);
-    let Some(live) = ensure_identity_blocking(
-        cfg,
-        chain,
-        &store,
-        &shared.core,
-        &mut core_sup,
-        &flag,
-        false,
-        Some(&shared),
-    )?
-    else {
-        println!("[e-lite] shutdown requested; stopped cleanly");
-        return Ok(());
-    };
-    let bulk = build_bulk(cfg, chain, live.genesis, tunables.readers())?;
+    let bulk = build_bulk(cfg, chain, shared.identity().genesis, tunables.readers())?;
     let can_control = core_sup.can_control_core();
     let idx = Indexer::new(
         Arc::clone(&store),
@@ -2971,13 +3551,20 @@ fn cmd_run(cfg: &Config, chain: Chain) -> R<()> {
         chain,
         Some(Arc::clone(&shared)),
         idx,
-        core_sup,
+        &mut core_sup,
         Arc::clone(&flag),
         false,
     );
-    if result.is_ok() {
-        println!("[e-lite] shutdown requested; stopped cleanly");
-    }
+    shared.shutdown.store(true, Ordering::SeqCst);
+    let _ = transports.mempool.join();
+    let _ = transports.notifications.join();
+    let _ = transports.memory.join();
+    core_sup.stop();
+    println!(
+        "[e-lite] stopped at {} (uptime {})",
+        format_local_time(SystemTime::now()),
+        format_uptime(started.elapsed())
+    );
     result
 }
 
@@ -3018,6 +3605,12 @@ fn cmd_status(cfg: &Config, chain: Chain, as_json: bool) -> R<()> {
         "db_bytes": store.disk_usage_bytes(),
         "disk_free_bytes": el_serve::disk_free_bytes(&cfg.data_dir(chain)),
         "data_dir": cfg.data_dir(chain).display().to_string(),
+        "memory": {
+            "total_mib": tuning::memory_info().total_mib.unwrap_or(0),
+            "available_mib": tuning::memory_info().available_mib,
+            "cgroup_limit_mib": tuning::memory_info().cgroup_limit_mib.unwrap_or(0),
+            "reclaimable_mib": tuning::memory_info().reclaimable_mib.unwrap_or(0),
+        },
     });
     if as_json {
         println!("{}", serde_json::to_string_pretty(&v)?);
@@ -3041,10 +3634,23 @@ fn print_status_human(v: &serde_json::Value) {
         g("lag_blocks")
     );
     println!(
-        "core      height {}   pruneheight {}   networkactive {}",
+        "core      height {}/{} ({:.1}%)   pruneheight {}   networkactive {}",
         g("core_height"),
+        g("core_headers"),
+        if g("core_headers") > 0 {
+            g("core_height") as f64 / g("core_headers") as f64 * 100.0
+        } else {
+            0.0
+        },
         v["core"]["pruneheight"].as_u64().unwrap_or(0),
         v["core"]["network_active"].as_bool().unwrap_or(false)
+    );
+    println!(
+        "memory    total {} MiB   available {} MiB   cgroup limit {} MiB   reclaimable {} MiB",
+        v["memory"]["total_mib"].as_u64().unwrap_or(0),
+        v["memory"]["available_mib"].as_u64().unwrap_or(0),
+        v["memory"]["cgroup_limit_mib"].as_u64().unwrap_or(0),
+        v["memory"]["reclaimable_mib"].as_u64().unwrap_or(0)
     );
     println!("last block {} ms", g("last_block_ms"));
     println!(
@@ -3206,5 +3812,40 @@ mod tests {
     fn pruned_with_covered_tip_is_allowed() {
         assert!(check_pruned(&info(true, 100), Some(&tip(99)), None).is_ok());
         assert!(check_pruned(&info(true, 100), Some(&tip(150)), None).is_ok());
+    }
+
+    #[test]
+    fn milestone_triggers_by_blocks_or_time() {
+        let hour = Duration::from_secs(3600);
+        assert!(milestone_due(10_000, 20_000, Duration::ZERO, 10_000, 0));
+        assert!(!milestone_due(10_000, 19_999, Duration::ZERO, 10_000, 0));
+        assert!(milestone_due(10_000, 10_001, hour, 0, 3600));
+        assert!(!milestone_due(10_000, 10_001, hour, 0, 0));
+        // Both disabled means never.
+        assert!(!milestone_due(0, 1_000_000, hour, 0, 0));
+    }
+
+    #[test]
+    fn uptime_is_human_readable() {
+        assert_eq!(format_uptime(Duration::from_millis(500)), "0.5s");
+        assert_eq!(format_uptime(Duration::from_secs(59)), "59.0s");
+        assert_eq!(format_uptime(Duration::from_secs(3661)), "1h 01m 01s");
+    }
+
+    #[test]
+    fn directory_usage_counts_regular_files() {
+        let dir = std::env::temp_dir().join(format!(
+            "e-lite-dir-usage-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        std::fs::write(dir.join("a"), vec![0u8; 100]).unwrap();
+        std::fs::write(dir.join("sub/b"), vec![0u8; 50]).unwrap();
+        assert_eq!(dir_usage_bytes(&dir), 150);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

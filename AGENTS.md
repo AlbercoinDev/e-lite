@@ -59,6 +59,8 @@ Never treat a version number in this file as authoritative over the code/tag.
   separate listener (`tls_listen`). Neither listener authenticates clients; do
   not expose them publicly without a tunnel/firewall/access plan.
 - Core RPC is HTTP; LAN/WAN use requires SSH/VPN.
+- RocksDB memory is budgeted globally (`RAM/16` for memtables, cache `RAM/4`),
+  background jobs are CPU-capped, and every knob is available via CLI/`--set`.
 - Raw transactions are local-first. External fallback requests whole blocks by
   hash, validates them, uses Tor by default and never sends wallet txids/scripts.
 
