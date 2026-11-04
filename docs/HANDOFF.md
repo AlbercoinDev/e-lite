@@ -4,7 +4,7 @@
 **Latest published release:** `0.1.0-alpha.16`
 **Release:** https://github.com/AlbercoinDev/e-lite/releases/tag/v0.1.0-alpha.16
 **Working version:** `0.1.0-alpha.17` (unreleased: optional Electrum TLS)
-**Main commit at handoff:** `8626105` (`alpha.17: optional Electrum TLS listener with certificate reload`)
+**Main commit at handoff:** `e9d4152` (`alpha.17: optional Electrum TLS listener with certificate reload`)
 
 This file is the short “where we are” for a new session. The invariants live in
 [`AGENTS.md`](../AGENTS.md) and [`PROJECT_MEMORY.md`](PROJECT_MEMORY.md); the
