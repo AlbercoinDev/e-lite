@@ -1,10 +1,9 @@
 # Session handoff
 
 **Updated:** 2026-11-04
-**Latest published release:** `0.1.0-alpha.18`
-**Release:** https://github.com/AlbercoinDev/e-lite/releases/tag/v0.1.0-alpha.18
-**Working version:** `0.1.0-alpha.19` (unreleased: log file, parallel decode, prune cadence)
-**Main commit at handoff:** `PENDING`
+**Latest published release:** `0.1.0-alpha.19`
+**Release:** https://github.com/AlbercoinDev/e-lite/releases/tag/v0.1.0-alpha.19
+**Main commit at handoff:** `084b974` (`alpha.19: e-lite.log, parallel decode, prune cadence and relative bulk guard`)
 
 This file is the short “where we are” for a new session. The invariants live in
 [`AGENTS.md`](../AGENTS.md) and [`PROJECT_MEMORY.md`](PROJECT_MEMORY.md); the
@@ -156,8 +155,8 @@ kill -USR1 "$(pgrep -f 'e-lite run')"
 ## Known working test baseline at handoff
 
 `cargo fmt --check`, clippy, workspace tests and the local regtest e2e
-(`launch_core`, `pruned_ibd`, `regtest` with plain + TLS Electrum and clean
-startup/shutdown/memory assertions) passed on the alpha.18 code. Release
-artifacts and `SHA256SUMS` for alpha.18 were verified. Full signet/testnet4
-acceptance is still operator-run; results belong in
-`docs/GETTING-STARTED.md`/release notes when available.
+(`launch_core`, `pruned_ibd`, `regtest` with plain + TLS Electrum, clean
+startup/shutdown/memory assertions, `e-lite.log` presence and milestone checks)
+passed on the alpha.19 code. Release artifacts and `SHA256SUMS` for alpha.19
+were verified. Full signet/testnet4 acceptance is still operator-run; results
+belong in `docs/GETTING-STARTED.md`/release notes when available.
