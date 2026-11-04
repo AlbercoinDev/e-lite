@@ -796,6 +796,14 @@ impl Store {
 mod tests {
     use super::*;
 
+    /// Failpoints are process-global; serialize the tests that commit so one
+    /// test cannot inject a failure into another running in parallel.
+    static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn serial() -> std::sync::MutexGuard<'static, ()> {
+        SERIAL.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     #[test]
     fn write_buffer_budget_is_split_across_column_families() {
         // 1 GiB total over 7 CFs and 3 memtables = ~48 MiB per CF.
@@ -832,6 +840,7 @@ mod tests {
 
     #[test]
     fn reopen_keeps_tip_and_truncates_extra_txids() {
+        let _guard = serial();
         failpoints::set(failpoints::NONE);
         let dir = tmp("reopen");
         let txid = Hash32::from_hex(&"aa".repeat(32)).unwrap();
@@ -879,6 +888,7 @@ mod tests {
 
     #[test]
     fn failpoint_before_commit_does_not_advance_tip() {
+        let _guard = serial();
         let dir = tmp("failpoint");
         let s = Store::open(&dir).unwrap();
         s.init_identity(&identity()).unwrap();
@@ -901,6 +911,7 @@ mod tests {
 
     #[test]
     fn short_txids_file_is_fatal() {
+        let _guard = serial();
         let dir = tmp("short");
         let txid = Hash32::from_hex(&"11".repeat(32)).unwrap();
         {
@@ -930,6 +941,7 @@ mod tests {
 
     #[test]
     fn rejects_newer_schema() {
+        let _guard = serial();
         let dir = tmp("schema");
         {
             let s = Store::open(&dir).unwrap();
@@ -944,6 +956,7 @@ mod tests {
 
     #[test]
     fn utxo_and_history_roundtrip() {
+        let _guard = serial();
         let dir = tmp("utxo");
         let s = Store::open(&dir).unwrap();
         let script = ScriptHash::from_script(b"\x51");
@@ -984,6 +997,7 @@ mod tests {
 
     #[test]
     fn canonical_digest_is_stable_across_reopen() {
+        let _guard = serial();
         let dir = tmp("digest");
         let script = ScriptHash::from_script(b"\x51");
         let d1 = {

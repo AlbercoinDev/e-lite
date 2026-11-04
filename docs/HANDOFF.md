@@ -3,7 +3,8 @@
 **Updated:** 2026-11-05
 **Latest published release:** `0.1.0-alpha.20`
 **Release:** https://github.com/AlbercoinDev/e-lite/releases/tag/v0.1.0-alpha.20
-**Main commit at handoff:** `0bbb597` (`alpha.20: fix bulk lag guard hold, explicit readers and log path`)
+**Working version:** `0.1.0-alpha.21` (unreleased: deterministic store tests)
+**Main commit at handoff:** `PENDING`
 
 This file is the short “where we are” for a new session. The invariants live in
 [`AGENTS.md`](../AGENTS.md) and [`PROJECT_MEMORY.md`](PROJECT_MEMORY.md); the
@@ -54,6 +55,11 @@ no repitas contexto ni rehagas decisiones ya documentadas.
 - `docs/FEATURES.md` is the current-feature source of truth.
 - `docs/ROADMAP.md` contains future features/improvements. Do not present them as
   available.
+
+## Last audit/fixes (alpha.21)
+
+- **Deterministic store tests**: global failpoint tests are serialized with a
+  mutex, fixing the alpha.20 CI flake. No runtime change.
 
 ## Last audit/fixes (alpha.20)
 

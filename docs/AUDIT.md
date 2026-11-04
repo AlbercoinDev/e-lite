@@ -1,7 +1,7 @@
 # Code audit
 
-**Base:** `0.1.0-alpha.19` → published `0.1.0-alpha.20` · **Scope:** `bin/e-lite`, `crates/*` (25 Rust files,
-~16.9k lines) · **Status:** findings fixed in `0.1.0-alpha.20` where noted.
+**Base:** `0.1.0-alpha.20` → published `0.1.0-alpha.21` · **Scope:** `bin/e-lite`, `crates/*` (25 Rust files,
+~16.9k lines) · **Status:** findings fixed in `0.1.0-alpha.21` where noted.
 
 This audit is not a claim of formal verification. It records static checks,
 manual review areas, concrete findings and residual risks.
@@ -45,6 +45,7 @@ Additional checks performed:
 | AUD-024 | P2 | Indexing throughput | `bin/e-lite/src/main.rs`, `crates/el-index` | Deserialize/hash and txid/Merkle work ran in the single apply thread, leaving reader threads idle and the second CPU core unused. | Reader threads prepare blocks (`prepare_block_bytes`), apply uses `apply_prepared`; block hash computed once; `decode_ms`/`wait_ms` exposed. |
 | AUD-025 | P2 | Bulk lag guard | `bin/e-lite/src/main.rs` | Absolute `max_bulk_lag_blocks` paused Core immediately on a 300k backlog and kept it paused until lag ≤10k, freezing Core's own sync for hours. | Window is relative to the lag baseline and follows it; resumes at half the growth window. |
 | AUD-026 | P1 | Bulk lag guard | `bin/e-lite/src/main.rs` | While paused, the relative baseline also followed the decreasing lag, so every indexed block lowered the resume threshold and Core resumed on the next check. The guard effectively never held. | `bulk_lag_window` takes `paused`; the baseline is frozen while paused and only follows the lag down while downloading. Unit test `bulk_lag_window_bounds_additional_growth`. |
+| AUD-027 | P3 | Test reliability | `crates/el-store/src/lib.rs` | Global failpoint state was shared by tests running in parallel; `reopen_keeps_tip...` could fail when another test injected `BEFORE_COMMIT`. | Test mutex serializes failpoint/commit tests; repeated local runs and CI pass. |
 
 ## Residual risks and intentional limits
 

@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.1.0-alpha.21 — 2026-11-05
+
+### Test reliability
+
+- **Serialized store tests that use global failpoints.** `reopen_keeps_tip...`
+  could race with `failpoint_before_commit...` and fail in CI even though the
+  code was correct. A test mutex now makes the suite deterministic. No runtime
+  behavior change from alpha.20.
+
 ## 0.1.0-alpha.20 — 2026-11-04
 
 ### Fixes for alpha.19
