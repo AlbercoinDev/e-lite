@@ -1,10 +1,9 @@
 # Session handoff
 
-**Updated:** 2026-11-04
-**Latest published release:** `0.1.0-alpha.19`
-**Release:** https://github.com/AlbercoinDev/e-lite/releases/tag/v0.1.0-alpha.19
-**Working version:** `0.1.0-alpha.20` (unreleased: bulk guard fix)
-**Main commit at handoff:** `PENDING`
+**Updated:** 2026-11-05
+**Latest published release:** `0.1.0-alpha.20`
+**Release:** https://github.com/AlbercoinDev/e-lite/releases/tag/v0.1.0-alpha.20
+**Main commit at handoff:** `0bbb597` (`alpha.20: fix bulk lag guard hold, explicit readers and log path`)
 
 This file is the short “where we are” for a new session. The invariants live in
 [`AGENTS.md`](../AGENTS.md) and [`PROJECT_MEMORY.md`](PROJECT_MEMORY.md); the
@@ -170,6 +169,6 @@ kill -USR1 "$(pgrep -f 'e-lite run')"
 `cargo fmt --check`, clippy, workspace tests and the local regtest e2e
 (`launch_core`, `pruned_ibd`, `regtest` with plain + TLS Electrum, clean
 startup/shutdown/memory assertions, `e-lite.log` presence and milestone checks)
-passed on the alpha.19 code. Release artifacts and `SHA256SUMS` for alpha.19
+passed on the alpha.20 code. Release artifacts and `SHA256SUMS` for alpha.20
 were verified. Full signet/testnet4 acceptance is still operator-run; results
 belong in `docs/GETTING-STARTED.md`/release notes when available.
