@@ -111,6 +111,8 @@ or `adaptive` in the TOML, send `SIGUSR1` and verify the values in `/status`.
 - [ ] Ctrl+C logs `stopped at …` with no post-shutdown Core/mempool errors.
 - [ ] `/status` shows real RAM/cgroup figures and the configured cache, not a false 0 MiB.
 - [ ] Progress shows height/Core percentages and a milestone every 10k blocks or 6 h.
+- [ ] `<data-dir>/e-lite.log` contains the same lines as the console (start/stop, progress, milestones).
+- [ ] Prune gate runs at most every 10k safe blocks by default (or immediately on low disk).
 - [ ] `--profile hdd|ssd|nvme|manual` and `--set` work without a config file.
 - [ ] Raw tx works from Core/cache; pruned fallback is explicit if unavailable.
 - [ ] Disk-low pauses downloads; indexing continues until the critical floor.

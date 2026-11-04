@@ -1,5 +1,36 @@
 # Changelog
 
+## 0.1.0-alpha.19 — 2026-11-04
+
+### Logging, indexing throughput and pruning cadence
+
+- **Application log**: `run`, `index` and `serve` tee stdout/stderr to
+  `<data-dir>/e-lite.log` (same lines as the console), append mode, 64 MiB
+  rotation to `e-lite.log.1`, `--log-file`/`--log-max-mib`/`--no-log-file` and
+  `[logging] file/max_mib`. Snapshots exclude the log and runtime markers.
+- **Prune every 10,000 blocks by default**: `min_gain_blocks` defaults to
+  `10000` instead of `288`, so the prune gate is far less intrusive. Low disk
+  still triggers an emergency prune.
+- **Parallel decode/txid/Merkle**: reader threads now deserialize the block,
+  verify its hash and Merkle root, and compute txids; the apply thread only does
+  continuity, UTXO work and batch writes. This overlaps CPU-heavy work with the
+  previous block's apply/commit.
+- **Commit path**: `prune_undo` is skipped when a group wrote no undo records;
+  the block hash is computed once; bulk commit interval can grow to 30 s and
+  batch to 4096; the controller avoids growing batches when commit already takes
+  >75% of the interval.
+- **Instrumentation**: progress/status/metrics now expose `decode_ms`,
+  `wait_ms`, `cache_hit_known` (`cache ?` when RocksDB does not report the
+  counter). Lightweight RocksDB statistics are enabled.
+- **Relative bulk lag guard**: `--max-bulk-lag-blocks` now bounds additional lag
+  growth from the baseline instead of freezing Core for an entire large
+  catch-up; it resumes at half the growth window.
+- **CPU-aware readers**: automatic reader counts are capped at `2 × CPUs`
+  (explicit `--readers` still wins), avoiding 8 readers on a 2-vCPU machine.
+- **Tests**: log file presence/content in e2e, relative bulk-lag window,
+  prune default, decode/wait metrics, plus the existing TLS/memory/startup
+  assertions.
+
 ## 0.1.0-alpha.18 — 2026-11-04
 
 ### Startup, shutdown and memory/performance

@@ -1,7 +1,7 @@
 # Code audit
 
-**Base:** `0.1.0-alpha.17` → published `0.1.0-alpha.18` · **Scope:** `bin/e-lite`, `crates/*` (25 Rust files,
-~16.4k lines) · **Status:** findings fixed in `0.1.0-alpha.18` where noted.
+**Base:** `0.1.0-alpha.18` → published `0.1.0-alpha.19` · **Scope:** `bin/e-lite`, `crates/*` (25 Rust files,
+~16.8k lines) · **Status:** findings fixed in `0.1.0-alpha.19` where noted.
 
 This audit is not a claim of formal verification. It records static checks,
 manual review areas, concrete findings and residual risks.
@@ -40,6 +40,10 @@ Additional checks performed:
 | AUD-019 | P1 | Memory accounting | `bin/e-lite/src/tuning.rs` | `/proc/meminfo` was parsed with `strip_prefix` without consuming the colon, so `MemTotal`/`MemAvailable` always returned `None`. The daemon fell back to 1 GiB and 0 MiB available, shrank cache/readers and logged false `memory pressure (0 MiB)` on every machine. | Parse with `split_once(':')`, add tests, cgroup-aware available memory and reclaimable `inactive_file`; `doctor`/`/status` expose the values. |
 | AUD-020 | P1 | RocksDB memory | `crates/el-store/src/lib.rs` | `write_buffer_bytes` was applied per column family: 7 CFs × 3 memtables × 64 MiB ≈ 1.3 GiB, plus the block cache. On low-RAM hosts this caused reclaim stalls and slow indexing. | Global memtable budget (`RAM/16`, 64 MiB..1 GiB) split across CFs, capped per CF; background jobs capped by CPU count; tests for the budget. |
 | AUD-021 | P2 | Lifecycle | `bin/e-lite/src/main.rs`, `crates/el-serve/src/lib.rs` | P2P discovery/mempool started before Core; shutdown stopped Core while detached mempool/notification threads were still running, logging `Connection refused` and post-shutdown tuning lines. | `run` waits for Core RPC before starting dependants; `serve` stays offline; shutdown flag + joined threads before Core stop; e2e asserts clean startup/shutdown logs. |
+| AUD-022 | P2 | Operational logging | `bin/e-lite/src/main.rs` | Console progress and errors were lost when running in the background; there was no application log (only Core's `bitcoind.log`). | Tee stdout/stderr to `<data-dir>/e-lite.log`, rotation, `--log-file`/`--log-max-mib`/`--no-log-file`; e2e checks the file. |
+| AUD-023 | P2 | Prune churn | `bin/e-lite/src/config.rs`, `el-chain` supervisor | Manual pruning evaluated every 288 safe blocks, causing frequent prune I/O during a long catch-up. | Default `min_gain_blocks = 10000`; emergency low-disk pruning still bypasses it. |
+| AUD-024 | P2 | Indexing throughput | `bin/e-lite/src/main.rs`, `crates/el-index` | Deserialize/hash and txid/Merkle work ran in the single apply thread, leaving reader threads idle and the second CPU core unused. | Reader threads prepare blocks (`prepare_block_bytes`), apply uses `apply_prepared`; block hash computed once; `decode_ms`/`wait_ms` exposed. |
+| AUD-025 | P2 | Bulk lag guard | `bin/e-lite/src/main.rs` | Absolute `max_bulk_lag_blocks` paused Core immediately on a 300k backlog and kept it paused until lag ≤10k, freezing Core's own sync for hours. | Window is relative to the lag baseline and follows it; resumes at half the growth window. |
 
 ## Residual risks and intentional limits
 

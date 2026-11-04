@@ -57,7 +57,7 @@ version          print version
 | `--cache-mib <n>` | `index.cache_mib` | `0` (RAM/4) |
 | `--write-buffer-mib <n>` | `index.write_buffer_mib` | `0` (RAM/16) |
 | `--background-jobs <n>` | `index.background_jobs` | `0` (profile, capped by CPUs) |
-| `--commit-interval-ms <n>` | `index.commit_interval_ms` | `0` (profile) |
+| `--commit-interval-ms <n>` | `index.commit_interval_ms` | `0` (profile; 500..30000) |
 | `--prefetch-blocks <n>` | `index.prefetch_blocks` | `0` (reserved) |
 | `--batch <n>` | `index.batch_blocks` | `256`/profile |
 | `--reorg-window <n>` | `index.reorg_window` | `288` |
@@ -111,7 +111,7 @@ e-lite run --network mainnet --allow-mainnet \
 |---|---|---|
 | `--max-core-lag-blocks <n>` | `pruning.max_core_lag_blocks` | `192` (auto-prune only) |
 | `--max-bulk-lag-blocks <n>` | `pruning.max_bulk_lag_blocks` | `0` (off) |
-| `--min-gain-blocks <n>` | `pruning.min_gain_blocks` | `288` |
+| `--min-gain-blocks <n>` | `pruning.min_gain_blocks` | `10000` |
 | `--prune-interval-seconds <n>` | `pruning.prune_interval_seconds` | `30` |
 | `--poll-seconds <n>` | `pruning.poll_seconds` | `10` |
 | `--repair-max-gap-blocks <n>` | `pruning.repair_max_gap_blocks` | `2048` |
@@ -121,9 +121,10 @@ e-lite run --network mainnet --allow-mainnet \
 | `--restart` / `--no-restart` | `core.restart` | `true` |
 
 `--max-bulk-lag-blocks` pauses Core's P2P when a managed, pruned Core is in IBD
-and the index lags more than N blocks; it resumes at half the limit. It bounds
-the gap and disk contention, at the cost of a longer total sync. `0` disables it.
-It is independent of the automatic-pruning safety limit.
+and the index lags more than N blocks **beyond the lag seen when the guard
+started**; it resumes at half that growth. It bounds additional separation and
+disk contention without freezing Core for an entire large catch-up. `0`
+disables it. It is independent of the automatic-pruning safety limit.
 
 Low-RAM Core example:
 
@@ -147,6 +148,20 @@ e-lite run --network mainnet --allow-mainnet \
 | `--no-rawtx` | `rawtx.enabled=false` | enabled |
 | `--tls-listen <addr>` | `server.tls_listen` | disabled |
 | `--tls-cert`, `--tls-key` | `server.tls_cert`, `server.tls_key` | none |
+
+## Logging
+
+| Flag | TOML field | Default |
+|---|---|---|
+| `--log-file <path>` | `logging.file` | `<data-dir>/e-lite.log` |
+| `--log-max-mib <n>` | `logging.max_mib` | `64` (0 disables rotation) |
+| `--no-log-file` | — | logging enabled |
+
+The file receives exactly the same lines as the console (stdout + stderr),
+including progress, milestones, tuning and TLS messages. Rotation keeps one
+backup (`e-lite.log.1`) and the file mode is `0640`. Logs are per network because
+the default path lives in the network data directory. `e-lite core logs` still
+shows Core's own log.
 
 ## `--set` examples
 
@@ -172,7 +187,8 @@ and TOML arrays are parsed as TOML.
 
 - indexed height and percentage of Core's `headers`;
 - Core blocks/headers and percentage, plus verification progress during IBD;
-- lag, blocks/s, tx/s, elapsed time and read/apply/commit/cache metrics;
+- lag, blocks/s, tx/s, elapsed time and read/decode/wait/apply/commit/cache
+  metrics (`cache ?` means RocksDB did not report the counter);
 - a milestone line every `milestone_blocks` or `milestone_seconds` (whichever
   happens first) with interval throughput and disk usage for e-lite and Core.
 

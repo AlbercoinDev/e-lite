@@ -35,6 +35,8 @@ pub struct Config {
     pub pruning: PruningCfg,
     #[serde(default)]
     pub silent_payments: SilentPaymentsCfg,
+    #[serde(default)]
+    pub logging: LoggingCfg,
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -252,6 +254,26 @@ pub struct SilentPaymentsCfg {
 
 #[derive(Debug, Clone, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct LoggingCfg {
+    /// Application log path. Empty/None uses `<data-dir>/e-lite.log`.
+    #[serde(default)]
+    pub file: Option<String>,
+    /// Rotate `e-lite.log` to `e-lite.log.1` above this size. 0 disables it.
+    #[serde(default = "d_log_max_mib")]
+    pub max_mib: u64,
+}
+
+impl Default for LoggingCfg {
+    fn default() -> Self {
+        LoggingCfg {
+            file: None,
+            max_mib: d_log_max_mib(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PruningCfg {
     /// Pause Core downloads when free space is below this. The indexer keeps
     /// draining already-downloaded blocks so it can prune and free space.
@@ -383,6 +405,9 @@ fn d_milestone_blocks() -> u64 {
 fn d_milestone_seconds() -> u64 {
     21_600
 }
+fn d_log_max_mib() -> u64 {
+    64
+}
 fn d_block_source() -> String {
     "auto".to_string()
 }
@@ -411,7 +436,7 @@ fn d_max_lag() -> u32 {
     192
 }
 fn d_min_gain() -> u32 {
-    288
+    10_000
 }
 fn d_prune_interval() -> u64 {
     30
@@ -554,6 +579,14 @@ impl Config {
         }
     }
 
+    /// Application log (`e-lite.log`). Separate from Core's `bitcoind.log`.
+    pub fn app_log_file(&self, chain: Chain) -> PathBuf {
+        match &self.logging.file {
+            Some(p) if !p.trim().is_empty() => PathBuf::from(p),
+            _ => self.data_dir(chain).join("e-lite.log"),
+        }
+    }
+
     pub fn pid_file(&self, chain: Chain) -> PathBuf {
         self.data_dir(chain).join("core-child.pid")
     }
@@ -569,9 +602,9 @@ impl Config {
             return Err("[index] profile must be auto, hdd, ssd, nvme or manual".to_string());
         }
         if self.index.commit_interval_ms != 0
-            && !(500..=10_000).contains(&self.index.commit_interval_ms)
+            && !(500..=30_000).contains(&self.index.commit_interval_ms)
         {
-            return Err("[index] commit_interval_ms must be 0 or 500..10000".to_string());
+            return Err("[index] commit_interval_ms must be 0 or 500..30000".to_string());
         }
         if self.server.max_clients == 0 {
             return Err("[server] max_clients must be >= 1".to_string());
@@ -756,6 +789,11 @@ mod tests {
         cfg.server.tls_cert = "/etc/e-lite/tls/cert.pem".to_string();
         cfg.server.tls_key = "/etc/e-lite/tls/key.pem".to_string();
         assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn prune_gain_default_is_ten_thousand_blocks() {
+        assert_eq!(Config::default().pruning.min_gain_blocks, 10_000);
     }
 
     #[test]

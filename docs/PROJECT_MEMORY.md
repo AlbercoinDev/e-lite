@@ -35,13 +35,16 @@ a separate listener is implemented; authentication and rate limiting are not.
 ## Safety defaults
 
 - `prune_mib = 1` for from-zero pruned IBD; `prune_mib >= 550` needs
-  `allow_auto_prune = true`.
+  `allow_auto_prune = true`. The prune gate evaluates every 10,000 safe blocks
+  by default; low disk triggers an emergency prune.
 - Snapshots are optional, never required by the from-zero flow.
 - Electrum is plain TCP and loopback by default; TLS is an optional separate
   listener and does not authenticate clients.
 - Core RPC is HTTP; use SSH/VPN for LAN/WAN.
 - RocksDB memtables use a global `RAM/16` budget; cache and readers scale with
   real RAM, and every knob can be overridden from the CLI or `--set`.
+- `run`/`index`/`serve` keep an application log at `<data-dir>/e-lite.log` with
+  the same lines as the console.
 - Rawtx external lookup is block-based, validated, Tor-first and decoy-enhanced.
 
 ## Audit and release

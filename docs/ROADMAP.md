@@ -18,12 +18,11 @@ acceptance signal that would move it to `FEATURES.md`.
 
 | Priority | Item | Why / acceptance |
 |---|---|---|
-| P1 | Parallel decode/txid/Merkle in reader threads | overlap SHA256 with I/O/apply; measure tx/s on large blocks. |
 | P1 | UTXO prefetch pipeline | prefetch next block’s prevouts into a bounded cache; overlay wins. |
 | P2 | HDD sequential mode/readahead | fewer readers in file order, `fadvise`/readahead; A/B on HDD. |
-| P2 | Adaptive controller v2 | queue-wait metrics, compaction/RocksDB signals, safer AIMD, benchmark profiles. |
+| P2 | Adaptive controller v2 | queue-wait metrics, compaction/RocksDB signals, safer AIMD, benchmark profiles. Commit-share and CPU-capped readers are already in place. |
 | P2 | Parallel compaction/job tuning | expose/test mutable RocksDB options per profile. |
-| P3 | Commit-group batching | amortise fsync while bounding crash window; make interval configurable/tested. |
+| P3 | Commit-group batching | interval/batch already extend to 30 s/4096 in bulk; still make durability tradeoff explicit/tested per workload. |
 
 ## Storage savings
 

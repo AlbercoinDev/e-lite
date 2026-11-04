@@ -45,9 +45,9 @@ min_free_gib = 10                   # pause Core downloads below this; indexing 
 critical_free_gib = 1               # also pause indexing below this hard floor (0 = never)
 max_core_lag_blocks = 192           # automatic pruning only; hard-capped at 224
 allow_auto_prune = false            # required for prune_mib >= 550; not for from-zero
-max_bulk_lag_blocks = 0             # opt-in: pause Core downloads when the index lags
-                                    # more than this during IBD (0 = disabled)
-min_gain_blocks = 288               # minimum safe-height gain between prune requests
+max_bulk_lag_blocks = 0             # opt-in: pause Core downloads when the lag grows this
+                                    # many blocks above its baseline during IBD (0 = disabled)
+min_gain_blocks = 10000              # evaluate/execute prune every ~10k safe blocks
 prune_interval_seconds = 30         # minimum time between prune requests (low disk bypasses)
 repair_max_gap_blocks = 2048        # auto-repair a prune gap from verified sources
 poll_seconds = 10
@@ -86,6 +86,10 @@ p2p_peers = []                      # empty: discover from local Core
 
 [silent_payments]
 enabled = false                     # opt-in gate; BIP352 indexer not included yet
+
+[logging]
+# file = "/var/log/e-lite/e-lite.log"  # default <data-dir>/e-lite.log
+max_mib = 64                        # rotate to e-lite.log.1 above this; 0 = never
 
 [safety]
 allow_mainnet = false               # mainnet requires explicit opt-in

@@ -164,6 +164,10 @@ impl Store {
         opts.set_max_background_jobs(store_opts.background_jobs.max(1));
         opts.set_bytes_per_sync(1024 * 1024);
         opts.set_wal_bytes_per_sync(1024 * 1024);
+        // Lightweight statistics make the block-cache hit/miss counters
+        // available to the adaptive controller without timer/histogram cost.
+        opts.enable_statistics();
+        opts.set_statistics_level(rocksdb::statistics::StatsLevel::ExceptHistogramOrTimers);
         opts.set_write_buffer_size(per_cf_write);
         opts.set_max_write_buffer_number(max_buffers as i32);
         let mut descriptors = Vec::new();

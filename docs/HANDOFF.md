@@ -3,7 +3,8 @@
 **Updated:** 2026-11-04
 **Latest published release:** `0.1.0-alpha.18`
 **Release:** https://github.com/AlbercoinDev/e-lite/releases/tag/v0.1.0-alpha.18
-**Main commit at handoff:** `9198fe2` (`alpha.18: fix memory accounting and RocksDB budget, ordered lifecycle, CLI and progress`)
+**Working version:** `0.1.0-alpha.19` (unreleased: log file, parallel decode, prune cadence)
+**Main commit at handoff:** `PENDING`
 
 This file is the short “where we are” for a new session. The invariants live in
 [`AGENTS.md`](../AGENTS.md) and [`PROJECT_MEMORY.md`](PROJECT_MEMORY.md); the
@@ -54,6 +55,29 @@ no repitas contexto ni rehagas decisiones ya documentadas.
 - `docs/FEATURES.md` is the current-feature source of truth.
 - `docs/ROADMAP.md` contains future features/improvements. Do not present them as
   available.
+
+## Last audit/fixes (alpha.19)
+
+- **`e-lite.log`**: stdout/stderr are teed to `<data-dir>/e-lite.log` (append,
+  rotation to `.1`, `--log-file`/`--log-max-mib`/`--no-log-file`). Snapshot
+  export skips the log.
+- **Prune cadence**: `min_gain_blocks` default 10,000 (emergency low-disk prune
+  still bypasses it).
+- **Parallel decode/txid/Merkle** in reader threads; apply only does UTXO work
+  and batch writes. Block hash is computed once.
+- **Commit**: skip `prune_undo` when the group has no undo; bulk interval up to
+  30 s and batch up to 4096; controller shrinks the batch when commit dominates
+  the interval.
+- **Metrics**: `decode_ms`, `wait_ms`, `cache_hit_known` (`?` when unknown);
+  RocksDB lightweight statistics enabled.
+- **Bulk guard is relative**: `--max-bulk-lag-blocks` bounds additional growth
+  from the baseline, so a 300k backlog no longer freezes Core for the whole
+  catch-up.
+- **Readers capped by `2 × CPUs`** unless explicitly overridden.
+
+Evidence: `CHANGELOG.md`, `docs/CLI.md`, `docs/TUNING.md`,
+`cargo test --workspace`, `tests/e2e_regtest.sh` (log file + startup/shutdown),
+`tests/e2e_pruned_ibd.sh` (prune gate with explicit 288 gain).
 
 ## Last audit/fixes (alpha.18)
 

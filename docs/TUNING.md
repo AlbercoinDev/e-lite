@@ -59,10 +59,12 @@ e-lite run --set index.profile=ssd --set index.commit_interval_ms=3000
 The indexer records EWMA values for:
 
 - block-read latency (`read_ms`),
+- block decode/hash latency (`decode_ms`),
+- pipeline wait (`wait_ms`),
 - `apply_block` latency (`apply_ms`),
 - commit + fsync latency (`commit_ms`),
 - indexed transactions per second,
-- RocksDB block-cache hit percentage.
+- RocksDB block-cache hit percentage (`?` when the counter is unavailable).
 
 They are exported in `/status` under `tuning` and in `/metrics` as
 `e_lite_tuning_*`, `e_lite_tx_per_sec` and `e_lite_commit_ms`.
@@ -73,10 +75,12 @@ Only these hot fields are adjusted automatically:
 
 - `readers`: less on a rotational disk when read latency is high; more only on
   non-rotational disks when reads are actually slow, never just because a read
-  was fast. Automatic readers are capped at 4 (HDD), 8 (SSD) or 16 (NVMe) and
-  by available memory.
+  was fast. Automatic readers are capped at 4 (HDD), 8 (SSD) or 16 (NVMe), by
+  available memory and by `2 × CPU count` (explicit `--readers` wins).
 - `commit_interval_ms` and `batch_blocks`: larger groups when commit/fsync is
-  slow.
+  slow and commit is less than half of the interval; if commit dominates the
+  interval (>75%), the batch shrinks instead. The bulk maximum is 30 s / 4096
+  blocks, with the usual crash-window tradeoff.
 - `cache_mib`: grows when the cache hit rate is low and RAM is available;
   shrinks when `MemAvailable` is low.
 
@@ -157,18 +161,25 @@ investigating.
 ## Long catch-up and Core separation
 
 With `prune_mib = 1` (manual pruning), Core can download faster than e-lite
-indexes. The prune gate keeps the index safe, but the gap can grow on a slow
-disk. The opt-in guard:
+indexes. The prune gate now evaluates pruning every `min_gain_blocks` safe
+blocks (default **10,000**) to avoid constant disk churn; low disk still
+triggers an emergency prune. The opt-in lag guard:
 
 ```bash
 e-lite run --max-bulk-lag-blocks 20000 ...
 ```
 
-pauses Core's P2P while the index is more than 20,000 blocks behind during IBD,
-and resumes when the gap halves. It bounds the gap and reduces disk contention
-at the cost of a longer total sync. `0` (default) disables it. `--core-arg` can
-also reduce Core's own memory/IO footprint (for example
-`--core-arg=-dbcache=128`).
+pauses Core's P2P when the lag grows 20,000 blocks above the baseline seen while
+Core was downloading, and resumes when it falls halfway back. This bounds
+additional separation instead of freezing Core for an entire 300k-block
+catch-up. `0` (default) disables it. `--core-arg` can also reduce Core's own
+memory/IO footprint (for example `--core-arg=-dbcache=128`).
+
+## Application log
+
+`run`, `index` and `serve` tee stdout/stderr to `<data-dir>/e-lite.log` (same
+lines as the console). Use `--log-file`, `--log-max-mib` or `--no-log-file` to
+override; rotation keeps one `e-lite.log.1`.
 
 ## Safety and correctness
 

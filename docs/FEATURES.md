@@ -12,9 +12,10 @@ available**.
 | Core `external`, `auto`, `managed` | experimental | only owned Core can be paused/pruned/stopped |
 | Local Core, LAN Core, WAN via SSH/VPN | experimental | RPC-only for LAN/WAN; no remote block files |
 | Block source `files`, `rpc`, `auto` | experimental | files reads `blk*.dat`, XOR aware, read-only |
-| From-zero pruned IBD with `prune_mib=1` | experimental | manual prune gate; default |
+| From-zero pruned IBD with `prune_mib=1` | experimental | manual prune gate; default 10k safe-block gain |
 | Full node `prune_mib=0` | experimental | no pruning |
 | Automatic pruning `>=550` + opt-in | experimental | hard lag cap + verified gap repair |
+| Parallel decode/txid/Merkle | experimental | readers prepare blocks; apply does UTXO/batch |
 | Disk guard with download/index split | experimental | cgroup/LXC aware |
 | Adaptive profiles and hot reload | experimental | `auto/hdd/ssd/nvme/manual`, `SIGUSR1` |
 | Global RocksDB memory budget | experimental | `RAM/16` memtables, `RAM/4` cache, CPU-capped jobs |
@@ -70,6 +71,7 @@ available**.
 | Feature | Status | Notes |
 |---|---|---|
 | `/status`, `/metrics`, `/healthz` | experimental | loopback by default; memory and TLS counters |
+| Application log `e-lite.log` | experimental | tee of console; rotation; `--log-file`/`--no-log-file` |
 | Ordered startup/shutdown | experimental | `run` waits for Core; threads joined before Core stop |
 | CLI overrides and `--set` | stable | every TOML field; see `docs/CLI.md` |
 | Progress percentages and milestones | experimental | height/Core %, 10k blocks or 6 h; disk usage |

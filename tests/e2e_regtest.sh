@@ -45,6 +45,8 @@ COMMON=(--network regtest --core-datadir "$CORE" --core-rpc "http://127.0.0.1:$R
   >"$RUN/index.log" 2>&1
 grep -q "milestone" "$RUN/index.log" || { cat "$RUN/index.log"; exit 1; }
 grep -q "%" "$RUN/index.log" || { cat "$RUN/index.log"; exit 1; }
+test -f "$DATA/e-lite.log" || { echo "missing e-lite.log"; exit 1; }
+grep -q "tuning profile" "$DATA/e-lite.log" || { cat "$DATA/e-lite.log"; exit 1; }
 
 "$BIN" run "${COMMON[@]}" --no-follow --reorg-window 8 \
   --listen "127.0.0.1:$ELECTRUM_PORT" --metrics "127.0.0.1:$METRICS_PORT" \
@@ -162,6 +164,8 @@ set -e
 echo "shutdown exit=$RC"
 [ "$RC" -eq 0 ] || { cat "$RUN/serve.log"; exit 1; }
 grep -q "stopped at" "$RUN/serve.log" || { cat "$RUN/serve.log"; exit 1; }
+grep -q "started at" "$DATA/e-lite.log" || { tail -40 "$DATA/e-lite.log"; exit 1; }
+grep -q "stopped at" "$DATA/e-lite.log" || { tail -40 "$DATA/e-lite.log"; exit 1; }
 if tail -n 5 "$RUN/serve.log" | grep -qE "Connection refused|mempool refresh"; then
   echo "unexpected shutdown error in serve.log:" >&2
   cat "$RUN/serve.log" >&2

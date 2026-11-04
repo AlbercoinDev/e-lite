@@ -106,9 +106,12 @@ pub struct Stats {
     pub tuning_cache_mib: AtomicU64,
     pub tuning_read_ms: AtomicU64,
     pub tuning_apply_ms: AtomicU64,
+    pub tuning_decode_ms: AtomicU64,
+    pub tuning_wait_ms: AtomicU64,
     pub tuning_commit_ms_ewma: AtomicU64,
     pub tuning_tx_per_sec: AtomicU64,
     pub tuning_cache_hit_pct: AtomicU64,
+    pub tuning_cache_known: AtomicBool,
     pub tuning_profile: AtomicU64,
     pub tuning_adaptive: AtomicBool,
     pub tuning_background_jobs: AtomicU64,
@@ -152,9 +155,12 @@ impl Default for Stats {
             tuning_cache_mib: AtomicU64::new(0),
             tuning_read_ms: AtomicU64::new(0),
             tuning_apply_ms: AtomicU64::new(0),
+            tuning_decode_ms: AtomicU64::new(0),
+            tuning_wait_ms: AtomicU64::new(0),
             tuning_commit_ms_ewma: AtomicU64::new(0),
             tuning_tx_per_sec: AtomicU64::new(0),
             tuning_cache_hit_pct: AtomicU64::new(0),
+            tuning_cache_known: AtomicBool::new(false),
             tuning_profile: AtomicU64::new(0),
             tuning_adaptive: AtomicBool::new(false),
             tuning_background_jobs: AtomicU64::new(0),
@@ -658,9 +664,12 @@ impl Shared {
                 "cache_mib": self.stats.tuning_cache_mib.load(Ordering::Relaxed),
                 "read_ms_ewma": self.stats.tuning_read_ms.load(Ordering::Relaxed),
                 "apply_ms_ewma": self.stats.tuning_apply_ms.load(Ordering::Relaxed),
+                "decode_ms_ewma": self.stats.tuning_decode_ms.load(Ordering::Relaxed),
+                "wait_ms_ewma": self.stats.tuning_wait_ms.load(Ordering::Relaxed),
                 "commit_ms_ewma": self.stats.tuning_commit_ms_ewma.load(Ordering::Relaxed),
                 "tx_per_sec": self.stats.tuning_tx_per_sec.load(Ordering::Relaxed),
                 "cache_hit_pct": self.stats.tuning_cache_hit_pct.load(Ordering::Relaxed),
+                "cache_hit_known": self.stats.tuning_cache_known.load(Ordering::Relaxed),
                 "profile": match self.stats.tuning_profile.load(Ordering::Relaxed) {
                     1 => "hdd", 2 => "ssd", 3 => "nvme", 4 => "manual", _ => "auto"
                 },
@@ -2016,6 +2025,18 @@ fn metrics_text(shared: &Shared) -> String {
         "Effective commit interval",
         "gauge",
         st["tuning"]["commit_interval_ms"].as_u64().unwrap_or(0),
+    );
+    line(
+        "e_lite_tuning_decode_ms",
+        "Block decode/hash latency (EWMA)",
+        "gauge",
+        st["tuning"]["decode_ms_ewma"].as_u64().unwrap_or(0),
+    );
+    line(
+        "e_lite_tuning_wait_ms",
+        "Pipeline wait latency (EWMA)",
+        "gauge",
+        st["tuning"]["wait_ms_ewma"].as_u64().unwrap_or(0),
     );
     line(
         "e_lite_tuning_cache_mib",

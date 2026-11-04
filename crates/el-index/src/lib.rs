@@ -170,8 +170,60 @@ fn is_provably_unspendable(script: &[u8]) -> bool {
     script.first() == Some(&0x6a) // OP_RETURN
 }
 
+/// A block already decoded, hash-checked and Merkle-validated in a reader
+/// thread. The apply thread only performs continuity, UTXO work and batch
+/// writes, which overlaps the CPU-heavy decode with the previous block.
+pub struct PreparedBlock {
+    pub block: bitcoin::Block,
+    pub block_hash: Hash32,
+    pub txids: Vec<Hash32>,
+}
+
+fn compute_txids(block: &bitcoin::Block) -> Result<Vec<Hash32>> {
+    block
+        .txdata
+        .iter()
+        .map(|tx| hash_from_txid(&tx.compute_txid()))
+        .collect::<Result<Vec<_>>>()
+}
+
+fn validate_merkle(block: &bitcoin::Block, txids: &[Hash32], height: u32) -> Result<()> {
+    let expected_merkle =
+        Hash32::from_hex(&block.header.merkle_root.to_string()).map_err(IndexError::Message)?;
+    match merkle_root(txids) {
+        Some(root) if root == expected_merkle => Ok(()),
+        _ => Err(IndexError::MerkleMismatch { height }),
+    }
+}
+
+/// Decode and validate a block outside the apply thread.
+pub fn prepare_block_bytes(
+    bytes: &[u8],
+    expected_hash: &str,
+    height: u32,
+) -> Result<PreparedBlock> {
+    let block: bitcoin::Block = bitcoin::consensus::deserialize(bytes)
+        .map_err(|e| IndexError::Message(format!("cannot decode block {height}: {e}")))?;
+    let block_hash = hash_from_blockhash(&block.block_hash())?;
+    if block_hash.to_hex() != expected_hash {
+        return Err(IndexError::Message(format!(
+            "block hash mismatch at {height}: expected {expected_hash}, computed {}",
+            block_hash.to_hex()
+        )));
+    }
+    let txids = compute_txids(&block)?;
+    validate_merkle(&block, &txids, height)?;
+    Ok(PreparedBlock {
+        block,
+        block_hash,
+        txids,
+    })
+}
+
 /// Apply one block into `batch`, updating the overlay. The caller commits the
 /// batch (plus the tip) atomically and then appends `txids` to the flat file.
+/// This compatibility wrapper prepares the block in the caller's thread; the
+/// indexer uses `prepare_block_bytes` in its reader threads and `apply_prepared`.
 pub fn apply_block(
     store: &Store,
     height: u32,
@@ -181,8 +233,49 @@ pub fn apply_block(
     batch: &mut WriteBatch,
     store_undo: bool,
 ) -> Result<ApplyOutcome> {
-    // --- continuity -------------------------------------------------------
     let block_hash = hash_from_blockhash(&block.block_hash())?;
+    let txids = compute_txids(block)?;
+    validate_merkle(block, &txids, height)?;
+    apply_inner(
+        store, height, block, block_hash, &txids, prev_tip, overlay, batch, store_undo,
+    )
+}
+
+pub fn apply_prepared(
+    store: &Store,
+    height: u32,
+    prepared: &PreparedBlock,
+    prev_tip: Option<IndexedTip>,
+    overlay: &mut GroupOverlay,
+    batch: &mut WriteBatch,
+    store_undo: bool,
+) -> Result<ApplyOutcome> {
+    apply_inner(
+        store,
+        height,
+        &prepared.block,
+        prepared.block_hash,
+        &prepared.txids,
+        prev_tip,
+        overlay,
+        batch,
+        store_undo,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn apply_inner(
+    store: &Store,
+    height: u32,
+    block: &bitcoin::Block,
+    block_hash: Hash32,
+    txids: &[Hash32],
+    prev_tip: Option<IndexedTip>,
+    overlay: &mut GroupOverlay,
+    batch: &mut WriteBatch,
+    store_undo: bool,
+) -> Result<ApplyOutcome> {
+    // --- continuity -------------------------------------------------------
     let prev_hash = hash_from_blockhash(&block.header.prev_blockhash)?;
     let expected_height = prev_tip.map(|t| t.height + 1).unwrap_or(0);
     if height != expected_height {
@@ -205,21 +298,6 @@ pub fn apply_block(
             expected_prev: Hash32::ZERO.to_hex(),
             got_prev: prev_hash.to_hex(),
         });
-    }
-
-    // --- txids and merkle -------------------------------------------------
-    // Compute every TXID once; the merkle root and the apply loop both use this
-    // list instead of re-serialising every transaction twice.
-    let txids: Vec<Hash32> = block
-        .txdata
-        .iter()
-        .map(|tx| hash_from_txid(&tx.compute_txid()))
-        .collect::<Result<Vec<_>>>()?;
-    let expected_merkle =
-        Hash32::from_hex(&block.header.merkle_root.to_string()).map_err(IndexError::Message)?;
-    match merkle_root(&txids) {
-        Some(root) if root == expected_merkle => {}
-        _ => return Err(IndexError::MerkleMismatch { height }),
     }
 
     // Prefetch every prevout that is not created inside this block in one
@@ -396,7 +474,7 @@ pub fn apply_block(
 
     Ok(ApplyOutcome {
         undo,
-        txids,
+        txids: txids.to_vec(),
         txnum_base,
         tip,
         touched_scripts,

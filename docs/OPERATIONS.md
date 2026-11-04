@@ -186,7 +186,9 @@ stream {
 | `>=550` | Core automatic pruning; requires `allow_auto_prune = true` |
 
 Manual mode: the prune gate uses min(`index - 288`, readers, `tip - 288`) and
-throttles requests. Core may return a lower height because it prunes whole files.
+throttles requests. By default it evaluates pruning every **10,000** safe blocks
+(`min_gain_blocks`), which keeps disk churn low; low disk still triggers an
+emergency prune. Core may return a lower height because it prunes whole files.
 
 Automatic mode: a 224-block lag guard, fast tip checks and a bounded verified
 gap-repair path protect the index. It is opt-in.
@@ -229,6 +231,21 @@ kill -USR1 "$(pgrep -f 'e-lite run')"
 Cold fields (`prune_mib`, `block_source`, `reorg_window`, data dir/network)
 require restart. Full details in [`TUNING.md`](TUNING.md).
 
+## Logs
+
+`run`, `index` and `serve` write the same lines shown on screen to
+`<data-dir>/e-lite.log` (per network). Rotation keeps `e-lite.log.1` at 64 MiB by
+default. Override with `--log-file`, `--log-max-mib` or `--no-log-file`, or:
+
+```toml
+[logging]
+file = "/var/log/e-lite/e-lite.log"
+max_mib = 64
+```
+
+Core's own log is separate: `<data-dir>/bitcoind.log` (or `[core] log_file`), and
+`e-lite core logs` prints its tail.
+
 ## Monitoring
 
 ```bash
@@ -240,7 +257,9 @@ curl -s http://127.0.0.1:9184/metrics | grep -E 'e_lite_(lag|tuning|tx_per_sec|c
 ```
 
 Useful fields: `state`, `indexed_height`, `core_height`, `lag_blocks`,
-`retention_blocks`, `core.pruneheight`, `disk_free_bytes`, `disk_low`, `tuning`.
+`retention_blocks`, `core.pruneheight`, `disk_free_bytes`, `disk_low`,
+`memory`, `tuning` (`read_ms_ewma`, `decode_ms_ewma`, `wait_ms_ewma`,
+`apply_ms_ewma`, `commit_ms_ewma`, `cache_hit_pct`/`cache_hit_known`).
 
 ## Troubleshooting
 

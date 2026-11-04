@@ -105,9 +105,12 @@ pub struct Tunables {
     // Exportable performance signals.
     pub read_ms: AtomicU64,
     pub apply_ms: AtomicU64,
+    pub decode_ms: AtomicU64,
+    pub wait_ms: AtomicU64,
     pub commit_ewma: AtomicU64,
     pub tx_per_sec: AtomicU64,
     pub cache_hit_pct: AtomicU64,
+    cache_known: AtomicBool,
 
     last_change: Mutex<Instant>,
 }
@@ -184,10 +187,15 @@ impl Tunables {
             Profile::Nvme => 16,
             Profile::Auto | Profile::Manual => 32,
         };
-        let readers = readers.clamp(1, max_readers);
+        let cpu_reader_cap = cpus.saturating_mul(2).max(2);
+        let readers = if cfg.index.readers > 0 {
+            readers.clamp(1, max_readers)
+        } else {
+            readers.clamp(1, max_readers).min(cpu_reader_cap)
+        };
         let cache_mib = cache_mib.clamp(64, max_cache_mib);
-        let commit_ms = commit_ms.clamp(500, 10_000);
-        let batch_blocks = batch_blocks.clamp(16, 2048);
+        let commit_ms = commit_ms.clamp(500, 30_000);
+        let batch_blocks = batch_blocks.clamp(16, 4096);
 
         Tunables {
             readers: AtomicUsize::new(readers),
@@ -212,16 +220,19 @@ impl Tunables {
             background_jobs: AtomicUsize::new(jobs.clamp(1, 32)),
             min_readers: 1,
             min_commit_ms: 500,
-            max_commit_ms: 10_000,
+            max_commit_ms: 30_000,
             min_cache_mib: 64,
             max_cache_mib,
             min_batch: 16,
-            max_batch: 2048,
+            max_batch: 4096,
             read_ms: AtomicU64::new(0),
             apply_ms: AtomicU64::new(0),
+            decode_ms: AtomicU64::new(0),
+            wait_ms: AtomicU64::new(0),
             commit_ewma: AtomicU64::new(0),
             tx_per_sec: AtomicU64::new(0),
             cache_hit_pct: AtomicU64::new(0),
+            cache_known: AtomicBool::new(false),
             last_change: Mutex::new(
                 Instant::now()
                     .checked_sub(Duration::from_secs(120))
@@ -251,6 +262,15 @@ impl Tunables {
     pub fn prefetch_blocks(&self) -> usize {
         self.prefetch_blocks.load(Ordering::Relaxed)
     }
+    pub fn cache_known(&self) -> bool {
+        self.cache_known.load(Ordering::Relaxed)
+    }
+    pub fn decode_ms(&self) -> u64 {
+        self.decode_ms.load(Ordering::Relaxed)
+    }
+    pub fn wait_ms(&self) -> u64 {
+        self.wait_ms.load(Ordering::Relaxed)
+    }
 
     /// Apply cache capacity and mutable RocksDB options to an open store.
     pub fn apply_store(&self, store: &Store) {
@@ -276,12 +296,16 @@ impl Tunables {
     }
 
     fn profile_max_readers(&self) -> usize {
-        match self.profile() {
+        let cpus = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4);
+        let base = match self.profile() {
             Profile::Hdd => 4,
             Profile::Ssd => 8,
             Profile::Nvme => 16,
             Profile::Auto | Profile::Manual => 32,
-        }
+        };
+        base.min(cpus.saturating_mul(2).max(2))
     }
 
     fn memory_reader_cap(&self) -> usize {
@@ -297,6 +321,12 @@ impl Tunables {
     pub fn record_apply(&self, d: Duration) {
         ewma(&self.apply_ms, d.as_millis() as u64);
     }
+    pub fn record_decode(&self, d: Duration) {
+        ewma(&self.decode_ms, d.as_millis() as u64);
+    }
+    pub fn record_wait(&self, d: Duration) {
+        ewma(&self.wait_ms, d.as_millis() as u64);
+    }
     pub fn record_commit(&self, d: Duration) {
         ewma(&self.commit_ewma, d.as_millis() as u64);
     }
@@ -311,9 +341,11 @@ impl Tunables {
         let cpus = std::thread::available_parallelism()
             .map(|n| n.get())
             .unwrap_or(4);
+        let reader_cap = cpus.saturating_mul(2).max(2);
         match profile {
             Profile::Hdd => {
-                self.readers.store(2, Ordering::Relaxed);
+                self.readers
+                    .store(2usize.min(reader_cap), Ordering::Relaxed);
                 self.commit_ms.store(5_000, Ordering::Relaxed);
                 self.batch_blocks.store(512, Ordering::Relaxed);
                 self.max_group_txs.store(500_000, Ordering::Relaxed);
@@ -321,7 +353,8 @@ impl Tunables {
                     .store(4usize.min(cpus.max(1)), Ordering::Relaxed);
             }
             Profile::Ssd => {
-                self.readers.store(8, Ordering::Relaxed);
+                self.readers
+                    .store(8usize.min(reader_cap), Ordering::Relaxed);
                 self.commit_ms.store(2_000, Ordering::Relaxed);
                 self.batch_blocks.store(256, Ordering::Relaxed);
                 self.max_group_txs.store(250_000, Ordering::Relaxed);
@@ -329,7 +362,8 @@ impl Tunables {
                     .store(8usize.min(cpus.max(1)), Ordering::Relaxed);
             }
             Profile::Nvme => {
-                self.readers.store(16, Ordering::Relaxed);
+                self.readers
+                    .store(16usize.min(reader_cap), Ordering::Relaxed);
                 self.commit_ms.store(2_000, Ordering::Relaxed);
                 self.batch_blocks.store(256, Ordering::Relaxed);
                 self.max_group_txs.store(250_000, Ordering::Relaxed);
@@ -467,14 +501,21 @@ impl Tunables {
             }
         }
         if let Some(pct) = store.cache_hit_pct() {
+            self.cache_known.store(true, Ordering::Relaxed);
             self.record_cache_hit_pct(pct);
+        } else {
+            self.cache_known.store(false, Ordering::Relaxed);
         }
 
         let mut action = None;
 
-        // Commit/fsync pain: amortise with larger groups on slow storage.
+        // Commit/fsync pain: amortise with larger groups on slow storage. Avoid
+        // growing the group when commit already dominates the interval; in that
+        // case shrink the group to reduce the per-commit stall.
+        let commit_share = commit_ms as f64 / self.commit_ms().max(1) as f64;
         if !self.commit_locked.load(Ordering::Relaxed)
             && commit_ms > 500
+            && commit_share < 0.5
             && self.commit_ms() < self.max_commit_ms
         {
             let v = (self.commit_ms() * 3 / 2).min(self.max_commit_ms);
@@ -482,7 +523,18 @@ impl Tunables {
             let b = (self.batch_blocks() * 3 / 2).min(self.max_batch);
             self.batch_blocks.store(b, Ordering::Relaxed);
             action = Some(format!(
-                "commit {commit_ms}ms: interval -> {v}ms, batch -> {b}"
+                "commit {commit_ms}ms ({:.0}% of interval): interval -> {v}ms, batch -> {b}",
+                commit_share * 100.0
+            ));
+        } else if !self.commit_locked.load(Ordering::Relaxed)
+            && commit_share > 0.75
+            && self.batch_blocks() > self.min_batch.saturating_mul(4)
+        {
+            let b = (self.batch_blocks() * 3 / 4).max(self.min_batch);
+            self.batch_blocks.store(b, Ordering::Relaxed);
+            action = Some(format!(
+                "commit {commit_ms}ms ({:.0}% of interval): batch -> {b}",
+                commit_share * 100.0
             ));
         } else if !self.commit_locked.load(Ordering::Relaxed)
             && mode == Mode::Live
@@ -573,6 +625,12 @@ impl Tunables {
             .tuning_apply_ms
             .store(self.apply_ms.load(Ordering::Relaxed), Ordering::Relaxed);
         stats
+            .tuning_decode_ms
+            .store(self.decode_ms.load(Ordering::Relaxed), Ordering::Relaxed);
+        stats
+            .tuning_wait_ms
+            .store(self.wait_ms.load(Ordering::Relaxed), Ordering::Relaxed);
+        stats
             .tuning_commit_ms_ewma
             .store(self.commit_ewma.load(Ordering::Relaxed), Ordering::Relaxed);
         stats
@@ -582,6 +640,9 @@ impl Tunables {
             self.cache_hit_pct.load(Ordering::Relaxed),
             Ordering::Relaxed,
         );
+        stats
+            .tuning_cache_known
+            .store(self.cache_known.load(Ordering::Relaxed), Ordering::Relaxed);
         stats
             .tuning_profile
             .store(self.profile().code() as u64, Ordering::Relaxed);

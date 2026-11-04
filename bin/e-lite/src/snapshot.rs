@@ -111,8 +111,15 @@ fn add_tree<W: Write>(builder: &mut tar::Builder<W>, base: &Path, dir: &Path) ->
         let entry = entry?;
         let name = entry.file_name();
         let name = name.to_string_lossy();
-        // The rawtx cache is rebuildable and can be large.
-        if name == "rawtx-cache" || name == "LOG" || name == "LOCK" {
+        // The rawtx cache is rebuildable and can be large. Logs and runtime
+        // markers are not part of the index either.
+        if name == "rawtx-cache"
+            || name == "LOG"
+            || name == "LOCK"
+            || name == "e-lite.log"
+            || name == "e-lite.log.1"
+            || name == "core-paused-by-e-lite"
+        {
             continue;
         }
         let path = entry.path();

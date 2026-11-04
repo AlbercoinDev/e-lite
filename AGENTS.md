@@ -52,7 +52,8 @@ Never treat a version number in this file as authoritative over the code/tag.
 ## Current defaults worth remembering
 
 - From-zero pruned IBD uses `prune_mib = 1` (manual pruning). Core never prunes
-  on its own; the prune gate keeps the cut below `index - 288`.
+  on its own; the prune gate keeps the cut below `index - 288` and evaluates
+  pruning every 10,000 safe blocks by default (low disk bypasses it).
 - `prune_mib >= 550` requires `[pruning] allow_auto_prune = true`.
 - Snapshots are optional; they are never required by the from-zero flow.
 - Electrum listens on `127.0.0.1:50001` (plain) by default. Optional TLS uses a
@@ -61,6 +62,8 @@ Never treat a version number in this file as authoritative over the code/tag.
 - Core RPC is HTTP; LAN/WAN use requires SSH/VPN.
 - RocksDB memory is budgeted globally (`RAM/16` for memtables, cache `RAM/4`),
   background jobs are CPU-capped, and every knob is available via CLI/`--set`.
+- `run`/`index`/`serve` tee console output to `<data-dir>/e-lite.log`
+  (`--log-file`, `--log-max-mib`, `--no-log-file`).
 - Raw transactions are local-first. External fallback requests whole blocks by
   hash, validates them, uses Tor by default and never sends wallet txids/scripts.
 
