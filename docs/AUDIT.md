@@ -1,7 +1,7 @@
 # Code audit
 
-**Base:** `0.1.0-alpha.15` → published `0.1.0-alpha.16` · **Scope:** `bin/e-lite`, `crates/*` (25 Rust files,
-~15.9k lines) · **Status:** findings fixed in `0.1.0-alpha.16` where noted.
+**Base:** `0.1.0-alpha.16` → published `0.1.0-alpha.17` · **Scope:** `bin/e-lite`, `crates/*` (25 Rust files,
+~16k lines) · **Status:** findings fixed in `0.1.0-alpha.17` where noted.
 
 This audit is not a claim of formal verification. It records static checks,
 manual review areas, concrete findings and residual risks.
@@ -34,14 +34,15 @@ Additional checks performed:
 | AUD-003 | P1 | Snapshot import | `bin/e-lite/src/snapshot.rs` | A tar containing symlinks/hardlinks/device nodes could escape the target or create special files. | Reject every entry that is not a regular file or directory; regression test `import_rejects_symlink_entries`. |
 | AUD-004 | P2 | Snapshot import | same | No archive size/entry-count limit; a malicious snapshot can exhaust disk. | Residual risk, documented. Import is operator-supplied, but a `snapshot_max_bytes` limit is a future hardening item. |
 | AUD-005 | P2 | Rawtx providers | `crates/el-rawtx/src/esplora.rs` | Non-HTTP endpoints were accepted by config and failed later. | Skip endpoints not starting with `http://`/`https://`; test `refuses_non_http_endpoints`. |
-| AUD-006 | P2 | Public listener | `bin/e-lite/src/main.rs` | `listen` could be set to `0.0.0.0`/LAN without TLS or auth; only documentation warned. | Startup warning for Electrum and metrics listeners that are not loopback. |
+| AUD-006 | P2 | Public listener | `bin/e-lite/src/main.rs` | `listen` could be set to `0.0.0.0`/LAN without TLS or auth; only documentation warned. | Startup warning for Electrum and metrics listeners that are not loopback; optional TLS since alpha.17 (AUD-018). |
 | AUD-007 | P1 | LXC memory | `bin/e-lite/src/tuning.rs` | alpha.14 raised readers to 28 on low read latency and used host `MemTotal`, causing OOM kills in LXC. | Reader caps 4/8/16, cgroup v2/v1 memory accounting, memory-pressure backoff and explicit overrides. |
+| AUD-018 | P1 | Electrum transport | `crates/el-serve/src/lib.rs` | Electrum could only be plain TCP; LAN/WAN traffic had no encryption in e-lite. | Optional TLS listener (rustls, TLS 1.2+) with PEM cert/key, 10 s handshake timeout, same 1 MiB line cap and mtime-based certificate reload. Tests `tls_listener_completes_handshake_and_serves`, `tls_watcher_reloads_changed_pem_and_keeps_old_on_error`, `e2e_regtest.sh`. |
 
 ## Residual risks and intentional limits
 
 | ID | Sev. | Area | Risk | Current mitigation |
 |---|---|---|---|---|
-| AUD-010 | P1 | Electrum exposure | No TLS, authentication or per-request rate limit. A non-loopback listener is plain TCP. | Loopback default, startup warning; use SSH/VPN/reverse proxy; TLS is roadmap. |
+| AUD-010 | P1 | Electrum exposure | No client authentication or per-request rate limit. A non-loopback listener accepts any client that can reach the port; TLS only encrypts the transport. | Loopback default, startup warning, optional TLS with certificate reload; use firewall/IP allowlist/SSH/VPN/Tor. Rate limiting and wallet-compatible authentication remain roadmap. |
 | AUD-011 | P1 | Core RPC | HTTP only, no TLS. Credentials/cookie traverse the connection in clear text. | Loopback default; LAN/WAN requires SSH/VPN; documented. |
 | AUD-012 | P2 | External rawtx | Provider can withhold blocks; provider learns the set of block hashes fetched. | Whole blocks only, decoys, random source order, Tor by default, validation and cache. |
 | AUD-013 | P2 | Silent payments | BIP352 scan key/indexer not implemented; only the opt-in gate exists. | Methods return an explicit error; feature not advertised. |

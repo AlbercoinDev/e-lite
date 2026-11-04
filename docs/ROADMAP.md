@@ -7,8 +7,7 @@ acceptance signal that would move it to `FEATURES.md`.
 
 | Priority | Item | Why / acceptance |
 |---|---|---|
-| P1 | **TLS on a separate Electrum port** (e.g. TCP 50002) | optional cert/key config; plain 50001 remains loopback. Accept when Electrum/Sparrow connects over TLS with a test cert and no regression in plain mode. |
-| P1 | Authentication/rate limiting for non-loopback Electrum | token/basic policy, per-client request budget, connection limits; needed before any public listener. |
+| P1 | Authentication and rate limiting for non-loopback Electrum | Electrum has no standard client authentication; a token/basic policy or mTLS is not wallet-compatible. At minimum add per-client request budgets and document firewall/IP allowlist/VPN/Tor. TLS on a separate listener is already implemented. |
 | P1 | Core RPC over TLS or a documented authenticated tunnel | avoids cleartext credentials on LAN/WAN. Could be native TLS or a mandatory SSH/VPN recipe with tests. |
 | P2 | Onion service packaging | publish Electrum over Tor without exposing a clearnet port. |
 | P2 | Electrum 1.7 | feature negotiation and new methods; only when tested against Sparrow/Electrum. |

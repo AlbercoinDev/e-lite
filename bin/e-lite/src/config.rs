@@ -175,14 +175,33 @@ impl Default for IndexCfg {
 pub struct ServerCfg {
     #[serde(default = "d_listen")]
     pub listen: String,
+    /// Optional TLS listener (for example `127.0.0.1:50002`). Empty disables
+    /// TLS; the plain listener keeps working.
+    #[serde(default)]
+    pub tls_listen: String,
+    /// PEM certificate chain (a public CA certificate can be reused).
+    #[serde(default)]
+    pub tls_cert: String,
+    /// PEM private key matching `tls_cert`.
+    #[serde(default)]
+    pub tls_key: String,
     #[serde(default = "d_clients")]
     pub max_clients: usize,
+}
+
+impl ServerCfg {
+    pub fn tls_enabled(&self) -> bool {
+        !self.tls_listen.trim().is_empty()
+    }
 }
 
 impl Default for ServerCfg {
     fn default() -> Self {
         ServerCfg {
             listen: d_listen(),
+            tls_listen: String::new(),
+            tls_cert: String::new(),
+            tls_key: String::new(),
             max_clients: d_clients(),
         }
     }
@@ -494,6 +513,24 @@ impl Config {
         if self.server.max_clients == 0 {
             return Err("[server] max_clients must be >= 1".to_string());
         }
+        if self.server.tls_enabled() {
+            if self.server.tls_cert.trim().is_empty() || self.server.tls_key.trim().is_empty() {
+                return Err(
+                    "[server] tls_listen requires both tls_cert and tls_key (PEM files)"
+                        .to_string(),
+                );
+            }
+            if self.server.tls_listen.trim() == self.server.listen.trim() {
+                return Err("[server] tls_listen must differ from listen".to_string());
+            }
+        } else if !self.server.tls_cert.trim().is_empty() || !self.server.tls_key.trim().is_empty()
+        {
+            return Err(
+                "[server] tls_cert/tls_key are set but tls_listen is empty; \
+                 set tls_listen or remove them"
+                    .to_string(),
+            );
+        }
         if self.pruning.min_free_gib == 0 {
             return Err("[pruning] min_free_gib must be >= 1".to_string());
         }
@@ -602,5 +639,25 @@ mod tests {
         cfg.core.core_datadir = Some("/srv/bitcoin".to_string());
         cfg.network.data_dir = Some("/srv/e-lite".to_string());
         assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn tls_listener_requires_cert_and_key() {
+        let mut cfg = Config::default();
+        cfg.server.tls_listen = "127.0.0.1:50002".to_string();
+        assert!(cfg.validate().is_err());
+        cfg.server.tls_cert = "/etc/e-lite/tls/cert.pem".to_string();
+        cfg.server.tls_key = "/etc/e-lite/tls/key.pem".to_string();
+        assert!(cfg.validate().is_ok());
+        cfg.server.listen = "127.0.0.1:50002".to_string();
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn tls_files_without_listener_are_rejected() {
+        let mut cfg = Config::default();
+        cfg.server.tls_cert = "/etc/e-lite/tls/cert.pem".to_string();
+        cfg.server.tls_key = "/etc/e-lite/tls/key.pem".to_string();
+        assert!(cfg.validate().is_err());
     }
 }

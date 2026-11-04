@@ -9,9 +9,10 @@ BIN="${E_LITE_BIN:-$PWD/target/debug/e-lite}"
 command -v bitcoind >/dev/null || { echo "bitcoind not found" >&2; exit 1; }
 
 RUN="$(mktemp -d "${TMPDIR:-/tmp}/e-lite-e2e-XXXXXX")"
-CORE="$RUN/core"; DATA="$RUN/index"
+CORE="$RUN/core"; DATA="$RUN/index"; TLS_DIR="$RUN/tls"
 RPC_PORT="${E_LITE_E2E_RPC_PORT:-18443}"
 ELECTRUM_PORT="${E_LITE_E2E_ELECTRUM_PORT:-15001}"
+TLS_PORT="${E_LITE_E2E_TLS_PORT:-15002}"
 METRICS_PORT="${E_LITE_E2E_METRICS_PORT:-19184}"
 
 cleanup() {
@@ -23,7 +24,10 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-mkdir -p "$CORE" "$DATA"
+mkdir -p "$CORE" "$DATA" "$TLS_DIR"
+cp crates/el-serve/tests/fixtures/tls-cert.pem "$TLS_DIR/cert.pem"
+cp crates/el-serve/tests/fixtures/tls-key.pem "$TLS_DIR/key.pem"
+cp crates/el-serve/tests/fixtures/tls-ca.pem "$TLS_DIR/ca.pem"
 bitcoind -regtest -datadir="$CORE" -daemon -server -listen=0 \
   -rpcport="$RPC_PORT" -fallbackfee=0.0002 >/dev/null
 CLI="bitcoin-cli -regtest -datadir=$CORE -rpcport=$RPC_PORT"
@@ -35,11 +39,13 @@ HEIGHT=$($CLI getblockcount)
 
 COMMON=(--network regtest --core-datadir "$CORE" --core-rpc "http://127.0.0.1:$RPC_PORT" --data-dir "$DATA" --min-free-gib 1)
 "$BIN" init "${COMMON[@]}"
-"$BIN" doctor "${COMMON[@]}" --listen "127.0.0.1:$ELECTRUM_PORT" --metrics "127.0.0.1:$METRICS_PORT"
+"$BIN" doctor "${COMMON[@]}" --listen "127.0.0.1:$ELECTRUM_PORT" --metrics "127.0.0.1:$METRICS_PORT" \
+  --tls-listen "127.0.0.1:$TLS_PORT" --tls-cert "$TLS_DIR/cert.pem" --tls-key "$TLS_DIR/key.pem"
 "$BIN" index "${COMMON[@]}" --no-follow --batch 16 --reorg-window 8
 
 "$BIN" run "${COMMON[@]}" --no-follow --reorg-window 8 \
   --listen "127.0.0.1:$ELECTRUM_PORT" --metrics "127.0.0.1:$METRICS_PORT" \
+  --tls-listen "127.0.0.1:$TLS_PORT" --tls-cert "$TLS_DIR/cert.pem" --tls-key "$TLS_DIR/key.pem" \
   >"$RUN/serve.log" 2>&1 &
 echo $! >"$RUN/serve.pid"
 for _ in $(seq 1 100); do
@@ -86,6 +92,34 @@ assert call(9, "blockchain.transaction.get_merkle", [txid, txheight])["pos"] >= 
 assert call(10, "blockchain.transaction.id_from_pos", [txheight, 0, False]) == txid
 assert call(11, "blockchain.scripthash.get_history", ["00"*32]) == []
 print("electrum queries OK")
+PY
+
+echo "== Electrum over TLS =="
+python3 - "$TLS_PORT" "$HEIGHT" "$TLS_DIR/ca.pem" <<'PY'
+import json, socket, ssl, sys
+port, height, ca = int(sys.argv[1]), int(sys.argv[2]), sys.argv[3]
+ctx = ssl.create_default_context(cafile=ca)
+with socket.create_connection(("127.0.0.1", port), timeout=10) as raw:
+    with ctx.wrap_socket(raw, server_hostname="localhost") as s:
+        f = s.makefile("rwb")
+        def call(i, m, p):
+            f.write((json.dumps({"jsonrpc":"2.0","id":i,"method":m,"params":p})+"\n").encode()); f.flush()
+            r = json.loads(f.readline())
+            assert "error" not in r, r
+            return r["result"]
+        assert call(1, "server.version", ["e2e-tls", "1.4"])[1] == "1.4"
+        assert call(2, "blockchain.headers.subscribe", [])["height"] == height
+        assert call(3, "blockchain.scripthash.get_history", ["00"*32]) == []
+print("electrum TLS queries OK")
+PY
+curl -sf "http://127.0.0.1:$METRICS_PORT/status" >"$RUN/status-tls.json"
+python3 - "$RUN/status-tls.json" "$TLS_PORT" <<'PY'
+import json, sys
+st = json.load(open(sys.argv[1]))
+assert st["tls_listen"] == f"127.0.0.1:{int(sys.argv[2])}", st.get("tls_listen")
+assert st["tls_handshakes"] >= 1, st.get("tls_handshakes")
+assert st["tls_handshake_failures"] == 0, st.get("tls_handshake_failures")
+print("TLS status counters OK")
 PY
 
 echo "== Sparrow-like sequence: fees, broadcast, mempool, notifications =="

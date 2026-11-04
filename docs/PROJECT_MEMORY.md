@@ -28,15 +28,17 @@ Every documentation rewrite must cover:
 - current features (`docs/FEATURES.md`);
 - future features and proposed improvements (`docs/ROADMAP.md`).
 
-Do not claim TLS, Electrum 1.7, BIP352 silent payments or external-provider
-features that are not implemented. TLS is currently a roadmap item.
+Do not claim client authentication, rate limiting, Electrum 1.7, BIP352 silent
+payments or external-provider features that are not implemented. Electrum TLS on
+a separate listener is implemented; authentication and rate limiting are not.
 
 ## Safety defaults
 
 - `prune_mib = 1` for from-zero pruned IBD; `prune_mib >= 550` needs
   `allow_auto_prune = true`.
 - Snapshots are optional, never required by the from-zero flow.
-- Electrum is plain TCP and loopback by default.
+- Electrum is plain TCP and loopback by default; TLS is an optional separate
+  listener and does not authenticate clients.
 - Core RPC is HTTP; use SSH/VPN for LAN/WAN.
 - Rawtx external lookup is block-based, validated, Tor-first and decoy-enhanced.
 

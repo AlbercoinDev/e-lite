@@ -106,5 +106,7 @@ and should be restricted to loopback/self-hosted use.
   balances and UTXOs still work from the index.
 - External providers can be unavailable, rate-limited or blocked. Configure
   multiple `esplora_urls`/`p2p_peers` or use a full node if this matters.
-- TLS is not implemented for Electrum or Core RPC. Use loopback, SSH/VPN or a
-  reverse proxy with TLS for remote access.
+- Electrum has an optional TLS listener (`[server] tls_listen`) for LAN/WAN
+  wallets. TLS protects the transport but does not authenticate the wallet; use
+  loopback, SSH/VPN, a firewall or a TLS reverse proxy. Core RPC has no TLS in
+  e-lite.

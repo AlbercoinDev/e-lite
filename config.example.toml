@@ -47,6 +47,14 @@ poll_seconds = 10
 [server]
 listen = "127.0.0.1:50001"
 max_clients = 32
+# Optional TLS listener. Empty disables TLS; the plain listener keeps working.
+# The certificate is validated against the hostname the client connects to, so
+# a public-domain certificate only works when the wallet uses that name (use
+# split-DNS for LAN access). A self-signed/internal CA certificate also works if
+# the wallet trusts it. The PEM files are reloaded when they change on disk.
+# tls_listen = "127.0.0.1:50002"
+# tls_cert = "/etc/e-lite/tls/fullchain.pem"
+# tls_key = "/etc/e-lite/tls/privkey.pem"
 
 [metrics]
 enabled = true

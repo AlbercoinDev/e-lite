@@ -47,15 +47,15 @@ export PATH="$HOME/.local/bin:$PATH"
 ## Pinned version
 
 ```bash
-curl -fsSL https://github.com/AlbercoinDev/e-lite/releases/download/v0.1.0-alpha.16/install.sh \
-  | sh -s -- --version 0.1.0-alpha.16 --yes
+curl -fsSL https://github.com/AlbercoinDev/e-lite/releases/download/v0.1.0-alpha.17/install.sh \
+  | sh -s -- --version 0.1.0-alpha.17 --yes
 ```
 
 With Core:
 
 ```bash
-curl -fsSL https://github.com/AlbercoinDev/e-lite/releases/download/v0.1.0-alpha.16/install.sh \
-  | sh -s -- --version 0.1.0-alpha.16 --with-core --yes
+curl -fsSL https://github.com/AlbercoinDev/e-lite/releases/download/v0.1.0-alpha.17/install.sh \
+  | sh -s -- --version 0.1.0-alpha.17 --with-core --yes
 ```
 
 ## System-wide .deb
@@ -96,6 +96,23 @@ install -m 0755 target/release/e-lite "$HOME/.local/bin/e-lite"
 e-lite --version
 sha256sum -c SHA256SUMS   # inside the release artifact directory
 ```
+
+## Electrum connection
+
+Wallets connect to `127.0.0.1:50001` by default (plain TCP). TLS is optional and
+uses a separate listener:
+
+```toml
+[server]
+tls_listen = "127.0.0.1:50002"
+tls_cert = "/etc/e-lite/tls/fullchain.pem"
+tls_key = "/etc/e-lite/tls/privkey.pem"
+```
+
+The certificate must match the name the wallet uses (not a private IP). See
+[`OPERATIONS.md`](OPERATIONS.md#electrum-tls-optional) for Let's Encrypt reuse,
+renewal without restart, split-DNS and the nginx `stream` alternative. No TLS
+configuration is needed for a local-only setup.
 
 ## Update safely
 

@@ -149,6 +149,7 @@ fn fixture() -> (Fixture, ScriptHash, Hash32) {
         data_dir: dir.clone(),
         core_datadir: dir.clone(),
         listen: "127.0.0.1:0".to_string(),
+        tls_listen: None,
         max_clients: 4,
         state: AtomicU8::new(state::READY),
         lock: Arc::new(RwLock::new(())),
@@ -434,6 +435,7 @@ fn slow_transaction_get_does_not_hold_the_index_lock() {
         data_dir: dir.clone(),
         core_datadir: dir.clone(),
         listen: "127.0.0.1:0".to_string(),
+        tls_listen: None,
         max_clients: 4,
         state: AtomicU8::new(state::READY),
         lock: Arc::new(RwLock::new(())),
@@ -481,4 +483,66 @@ fn fee_and_mempool_methods_never_return_method_not_found() {
         json!([script.to_electrum_hex()]),
     );
     assert_eq!(r["result"], json!([]), "{r}");
+}
+
+#[test]
+fn tls_listener_completes_handshake_and_serves() {
+    use rustls::pki_types::pem::PemObject;
+    use std::io::{BufRead, Write};
+
+    let (fx, _script, _txid) = fixture();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let fixtures = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+    let cert = fixtures.join("tls-cert.pem");
+    let key = fixtures.join("tls-key.pem");
+    let ca = fixtures.join("tls-ca.pem");
+    let watcher = Arc::new(el_serve::CertWatcher::load(cert.clone(), key, Duration::ZERO).unwrap());
+    el_serve::start_listener_on(listener, Arc::clone(&fx.shared), Some(watcher));
+
+    let mut roots = rustls::RootCertStore::empty();
+    for item in rustls::pki_types::CertificateDer::pem_file_iter(&ca).unwrap() {
+        roots.add(item.unwrap()).unwrap();
+    }
+    let config = rustls::ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    let name = rustls::pki_types::ServerName::try_from("localhost").unwrap();
+    let conn = rustls::ClientConnection::new(Arc::new(config), name).unwrap();
+    let sock = std::net::TcpStream::connect(addr).unwrap();
+    sock.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    let mut tls = rustls::StreamOwned::new(conn, sock);
+
+    tls.write_all(b"{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"server.ping\",\"params\":[]}\n")
+        .unwrap();
+    tls.flush().unwrap();
+
+    let mut reader = std::io::BufReader::new(tls);
+    let mut line = String::new();
+    reader.read_line(&mut line).unwrap();
+    let response: Value = serde_json::from_str(&line).unwrap();
+    assert_eq!(response["id"], json!(7));
+    assert_eq!(response["result"], Value::Null);
+    assert!(
+        fx.shared
+            .stats
+            .tls_handshakes
+            .load(std::sync::atomic::Ordering::Relaxed)
+            >= 1
+    );
+
+    // The notifier must be able to write while the reader is idle: this is the
+    // reason the read loop releases the TLS connection lock between attempts.
+    let clients = fx.shared.clients.snapshot();
+    assert_eq!(clients.len(), 1);
+    assert!(clients[0].send(&json!({
+        "jsonrpc": "2.0",
+        "method": "e-lite.test.notification",
+        "params": ["ok"],
+    })));
+    line.clear();
+    reader.read_line(&mut line).unwrap();
+    let notification: Value = serde_json::from_str(&line).unwrap();
+    assert_eq!(notification["method"], "e-lite.test.notification");
+    assert_eq!(notification["params"], json!(["ok"]));
 }

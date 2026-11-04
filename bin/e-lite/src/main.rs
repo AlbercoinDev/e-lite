@@ -125,6 +125,9 @@ struct Args {
     blocks_dir: Option<String>,
     cookie_file: Option<String>,
     listen: Option<String>,
+    tls_listen: Option<String>,
+    tls_cert: Option<String>,
+    tls_key: Option<String>,
     metrics: Option<String>,
     allow_mainnet: bool,
     json: bool,
@@ -172,6 +175,9 @@ fn parse_args() -> R<Args> {
             "--rpc-user" => args.rpc_user = Some(value("--rpc-user")?),
             "--rpc-password" => args.rpc_password = Some(value("--rpc-password")?),
             "--listen" => args.listen = Some(value("--listen")?),
+            "--tls-listen" => args.tls_listen = Some(value("--tls-listen")?),
+            "--tls-cert" => args.tls_cert = Some(value("--tls-cert")?),
+            "--tls-key" => args.tls_key = Some(value("--tls-key")?),
             "--metrics" => args.metrics = Some(value("--metrics")?),
             "--batch" => args.batch = Some(value("--batch")?.parse()?),
             "--reorg-window" => args.reorg_window = Some(value("--reorg-window")?.parse()?),
@@ -248,6 +254,15 @@ fn effective_config(args: &Args) -> R<(Config, Chain)> {
     }
     if let Some(l) = &args.listen {
         cfg.server.listen = l.clone();
+    }
+    if let Some(l) = &args.tls_listen {
+        cfg.server.tls_listen = l.clone();
+    }
+    if let Some(c) = &args.tls_cert {
+        cfg.server.tls_cert = c.clone();
+    }
+    if let Some(k) = &args.tls_key {
+        cfg.server.tls_key = k.clone();
     }
     if let Some(m) = &args.metrics {
         cfg.metrics.listen = m.clone();
@@ -680,6 +695,9 @@ OPTIONS:
     --prune-mib <n>         Core prune mode: 1 manual (default), 0 full, >=550 auto (needs opt-in)
     --min-free-gib <n>      pause Core downloads below this free space
     --listen <addr>         Electrum listen address (default 127.0.0.1:50001)
+    --tls-listen <addr>     optional Electrum TLS listener (e.g. 127.0.0.1:50002)
+    --tls-cert <path>       PEM certificate chain for --tls-listen
+    --tls-key <path>        PEM private key for --tls-listen
     --metrics <addr>        status/metrics listen address (default 127.0.0.1:9184)
     --batch <n>             blocks per atomic commit (default 256)
     --reorg-window <n>      undo window in blocks (default 288)
@@ -980,6 +998,28 @@ fn cmd_doctor(cfg: &Config, chain: Chain) -> R<()> {
             "electrum listen {} is already in use",
             cfg.server.listen
         ));
+    }
+    if cfg.server.tls_enabled() {
+        if bind_ok(&cfg.server.tls_listen) {
+            println!("electrum TLS listen {}: available", cfg.server.tls_listen);
+        } else {
+            problems.push(format!(
+                "electrum TLS listen {} is already in use",
+                cfg.server.tls_listen
+            ));
+        }
+        let cert = std::path::PathBuf::from(&cfg.server.tls_cert);
+        let key = std::path::PathBuf::from(&cfg.server.tls_key);
+        match el_serve::CertWatcher::load(cert.clone(), key.clone(), Duration::ZERO) {
+            Ok(_) => println!(
+                "electrum TLS certificate: {} (key {})",
+                cert.display(),
+                key.display()
+            ),
+            Err(e) => problems.push(format!("electrum TLS certificate/key: {e}")),
+        }
+    } else {
+        println!("electrum TLS: disabled (set [server] tls_listen to enable)");
     }
     if cfg.metrics.enabled {
         if bind_ok(&cfg.metrics.listen) {
@@ -2368,9 +2408,14 @@ fn reload_hot(
                 || new.index.block_source != old.index.block_source
                 || new.index.reorg_window != old.index.reorg_window
                 || new.network.data_dir != old.network.data_dir
+                || new.server.listen != old.server.listen
+                || new.server.tls_listen != old.server.tls_listen
+                || new.server.tls_cert != old.server.tls_cert
+                || new.server.tls_key != old.server.tls_key
             {
                 eprintln!(
-                    "[e-lite] reload: cold fields changed (prune_mib/block_source/                     reorg_window/data_dir); restart required for those"
+                    "[e-lite] reload: cold fields changed (prune_mib, block_source, \
+                     reorg_window, data_dir, server listeners/TLS); restart required"
                 );
             }
             eprintln!(
@@ -2707,6 +2752,11 @@ fn build_shared(
         data_dir: cfg.data_dir(chain),
         core_datadir: cfg.core_datadir(),
         listen: cfg.server.listen.clone(),
+        tls_listen: if cfg.server.tls_enabled() {
+            Some(cfg.server.tls_listen.clone())
+        } else {
+            None
+        },
         max_clients: cfg.server.max_clients,
         state: std::sync::atomic::AtomicU8::new(state::WAITING_FOR_CORE),
         lock: Arc::new(RwLock::new(())),
@@ -2724,10 +2774,36 @@ fn warn_public_listen(what: &str, addr: &str) {
     if !is_loopback_listen(addr) {
         eprintln!(
             "[e-lite] WARNING: {what} is listening on {addr}, not loopback. \
-             It has no TLS/authentication; use an SSH/VPN tunnel, a reverse proxy \
-             with TLS, or firewall it explicitly."
+             {what} has no transport encryption or client authentication; use a \
+             firewall, an SSH/VPN tunnel, a TLS reverse proxy or Tor, and restrict \
+             who can connect."
         );
     }
+}
+
+fn start_tls_transport(shared: &Arc<Shared>, cfg: &Config) -> R<()> {
+    let watcher = el_serve::CertWatcher::load(
+        std::path::PathBuf::from(&cfg.server.tls_cert),
+        std::path::PathBuf::from(&cfg.server.tls_key),
+        el_serve::TLS_CERT_CHECK_INTERVAL,
+    )
+    .map_err(|e| format!("TLS configuration: {e}"))?;
+    if !is_loopback_listen(&cfg.server.tls_listen) {
+        eprintln!(
+            "[e-lite] WARNING: Electrum TLS is listening on {} without client \
+             authentication. TLS encrypts the connection but does not restrict who \
+             can connect; use a firewall, SSH/VPN or Tor.",
+            cfg.server.tls_listen
+        );
+    }
+    let listener = std::net::TcpListener::bind(&cfg.server.tls_listen)
+        .map_err(|e| format!("cannot bind TLS {}: {e}", cfg.server.tls_listen))?;
+    el_serve::start_listener_on(listener, Arc::clone(shared), Some(Arc::new(watcher)));
+    eprintln!(
+        "[e-lite] Electrum TLS listening on {} (cert {})",
+        cfg.server.tls_listen, cfg.server.tls_cert
+    );
+    Ok(())
 }
 
 fn start_transports(shared: &Arc<Shared>, cfg: &Config) -> R<()> {
@@ -2735,6 +2811,9 @@ fn start_transports(shared: &Arc<Shared>, cfg: &Config) -> R<()> {
     warn_public_listen("metrics", &cfg.metrics.listen);
     let server = Arc::clone(shared);
     el_serve::start_server(server).map_err(|e| format!("cannot bind {}: {e}", shared.listen))?;
+    if cfg.server.tls_enabled() {
+        start_tls_transport(shared, cfg)?;
+    }
     if cfg.metrics.enabled {
         let m = Arc::clone(shared);
         el_serve::start_metrics(m, cfg.metrics.listen.clone())
@@ -2819,11 +2898,16 @@ fn cmd_serve(cfg: &Config, chain: Chain) -> R<()> {
         );
     }
     println!(
-        "serving Electrum {} on {} (network {}, indexed height {})",
+        "serving Electrum {} on {} (network {}, indexed height {}, TLS {})",
         el_serve::PROTOCOL_MAX,
         cfg.server.listen,
         chain.name(),
-        tip
+        tip,
+        if cfg.server.tls_enabled() {
+            cfg.server.tls_listen.as_str()
+        } else {
+            "disabled"
+        }
     );
     while !flag.load(Ordering::SeqCst) {
         std::thread::sleep(Duration::from_secs(1));

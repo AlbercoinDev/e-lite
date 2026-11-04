@@ -41,8 +41,9 @@ Never treat a version number in this file as authoritative over the code/tag.
 4. Maintain two explicit documentation sections:
    - current functionality (`docs/FEATURES.md`);
    - future functionality and proposed improvements (`docs/ROADMAP.md`).
-   Never describe an unimplemented feature as available. TLS is currently not
-   implemented.
+   Never describe an unimplemented feature as available. Electrum TLS on a
+   separate listener is implemented; client authentication and rate limiting are
+   not.
 5. Every behaviour change updates documentation, `config.example.toml` and
    `CHANGELOG.md`.
 6. Pruning, snapshots, network exposure, privacy and data-loss questions require
@@ -54,8 +55,9 @@ Never treat a version number in this file as authoritative over the code/tag.
   on its own; the prune gate keeps the cut below `index - 288`.
 - `prune_mib >= 550` requires `[pruning] allow_auto_prune = true`.
 - Snapshots are optional; they are never required by the from-zero flow.
-- Electrum listens on `127.0.0.1:50001` without TLS by default. Do not expose it
-  publicly without a tunnel/authentication plan.
+- Electrum listens on `127.0.0.1:50001` (plain) by default. Optional TLS uses a
+  separate listener (`tls_listen`). Neither listener authenticates clients; do
+  not expose them publicly without a tunnel/firewall/access plan.
 - Core RPC is HTTP; LAN/WAN use requires SSH/VPN.
 - Raw transactions are local-first. External fallback requests whole blocks by
   hash, validates them, uses Tor by default and never sends wallet txids/scripts.

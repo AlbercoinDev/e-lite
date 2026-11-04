@@ -4,9 +4,10 @@
 any `scriptPubKey` in the active chain without registering wallets. Core remains
 the authority for consensus and the active chain; e-lite never invents data.
 
-> **Status: `v0.1.0-alpha.16` — experimental, no funds.**
+> **Status: `v0.1.0-alpha.17` — experimental, no funds.**
 > Test on regtest/signet/testnet4 before mainnet.
-> TLS is **not implemented**; Electrum is plain TCP and loopback by default.
+> Electrum is plain TCP on loopback by default. Optional TLS is available on a
+> separate listener; there is no client authentication (use a firewall/VPN/Tor).
 
 ## Install or update (one line)
 
@@ -37,8 +38,9 @@ e-lite run    --network signet --manage managed \
   --core-datadir "$CORE" --data-dir "$DATA" --prune-mib 1
 ```
 
-Electrum/Sparrow: `127.0.0.1:50001` (no SSL). Status and metrics:
-`http://127.0.0.1:9184/status` and `/metrics`.
+Electrum/Sparrow: `127.0.0.1:50001` (plain). Optional TLS: configure
+`[server] tls_listen`/`tls_cert`/`tls_key` and connect to that port with SSL.
+Status and metrics: `http://127.0.0.1:9184/status` and `/metrics`.
 
 ## Documentation
 
@@ -68,8 +70,10 @@ Electrum/Sparrow: `127.0.0.1:50001` (no SSL). Status and metrics:
 
 ## Security notes
 
-- Electrum listens on `127.0.0.1:50001` by default, without TLS or
-  authentication. Do not expose it publicly without a tunnel/reverse proxy.
+- Electrum listens on `127.0.0.1:50001` by default. Optional TLS on a separate
+  listener (`tls_listen`) encrypts the connection, but there is **no client
+  authentication**: restrict access with a firewall, SSH/VPN tunnel or Tor. Do not
+  expose the plain port publicly.
 - Core RPC is HTTP. LAN/WAN use requires SSH/VPN; never expose the RPC port.
 - External rawtx lookup is local-first and Tor-first; it requests whole blocks by
   hash and validates them. See [`docs/PRIVACY.md`](docs/PRIVACY.md).

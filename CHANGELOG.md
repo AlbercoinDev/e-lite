@@ -1,5 +1,33 @@
 # Changelog
 
+## 0.1.0-alpha.17 — 2026-11-04
+
+### Optional Electrum TLS
+
+- **TLS is available on a separate, opt-in listener** (`[server] tls_listen`,
+  `tls_cert`, `tls_key`; CLI `--tls-listen`, `--tls-cert`, `--tls-key`). The
+  plain `127.0.0.1:50001` listener is unchanged and remains the default.
+- **Any PEM certificate chain works**, including a public CA certificate reused
+  from a web server. TLS 1.2+ via rustls; no client authentication.
+- **Certificate reload on change**: the listener checks the PEM files every 60 s
+  and rebuilds the TLS configuration when they change, so a Let's Encrypt
+  renewal does not require restarting e-lite. An invalid PEM keeps the previous
+  certificate and logs a warning.
+- **Bounded handshake**: 10 s TLS handshake timeout; the existing 1 MiB request
+  line cap and 600 s idle timeout still apply.
+- **Transport refactor**: plain and TLS connections share one read/write path, so
+  scripthash notifications can write to the same TLS connection. Notifications
+  are delivered with at most ~250 ms of latency while a client is idle.
+- **Observability**: `/status` and `/metrics` expose `tls_listen`,
+  `tls_handshakes` and `tls_handshake_failures`.
+- **Docs**: certificate setup, Let's Encrypt deploy hook, split-DNS, private-IP
+  caveats, renewal and the nginx `stream` alternative in `docs/OPERATIONS.md`.
+- **Tests**: TLS handshake + JSON-RPC integration test, certificate reload tests,
+  and the regtest e2e now queries both plain and TLS listeners.
+
+TLS encrypts the transport but does **not** authenticate wallets or rate-limit
+requests; use a firewall, SSH/VPN or Tor for non-loopback listeners.
+
 ## 0.1.0-alpha.16 — 2026-11-03
 
 ### Security audit and documentation rewrite

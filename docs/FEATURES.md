@@ -33,7 +33,7 @@ available**.
 | Broadcast | experimental | via Core |
 | Raw transaction get | experimental | local Core -> cache -> P2P/Esplora |
 | Electrum 1.4 negotiation | experimental | 1.7 not implemented |
-| TLS Electrum | **not available** | plain TCP only |
+| TLS Electrum | experimental | opt-in `tls_listen`; PEM cert/key; reload on change; no client auth |
 | Silent payments BIP352 | **gate** | explicit error; no indexer |
 
 ### Electrum methods currently implemented

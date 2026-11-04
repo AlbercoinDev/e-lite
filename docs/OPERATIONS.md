@@ -18,7 +18,8 @@ e-lite run --network signet --manage managed \
 - `run` starts Core if needed, waits for RPC, initializes the DB and indexes.
 - `prune_mib=1` is manual pruning: Core never deletes on its own; e-lite’s prune
   gate keeps the cut below `index - 288`.
-- Electrum: `127.0.0.1:50001` (no TLS). Status: `127.0.0.1:9184`.
+- Electrum: `127.0.0.1:50001` (plain). Optional TLS listener: configure
+  `[server] tls_listen/tls_cert/tls_key`. Status: `127.0.0.1:9184`.
 - Stop with Ctrl+C/SIGTERM. With `stop_on_exit=true`, a Core started by e-lite is
   stopped too.
 
@@ -84,6 +85,77 @@ rpc_url = "http://127.0.0.1:38332"
 ```
 
 Maintenance only; never expose Core RPC directly to the Internet.
+
+## Electrum TLS (optional)
+
+The plain listener (`[server] listen`, default `127.0.0.1:50001`) keeps working.
+TLS is a separate, opt-in listener:
+
+```toml
+[server]
+listen = "127.0.0.1:50001"
+tls_listen = "0.0.0.0:50002"
+tls_cert = "/etc/e-lite/tls/fullchain.pem"
+tls_key = "/etc/e-lite/tls/privkey.pem"
+```
+
+The certificate is validated against the name the wallet uses, not the server
+IP:
+
+- a public-domain certificate works when the wallet connects to
+  `electrum.example.com:50002`. On a LAN, use split-DNS so that name resolves to
+  the LAN address;
+- connecting to `192.168.x.x` or `127.0.0.1` with a public-domain certificate
+  fails with a name mismatch (public CAs do not issue certificates for private
+  IPs);
+- loopback wallets should keep using plain `127.0.0.1:50001`.
+
+A self-signed or internal-CA certificate also works if the wallet trusts it
+(Sparrow uses the Java trust store, so importing a private CA is possible but
+more work).
+
+### Reusing a Let's Encrypt certificate
+
+certbot's `privkey.pem` is usually `600 root`. Copy the files to a path e-lite can
+read, or grant access explicitly. Example deploy hook:
+
+```bash
+certbot renew --deploy-hook 'install -d -m 700 /etc/e-lite/tls && \
+  install -m 644 /etc/letsencrypt/live/electrum.example.com/fullchain.pem /etc/e-lite/tls/fullchain.pem && \
+  install -m 600 /etc/letsencrypt/live/electrum.example.com/privkey.pem /etc/e-lite/tls/privkey.pem'
+```
+
+e-lite checks the PEM files every 60 s and reloads them when they change, so a
+renewal does not need a restart. If the new PEM is invalid, it keeps the previous
+certificate and logs a warning. Changing `tls_listen` or the configured paths
+requires a restart; only the file contents are reloaded automatically.
+
+### Verify and test
+
+```bash
+openssl s_client -connect electrum.example.com:50002 \
+  -servername electrum.example.com </dev/null
+```
+
+In Sparrow/Electrum use the host and `50002` and enable SSL. There is **no client
+authentication**: TLS encrypts the connection but does not restrict who can
+connect. Use a firewall, SSH/VPN or Tor in front of any non-loopback listener.
+
+### TLS reverse proxy alternative
+
+If TLS is already terminated by nginx/haproxy/stunnel, leave e-lite plain on
+loopback and proxy to it:
+
+```nginx
+stream {
+    server {
+        listen 50002 ssl;
+        proxy_pass 127.0.0.1:50001;
+        ssl_certificate     /etc/letsencrypt/live/electrum.example.com/fullchain.pem;
+        ssl_certificate_key /etc/letsencrypt/live/electrum.example.com/privkey.pem;
+    }
+}
+```
 
 ## Pruning
 
@@ -184,5 +256,8 @@ offline. `WAITING_FOR_CORE` means no index initialization has happened yet.
 
 ### Electrum cannot connect
 
-Check `127.0.0.1:50001`, no SSL checkbox, and firewall. Do not expose plain
-Electrum to the Internet: there is no TLS/authentication yet.
+Check `127.0.0.1:50001`, that the SSL checkbox is off for the plain port, and the
+firewall. For TLS use the configured `tls_listen` port, enable SSL, and connect
+to the certificate's hostname (not a private IP). Do not expose the plain port to
+the Internet: it has no TLS or authentication. The TLS listener also has no
+client authentication.

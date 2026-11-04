@@ -9,14 +9,18 @@ use el_model::{merkle_branch, Hash32, NetworkIdentity, ScriptHash};
 use el_rawtx::Resolver;
 use el_rpc::CoreClient;
 use el_store::Store;
+use rustls::pki_types::pem::PemObject;
+use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+use rustls::{ServerConfig, ServerConnection, StreamOwned};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock, RwLockReadGuard};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 /// Electrum clients ask for a script's full history. A script with millions of
 /// entries would hold the index lock for too long; keep a generous cap that
@@ -30,6 +34,18 @@ pub const MAX_HEADERS_CHUNK: usize = 2016;
 /// Hard limit for a single Electrum JSON-RPC line. Prevents an unauthenticated
 /// client from growing the per-connection buffer without bound.
 pub const MAX_REQUEST_BYTES: usize = 1024 * 1024;
+
+/// Idle connections are polled at this interval so a TLS connection can be
+/// shared between the request reader and the notifier writer without splitting
+/// rustls' connection state. It also bounds notification latency.
+const CLIENT_READ_POLL: Duration = Duration::from_millis(250);
+/// A client that sends nothing for this long is disconnected.
+const CLIENT_IDLE_TIMEOUT: Duration = Duration::from_secs(600);
+const CLIENT_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
+/// A TLS client gets this long to finish the handshake.
+const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+/// How often the TLS listener checks the configured PEM files for renewal.
+pub const TLS_CERT_CHECK_INTERVAL: Duration = Duration::from_secs(60);
 
 pub mod state {
     pub const BUILDING: u8 = 0;
@@ -92,6 +108,8 @@ pub struct Stats {
     pub tuning_profile: AtomicU64,
     pub tuning_adaptive: AtomicBool,
     pub tuning_background_jobs: AtomicU64,
+    pub tls_handshakes: AtomicU64,
+    pub tls_handshake_failures: AtomicU64,
     pub started: Instant,
 }
 
@@ -129,6 +147,8 @@ impl Default for Stats {
             tuning_profile: AtomicU64::new(0),
             tuning_adaptive: AtomicBool::new(false),
             tuning_background_jobs: AtomicU64::new(0),
+            tls_handshakes: AtomicU64::new(0),
+            tls_handshake_failures: AtomicU64::new(0),
             started: Instant::now(),
         }
     }
@@ -219,13 +239,201 @@ impl DirtyScripts {
     }
 }
 
+/// Transport for one Electrum client. Plain TCP and TLS share one read/write
+/// path so the notifier can write to a TLS connection without splitting
+/// rustls' connection state across threads.
+pub enum Wire {
+    Plain(TcpStream),
+    Tls(Box<StreamOwned<ServerConnection, TcpStream>>),
+}
+
+impl Wire {
+    fn plain(stream: TcpStream) -> std::io::Result<Self> {
+        configure_socket(&stream)?;
+        Ok(Wire::Plain(stream))
+    }
+
+    fn tls(config: Arc<ServerConfig>, stream: TcpStream) -> std::io::Result<Self> {
+        configure_socket(&stream)?;
+        let conn = ServerConnection::new(config)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+        Ok(Wire::Tls(Box::new(StreamOwned::new(conn, stream))))
+    }
+
+    pub fn is_tls(&self) -> bool {
+        matches!(self, Wire::Tls(_))
+    }
+
+    /// Complete the TLS handshake with a bounded deadline. Plain connections
+    /// return immediately.
+    fn handshake(&mut self) -> std::io::Result<()> {
+        let Wire::Tls(stream) = self else {
+            return Ok(());
+        };
+        let deadline = Instant::now() + TLS_HANDSHAKE_TIMEOUT;
+        while stream.conn.is_handshaking() {
+            match stream.conn.complete_io(&mut stream.sock) {
+                Ok((0, 0)) => std::thread::sleep(Duration::from_millis(5)),
+                Ok(_) => {}
+                Err(e)
+                    if e.kind() == std::io::ErrorKind::WouldBlock
+                        || e.kind() == std::io::ErrorKind::TimedOut => {}
+                Err(e) => return Err(e),
+            }
+            if Instant::now() >= deadline {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "TLS handshake timeout",
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+fn configure_socket(stream: &TcpStream) -> std::io::Result<()> {
+    stream.set_read_timeout(Some(CLIENT_READ_POLL))?;
+    stream.set_write_timeout(Some(CLIENT_WRITE_TIMEOUT))?;
+    let _ = stream.set_nodelay(true);
+    Ok(())
+}
+
+impl Read for Wire {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        match self {
+            Wire::Plain(s) => s.read(buf),
+            Wire::Tls(s) => s.read(buf),
+        }
+    }
+}
+
+impl Write for Wire {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        match self {
+            Wire::Plain(s) => s.write(buf),
+            Wire::Tls(s) => s.write(buf),
+        }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        match self {
+            Wire::Plain(s) => s.flush(),
+            Wire::Tls(s) => s.flush(),
+        }
+    }
+}
+
+/// Build a rustls server configuration from PEM files. Any certificate chain
+/// works, including a public CA certificate reused from a web server.
+pub fn build_tls_config(cert: &Path, key: &Path) -> Result<ServerConfig, String> {
+    let certs: Vec<CertificateDer<'static>> = CertificateDer::pem_file_iter(cert)
+        .map_err(|e| format!("cannot read TLS certificate {}: {e}", cert.display()))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| format!("invalid TLS certificate {}: {e}", cert.display()))?;
+    if certs.is_empty() {
+        return Err(format!(
+            "TLS certificate {} contains no certificates",
+            cert.display()
+        ));
+    }
+    let key_der = PrivateKeyDer::from_pem_file(key)
+        .map_err(|e| format!("cannot read TLS private key {}: {e}", key.display()))?;
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    ServerConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .map_err(|e| format!("TLS configuration error: {e}"))?
+        .with_no_client_auth()
+        .with_single_cert(certs, key_der)
+        .map_err(|e| format!("invalid TLS certificate/key: {e}"))
+}
+
+/// Reloads the TLS certificate when the PEM files change on disk. This lets a
+/// Let's Encrypt renewal take effect without restarting the indexer.
+pub struct CertWatcher {
+    cert: PathBuf,
+    key: PathBuf,
+    interval: Duration,
+    state: Mutex<CertState>,
+}
+
+struct CertState {
+    config: Arc<ServerConfig>,
+    cert_mtime: Option<SystemTime>,
+    key_mtime: Option<SystemTime>,
+    checked: Instant,
+    error_logged: bool,
+}
+
+impl CertWatcher {
+    pub fn load(cert: PathBuf, key: PathBuf, interval: Duration) -> Result<Self, String> {
+        let config = build_tls_config(&cert, &key)?;
+        let cert_mtime = file_mtime(&cert);
+        let key_mtime = file_mtime(&key);
+        Ok(Self {
+            cert,
+            key,
+            interval,
+            state: Mutex::new(CertState {
+                config: Arc::new(config),
+                cert_mtime,
+                key_mtime,
+                checked: Instant::now(),
+                error_logged: false,
+            }),
+        })
+    }
+
+    /// Current server configuration, reloading it when the files changed.
+    /// A failed reload keeps the previous certificate in use.
+    pub fn config(&self) -> Arc<ServerConfig> {
+        let mut state = match self.state.lock() {
+            Ok(g) => g,
+            Err(e) => e.into_inner(),
+        };
+        if state.checked.elapsed() >= self.interval {
+            state.checked = Instant::now();
+            let cert_mtime = file_mtime(&self.cert);
+            let key_mtime = file_mtime(&self.key);
+            if cert_mtime != state.cert_mtime || key_mtime != state.key_mtime {
+                match build_tls_config(&self.cert, &self.key) {
+                    Ok(config) => {
+                        state.config = Arc::new(config);
+                        state.cert_mtime = cert_mtime;
+                        state.key_mtime = key_mtime;
+                        state.error_logged = false;
+                        eprintln!(
+                            "[e-lite] TLS certificate reloaded from {}",
+                            self.cert.display()
+                        );
+                    }
+                    Err(e) => {
+                        if !state.error_logged {
+                            eprintln!(
+                                "[e-lite] WARNING: TLS certificate reload failed ({e}); \
+                                 keeping the previous certificate"
+                            );
+                            state.error_logged = true;
+                        }
+                    }
+                }
+            }
+        }
+        Arc::clone(&state.config)
+    }
+}
+
+fn file_mtime(path: &Path) -> Option<SystemTime> {
+    std::fs::metadata(path).and_then(|m| m.modified()).ok()
+}
+
 pub struct ClientState {
     pub id: u64,
-    pub writer: Mutex<TcpStream>,
+    pub writer: Mutex<Wire>,
     pub subs: Mutex<HashMap<ScriptHash, Option<String>>>,
     pub headers: AtomicBool,
     pub last_height: AtomicU64,
     pub alive: AtomicBool,
+    pub tls: bool,
 }
 
 impl ClientState {
@@ -265,15 +473,17 @@ impl ClientRegistry {
         Self::default()
     }
 
-    pub fn register(&self, writer: TcpStream) -> Arc<ClientState> {
+    pub fn register(&self, wire: Wire) -> Arc<ClientState> {
         let id = self.next.fetch_add(1, Ordering::SeqCst) + 1;
+        let tls = wire.is_tls();
         let state = Arc::new(ClientState {
             id,
-            writer: Mutex::new(writer),
+            writer: Mutex::new(wire),
             subs: Mutex::new(HashMap::new()),
             headers: AtomicBool::new(false),
             last_height: AtomicU64::new(0),
             alive: AtomicBool::new(true),
+            tls,
         });
         if let Ok(mut c) = self.clients.lock() {
             c.insert(id, Arc::clone(&state));
@@ -323,6 +533,7 @@ pub struct Shared {
     pub data_dir: std::path::PathBuf,
     pub core_datadir: std::path::PathBuf,
     pub listen: String,
+    pub tls_listen: Option<String>,
     pub max_clients: usize,
     pub state: AtomicU8,
     pub lock: Arc<RwLock<()>>,
@@ -406,6 +617,12 @@ impl Shared {
             "last_block_ms": self.stats.last_block_ms.load(Ordering::Relaxed),
             "uptime_seconds": self.stats.started.elapsed().as_secs(),
             "listen": self.listen,
+            "tls_listen": self.tls_listen,
+            "tls_handshakes": self.stats.tls_handshakes.load(Ordering::Relaxed),
+            "tls_handshake_failures": self
+                .stats
+                .tls_handshake_failures
+                .load(Ordering::Relaxed),
             "protocol": PROTOCOL_MAX,
             "tuning": {
                 "readers": self.stats.tuning_readers.load(Ordering::Relaxed),
@@ -1417,7 +1634,17 @@ pub fn start_notifications(shared: Arc<Shared>) -> std::thread::JoinHandle<()> {
 
 pub fn start_server(shared: Arc<Shared>) -> std::io::Result<std::thread::JoinHandle<()>> {
     let listener = TcpListener::bind(&shared.listen)?;
-    let handle = std::thread::spawn(move || {
+    Ok(start_listener_on(listener, shared, None))
+}
+
+/// Serve an already-bound listener. When `tls` is set, every accepted
+/// connection is wrapped in TLS before it reaches the JSON-RPC loop.
+pub fn start_listener_on(
+    listener: TcpListener,
+    shared: Arc<Shared>,
+    tls: Option<Arc<CertWatcher>>,
+) -> std::thread::JoinHandle<()> {
+    std::thread::spawn(move || {
         for incoming in listener.incoming() {
             let stream = match incoming {
                 Ok(s) => s,
@@ -1431,19 +1658,81 @@ pub fn start_server(shared: Arc<Shared>) -> std::io::Result<std::thread::JoinHan
                 let _ = stream.shutdown(std::net::Shutdown::Both);
                 continue;
             }
-            let shared = Arc::clone(&shared);
-            let Ok(writer) = stream.try_clone() else {
-                shared.stats.clients.fetch_sub(1, Ordering::SeqCst);
-                continue;
+            let wire = match &tls {
+                Some(watcher) => Wire::tls(watcher.config(), stream),
+                None => Wire::plain(stream),
             };
-            let client = shared.clients.register(writer);
+            let wire = match wire {
+                Ok(w) => w,
+                Err(_) => {
+                    if tls.is_some() {
+                        shared
+                            .stats
+                            .tls_handshake_failures
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
+                    shared.stats.clients.fetch_sub(1, Ordering::SeqCst);
+                    continue;
+                }
+            };
+            let client = shared.clients.register(wire);
+            let shared = Arc::clone(&shared);
             std::thread::spawn(move || {
-                let _ = handle_client(&shared, stream, client);
+                let _ = handle_client(&shared, client);
                 shared.stats.clients.fetch_sub(1, Ordering::SeqCst);
             });
         }
-    });
-    Ok(handle)
+    })
+}
+
+/// Reads from the client while releasing the connection lock between attempts,
+/// so the notifier thread can write to the same TLS connection.
+struct WireReader {
+    client: Arc<ClientState>,
+    idle_deadline: Instant,
+}
+
+impl WireReader {
+    fn new(client: Arc<ClientState>) -> Self {
+        Self {
+            client,
+            idle_deadline: Instant::now() + CLIENT_IDLE_TIMEOUT,
+        }
+    }
+}
+
+impl Read for WireReader {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        loop {
+            {
+                let mut wire = self
+                    .client
+                    .writer
+                    .lock()
+                    .map_err(|_| std::io::Error::other("connection lock poisoned"))?;
+                match wire.read(buf) {
+                    Ok(n) => {
+                        self.idle_deadline = Instant::now() + CLIENT_IDLE_TIMEOUT;
+                        return Ok(n);
+                    }
+                    Err(e)
+                        if e.kind() == std::io::ErrorKind::WouldBlock
+                            || e.kind() == std::io::ErrorKind::TimedOut => {}
+                    Err(e) => return Err(e),
+                }
+            }
+            if Instant::now() >= self.idle_deadline {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "client idle timeout",
+                ));
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
 }
 
 /// Read one newline-terminated line without allowing the buffer to exceed
@@ -1484,14 +1773,33 @@ fn read_line_limited<R: BufRead>(
     }
 }
 
-fn handle_client(
-    shared: &Shared,
-    stream: TcpStream,
-    client: Arc<ClientState>,
-) -> std::io::Result<()> {
-    stream.set_read_timeout(Some(Duration::from_secs(600)))?;
-    stream.set_write_timeout(Some(Duration::from_secs(30)))?;
-    let mut reader = BufReader::new(stream);
+fn handle_client(shared: &Shared, client: Arc<ClientState>) -> std::io::Result<()> {
+    let result = client_loop(shared, &client);
+    client.alive.store(false, Ordering::SeqCst);
+    shared.clients.unregister(client.id);
+    result
+}
+
+fn client_loop(shared: &Shared, client: &Arc<ClientState>) -> std::io::Result<()> {
+    if client.tls {
+        let handshake = {
+            let mut wire = client
+                .writer
+                .lock()
+                .map_err(|_| std::io::Error::other("connection lock poisoned"))?;
+            wire.handshake()
+        };
+        if let Err(e) = handshake {
+            shared
+                .stats
+                .tls_handshake_failures
+                .fetch_add(1, Ordering::Relaxed);
+            return Err(e);
+        }
+        shared.stats.tls_handshakes.fetch_add(1, Ordering::Relaxed);
+    }
+
+    let mut reader = BufReader::new(WireReader::new(Arc::clone(client)));
     let mut buf = Vec::new();
     loop {
         buf.clear();
@@ -1512,12 +1820,11 @@ fn handle_client(
         if line.trim().is_empty() {
             continue;
         }
-        let response = process_line_for(shared, Some(&client), &line);
+        let response = process_line_for(shared, Some(client), &line);
         if !client.send(&response) {
             break;
         }
     }
-    shared.clients.unregister(client.id);
     Ok(())
 }
 
@@ -1721,6 +2028,18 @@ fn metrics_text(shared: &Shared) -> String {
         g("requests_total"),
     );
     line(
+        "e_lite_tls_handshakes_total",
+        "Completed Electrum TLS handshakes",
+        "counter",
+        g("tls_handshakes"),
+    );
+    line(
+        "e_lite_tls_handshake_failures_total",
+        "Failed Electrum TLS handshakes",
+        "counter",
+        g("tls_handshake_failures"),
+    );
+    line(
         "e_lite_errors_total",
         "Protocol and internal errors",
         "counter",
@@ -1809,5 +2128,74 @@ mod tests {
         let v = json!([sh.to_electrum_hex()]);
         assert_eq!(param_scripthash(&v).unwrap(), sh);
         assert!(param_scripthash(&json!(["zz"])).is_err());
+    }
+
+    #[test]
+    fn tls_config_rejects_missing_and_invalid_files() {
+        assert!(build_tls_config(
+            Path::new("/nonexistent/e-lite-cert.pem"),
+            Path::new("/nonexistent/e-lite-key.pem"),
+        )
+        .is_err());
+
+        let dir = std::env::temp_dir().join(format!(
+            "e-lite-tls-config-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cert = dir.join("cert.pem");
+        std::fs::write(&cert, b"not a certificate").unwrap();
+        let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+        let key = dir.join("key.pem");
+        std::fs::copy(fixtures.join("tls-key.pem"), &key).unwrap();
+        assert!(build_tls_config(&cert, &key).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn tls_watcher_reloads_changed_pem_and_keeps_old_on_error() {
+        let dir = std::env::temp_dir().join(format!(
+            "e-lite-tls-watch-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+        let cert = dir.join("cert.pem");
+        let key = dir.join("key.pem");
+        std::fs::copy(fixtures.join("tls-cert.pem"), &cert).unwrap();
+        std::fs::copy(fixtures.join("tls-key.pem"), &key).unwrap();
+
+        let watcher = CertWatcher::load(cert.clone(), key, Duration::ZERO).unwrap();
+        let first = watcher.config();
+
+        // A new mtime with the same valid certificate rebuilds the config.
+        filetime::set_file_mtime(&cert, filetime::FileTime::from_unix_time(2_000_000_000, 0))
+            .unwrap();
+        let second = watcher.config();
+        assert!(!Arc::ptr_eq(&first, &second));
+
+        // A corrupt certificate keeps the previous configuration in use.
+        std::fs::write(&cert, b"not a certificate").unwrap();
+        filetime::set_file_mtime(&cert, filetime::FileTime::from_unix_time(2_000_000_001, 0))
+            .unwrap();
+        let third = watcher.config();
+        assert!(Arc::ptr_eq(&second, &third));
+
+        // Restoring a valid certificate recovers.
+        std::fs::copy(fixtures.join("tls-cert.pem"), &cert).unwrap();
+        filetime::set_file_mtime(&cert, filetime::FileTime::from_unix_time(2_000_000_002, 0))
+            .unwrap();
+        let fourth = watcher.config();
+        assert!(!Arc::ptr_eq(&third, &fourth));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

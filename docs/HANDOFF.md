@@ -1,9 +1,10 @@
 # Session handoff
 
 **Updated:** 2026-11-04
-**Latest published release at handoff:** `0.1.0-alpha.16`
+**Latest published release:** `0.1.0-alpha.16`
 **Release:** https://github.com/AlbercoinDev/e-lite/releases/tag/v0.1.0-alpha.16
-**Main commit at handoff:** `0245d85` (`alpha.16: security audit fixes, project memory and documentation rewrite`)
+**Working version:** `0.1.0-alpha.17` (unreleased: optional Electrum TLS)
+**Main commit at handoff:** `8626105` (`alpha.17: optional Electrum TLS listener with certificate reload`)
 
 This file is the short “where we are” for a new session. The invariants live in
 [`AGENTS.md`](../AGENTS.md) and [`PROJECT_MEMORY.md`](PROJECT_MEMORY.md); the
@@ -37,7 +38,9 @@ no repitas contexto ni rehagas decisiones ya documentadas.
   by itself; the prune gate keeps the cut below `index - 288`.
 - `prune_mib >= 550` requires `[pruning] allow_auto_prune = true`.
 - Snapshots are optional and are not needed for the from-zero flow.
-- Electrum is plain TCP on `127.0.0.1:50001`; TLS is **not implemented**.
+- Electrum is plain TCP on `127.0.0.1:50001` by default. Optional TLS is
+  available on `[server] tls_listen` with `tls_cert`/`tls_key`; the PEM files are
+  reloaded when they change. There is no client authentication or rate limiting.
 - Core RPC is HTTP; LAN/WAN requires SSH/VPN.
 - Rawtx resolution is local Core -> validated cache -> P2P/Esplora (whole blocks,
   Tor-first, decoys, verified).
@@ -48,25 +51,33 @@ no repitas contexto ni rehagas decisiones ya documentadas.
 - `docs/ROADMAP.md` contains future features/improvements. Do not present them as
   available.
 
-## Last audit/fixes (alpha.16)
+## Last audit/fixes (alpha.17)
 
-- Electrum request lines capped at 1 MiB; per-client memory DoS fixed.
-- `max_clients` reserved atomically before spawning client threads.
-- Snapshot import rejects symlinks/hardlinks/special files.
-- Esplora endpoints must be http/https.
-- Non-loopback Electrum/metrics listeners log a security warning.
-- Docs rewritten and project memory added.
+- **Optional Electrum TLS listener** (`tls_listen`, `tls_cert`, `tls_key`):
+  rustls 0.23 with TLS 1.2+, PEM chains (public CA certificates can be reused),
+  10 s handshake timeout, same 1 MiB request-line cap.
+- **Certificate reload on change**: the TLS listener checks the PEM files every
+  60 s and swaps the rustls configuration without restarting the indexer; an
+  invalid renewal keeps the previous certificate and logs a warning.
+- **Transport refactor**: plain and TLS share one `Wire` path, so scripthash
+  notifications can write to the same TLS connection. Idle timeout stays 600 s;
+  notification latency is bounded by a 250 ms read poll.
+- **`/status` and `/metrics`** expose `tls_listen`, `tls_handshakes` and
+  `tls_handshake_failures`.
+- **Docs**: TLS setup, Let's Encrypt reuse, split-DNS, permissions, renewal and
+  the nginx `stream` alternative are in `docs/OPERATIONS.md`.
 
-Evidence: `docs/AUDIT.md`, `CHANGELOG.md`, CI/release for alpha.16 (success).
+Evidence: `docs/AUDIT.md` (AUD-018), `CHANGELOG.md`, `cargo test --workspace`
+and `tests/e2e_regtest.sh` (plain + TLS).
 
 ## Open risks / next priorities
 
 P1 (before any public exposure or mainnet production claim):
 
-1. TLS on a separate Electrum port (e.g. 50002), certificate/key config.
-2. Authentication/rate limiting for non-loopback Electrum.
-3. Core RPC TLS or a hard SSH/VPN requirement with tests.
-4. Verify/close the audit residual risks in `docs/AUDIT.md` (snapshot archive
+1. Authentication/rate limiting for non-loopback Electrum. TLS encrypts the
+   transport but does not restrict clients; document firewall/allowlist/VPN/Tor.
+2. Core RPC TLS or a hard SSH/VPN requirement with tests.
+3. Verify/close the audit residual risks in `docs/AUDIT.md` (snapshot archive
    limits, per-client threads, provider trust).
 
 Performance/storage (P2, benchmark first):
@@ -103,14 +114,17 @@ kill -USR1 "$(pgrep -f 'e-lite run')"
 
 - Change the database schema without `schema_version` + migration/test.
 - Re-enable automatic pruning by default or weaken the 288/224 safety margins.
-- Expose Electrum/metrics publicly without TLS/auth.
-- Claim TLS, 1.7 or silent payments are implemented.
+- Expose metrics publicly.
+- Expose Electrum without TLS or without a firewall/VPN/Tor access policy; TLS
+  alone does not authenticate clients.
+- Claim client authentication/rate limiting, Electrum 1.7 or silent payments are
+  implemented.
 - Delete an existing index/datadir to “fix” an error before checking
   `NEEDS_RECOVERY`/snapshot options.
 
 ## Known working test baseline at handoff
 
 `cargo fmt --check`, clippy, workspace tests and the local regtest e2e
-(`launch_core`, `pruned_ibd`, `regtest`) passed on the alpha.16 code. Full
-signet/testnet4 acceptance is still operator-run; results belong in
-`docs/GETTING-STARTED.md`/release notes when available.
+(`launch_core`, `pruned_ibd`, `regtest` with plain + TLS Electrum) passed on the
+alpha.17 code. Full signet/testnet4 acceptance is still operator-run; results
+belong in `docs/GETTING-STARTED.md`/release notes when available.

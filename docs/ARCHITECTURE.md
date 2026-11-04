@@ -15,10 +15,14 @@ e-lite indexer  --->  RocksDB index (history, UTXO, txids, blocks, undo)
         |                     |
         |                     +--> canonical snapshots (optional)
         |
-        +--> Electrum TCP 127.0.0.1:50001
+        +--> Electrum TCP 127.0.0.1:50001 (optional TLS on tls_listen)
         +--> /status and /metrics 127.0.0.1:9184
         +--> rawtx resolver: Core -> validated cache -> P2P/Esplora (Tor-first)
 ```
+
+The plain and TLS Electrum listeners share the same JSON-RPC dispatcher. TLS
+wraps each accepted socket with rustls; the certificate/key PEM files are
+reloaded when they change on disk. There is no client authentication.
 
 ## Execution modes
 

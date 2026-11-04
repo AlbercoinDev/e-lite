@@ -55,7 +55,9 @@ Expected:
 - Core starts or is adopted; state `WAITING_FOR_CORE` → `BUILDING_INDEX` → `READY`.
 - `prune_mib=1`: Core does not prune by itself; e-lite’s prune gate does.
 - `/status` shows `indexed_height`, `core_height`, `pruneheight`, `tuning`.
-- Electrum at `127.0.0.1:50001`; metrics at `127.0.0.1:9184`.
+- Electrum at `127.0.0.1:50001` (plain); metrics at `127.0.0.1:9184`.
+- Optional TLS listener: `--tls-listen`/`--tls-cert`/`--tls-key` (see
+  [`OPERATIONS.md`](OPERATIONS.md#electrum-tls-optional)).
 
 ## 4. Automated suite
 
@@ -104,6 +106,7 @@ or `adaptive` in the TOML, send `SIGUSR1` and verify the values in `/status`.
 - [ ] `pruneheight` stays at or below `indexed_height - 288`.
 - [ ] No `NEEDS_RECOVERY` / prune gap.
 - [ ] Electrum history/balance/UTXO/mempool/fees/broadcast work.
+- [ ] Optional Electrum TLS works and a renewed PEM is picked up without restart.
 - [ ] Raw tx works from Core/cache; pruned fallback is explicit if unavailable.
 - [ ] Disk-low pauses downloads; indexing continues until the critical floor.
 - [ ] `SIGUSR1` applies hot fields; cold fields are logged.
