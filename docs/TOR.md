@@ -28,7 +28,8 @@ binary:
 ```
 
 The default prefix is `~/.local/bin`, so the bundle normally lives in
-`~/.local/lib/e-lite/tor/`. No `apt`, root or system service is needed.
+`~/.local/lib/e-lite/tor/`. A system `.deb` install uses `/usr/lib/e-lite/tor/`.
+No `apt`, root or system service is needed for a user install.
 
 ```bash
 curl -fsSL https://github.com/AlbercoinDev/e-lite/releases/latest/download/install.sh | sh

@@ -255,7 +255,12 @@ esac
 # ----------------------------------------------------------------------- tor
 install_tor() {
   [ "$TOR_MODE" = "yes" ] || { log "Tor: skipped"; return 0; }
-  libdir="$(dirname "$PREFIX")/lib/e-lite/tor"
+  if [ "$SYSTEM" -eq 1 ]; then
+    elite_bin="/usr/bin/e-lite"
+  else
+    elite_bin="$PREFIX/e-lite"
+  fi
+  libdir="$(dirname "$elite_bin")/../lib/e-lite/tor"
   if [ -x "$libdir/tor" ] && [ "$(cat "$libdir/VERSION" 2>/dev/null || true)" = "$TOR_BUNDLE_VERSION" ]; then
     log "Tor is already up to date ($TOR_BUNDLE_VERSION)"
     return 0

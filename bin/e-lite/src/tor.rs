@@ -159,6 +159,13 @@ pub fn resolve_binary(cfg: &Config) -> Option<PathBuf> {
             }
         }
     }
+    // .deb installs the binary in /usr/bin and the bundle in /usr/lib; user
+    // installs may place it in /usr/local/lib.
+    for p in ["/usr/lib/e-lite/tor/tor", "/usr/local/lib/e-lite/tor/tor"] {
+        if Path::new(p).is_file() {
+            return Some(PathBuf::from(p));
+        }
+    }
     find_in_path("tor")
 }
 
