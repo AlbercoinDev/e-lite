@@ -5,6 +5,7 @@
 #
 # Options (pass after `sh -s --`):
 #   --with-core | --no-core   install/update Bitcoin Core, or skip it (default: ask)
+#   --with-tor | --without-tor install/update the bundled Tor (default: yes)
 #   --yes                     non-interactive
 #   --prefix DIR              install prefix (default: ~/.local/bin)
 #   --system                  install the .deb (requires root)
@@ -20,12 +21,18 @@ set -eu
 REPO="AlbercoinDev/e-lite"
 PREFIX="${E_LITE_PREFIX:-$HOME/.local/bin}"
 CORE_MODE="ask"
+TOR_MODE="yes"
 ASSUME_YES=0
 SYSTEM=0
 FORCE=0
 PIN_VERSION=""
 CORE_VERSION=""
 ASSET="e-lite_x86_64-unknown-linux-gnu.tar.gz"
+# Tor expert bundle (GPLv3 binary, downloaded from the Tor Project at install
+# time; e-lite does not redistribute it).
+TOR_BUNDLE_VERSION="16.0"
+TOR_BUNDLE_SHA256="cc950ebe9acb80188325c3a2cd8817def7dd7237d6fdcd861bb87b234a0cb2fd"
+TOR_BUNDLE_URL="https://dist.torproject.org/torbrowser/${TOR_BUNDLE_VERSION}/tor-expert-bundle-linux-x86_64-${TOR_BUNDLE_VERSION}.tar.gz"
 
 usage() {
   cat <<'EOF'
@@ -35,6 +42,7 @@ e-lite installer / updater (Debian 12+, x86_64)
 
 Options (after `sh -s --`):
   --with-core | --no-core   install/update Bitcoin Core, or skip it (default: ask)
+  --with-tor | --without-tor install/update the bundled Tor (default: yes)
   --yes                     non-interactive
   --prefix DIR              install prefix (default: ~/.local/bin)
   --system                  install the .deb (requires root)
@@ -52,6 +60,8 @@ while [ $# -gt 0 ]; do
   case "$1" in
     --with-core) CORE_MODE="yes" ;;
     --no-core) CORE_MODE="no" ;;
+    --with-tor) TOR_MODE="yes" ;;
+    --without-tor|--no-tor) TOR_MODE="no" ;;
     --yes|-y) ASSUME_YES=1 ;;
     --system) SYSTEM=1; PREFIX="/usr/local/bin" ;;
     --force) FORCE=1 ;;
@@ -241,6 +251,40 @@ case "$CORE_MODE" in
     ;;
   *) die "bad core mode" ;;
 esac
+
+# ----------------------------------------------------------------------- tor
+install_tor() {
+  [ "$TOR_MODE" = "yes" ] || { log "Tor: skipped"; return 0; }
+  libdir="$(dirname "$PREFIX")/lib/e-lite/tor"
+  if [ -x "$libdir/tor" ] && [ "$(cat "$libdir/VERSION" 2>/dev/null || true)" = "$TOR_BUNDLE_VERSION" ]; then
+    log "Tor is already up to date ($TOR_BUNDLE_VERSION)"
+    return 0
+  fi
+  log "Tor: installing/updating to $TOR_BUNDLE_VERSION (official expert bundle)"
+  tgz="tor-expert-$TOR_BUNDLE_VERSION.tar.gz"
+  if ! fetch "$TOR_BUNDLE_URL" "$TMP/$tgz"; then
+    warn "cannot download the Tor bundle; install tor with your package manager or rerun with --with-tor"
+    return 0
+  fi
+  actual="$(sha256sum "$TMP/$tgz" | awk '{print $1}')"
+  if [ "$actual" != "$TOR_BUNDLE_SHA256" ]; then
+    warn "Tor bundle checksum mismatch (expected $TOR_BUNDLE_SHA256, got $actual); skipping"
+    return 0
+  fi
+  mkdir -p "$TMP/torbundle"
+  tar -xzf "$TMP/$tgz" -C "$TMP/torbundle" tor || { warn "bad Tor bundle layout; skipping"; return 0; }
+  mkdir -p "$libdir"
+  # Only the daemon and its bundled libraries are needed; skip the pluggable
+  # transports (bridges) to keep the install small.
+  cp -a "$TMP/torbundle/tor/tor" "$libdir/tor"
+  for lib in "$TMP/torbundle/tor/"lib*.so*; do
+    [ -f "$lib" ] && cp -a "$lib" "$libdir/"
+  done
+  printf '%s\n' "$TOR_BUNDLE_VERSION" > "$libdir/VERSION"
+  chmod 0755 "$libdir/tor" 2>/dev/null || true
+  log "Tor $TOR_BUNDLE_VERSION installed at $libdir"
+}
+install_tor
 
 # ---------------------------------------------------------------------- done
 log ""

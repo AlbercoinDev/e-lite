@@ -61,11 +61,20 @@ Never treat a version number in this file as authoritative over the code/tag.
 - `commit_sync = auto` relaxes the RocksDB fsync in bulk; `txids.dat` is always
   fsynced and live mode is strict.
 - Electrum listens on `127.0.0.1:50001` (plain) by default. Optional TLS uses a
-  separate listener (`tls_listen`). Neither listener authenticates clients; do
-  not expose them publicly without a tunnel/firewall/access plan.
+  separate listener (`tls_listen`). `[tor] mode = "managed"` runs e-lite's own
+  Tor and publishes plain 50001 and TLS 50002 as a v3 onion service; TLS uses an
+  auto-generated self-signed certificate when none is configured. Neither
+  listener authenticates clients; the onion address is the access secret. Do not
+  expose them publicly without a tunnel/firewall/access plan.
+- The memory budget reserves `max(1024 MiB, RAM/8)` for the OS/Core/page cache,
+  caps e-lite at 75 % of total RAM, fixes memtables at `RAM/8`, and grows/shrinks
+  the block cache in 256 MiB steps under `MemAvailable` + page-cache pressure.
+  `cache_mib` is a maximum, not a lock. Before Core resumes downloads after a
+  bulk pause, the cache shrinks to the live budget.
 - Core RPC is HTTP; LAN/WAN use requires SSH/VPN.
-- RocksDB memory is budgeted globally (`RAM/16` for memtables, cache `RAM/4`),
-  background jobs are CPU-capped, and every knob is available via CLI/`--set`.
+- RocksDB memory is budgeted globally (`RAM/8` for memtables within the memory
+  budget, cache starts at `RAM/4` and adapts), background jobs are CPU-capped,
+  and every knob is available via CLI/`--set`.
 - `run`/`index`/`serve` tee console output to `<data-dir>/e-lite.log`
   (`--log-file`, `--log-max-mib`, `--no-log-file`).
 - Raw transactions are local-first. External fallback requests whole blocks by

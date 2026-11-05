@@ -21,7 +21,7 @@ available**.
 | Core bulk pause + peer warm-up | experimental | pause during bulk; resume 5k blocks early |
 | Disk guard with download/index split | experimental | cgroup/LXC aware |
 | Adaptive profiles and hot reload | experimental | `auto/hdd/ssd/nvme/manual`, `SIGUSR1` |
-| Global RocksDB memory budget | experimental | `RAM/16` memtables, `RAM/4` cache, CPU-capped jobs |
+| Global RocksDB memory budget | experimental | `RAM/8` memtables inside a 75 % ceiling; adaptive cache; CPU-capped jobs |
 | Reorg recovery within undo window | experimental | deeper reorg fails clearly |
 | Snapshots export/import | experimental | optional; not required from zero |
 
@@ -61,7 +61,9 @@ available**.
 |---|---|---|
 | Local-first rawtx | experimental | Core/cache before external |
 | Whole-block external fetch | experimental | by hash, never txid |
-| Tor SOCKS5h, fail closed | experimental | `tor_socks`, `allow_clearnet` |
+| Tor SOCKS5h, fail closed | experimental | managed Tor by default; `tor_socks`, `allow_clearnet` |
+| Managed Tor + onion service | experimental | plain 50001 + TLS 50002; `e-lite onion show/reset` |
+| Auto self-signed onion TLS cert | experimental | SAN includes the onion; reloaded on change |
 | Decoys and random source order | experimental | `decoys=3` default |
 | Block hash/header/Merkle/witness validation | experimental | before serving/caching |
 | Configurable Esplora endpoints | experimental | `esplora_urls` |
@@ -76,12 +78,14 @@ available**.
 | `/status`, `/metrics`, `/healthz` | experimental | loopback by default; memory and TLS counters |
 | Application log `e-lite.log` | experimental | tee of console; rotation; `--log-file`/`--no-log-file` |
 | Wallet banner | experimental | built-in INDEXING/READY + template file |
+| Adaptive memory budget | experimental | hot cache grow/shrink; 75 % ceiling; reserve |
 | READY / FULLY SYNCED status | experimental | log, `/status`, `/metrics`, `e-lite status` |
 | Ordered startup/shutdown | experimental | `run` waits for Core; threads joined before Core stop |
 | CLI overrides and `--set` | stable | every TOML field; see `docs/CLI.md` |
 | Progress percentages and milestones | experimental | height/Core %, 10k blocks or 6 h; disk usage |
-| One-line install/update | stable | installer verifies SHA256SUMS |
+| One-line install/update | stable | installer verifies SHA256SUMS; Tor bundle by default |
 | Optional official Core install/update | stable | `--with-core` |
+| Optional Tor expert bundle | stable | `--with-tor` default; `--without-tor` |
 | `.deb`, tarball, release checksums | stable | GitHub Releases |
 | All-in-one test harness | experimental | `scripts/e-lite-all-in-one.sh` |
 | Systemd unit / container image | **not available** | roadmap |

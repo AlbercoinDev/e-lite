@@ -72,8 +72,16 @@ p2p_peers = []             # empty = discover from local Core
 - Default is **Tor-first, fail closed**: with `allow_clearnet = false`,
   clearnet endpoints are skipped when Tor is not configured, and the resolver
   reports that no source is available.
-- When Tor is configured (`socks5h://127.0.0.1:9050`), both clearnet and `.onion`
-  requests go through the proxy.
+- e-lite runs its own Tor by default (`[tor] mode = "managed"`) and uses that
+  SOCKS proxy for external rawtx/repair requests. There is no dependency on a
+  system Tor daemon.
+- When an external Tor proxy is configured (`socks5h://127.0.0.1:9050`), both
+  clearnet and `.onion` requests go through the proxy.
+- **Inbound onion:** the same managed Tor publishes Electrum as a v3 onion
+  service. This hides the server IP and encrypts the transport, but anyone with
+  the address can query it: e-lite does not authenticate clients or rate limit
+  requests. Treat the address as a secret; use `[tor] mode = "off"` to disable
+  the onion.
 - `allow_clearnet = true` permits direct clearnet access if you explicitly
   accept the privacy trade-off. It is not the default.
 - `decoys = 3` fetches extra random blocks after a real external fetch, so the

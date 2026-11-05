@@ -87,7 +87,6 @@ pub struct Tunables {
     prefetch_blocks: AtomicUsize,
     adaptive: AtomicBool,
     readers_locked: AtomicBool,
-    cache_locked: AtomicBool,
     commit_locked: AtomicBool,
     batch_locked: AtomicBool,
     profile: AtomicU8,
@@ -101,6 +100,15 @@ pub struct Tunables {
     max_cache_mib: u64,
     min_batch: u32,
     max_batch: u32,
+
+    // Memory split computed at startup.
+    total_mib: u64,
+    reserve_mib: u64,
+    ceiling_mib: u64,
+    memtables_mib: u64,
+    runtime_mib: u64,
+    mem_streak: Mutex<(i8, u32)>,
+    resume_shrunk: AtomicBool,
 
     // Exportable performance signals.
     pub read_ms: AtomicU64,
@@ -178,7 +186,13 @@ impl Tunables {
             default_cache
         };
 
-        let max_cache_mib = (ram_mib / 2).clamp(256, 16_384);
+        let budget = budget_from(
+            cfg,
+            ram_mib,
+            memory_info().available_mib,
+            memory_info().cached_mib,
+        );
+        let max_cache_mib = budget.cache_max_mib.max(64);
         // Keep a single hard ceiling; the profile only changes the starting
         // point. The controller never raises readers on a rotational disk.
         let max_readers = match profile {
@@ -210,7 +224,6 @@ impl Tunables {
             prefetch_blocks: AtomicUsize::new(cfg.index.prefetch_blocks.max(1)),
             adaptive: AtomicBool::new(cfg.index.adaptive),
             readers_locked: AtomicBool::new(cfg.index.readers > 0),
-            cache_locked: AtomicBool::new(cfg.index.cache_mib > 0),
             commit_locked: AtomicBool::new(cfg.index.commit_interval_ms > 0),
             batch_locked: AtomicBool::new(
                 cfg.index.batch_blocks > 0 && cfg.index.batch_blocks != 256,
@@ -225,6 +238,13 @@ impl Tunables {
             max_cache_mib,
             min_batch: 16,
             max_batch: 4096,
+            total_mib: ram_mib,
+            reserve_mib: budget.reserve_mib,
+            ceiling_mib: budget.ceiling_mib,
+            memtables_mib: budget.memtables_mib,
+            runtime_mib: budget.runtime_mib,
+            mem_streak: Mutex::new((0, 0)),
+            resume_shrunk: AtomicBool::new(false),
             read_ms: AtomicU64::new(0),
             apply_ms: AtomicU64::new(0),
             decode_ms: AtomicU64::new(0),
@@ -393,8 +413,6 @@ impl Tunables {
         self.adaptive.store(cfg.index.adaptive, Ordering::Relaxed);
         self.readers_locked
             .store(cfg.index.readers > 0, Ordering::Relaxed);
-        self.cache_locked
-            .store(cfg.index.cache_mib > 0, Ordering::Relaxed);
         self.commit_locked
             .store(cfg.index.commit_interval_ms > 0, Ordering::Relaxed);
         self.batch_locked.store(
@@ -475,36 +493,11 @@ impl Tunables {
         let read_ms = self.read_ms.load(Ordering::Relaxed);
         let apply_ms = self.apply_ms.load(Ordering::Relaxed);
         let commit_ms = self.commit_ewma.load(Ordering::Relaxed);
-        let mem_available = mem_available_mib();
-        if mem_available < 512 {
-            // Cache first: it is reclaimable and usually the cheapest thing to
-            // shrink. Do not collapse the indexer to one reader on a temporary
-            // dip; keep a floor unless memory is truly critical.
-            let mut c = self.cache_mib();
-            if !self.cache_locked.load(Ordering::Relaxed) {
-                c = (c * 3 / 4).max(128);
+        if let Some(reason) = self.memory_step(store, stats) {
+            if let Ok(mut last) = self.last_change.lock() {
+                *last = Instant::now();
             }
-            let mut r = self.readers();
-            if mem_available < 256 {
-                r = (r * 3 / 4).max(2).min(self.readers());
-            }
-            let changed = c != self.cache_mib() || r != self.readers();
-            if c != self.cache_mib() {
-                self.cache_mib.store(c, Ordering::Relaxed);
-                store.set_cache_bytes(c as usize * 1024 * 1024);
-            }
-            if r != self.readers() {
-                self.readers.store(r, Ordering::Relaxed);
-            }
-            if changed {
-                eprintln!(
-                    "[e-lite] adaptive tuning: memory pressure ({mem_available} MiB):                      readers -> {r}, cache -> {c} MiB"
-                );
-                if let Some(stats) = stats {
-                    self.publish(stats);
-                }
-                return Some("memory pressure".to_string());
-            }
+            return Some(reason);
         }
         let mut action = None;
 
@@ -586,6 +579,122 @@ impl Tunables {
         action
     }
 
+    /// Hot memory policy: grow the block cache in small steps while page cache
+    /// and available RAM stay healthy, and shrink under pressure. Manual
+    /// `cache_mib` is treated as a maximum, not as an immutable value.
+    fn memory_step(&self, store: &Store, stats: Option<&Stats>) -> Option<String> {
+        let mem = memory_info();
+        let action = cache_action(
+            mem.available_mib,
+            mem.cached_mib,
+            self.reserve_mib,
+            self.cache_mib(),
+            self.max_cache_mib,
+        );
+        let dir = match action {
+            CacheAction::Grow => 1i8,
+            CacheAction::Shrink => -1,
+            CacheAction::Hold => 0,
+        };
+        if dir == 0 {
+            if let Ok(mut streak) = self.mem_streak.lock() {
+                *streak = (0, 0);
+            }
+            return None;
+        }
+        {
+            let Ok(mut streak) = self.mem_streak.lock() else {
+                return None;
+            };
+            if streak.0 == dir {
+                streak.1 = streak.1.saturating_add(1);
+            } else {
+                *streak = (dir, 1);
+            }
+            if streak.1 < 2 {
+                return None;
+            }
+            *streak = (0, 0);
+        }
+        let old = self.cache_mib();
+        let new = match action {
+            CacheAction::Grow => (old + 256).min(self.max_cache_mib),
+            CacheAction::Shrink => {
+                let floor = 256u64.min(old.max(1));
+                (old * 3 / 4).max(floor)
+            }
+            CacheAction::Hold => old,
+        };
+        if new == old {
+            return None;
+        }
+        self.cache_mib.store(new, Ordering::Relaxed);
+        store.set_cache_bytes(new as usize * 1024 * 1024);
+        // Memory is truly critical: also give back a reader.
+        let mut readers = self.readers();
+        if mem.available_mib < 256 && readers > self.min_readers {
+            readers = (readers * 3 / 4).max(self.min_readers);
+            self.readers.store(readers, Ordering::Relaxed);
+        }
+        eprintln!(
+            "[e-lite] memory: available {} MiB, buff/cache {} MiB, reserve {} MiB: \
+             cache {} -> {} MiB (max {}, memtables {} MiB, readers {})",
+            mem.available_mib,
+            mem.cached_mib,
+            self.reserve_mib,
+            old,
+            new,
+            self.max_cache_mib,
+            self.memtables_mib,
+            readers
+        );
+        if let Some(stats) = stats {
+            self.publish(stats);
+        }
+        Some(format!("memory: cache {} -> {} MiB", old, new))
+    }
+
+    /// Give RAM back before Core resumes downloads. Called once per bulk pause:
+    /// Core's block index and verification grow after this point.
+    pub fn shrink_for_core_resume(&self, store: &Store) {
+        if self.resume_shrunk.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let live = (self.total_mib / 4)
+            .max(1024)
+            .min(self.max_cache_mib)
+            .max(self.min_cache_mib);
+        let old = self.cache_mib();
+        if old <= live {
+            return;
+        }
+        self.cache_mib.store(live, Ordering::Relaxed);
+        store.set_cache_bytes(live as usize * 1024 * 1024);
+        eprintln!(
+            "[e-lite] memory: Core is about to resume; cache {} -> {} MiB \
+             (available {}, buff/cache {})",
+            old,
+            live,
+            memory_info().available_mib,
+            memory_info().cached_mib
+        );
+    }
+
+    /// Arm the one-shot pre-resume shrink again after a new bulk pause.
+    pub fn reset_resume_shrink(&self) {
+        self.resume_shrunk.store(false, Ordering::SeqCst);
+    }
+
+    pub fn memory_numbers(&self) -> (u64, u64, u64, u64, u64) {
+        (
+            self.total_mib,
+            self.reserve_mib,
+            self.ceiling_mib,
+            self.memtables_mib,
+            self.runtime_mib,
+        )
+    }
+
     /// Export current hot values and metrics to the shared status.
     pub fn publish(&self, stats: &Stats) {
         stats
@@ -647,6 +756,21 @@ impl Tunables {
         stats
             .mem_reclaimable_mib
             .store(mem.reclaimable_mib.unwrap_or(0), Ordering::Relaxed);
+        stats
+            .mem_cached_mib
+            .store(mem.cached_mib, Ordering::Relaxed);
+        stats
+            .mem_cache_max_mib
+            .store(self.max_cache_mib, Ordering::Relaxed);
+        stats
+            .mem_memtables_mib
+            .store(self.memtables_mib, Ordering::Relaxed);
+        stats
+            .mem_reserve_mib
+            .store(self.reserve_mib, Ordering::Relaxed);
+        stats
+            .mem_budget_mib
+            .store(self.ceiling_mib, Ordering::Relaxed);
     }
 }
 
@@ -672,6 +796,10 @@ pub struct MemoryInfo {
     pub cgroup_used_mib: Option<u64>,
     /// Page cache in the cgroup that the kernel can reclaim under pressure.
     pub reclaimable_mib: Option<u64>,
+    /// `MemFree`, useful for diagnostics.
+    pub free_mib: u64,
+    /// `Buffers + Cached`: page cache that a growing anonymous cache evicts.
+    pub cached_mib: u64,
 }
 
 pub fn total_ram_mib() -> Option<u64> {
@@ -701,6 +829,10 @@ pub fn memory_info() -> MemoryInfo {
         Some(cg) => host_available.min(cg),
         None => host_available,
     };
+    let free = meminfo_mib("MemFree").unwrap_or(0);
+    let cached = meminfo_mib("Buffers")
+        .unwrap_or(0)
+        .saturating_add(meminfo_mib("Cached").unwrap_or(0));
     MemoryInfo {
         total_mib: total,
         available_mib: available,
@@ -708,6 +840,8 @@ pub fn memory_info() -> MemoryInfo {
         cgroup_limit_mib: cg_limit,
         cgroup_used_mib: cg_used,
         reclaimable_mib: reclaimable,
+        free_mib: free,
+        cached_mib: cached,
     }
 }
 
@@ -802,6 +936,118 @@ fn cgroup_available_mib() -> Option<u64> {
     Some(limit.saturating_sub(used.saturating_sub(reclaimable)))
 }
 
+/// Memory split for the indexer. Kept as a pure calculation so it can be
+/// tested without touching the host.
+#[derive(Debug, Clone, Copy)]
+pub struct MemoryBudget {
+    pub total_mib: u64,
+    pub available_mib: u64,
+    pub cached_mib: u64,
+    pub reserve_mib: u64,
+    pub ceiling_mib: u64,
+    pub memtables_mib: u64,
+    pub runtime_mib: u64,
+    pub cache_max_mib: u64,
+    pub cache_start_mib: u64,
+}
+
+pub fn memory_budget(cfg: &Config) -> MemoryBudget {
+    let mem = memory_info();
+    budget_from(
+        cfg,
+        mem.total_mib.unwrap_or(1024),
+        mem.available_mib,
+        mem.cached_mib,
+    )
+}
+
+pub fn budget_from(
+    cfg: &Config,
+    total_mib: u64,
+    available_mib: u64,
+    cached_mib: u64,
+) -> MemoryBudget {
+    let reserve_mib = if cfg.index.memory_reserve_mib > 0 {
+        cfg.index.memory_reserve_mib
+    } else {
+        (total_mib / 8).max(1024)
+    };
+    let fraction = if cfg.index.memory_fraction > 0.0 {
+        cfg.index.memory_fraction.clamp(0.1, 1.0)
+    } else {
+        0.75
+    };
+    let ceiling_mib = ((total_mib as f64 * fraction) as u64)
+        .max(reserve_mib.saturating_add(256))
+        .min(total_mib);
+    let memtables_mib = if cfg.index.write_buffer_mib > 0 {
+        cfg.index.write_buffer_mib
+    } else {
+        (total_mib / 8).clamp(256, 2048)
+    };
+    let runtime_mib = (total_mib / 16).clamp(256, 1024);
+    let cache_ceiling = ceiling_mib
+        .saturating_sub(memtables_mib.saturating_add(runtime_mib))
+        .max(256);
+    let cache_max_mib = if cfg.index.cache_mib > 0 {
+        cfg.index.cache_mib.min(cache_ceiling)
+    } else {
+        cache_ceiling
+    };
+    let cache_start_mib = if cfg.index.cache_mib > 0 {
+        cache_max_mib
+    } else {
+        (total_mib / 4).clamp(256, cache_max_mib)
+    };
+    MemoryBudget {
+        total_mib,
+        available_mib,
+        cached_mib,
+        reserve_mib,
+        ceiling_mib,
+        memtables_mib,
+        runtime_mib,
+        cache_max_mib,
+        cache_start_mib,
+    }
+}
+
+pub fn auto_memtables_mib(cfg: &Config) -> u64 {
+    memory_budget(cfg).memtables_mib
+}
+
+pub fn initial_cache_mib(cfg: &Config) -> u64 {
+    memory_budget(cfg).cache_start_mib
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CacheAction {
+    Grow,
+    Hold,
+    Shrink,
+}
+
+/// One sample of the hot memory policy. `cached_mib` is page cache: growing the
+/// RocksDB cache evicts it, so it is the guard that keeps block reads fast.
+pub fn cache_action(
+    available_mib: u64,
+    cached_mib: u64,
+    reserve_mib: u64,
+    cache_mib: u64,
+    cache_max_mib: u64,
+) -> CacheAction {
+    if available_mib < reserve_mib || cached_mib < reserve_mib / 2 {
+        CacheAction::Shrink
+    } else if available_mib >= reserve_mib + reserve_mib / 2
+        && cached_mib >= reserve_mib
+        && cache_mib < cache_max_mib
+    {
+        CacheAction::Grow
+    } else {
+        CacheAction::Hold
+    }
+}
+
 /// `rotational` hint for the device holding `path`. Falls back to false.
 /// Uses mountinfo's major:minor and walks sysfs to the parent block device, so
 /// partitions and device-mapper volumes are handled too.
@@ -856,6 +1102,68 @@ mod tests {
         assert_eq!(slot.load(Ordering::Relaxed), 100);
         ewma(&slot, 200);
         assert_eq!(slot.load(Ordering::Relaxed), 112);
+    }
+
+    #[test]
+    fn meminfo_parser_reads_free_and_page_cache() {
+        let text =
+            "MemTotal: 8131584 kB\nMemFree: 163840 kB\nBuffers: 10240 kB\nCached: 2772992 kB\n";
+        assert_eq!(meminfo_from(text, "MemFree"), Some(160));
+        assert_eq!(meminfo_from(text, "Buffers"), Some(10));
+        assert_eq!(meminfo_from(text, "Cached"), Some(2708));
+    }
+
+    #[test]
+    fn memory_budget_scales_with_ram_and_respects_overrides() {
+        let mut cfg = Config::default();
+        let b = budget_from(&cfg, 7941, 2583, 2708);
+        assert_eq!(b.reserve_mib, 1024);
+        assert_eq!(b.ceiling_mib, 5955);
+        assert_eq!(b.memtables_mib, 992);
+        assert!(b.cache_max_mib > b.cache_start_mib || b.cache_start_mib == b.cache_max_mib);
+
+        cfg.index.memory_fraction = 0.5;
+        cfg.index.memory_reserve_mib = 2048;
+        cfg.index.write_buffer_mib = 512;
+        let b = budget_from(&cfg, 8192, 3000, 1000);
+        assert_eq!(b.reserve_mib, 2048);
+        assert_eq!(b.ceiling_mib, 4096);
+        assert_eq!(b.memtables_mib, 512);
+
+        // Manual cache is a maximum, not a fixed value.
+        cfg.index.cache_mib = 128;
+        let b = budget_from(&cfg, 8192, 3000, 1000);
+        assert_eq!(b.cache_max_mib, 128);
+        assert_eq!(b.cache_start_mib, 128);
+    }
+
+    #[test]
+    fn cache_action_grows_and_shrinks_with_hysteresis_inputs() {
+        // Healthy: available > 1.5*reserve and page cache >= reserve.
+        assert_eq!(
+            cache_action(2583, 2708, 1024, 1985, 4000),
+            CacheAction::Grow
+        );
+        // No room above the ceiling: hold.
+        assert_eq!(
+            cache_action(2583, 2708, 1024, 4000, 4000),
+            CacheAction::Hold
+        );
+        // Available below reserve: shrink.
+        assert_eq!(
+            cache_action(800, 2708, 1024, 2000, 4000),
+            CacheAction::Shrink
+        );
+        // Page cache below half the reserve: shrink even with free RAM.
+        assert_eq!(
+            cache_action(4000, 400, 1024, 2000, 4000),
+            CacheAction::Shrink
+        );
+        // Between 1x and 1.5x reserve: hold.
+        assert_eq!(
+            cache_action(1200, 2000, 1024, 2000, 4000),
+            CacheAction::Hold
+        );
     }
 
     #[test]

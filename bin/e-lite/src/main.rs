@@ -2,6 +2,7 @@ mod config;
 mod core_supervisor;
 mod logging;
 mod snapshot;
+mod tor;
 mod tuning;
 
 use config::{Config, CoreManage};
@@ -174,6 +175,7 @@ enum Command {
     ExportSnapshot,
     ImportSnapshot,
     Core,
+    Onion,
 }
 
 #[derive(Default)]
@@ -217,6 +219,8 @@ struct Args {
     commit_sync: Option<String>,
     prefetch_blocks: Option<usize>,
     write_buffer_mib: Option<u64>,
+    memory_reserve_mib: Option<u64>,
+    memory_fraction: Option<f64>,
     background_jobs: Option<usize>,
     milestone_blocks: Option<u64>,
     milestone_seconds: Option<u64>,
@@ -239,6 +243,16 @@ struct Args {
     decoys: Option<u32>,
     rawtx_cache_mib: Option<u64>,
     tor_socks: Option<String>,
+    tor_mode: Option<String>,
+    tor_plain: Option<bool>,
+    tor_tls: Option<bool>,
+    tor_auto_cert: Option<bool>,
+    tor_onion_port: Option<u16>,
+    tor_onion_tls_port: Option<u16>,
+    tor_socks_port: Option<u16>,
+    tor_binary: Option<String>,
+    no_tor: bool,
+    purge: bool,
     stop_on_exit: Option<bool>,
     restart: Option<bool>,
     log_file: Option<String>,
@@ -300,6 +314,12 @@ fn parse_args() -> R<Args> {
             "--write-buffer-mib" => {
                 args.write_buffer_mib = Some(value("--write-buffer-mib")?.parse()?)
             }
+            "--memory-reserve-mib" => {
+                args.memory_reserve_mib = Some(value("--memory-reserve-mib")?.parse()?)
+            }
+            "--memory-fraction" => {
+                args.memory_fraction = Some(value("--memory-fraction")?.parse()?)
+            }
             "--background-jobs" => {
                 args.background_jobs = Some(value("--background-jobs")?.parse()?)
             }
@@ -345,6 +365,21 @@ fn parse_args() -> R<Args> {
                 args.rawtx_cache_mib = Some(value("--rawtx-cache-mib")?.parse()?)
             }
             "--tor-socks" => args.tor_socks = Some(value("--tor-socks")?),
+            "--tor-mode" => args.tor_mode = Some(value("--tor-mode")?),
+            "--tor-onion-port" => args.tor_onion_port = Some(value("--tor-onion-port")?.parse()?),
+            "--tor-onion-tls-port" => {
+                args.tor_onion_tls_port = Some(value("--tor-onion-tls-port")?.parse()?)
+            }
+            "--tor-socks-port" => args.tor_socks_port = Some(value("--tor-socks-port")?.parse()?),
+            "--tor-binary" => args.tor_binary = Some(value("--tor-binary")?),
+            "--tor-plain" => args.tor_plain = Some(true),
+            "--no-tor-plain" => args.tor_plain = Some(false),
+            "--tor-tls" => args.tor_tls = Some(true),
+            "--no-tor-tls" => args.tor_tls = Some(false),
+            "--tor-auto-cert" => args.tor_auto_cert = Some(true),
+            "--no-tor-auto-cert" => args.tor_auto_cert = Some(false),
+            "--no-tor" => args.no_tor = true,
+            "--purge" => args.purge = true,
             "--adaptive" => args.adaptive = Some(true),
             "--no-adaptive" => args.adaptive = Some(false),
             "--no-p2p" => args.no_p2p = true,
@@ -364,7 +399,9 @@ fn parse_args() -> R<Args> {
             "--no-follow" => args.no_follow = true,
             other if other.starts_with('-') => return fail(format!("unknown flag: {other}")),
             other => {
-                if args.command == Some(Command::Core) && args.subcommand.is_none() {
+                if matches!(args.command, Some(Command::Core) | Some(Command::Onion))
+                    && args.subcommand.is_none()
+                {
                     args.subcommand = Some(other.to_string());
                     continue;
                 }
@@ -379,6 +416,7 @@ fn parse_args() -> R<Args> {
                     "run" => Command::Run,
                     "status" => Command::Status,
                     "core" => Command::Core,
+                    "onion" => Command::Onion,
                     "export-snapshot" => Command::ExportSnapshot,
                     "import-snapshot" => Command::ImportSnapshot,
                     "version" => Command::Version,
@@ -498,6 +536,12 @@ fn effective_config(args: &Args) -> R<(Config, Chain)> {
     if let Some(v) = args.write_buffer_mib {
         cfg.index.write_buffer_mib = v;
     }
+    if let Some(v) = args.memory_reserve_mib {
+        cfg.index.memory_reserve_mib = v;
+    }
+    if let Some(v) = args.memory_fraction {
+        cfg.index.memory_fraction = v;
+    }
     if let Some(v) = args.background_jobs {
         cfg.index.background_jobs = v;
     }
@@ -567,6 +611,33 @@ fn effective_config(args: &Args) -> R<(Config, Chain)> {
     }
     if let Some(v) = &args.tor_socks {
         cfg.rawtx.tor_socks = Some(v.clone());
+    }
+    if let Some(v) = &args.tor_mode {
+        cfg.tor.mode = v.clone();
+    }
+    if let Some(v) = args.tor_plain {
+        cfg.tor.plain = v;
+    }
+    if let Some(v) = args.tor_tls {
+        cfg.tor.tls = v;
+    }
+    if let Some(v) = args.tor_auto_cert {
+        cfg.tor.tls_auto_cert = v;
+    }
+    if let Some(v) = args.tor_onion_port {
+        cfg.tor.onion_port = v;
+    }
+    if let Some(v) = args.tor_onion_tls_port {
+        cfg.tor.onion_tls_port = v;
+    }
+    if let Some(v) = args.tor_socks_port {
+        cfg.tor.socks_port = v;
+    }
+    if let Some(v) = &args.tor_binary {
+        cfg.tor.binary = v.clone();
+    }
+    if args.no_tor {
+        cfg.tor.mode = "off".to_string();
     }
     if let Some(v) = args.stop_on_exit {
         cfg.core.stop_on_exit = v;
@@ -728,12 +799,7 @@ fn total_ram_mib() -> Option<u64> {
 }
 
 fn effective_cache_mib(cfg: &Config) -> u64 {
-    if cfg.index.cache_mib > 0 {
-        return cfg.index.cache_mib.clamp(16, 16384);
-    }
-    total_ram_mib()
-        .map(|ram| (ram / 4).clamp(64, 16_384))
-        .unwrap_or(256)
+    tuning::initial_cache_mib(cfg)
 }
 
 fn min_free_bytes(cfg: &Config, chain: Chain) -> Option<u64> {
@@ -799,7 +865,7 @@ fn open_store_with(
     let write_mib = if cfg.index.write_buffer_mib > 0 {
         cfg.index.write_buffer_mib
     } else {
-        (ram_mib / 16).clamp(64, 1024)
+        tuning::auto_memtables_mib(cfg)
     };
     let max_buffers = if ram_mib <= 2048 { 2 } else { 3 };
     let cpus = std::thread::available_parallelism()
@@ -815,7 +881,7 @@ fn open_store_with(
         cache_bytes,
         write_buffer_total_bytes: (write_mib as usize) * 1024 * 1024,
         max_write_buffer_number: max_buffers,
-        max_total_wal_bytes: ((write_mib / 2).clamp(32, 256) as usize) * 1024 * 1024,
+        max_total_wal_bytes: ((write_mib / 2).clamp(64, 1024) as usize) * 1024 * 1024,
         background_jobs: jobs,
         ..Default::default()
     };
@@ -941,6 +1007,7 @@ fn run() -> R<()> {
         Command::Run => cmd_run(&cfg, chain),
         Command::Status => cmd_status(&cfg, chain, args.json),
         Command::Core => cmd_core(&cfg, chain, args.subcommand.as_deref()),
+        Command::Onion => cmd_onion(&cfg, chain, args.subcommand.as_deref(), args.purge),
         Command::ExportSnapshot => cmd_export(&cfg, chain, args.output.as_deref()),
         Command::ImportSnapshot => cmd_import(&cfg, chain, args.input.as_deref()),
         Command::Help | Command::Version => unreachable!(),
@@ -963,6 +1030,8 @@ COMMANDS:
     status           print health (via local HTTP, or the database if stopped)
     core status      show the Core supervisor state and RPC reachability
     core logs        print the last 50 lines of a Core launched by e-lite
+    onion show       print the Tor onion address and managed-Tor state
+    onion reset      generate a new onion address (stop e-lite first)
     export-snapshot  print the canonical digest, or write a backup with --output
     import-snapshot  restore a backup with --input (target must be empty)
     version          print version
@@ -1004,7 +1073,9 @@ TUNING (all networks):
     --adaptive              enable the controller (default)
     --no-adaptive           freeze the configured/derived values
     --cache-mib <n>         RocksDB block cache (0 = profile/RAM)
-    --write-buffer-mib <n>  total RocksDB memtable budget (0 = RAM/16)
+    --write-buffer-mib <n>  total RocksDB memtable budget (0 = RAM/8)
+    --memory-reserve-mib <n> RAM left for OS/Core/page cache (0 = max(1024, RAM/8))
+    --memory-fraction <f>   e-lite ceiling as a share of total RAM (0 = 0.75)
     --background-jobs <n>   RocksDB jobs (0 = profile, capped by CPUs)
     --commit-interval-ms <n> commit/fsync interval (0 = profile; 500..30000)
     --commit-sync <mode>    auto | always | txids (bulk durability tradeoff)
@@ -1037,7 +1108,20 @@ RAWTX, SERVER AND TLS:
     --no-esplora            disable the Esplora rawtx/repair source
     --decoys <n>            extra blocks fetched per external lookup
     --rawtx-cache-mib <n>   validated rawtx cache size (0 = disabled)
-    --tor-socks <addr>      SOCKS5h proxy (empty requires --allow-clearnet)
+    --tor-socks <addr>      SOCKS5h proxy for rawtx (empty requires --allow-clearnet)
+
+TOR / ONION:
+    --tor-mode <mode>       managed | off (default managed)
+    --no-tor                same as --tor-mode off
+    --tor-plain / --no-tor-plain    publish the plain Electrum port on the onion
+    --tor-tls / --no-tor-tls        publish the TLS Electrum port on the onion
+    --tor-auto-cert / --no-tor-auto-cert
+                            self-signed TLS certificate when none is configured
+    --tor-onion-port <n>    onion virtual port for plain (default 50001)
+    --tor-onion-tls-port <n> onion virtual port for TLS (default 50002)
+    --tor-socks-port <n>    managed Tor SOCKS port (0 = auto)
+    --tor-binary <path>     Tor binary (empty = bundled bundle, then PATH)
+    --purge                 onion reset: delete keys instead of keeping onion.prev
 
 LOGGING:
     --log-file <path>       application log (default <data-dir>/e-lite.log)
@@ -1318,14 +1402,29 @@ fn cmd_doctor(cfg: &Config, chain: Chain) -> R<()> {
         );
     }
     let mem = tuning::memory_info();
+    let budget = tuning::memory_budget(cfg);
     println!(
-        "memory: total {} MiB, available {} MiB (host {} MiB), cgroup limit {} MiB, used {} MiB, reclaimable {} MiB",
+        "memory: total {} MiB, available {} MiB (host {} MiB), free {} MiB, \
+         buff/cache {} MiB, cgroup limit {} MiB, used {} MiB, reclaimable {} MiB",
         mem.total_mib.unwrap_or(0),
         mem.available_mib,
         mem.host_available_mib,
+        mem.free_mib,
+        mem.cached_mib,
         mem.cgroup_limit_mib.unwrap_or(0),
         mem.cgroup_used_mib.unwrap_or(0),
         mem.reclaimable_mib.unwrap_or(0)
+    );
+    println!(
+        "memory budget: total {} MiB, available {} MiB, cached {} MiB, reserve {} MiB, \
+         ceiling {} MiB, cache max {} MiB, memtables {} MiB",
+        budget.total_mib,
+        budget.available_mib,
+        budget.cached_mib,
+        budget.reserve_mib,
+        budget.ceiling_mib,
+        budget.cache_max_mib,
+        budget.memtables_mib
     );
     let core_sup = CoreSupervisor::new(cfg, chain);
     println!(
@@ -1365,6 +1464,51 @@ fn cmd_doctor(cfg: &Config, chain: Chain) -> R<()> {
         }
     } else {
         println!("electrum TLS: disabled (set [server] tls_listen to enable)");
+    }
+    let tor_status = tor::status(cfg, chain);
+    println!(
+        "tor: mode {}  socks {}  pid {}  running {}",
+        tor_status.mode,
+        tor_status.socks,
+        tor_status
+            .pid
+            .map(|p| p.to_string())
+            .unwrap_or_else(|| "-".to_string()),
+        tor_status.running
+    );
+    match &tor_status.binary {
+        Some(path) => println!("tor binary: {}", path.display()),
+        None => {
+            if cfg.tor.managed() {
+                println!(
+                    "tor note: Tor is enabled but no binary was found; install `tor` or rerun \
+                     the e-lite installer. Indexing and plain Electrum keep working."
+                );
+            }
+            println!("tor binary: not found");
+        }
+    }
+    match &tor_status.onion {
+        Some(addr) => println!(
+            "tor onion: {addr}:{} (plain), {}:{} (tls)",
+            cfg.tor.onion_port, addr, cfg.tor.onion_tls_port
+        ),
+        None => println!("tor onion: not created yet (it is created on `run`/`serve`)"),
+    }
+    if cfg.tor.managed() {
+        if let Err(e) = tor::loopback_target(&cfg.server.listen) {
+            problems.push(e);
+        }
+        if cfg.tor.tls {
+            if let Err(e) = tor::loopback_target(&tor_status.target_tls) {
+                problems.push(e);
+            }
+        }
+    } else if cfg.tor.tls && cfg.server.tls_listen.trim().is_empty() {
+        println!(
+            "tor TLS: will use {} with a self-signed certificate when Tor runs",
+            tor::DEFAULT_TLS_LISTEN
+        );
     }
     if cfg.metrics.enabled {
         if bind_ok(&cfg.metrics.listen) {
@@ -1425,6 +1569,58 @@ fn cmd_core(cfg: &Config, chain: Chain, action: Option<&str>) -> R<()> {
         ),
         other => fail(format!(
             "unknown core action \"{other}\": use status or logs"
+        )),
+    }
+}
+
+fn cmd_onion(cfg: &Config, chain: Chain, action: Option<&str>, purge: bool) -> R<()> {
+    match action.unwrap_or("show") {
+        "show" => {
+            let s = tor::status(cfg, chain);
+            println!("tor mode:   {}", s.mode);
+            match &s.binary {
+                Some(p) => println!("tor binary: {}", p.display()),
+                None => println!("tor binary: not found"),
+            }
+            println!("tor socks:  {}", s.socks);
+            println!(
+                "tor pid:    {} ({})",
+                s.pid
+                    .map(|p| p.to_string())
+                    .unwrap_or_else(|| "-".to_string()),
+                if s.running { "running" } else { "not running" }
+            );
+            println!("plain:      {} -> {}", s.target_plain, cfg.tor.onion_port);
+            println!("tls:        {} -> {}", s.target_tls, cfg.tor.onion_tls_port);
+            match &s.onion {
+                Some(addr) => {
+                    println!("onion:      {addr}");
+                    println!("connect:    {addr}:{} (plain)", cfg.tor.onion_port);
+                    if cfg.tor.tls {
+                        println!("connect:    {addr}:{} (tls)", cfg.tor.onion_tls_port);
+                    }
+                }
+                None => {
+                    println!("onion:      not created yet (start `e-lite run` or `e-lite serve`)")
+                }
+            }
+            Ok(())
+        }
+        "reset" => {
+            let old = tor::reset(cfg, chain, purge)?;
+            println!("old onion: {old}");
+            if purge {
+                println!("onion keys deleted; the new address is generated on the next start");
+            } else {
+                println!(
+                    "onion keys moved to {} (the new address is generated on the next start)",
+                    cfg.tor_dir(chain).join("onion.prev").display()
+                );
+            }
+            Ok(())
+        }
+        other => fail(format!(
+            "unknown onion action \"{other}\": use show or reset"
         )),
     }
 }
@@ -1965,6 +2161,7 @@ impl Indexer {
                 let first = !self.bulk_started.swap(true, Ordering::SeqCst);
                 if first && lag > ahead {
                     self.bulk_full_pause.store(true, Ordering::SeqCst);
+                    self.tunables.reset_resume_shrink();
                 }
                 if self.bulk_full_pause.load(Ordering::SeqCst) {
                     // Full bulk pause: keep Core stopped until the index is
@@ -2073,6 +2270,8 @@ impl Indexer {
                 self.lag_paused.store(false, Ordering::Relaxed);
                 return;
             }
+            // Core is about to grow again: give RAM back before resuming.
+            self.tunables.shrink_for_core_resume(&self.store);
             match self.core.set_network_active(true) {
                 Ok(_) => {
                     self.lag_paused.store(false, Ordering::Relaxed);
@@ -3209,6 +3408,21 @@ fn index_loop(
         idx.tunables.prefetch_blocks(),
         idx.tunables.adaptive()
     );
+    let (mem_total, mem_reserve, mem_ceiling, mem_memtables, mem_runtime) =
+        idx.tunables.memory_numbers();
+    let mem_now = tuning::memory_info();
+    eprintln!(
+        "[e-lite] memory: total {} MiB, available {} MiB, buff/cache {} MiB, \
+         reserve {} MiB, ceiling {} MiB -> cache {} MiB, memtables {} MiB, runtime {} MiB",
+        mem_total,
+        mem_now.available_mib,
+        mem_now.cached_mib,
+        mem_reserve,
+        mem_ceiling,
+        idx.tunables.cache_mib(),
+        mem_memtables,
+        mem_runtime
+    );
     if let Some(sh) = &shared {
         idx.tunables.publish(&sh.stats);
     }
@@ -3576,6 +3790,13 @@ fn build_shared(
         } else {
             None
         },
+        onion: Mutex::new(None),
+        onion_plain_port: cfg.tor.onion_port,
+        onion_tls_port: if cfg.tor.tls && cfg.server.tls_enabled() {
+            cfg.tor.onion_tls_port
+        } else {
+            0
+        },
         banner_file,
         max_clients: cfg.server.max_clients,
         state: std::sync::atomic::AtomicU8::new(state::WAITING_FOR_CORE),
@@ -3609,6 +3830,10 @@ fn publish_memory(shared: &Shared) {
         .stats
         .mem_reclaimable_mib
         .store(mem.reclaimable_mib.unwrap_or(0), Ordering::Relaxed);
+    shared
+        .stats
+        .mem_cached_mib
+        .store(mem.cached_mib, Ordering::Relaxed);
 }
 
 fn is_loopback_listen(addr: &str) -> bool {
@@ -3698,6 +3923,18 @@ fn start_transports(shared: &Arc<Shared>, cfg: &Config) -> R<Transports> {
 fn cmd_serve(cfg: &Config, chain: Chain) -> R<()> {
     let started_at = SystemTime::now();
     let started = Instant::now();
+    let mut prepared = cfg.clone();
+    let auto_cert = match tor::prepare(&mut prepared, chain) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("[e-lite] WARNING: Tor TLS disabled: {e}");
+            prepared.server.tls_listen.clear();
+            prepared.server.tls_cert.clear();
+            prepared.server.tls_key.clear();
+            false
+        }
+    };
+    let cfg = &prepared;
     let store = open_store(cfg, chain)?;
     let core = core_client(cfg, chain)?;
     let flag = shutdown_flag();
@@ -3721,6 +3958,13 @@ fn cmd_serve(cfg: &Config, chain: Chain) -> R<()> {
     };
     let shared = build_shared(cfg, chain, Arc::clone(&store), identity)?;
     let transports = start_transports(&shared, cfg)?;
+    let mut tor_runtime = match tor::spawn(cfg, chain, Some(Arc::clone(&shared)), auto_cert) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("[e-lite] WARNING: onion service unavailable: {e}");
+            None
+        }
+    };
     let tip = shared
         .store
         .committed_tip()?
@@ -3812,6 +4056,9 @@ fn cmd_serve(cfg: &Config, chain: Chain) -> R<()> {
         std::thread::sleep(Duration::from_secs(1));
     }
     shared.shutdown.store(true, Ordering::SeqCst);
+    if let Some(rt) = &mut tor_runtime {
+        rt.stop();
+    }
     let _ = transports.mempool.join();
     let _ = transports.notifications.join();
     let _ = transports.memory.join();
@@ -3827,6 +4074,18 @@ fn cmd_serve(cfg: &Config, chain: Chain) -> R<()> {
 fn cmd_run(cfg: &Config, chain: Chain) -> R<()> {
     let started_at = SystemTime::now();
     let started = Instant::now();
+    let mut prepared = cfg.clone();
+    let auto_cert = match tor::prepare(&mut prepared, chain) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("[e-lite] WARNING: Tor TLS disabled: {e}");
+            prepared.server.tls_listen.clear();
+            prepared.server.tls_cert.clear();
+            prepared.server.tls_key.clear();
+            false
+        }
+    };
+    let cfg = &prepared;
     let rotational = tuning::is_rotational(&cfg.data_dir(chain));
     let tunables = Arc::new(Tunables::new(cfg, rotational));
     let store = open_store_with(cfg, chain, tunables.cache_mib(), tunables.background_jobs())?;
@@ -3856,6 +4115,13 @@ fn cmd_run(cfg: &Config, chain: Chain) -> R<()> {
     };
     let shared = build_shared(cfg, chain, Arc::clone(&store), live)?;
     let transports = start_transports(&shared, cfg)?;
+    let mut tor_runtime = match tor::spawn(cfg, chain, Some(Arc::clone(&shared)), auto_cert) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("[e-lite] WARNING: onion service unavailable: {e}");
+            None
+        }
+    };
     println!(
         "e-lite {}: started at {} — indexing and serving on {} (network {}, core {}, manage {:?})",
         VERSION,
@@ -3891,6 +4157,9 @@ fn cmd_run(cfg: &Config, chain: Chain) -> R<()> {
         false,
     );
     shared.shutdown.store(true, Ordering::SeqCst);
+    if let Some(rt) = &mut tor_runtime {
+        rt.stop();
+    }
     let _ = transports.mempool.join();
     let _ = transports.notifications.join();
     let _ = transports.memory.join();
@@ -3940,11 +4209,20 @@ fn cmd_status(cfg: &Config, chain: Chain, as_json: bool) -> R<()> {
         "db_bytes": store.disk_usage_bytes(),
         "disk_free_bytes": el_serve::disk_free_bytes(&cfg.data_dir(chain)),
         "data_dir": cfg.data_dir(chain).display().to_string(),
+        "onion": tor::read_hostname(&cfg.tor_dir(chain)).unwrap_or_default(),
+        "onion_plain_port": cfg.tor.onion_port,
+        "onion_tls_port": if cfg.tor.tls { cfg.tor.onion_tls_port } else { 0 },
+        "tor_bootstrapped": false,
         "memory": {
             "total_mib": tuning::memory_info().total_mib.unwrap_or(0),
             "available_mib": tuning::memory_info().available_mib,
             "cgroup_limit_mib": tuning::memory_info().cgroup_limit_mib.unwrap_or(0),
             "reclaimable_mib": tuning::memory_info().reclaimable_mib.unwrap_or(0),
+            "cached_mib": tuning::memory_info().cached_mib,
+            "cache_max_mib": tuning::memory_budget(cfg).cache_max_mib,
+            "memtables_mib": tuning::memory_budget(cfg).memtables_mib,
+            "reserve_mib": tuning::memory_budget(cfg).reserve_mib,
+            "budget_mib": tuning::memory_budget(cfg).ceiling_mib,
         },
     });
     if as_json {
@@ -3988,12 +4266,42 @@ fn print_status_human(v: &serde_json::Value) {
         v["core"]["network_active"].as_bool().unwrap_or(false)
     );
     println!(
-        "memory    total {} MiB   available {} MiB   cgroup limit {} MiB   reclaimable {} MiB",
+        "memory    total {} MiB   available {} MiB   buff/cache {} MiB   cgroup limit {} MiB   \
+         reclaimable {} MiB",
         v["memory"]["total_mib"].as_u64().unwrap_or(0),
         v["memory"]["available_mib"].as_u64().unwrap_or(0),
+        v["memory"]["cached_mib"].as_u64().unwrap_or(0),
         v["memory"]["cgroup_limit_mib"].as_u64().unwrap_or(0),
         v["memory"]["reclaimable_mib"].as_u64().unwrap_or(0)
     );
+    println!(
+        "memory    cache {} / max {} MiB   memtables {} MiB   reserve {} MiB   budget {} MiB",
+        v["tuning"]["cache_mib"].as_u64().unwrap_or(0),
+        v["memory"]["cache_max_mib"].as_u64().unwrap_or(0),
+        v["memory"]["memtables_mib"].as_u64().unwrap_or(0),
+        v["memory"]["reserve_mib"].as_u64().unwrap_or(0),
+        v["memory"]["budget_mib"].as_u64().unwrap_or(0)
+    );
+    let onion = v["onion"].as_str().unwrap_or("");
+    if onion.is_empty() {
+        println!("tor       onion not created yet");
+    } else {
+        println!(
+            "tor       {}:{} (plain){}{}",
+            onion,
+            v["onion_plain_port"].as_u64().unwrap_or(50001),
+            if v["onion_tls_port"].as_u64().unwrap_or(0) > 0 {
+                format!(" · :{} (tls)", v["onion_tls_port"])
+            } else {
+                String::new()
+            },
+            if v["tor_bootstrapped"].as_bool().unwrap_or(false) {
+                ""
+            } else {
+                " · bootstrapping"
+            }
+        );
+    }
     println!("last block {} ms", g("last_block_ms"));
     println!(
         "storage   index {:.2} GiB   free {:.2} GiB   core free {:.2} GiB",

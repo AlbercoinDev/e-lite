@@ -177,6 +177,38 @@ stream {
 }
 ```
 
+## Tor onion (managed)
+
+`[tor] mode = "managed"` (the default) makes e-lite run its own Tor process and
+publish Electrum as an onion service. The address is stable across restarts and
+is created automatically on the first `run`/`serve`:
+
+```
+[e-lite] Tor onion: <56 chars>.onion:50001 (plain), :50002 (tls)
+[e-lite] Tor ready (bootstrapped 100%)
+```
+
+- plain: `<addr>.onion:50001`
+- TLS: `<addr>.onion:50002`
+
+The TLS port uses an automatically generated self-signed certificate unless
+`[server] tls_cert`/`tls_key` are configured; the SAN includes the onion address.
+If `[server] tls_listen` is empty, it defaults to `127.0.0.1:50002` when Tor TLS
+is enabled.
+
+```bash
+e-lite onion show  --network mainnet
+e-lite onion reset --network mainnet --yes   # stop e-lite first
+```
+
+`reset` moves the onion keys to `<data-dir>/tor/onion.prev`; the next start
+generates a new address. `tor/` and `tls/` are excluded from snapshots.
+
+The onion has **no client authentication or rate limiting**. Keep the address
+private, use a dedicated instance and a firewall/access policy if needed. See
+[`TOR.md`](TOR.md) for installation, the bundled Tor, troubleshooting and the
+security model.
+
 ## Pruning
 
 | `prune_mib` | Behaviour |

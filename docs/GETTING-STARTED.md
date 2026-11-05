@@ -93,9 +93,10 @@ kill -USR1 "$(pgrep -f 'e-lite run')"
 curl -s http://127.0.0.1:9184/status | python3 -m json.tool | grep -A20 '"tuning"'
 ```
 
-Change `readers`, `cache_mib`, `commit_interval_ms`, `batch_blocks`, `profile`
-or `adaptive` in the TOML, send `SIGUSR1` and verify the values in `/status`.
-`prune_mib`, `block_source`, `reorg_window`, data dir/network require restart.
+Change `readers`, `cache_mib` (maximum), `commit_interval_ms`, `batch_blocks`,
+`profile` or `adaptive` in the TOML, send `SIGUSR1` and verify the values in
+`/status`. `prune_mib`, `block_source`, `reorg_window`, memory budget fields,
+data dir/network require restart.
 
 ## 7. Acceptance checklist
 

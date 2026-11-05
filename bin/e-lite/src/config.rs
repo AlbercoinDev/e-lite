@@ -37,6 +37,8 @@ pub struct Config {
     pub silent_payments: SilentPaymentsCfg,
     #[serde(default)]
     pub logging: LoggingCfg,
+    #[serde(default)]
+    pub tor: TorCfg,
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -157,6 +159,13 @@ pub struct IndexCfg {
     /// RocksDB write-buffer budget in MiB across all column families. 0 = auto.
     #[serde(default)]
     pub write_buffer_mib: u64,
+    /// RAM left for the OS, Core and page cache, in MiB. 0 = auto
+    /// (`max(1024, RAM/8)`).
+    #[serde(default)]
+    pub memory_reserve_mib: u64,
+    /// Maximum share of total RAM e-lite may target (0 = 0.75).
+    #[serde(default)]
+    pub memory_fraction: f64,
     /// RocksDB background jobs. 0 = profile default, capped by CPU count.
     #[serde(default)]
     pub background_jobs: usize,
@@ -184,6 +193,8 @@ impl Default for IndexCfg {
             commit_interval_ms: 0,
             prefetch_blocks: 0,
             write_buffer_mib: 0,
+            memory_reserve_mib: 0,
+            memory_fraction: 0.0,
             background_jobs: 0,
             milestone_blocks: d_milestone_blocks(),
             milestone_seconds: d_milestone_seconds(),
@@ -232,6 +243,77 @@ impl Default for ServerCfg {
             max_clients: d_clients(),
         }
     }
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TorCfg {
+    /// `managed` runs e-lite's own Tor; `off` disables it.
+    #[serde(default = "d_tor_mode")]
+    pub mode: String,
+    /// Publish the plain Electrum listener as an onion service.
+    #[serde(default = "d_true")]
+    pub plain: bool,
+    /// Publish the TLS Electrum listener as an onion service.
+    #[serde(default = "d_true")]
+    pub tls: bool,
+    /// Generate a self-signed certificate when no operator cert is configured.
+    #[serde(default = "d_true")]
+    pub tls_auto_cert: bool,
+    #[serde(default = "d_onion_port")]
+    pub onion_port: u16,
+    #[serde(default = "d_onion_tls_port")]
+    pub onion_tls_port: u16,
+    /// SOCKS port for the managed Tor (also used by rawtx). 0 = auto.
+    #[serde(default)]
+    pub socks_port: u16,
+    /// Tor binary. Empty = bundled expert bundle, then `tor` in PATH.
+    #[serde(default)]
+    pub binary: String,
+    #[serde(default = "d_tor_timeout")]
+    pub start_timeout_seconds: u64,
+    /// Tor home. Empty = `<data-dir>/tor`.
+    #[serde(default)]
+    pub data_dir: String,
+}
+
+impl TorCfg {
+    pub fn managed(&self) -> bool {
+        self.mode.eq_ignore_ascii_case("managed")
+    }
+}
+
+impl Default for TorCfg {
+    fn default() -> Self {
+        TorCfg {
+            mode: d_tor_mode(),
+            plain: true,
+            tls: true,
+            tls_auto_cert: true,
+            onion_port: d_onion_port(),
+            onion_tls_port: d_onion_tls_port(),
+            socks_port: 0,
+            binary: String::new(),
+            start_timeout_seconds: d_tor_timeout(),
+            data_dir: String::new(),
+        }
+    }
+}
+
+fn d_tor_mode() -> String {
+    "managed".to_string()
+}
+
+fn d_onion_port() -> u16 {
+    50001
+}
+
+fn d_onion_tls_port() -> u16 {
+    50002
+}
+
+fn d_tor_timeout() -> u64 {
+    120
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -640,6 +722,21 @@ impl Config {
         self.data_dir(chain).join("core-child.pid")
     }
 
+    /// Directory for the managed Tor instance (keys, logs, torrc).
+    pub fn tor_dir(&self, chain: Chain) -> PathBuf {
+        let configured = self.tor.data_dir.trim();
+        if configured.is_empty() {
+            self.data_dir(chain).join("tor")
+        } else {
+            let p = PathBuf::from(configured);
+            if p.is_absolute() {
+                p
+            } else {
+                self.data_dir(chain).join(p)
+            }
+        }
+    }
+
     pub fn validate(&self) -> Result<(), String> {
         if self.index.batch_blocks == 0 {
             return Err("[index] batch_blocks must be >= 1".to_string());
@@ -657,6 +754,21 @@ impl Config {
         }
         if !matches!(self.index.commit_sync.as_str(), "auto" | "always" | "txids") {
             return Err("[index] commit_sync must be auto, always or txids".to_string());
+        }
+        if self.index.memory_fraction != 0.0 && !(0.1..=1.0).contains(&self.index.memory_fraction) {
+            return Err("[index] memory_fraction must be 0 (auto) or 0.1..1.0".to_string());
+        }
+        if self.index.memory_reserve_mib != 0 && self.index.memory_reserve_mib < 256 {
+            return Err("[index] memory_reserve_mib must be 0 (auto) or >= 256".to_string());
+        }
+        if !matches!(self.tor.mode.as_str(), "managed" | "off") {
+            return Err("[tor] mode must be managed or off".to_string());
+        }
+        if self.tor.onion_port == 0 || self.tor.onion_tls_port == 0 {
+            return Err("[tor] onion_port/onion_tls_port must be >= 1".to_string());
+        }
+        if self.tor.tls && self.tor.onion_tls_port == self.tor.onion_port {
+            return Err("[tor] onion_tls_port must differ from onion_port".to_string());
         }
         if self.server.max_clients == 0 {
             return Err("[server] max_clients must be >= 1".to_string());

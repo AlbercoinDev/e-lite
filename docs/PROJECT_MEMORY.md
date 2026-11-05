@@ -39,10 +39,13 @@ a separate listener is implemented; authentication and rate limiting are not.
   by default; low disk triggers an emergency prune.
 - Snapshots are optional, never required by the from-zero flow.
 - Electrum is plain TCP and loopback by default; TLS is an optional separate
-  listener and does not authenticate clients.
+  listener and does not authenticate clients. A managed Tor publishes an onion
+  (plain + TLS) by default; the address is the access secret.
 - Core RPC is HTTP; use SSH/VPN for LAN/WAN.
-- RocksDB memtables use a global `RAM/16` budget; cache and readers scale with
-  real RAM, and every knob can be overridden from the CLI or `--set`.
+- RocksDB memtables use a global `RAM/8` budget inside a memory ceiling of 75 %
+  of total RAM, with `max(1024, RAM/8)` reserved for the OS/Core/page cache; the
+  block cache grows/shrinks in 256 MiB steps and `cache_mib` is a maximum. Every
+  knob can be overridden from the CLI or `--set`.
 - `run`/`index`/`serve` keep an application log at `<data-dir>/e-lite.log` with
   the same lines as the console.
 - Ready state is `READY` at Core's validated tip and `FULLY SYNCED` at the

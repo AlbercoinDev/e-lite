@@ -26,25 +26,59 @@ only the starting point, not a hard classification. Use `--profile` (or
 `--set index.profile=...`) when you know the real hardware.
 
 RocksDB memory is budgeted globally, not per column family. The default memtable
-budget is `RAM/16` (64 MiB..1 GiB), split across the 7 CFs; the block cache is
-`RAM/4` (or the profile value). Background jobs are capped by the CPU count so a
-2-core machine does not run 8 compaction threads.
+budget is `RAM/8` (256 MiB..2 GiB), split across the 7 CFs. Background jobs are
+capped by the CPU count so a 2-core machine does not run 8 compaction threads.
 
-Explicit values win over the profile:
+## Memory budget
+
+e-lite reserves RAM for the OS, Core and the page cache, and uses the rest as a
+ceiling for its own cache/memtables/runtime:
+
+```
+reserve   = max(1024 MiB, RAM_total/8)
+ceiling   = 75 % of RAM_total
+memtables = RAM_total/8          (fixed at startup)
+runtime   = RAM_total/16         (batch, overlay, prefetch, Tor)
+cache_max = ceiling - memtables - runtime
+```
+
+The block cache starts at the profile value (`RAM/4`) and is adjusted at most
+once every 30 seconds:
+
+- **grow +256 MiB** while `MemAvailable >= 1.5 × reserve`, page cache
+  (`Buffers + Cached`) is at least `reserve`, and the cache is below `cache_max`;
+- **shrink 25 %** (floor 256 MiB) when `MemAvailable < reserve` or page cache is
+  below `reserve/2`;
+- two consecutive samples are required in the same direction (hysteresis).
+
+Growing the RocksDB cache consumes page cache, which is why the page-cache floor
+exists: it keeps block-file reads fast. If `read` latency rises while the cache
+grows, the policy backs off.
+
+`cache_mib` is a **maximum**, not a fixed value: the controller may use less
+under pressure and grow back up to it. A critical memory situation can shrink
+even a manual value. `write_buffer_mib` is fixed when the store opens.
+
+Before Core resumes downloads after a bulk pause, e-lite shrinks the cache to
+`max(1024 MiB, RAM/4)` so Core has room for its block index and verification.
+
+Explicit values cap the automatic policy:
 
 ```toml
 [index]
 profile = "auto"
 readers = 4              # explicit override
-cache_mib = 4096
+cache_mib = 4096         # maximum cache, not a fixed value
+write_buffer_mib = 1024  # fixed memtable budget
+memory_reserve_mib = 0   # 0 = max(1024, RAM/8)
+memory_fraction = 0      # 0 = 0.75 of total RAM
 commit_interval_ms = 5000
 adaptive = true
 ```
 
 Set `adaptive = false` to keep the profile/config values fixed. Explicit
-`readers`/`cache_mib`/`commit_interval_ms` are treated as locked: the controller
-will not change them, except a critical memory floor (<256 MiB) which reduces
-workers for safety.
+`readers`/`commit_interval_ms` remain locked; `cache_mib` is a ceiling that the
+memory policy can lower for safety.
 
 The same values can be passed without a config file:
 
@@ -92,22 +126,24 @@ Only these hot fields are adjusted automatically:
   slow and commit is less than half of the interval; if commit dominates the
   interval (>75%), the batch shrinks instead. The bulk maximum is 30 s / 4096
   blocks, with the usual crash-window tradeoff.
-- `cache_mib`: shrinks under real memory pressure; the cache-hit metric was
-  removed because RocksDB did not expose it reliably. `--cache-mib` still sets
-  the block cache.
+- `cache_mib`: grows/shrinks inside the memory budget described above. The
+  cache-hit metric was removed because RocksDB did not expose it reliably;
+  `--cache-mib` still sets the maximum.
 
 The controller runs at most once every 30 seconds. It is inhibited while the
 disk guard is active, during a prune-gap repair, during a reorg and during
-shutdown. If `MemAvailable` (including the cgroup v2/v1 limit in LXC/containers)
-falls below 512 MiB, it reduces readers/cache before doing anything else.
-`memory.current` includes reclaimable page cache, so `inactive_file` is
-subtracted before declaring pressure; this avoids the false `0 MiB available`
-state that used to shrink the cache on machines with plenty of RAM.
+shutdown. The memory policy uses `MemAvailable` (including the cgroup v2/v1
+limit in LXC/containers) and `Buffers + Cached`; two consecutive samples are
+required before a change. `memory.current` includes reclaimable page cache, so
+`inactive_file` is subtracted before declaring pressure; this avoids the false
+`0 MiB available` state that used to shrink the cache on machines with plenty of
+RAM.
 
 Every change is logged:
 
 ```text
 [e-lite] adaptive tuning: commit 620ms: interval -> 7500ms, batch -> 768
+[e-lite] memory: available 5317 MiB, buff/cache 4443 MiB, reserve 1024 MiB: cache 1977 -> 2233 MiB (max 4449, memtables 988 MiB, readers 8)
 ```
 
 ## Hot reload

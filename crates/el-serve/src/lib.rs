@@ -121,6 +121,12 @@ pub struct Stats {
     pub mem_cgroup_limit_mib: AtomicU64,
     pub mem_cgroup_used_mib: AtomicU64,
     pub mem_reclaimable_mib: AtomicU64,
+    pub mem_cached_mib: AtomicU64,
+    pub mem_cache_max_mib: AtomicU64,
+    pub mem_memtables_mib: AtomicU64,
+    pub mem_reserve_mib: AtomicU64,
+    pub mem_budget_mib: AtomicU64,
+    pub tor_bootstrapped: AtomicBool,
     pub started: Instant,
 }
 
@@ -169,6 +175,12 @@ impl Default for Stats {
             mem_cgroup_limit_mib: AtomicU64::new(0),
             mem_cgroup_used_mib: AtomicU64::new(0),
             mem_reclaimable_mib: AtomicU64::new(0),
+            mem_cached_mib: AtomicU64::new(0),
+            mem_cache_max_mib: AtomicU64::new(0),
+            mem_memtables_mib: AtomicU64::new(0),
+            mem_reserve_mib: AtomicU64::new(0),
+            mem_budget_mib: AtomicU64::new(0),
+            tor_bootstrapped: AtomicBool::new(false),
             started: Instant::now(),
         }
     }
@@ -555,6 +567,9 @@ pub struct Shared {
     pub log_file: PathBuf,
     pub listen: String,
     pub tls_listen: Option<String>,
+    pub onion: Mutex<Option<String>>,
+    pub onion_plain_port: u16,
+    pub onion_tls_port: u16,
     pub banner_file: Option<PathBuf>,
     pub max_clients: usize,
     pub state: AtomicU8,
@@ -713,6 +728,15 @@ impl Shared {
             "uptime_seconds": self.stats.started.elapsed().as_secs(),
             "listen": self.listen,
             "tls_listen": self.tls_listen,
+            "onion": self
+                .onion
+                .lock()
+                .ok()
+                .and_then(|v| v.clone())
+                .unwrap_or_default(),
+            "onion_plain_port": self.onion_plain_port,
+            "onion_tls_port": self.onion_tls_port,
+            "tor_bootstrapped": self.stats.tor_bootstrapped.load(Ordering::Relaxed),
             "tls_handshakes": self.stats.tls_handshakes.load(Ordering::Relaxed),
             "tls_handshake_failures": self
                 .stats
@@ -725,6 +749,11 @@ impl Shared {
                 "cgroup_limit_mib": self.stats.mem_cgroup_limit_mib.load(Ordering::Relaxed),
                 "cgroup_used_mib": self.stats.mem_cgroup_used_mib.load(Ordering::Relaxed),
                 "reclaimable_mib": self.stats.mem_reclaimable_mib.load(Ordering::Relaxed),
+                "cached_mib": self.stats.mem_cached_mib.load(Ordering::Relaxed),
+                "cache_max_mib": self.stats.mem_cache_max_mib.load(Ordering::Relaxed),
+                "memtables_mib": self.stats.mem_memtables_mib.load(Ordering::Relaxed),
+                "reserve_mib": self.stats.mem_reserve_mib.load(Ordering::Relaxed),
+                "budget_mib": self.stats.mem_budget_mib.load(Ordering::Relaxed),
             },
             "tuning": {
                 "readers": self.stats.tuning_readers.load(Ordering::Relaxed),

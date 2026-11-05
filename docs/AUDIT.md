@@ -1,7 +1,7 @@
 # Code audit
 
-**Base:** `0.1.0-alpha.22` → published `0.1.0-alpha.23` · **Scope:** `bin/e-lite`, `crates/*` (25 Rust files,
-~17.3k lines) · **Status:** findings fixed in `0.1.0-alpha.23` where noted.
+**Base:** `0.1.0-alpha.23` → published `0.1.0-alpha.24` · **Scope:** `bin/e-lite`, `crates/*` (25 Rust files,
+~18k lines) · **Status:** findings fixed in `0.1.0-alpha.24` where noted.
 
 This audit is not a claim of formal verification. It records static checks,
 manual review areas, concrete findings and residual risks.
@@ -15,6 +15,8 @@ cargo test --workspace                                 OK
 tests/e2e_launch_core.sh                               OK
 tests/e2e_pruned_ibd.sh                                OK
 tests/e2e_regtest.sh                                   OK
+E_LITE_REAL_TOR=... managed_tor_real_binary_creates_onion (ignored by default) OK
+install.sh --with-tor / --without-tor                  OK
 ```
 
 Additional checks performed:
@@ -51,6 +53,9 @@ Additional checks performed:
 | AUD-030 | P2 | Commit durability | `crates/el-store`, `bin/e-lite` | Two fsyncs per commit made bulk indexing slower than necessary. | `commit_sync=auto`: `txids` in bulk (txids.dat still fsynced, startup truncates extras), `always` live. |
 | AUD-031 | P3 | Readiness/banner | `crates/el-serve` | Wallets had no clear READY signal and a static banner. | Dynamic `READY`/`FULLY SYNCED` log/status/metrics and INDEXING/READY banner templates, optional file with placeholders. |
 | AUD-032 | P2 | Indexing throughput | `crates/el-index`, `bin/e-lite`, `crates/el-store` | Mainnet alpha.22 logs showed `apply` growing from ~300 ms to >1.5 s per block with `read`/`decode`/`wait` near zero: every prevout multi-get ran serially in the single apply thread, and the apply thread was also the only consumer of the reader pipeline. | Reader threads now prefetch each block's prevouts (`prefetch_prevouts`) while apply works on the previous block; apply uses the overlay first and falls back to a point lookup, so speculative misses are harmless. RocksDB `atomic_flush` and a larger L1/compaction readahead reduce multi-CF write amplification. Oracle-parity tests cover the prefetch path; `e2e_regtest`, `e2e_pruned_ibd`, `e2e_launch_core` pass. |
+| AUD-033 | P2 | Memory budget | `bin/e-lite/src/tuning.rs`, `bin/e-lite/src/main.rs` | The block cache was fixed at a profile value (`RAM/4`) and `cache_mib` was locked; the machine's real `MemAvailable` and page cache were only consulted below 512 MiB. On an 8 GiB host with Core, the cache could neither use spare RAM nor adapt to pressure. | New hot policy: 75 % ceiling, `max(1024, RAM/8)` reserve, memtables `RAM/8`, page-cache floor, 256 MiB steps/25 % shrink with hysteresis; `cache_mib` is a maximum; critical pressure overrides it; pre-resume shrink. Unit tests for the budget/actions and a status/log budget line. |
+| AUD-034 | P1 | Inbound onion | `bin/e-lite/src/tor.rs`, `bin/e-lite/src/main.rs` | The new managed Tor publishes Electrum on an onion; like the plain listener it has no client authentication or rate limiting. A leaked address gives full query access. | Loopback-only targets, v3 onion keys 0700, explicit warning in logs/docs, `mode=off`/`--no-tor`, address treated as a secret. Residual risk documented in `AUD-010`. |
+| AUD-035 | P2 | Installer supply chain | `install.sh`, `bin/e-lite/src/tor.rs` | The installer downloads a Tor expert bundle and e-lite later executes it; a compromised download would run as the user. | Pinned bundle version and SHA-256 in the installer; download from the Tor Project over TLS; fallback to `tor` in `PATH`; `doctor` shows the resolved binary. |
 
 ## Residual risks and intentional limits
 

@@ -22,6 +22,8 @@ run              index and serve in one process; waits for Core RPC
 status           print health (HTTP if running, database if stopped)
 core status      show the Core supervisor state and RPC reachability
 core logs        print the last 50 lines of a Core launched by e-lite
+onion show       show the Tor onion address, ports and managed-Tor state
+onion reset      generate a new onion address (stop e-lite first)
 export-snapshot  print the canonical digest or write --output
 import-snapshot  restore --input into an empty target
 version          print version
@@ -54,8 +56,10 @@ version          print version
 | `--profile <name>` | `index.profile` | `auto` |
 | `--adaptive` / `--no-adaptive` | `index.adaptive` | `true` |
 | `--readers <n>` | `index.readers` | `0` (profile/auto) |
-| `--cache-mib <n>` | `index.cache_mib` | `0` (RAM/4) |
-| `--write-buffer-mib <n>` | `index.write_buffer_mib` | `0` (RAM/16) |
+| `--cache-mib <n>` | `index.cache_mib` | `0` (auto; explicit = maximum) |
+| `--write-buffer-mib <n>` | `index.write_buffer_mib` | `0` (RAM/8) |
+| `--memory-reserve-mib <n>` | `index.memory_reserve_mib` | `0` (max(1024, RAM/8)) |
+| `--memory-fraction <f>` | `index.memory_fraction` | `0` (0.75 of total RAM) |
 | `--background-jobs <n>` | `index.background_jobs` | `0` (profile, capped by CPUs) |
 | `--commit-interval-ms <n>` | `index.commit_interval_ms` | `0` (profile; 500..30000) |
 | `--commit-sync <mode>` | `index.commit_sync` | `auto` (`txids` in bulk, `always` live) |
@@ -69,8 +73,9 @@ version          print version
 report it incorrectly; set `--profile ssd` or `--profile nvme` when you know the
 real hardware.
 
-Explicit numeric overrides lock that knob so the adaptive controller does not
-change it.
+Explicit readers/commit values lock that knob. `cache_mib` is a **maximum**: the
+memory policy can lower it for safety and grow back up to it. See
+[`TUNING.md`](TUNING.md#memory-budget).
 
 ### Examples
 
@@ -162,6 +167,35 @@ e-lite run --network mainnet --allow-mainnet \
 | `--no-rawtx` | `rawtx.enabled=false` | enabled |
 | `--tls-listen <addr>` | `server.tls_listen` | disabled |
 | `--tls-cert`, `--tls-key` | `server.tls_cert`, `server.tls_key` | none |
+
+## Tor and onion
+
+| Flag | TOML field | Default |
+|---|---|---|
+| `--tor-mode <mode>` | `tor.mode` | `managed` |
+| `--no-tor` | `tor.mode=off` | — |
+| `--tor-plain` / `--no-tor-plain` | `tor.plain` | `true` |
+| `--tor-tls` / `--no-tor-tls` | `tor.tls` | `true` |
+| `--tor-auto-cert` / `--no-tor-auto-cert` | `tor.tls_auto_cert` | `true` |
+| `--tor-onion-port <n>` | `tor.onion_port` | `50001` |
+| `--tor-onion-tls-port <n>` | `tor.onion_tls_port` | `50002` |
+| `--tor-socks-port <n>` | `tor.socks_port` | `0` (9050 if free, else 19050+) |
+| `--tor-binary <path>` | `tor.binary` | installer bundle, then PATH |
+
+`mode = managed` starts e-lite's own Tor and publishes Electrum as an onion
+service. `--tor-socks <addr>` (in the previous table) remains the rawtx proxy;
+the managed Tor overrides it only when it is unset or still the default
+`127.0.0.1:9050`.
+
+```bash
+e-lite onion show  --network mainnet
+e-lite onion reset --network mainnet --yes
+e-lite onion reset --network mainnet --yes --purge   # delete instead of onion.prev
+e-lite run --network mainnet --allow-mainnet --no-tor
+```
+
+See [`TOR.md`](TOR.md) for installation, ports, the self-signed TLS certificate,
+reset semantics and security.
 
 ## Wallet banner
 

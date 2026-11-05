@@ -34,9 +34,15 @@ The installer:
 1. downloads the latest release tarball or `.deb`;
 2. verifies it against the release `SHA256SUMS`;
 3. atomically replaces the binary;
-4. optionally installs/updates the latest official Bitcoin Core from
+4. downloads the official Tor expert bundle (pinned version, SHA-256 verified)
+   to `<prefix>/lib/e-lite/tor`; `--without-tor` skips it. If the download fails
+   or `tor` is already in `PATH`, Tor still works through the system binary;
+5. optionally installs/updates the latest official Bitcoin Core from
    bitcoincore.org, verifying its published checksums;
-5. leaves configuration, index data and Core's datadir untouched.
+6. leaves configuration, index data and Core's datadir untouched.
+
+The Tor bundle is GPLv3 and is downloaded directly from the Tor Project; it is
+not redistributed inside the e-lite release assets.
 
 Default prefix: `~/.local/bin` (`E_LITE_PREFIX` overrides). Add it to `PATH`:
 

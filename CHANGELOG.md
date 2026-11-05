@@ -1,5 +1,47 @@
 # Changelog
 
+## 0.1.0-alpha.24 — 2026-11-05
+
+### Adaptive memory and a managed Tor onion service
+
+**Memory (alpha.24)**
+
+- **Hot memory budget.** e-lite derives a ceiling from total RAM (75 %), keeps a
+  reserve for the OS/Core/page cache (`max(1024, RAM/8)`), and grows the RocksDB
+  block cache in 256 MiB steps while `MemAvailable` and `buff/cache` stay
+  healthy. It shrinks 25 % (floor 256 MiB) under pressure, with a two-sample
+  hysteresis, and can shrink even a manual `cache_mib` (now a maximum).
+- **Larger memtables.** The RocksDB memtable budget is `RAM/8` (was `RAM/16`),
+  reducing flush/compaction churn; the WAL cap scales with it.
+- **Pre-resume shrink.** When the bulk catch-up is about to resume Core, the
+  cache drops to the live budget so Core has room for its block index.
+- **Observability.** Startup budget line, per-change log lines, and
+  `memory.cache_mib`, `cache_max_mib`, `memtables_mib`, `reserve_mib`,
+  `budget_mib`, `cached_mib` in `/status`/`e-lite status`.
+
+**Tor (alpha.24)**
+
+- **Managed Tor by default.** `[tor] mode = "managed"` starts e-lite's own Tor
+  process (no system daemon), publishes Electrum as an onion service, and uses
+  that Tor's SOCKS for rawtx.
+- **Plain + TLS onion ports**: 50001 and 50002. TLS uses an automatically
+  generated self-signed certificate (ECDSA P-256, SAN includes the onion
+  address) when no operator certificate is configured; `CertWatcher` reloads it.
+- **Installer-provisioned Tor bundle.** `install.sh` downloads the official Tor
+  expert bundle (pinned version, SHA-256 verified) to
+  `<prefix>/lib/e-lite/tor`; falls back to `tor` in `PATH`. `--without-tor`
+  skips it. If no binary is available, indexing continues with a warning.
+- **`e-lite onion show` / `e-lite onion reset`**: show the address/ports/state;
+  reset moves the onion keys to `onion.prev` and the next start generates a new
+  address. Reset refuses while the managed Tor is running.
+- **Status and security.** `/status` and `e-lite status` show the onion address
+  and bootstrap state. A warning documents that the onion has no client
+  authentication or rate limiting.
+
+Tests: unit coverage for the memory policy, torrc rendering, onion validation,
+self-signed certificate SAN/permissions, fake-Tor lifecycle, real-Tor onion
+generation (ignored unless `E_LITE_REAL_TOR` is set), and `onion reset`.
+
 ## 0.1.0-alpha.23 — 2026-11-05
 
 ### Apply path: overlap UTXO reads with the indexer pipeline

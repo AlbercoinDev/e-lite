@@ -27,7 +27,7 @@ stop_on_exit = true                 # stop only a Core launched by e-lite
 [index]
 block_source = "auto"               # auto | rpc | files
 readers = 0                         # 0 = profile/adaptive
-cache_mib = 0                       # 0 = profile/adaptive
+cache_mib = 0                       # 0 = auto; >0 = maximum block cache
 reorg_window = 288                  # undo records kept for reorgs
 batch_blocks = 256                  # blocks per atomic commit (initial; adaptive may change)
 profile = "auto"                    # auto | hdd | ssd | nvme | manual
@@ -35,7 +35,9 @@ adaptive = true                     # event-driven readers/commit/cache tuning
 commit_sync = "auto"                # auto | always | txids (bulk durability tradeoff)
 commit_interval_ms = 0              # 0 = profile default (500..30000 when set)
 prefetch_blocks = 0                 # reserved for the UTXO prefetch pipeline
-write_buffer_mib = 0                # total RocksDB memtable budget; 0 = RAM/16
+write_buffer_mib = 0                # total RocksDB memtable budget; 0 = RAM/8
+memory_reserve_mib = 0              # RAM left for OS/Core/page cache; 0 = max(1024, RAM/8)
+memory_fraction = 0                 # e-lite ceiling over total RAM; 0 = 0.75
 background_jobs = 0                 # RocksDB jobs; 0 = profile, capped by CPU count
 milestone_blocks = 10000            # progress report every N blocks (0 = off)
 milestone_seconds = 21600           # or every N seconds (0 = off; 6 h default)
@@ -69,6 +71,20 @@ max_clients = 32
 # Optional wallet banner template. Empty = built-in banners. If set and missing,
 # e-lite creates it with [indexing]/[ready] sections and placeholders.
 # banner_file = "banner.txt"
+
+[tor]
+# managed = e-lite runs its own Tor and publishes Electrum as an onion service.
+# off     = no Tor, no onion (rawtx still uses [rawtx] tor_socks).
+mode = "managed"
+plain = true                        # publish the plain Electrum port (50001)
+tls = true                          # publish the TLS Electrum port (50002)
+tls_auto_cert = true                # self-signed cert when tls_cert/tls_key are empty
+onion_port = 50001                  # virtual onion port for plain
+onion_tls_port = 50002              # virtual onion port for TLS
+socks_port = 0                      # managed Tor SOCKS; 0 = 9050 if free, else 19050+
+binary = ""                         # "" = installer bundle, then `tor` in PATH
+start_timeout_seconds = 120
+# data_dir = ""                     # default <data-dir>/tor
 
 [metrics]
 enabled = true

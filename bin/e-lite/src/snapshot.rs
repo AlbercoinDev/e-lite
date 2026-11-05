@@ -111,9 +111,11 @@ fn add_tree<W: Write>(builder: &mut tar::Builder<W>, base: &Path, dir: &Path) ->
         let entry = entry?;
         let name = entry.file_name();
         let name = name.to_string_lossy();
-        // The rawtx cache is rebuildable and can be large. Logs and runtime
-        // markers are not part of the index either.
+        // The rawtx cache is rebuildable and can be large. Logs, runtime
+        // markers, Tor keys and TLS private keys are not part of the index.
         if name == "rawtx-cache"
+            || name == "tor"
+            || name == "tls"
             || name == "LOG"
             || name == "LOCK"
             || name == "e-lite.log"
