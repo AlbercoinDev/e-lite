@@ -3,7 +3,7 @@
 **Updated:** 2026-11-05
 **Latest published release:** `0.1.0-alpha.24`
 **Release:** https://github.com/AlbercoinDev/e-lite/releases/tag/v0.1.0-alpha.24
-**Main commit at handoff:** `ca66967` (`alpha.24: adaptive memory and managed Tor onion`)
+**Main commit at handoff:** `ecd5474` (`alpha.24: onion reset confirmation and status polish`)
 
 This file is the short “where we are” for a new session. The invariants live in
 [`AGENTS.md`](../AGENTS.md) and [`PROJECT_MEMORY.md`](PROJECT_MEMORY.md); the

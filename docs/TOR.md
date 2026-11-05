@@ -99,8 +99,8 @@ Some wallets accept self-signed certificates for `.onion`; others do not. Plain
 ## Commands
 
 ```bash
-e-lite onion show  --network mainnet
-e-lite onion reset --network mainnet --yes
+e-lite onion show  --network mainnet --allow-mainnet
+e-lite onion reset --network mainnet --allow-mainnet --yes
 ```
 
 `show` prints the managed/socks state, the PID, the targets and the address(es).
@@ -108,11 +108,15 @@ e-lite onion reset --network mainnet --yes
 `reset`:
 
 1. refuses if the managed Tor is still running (stop e-lite first);
-2. moves `<data-dir>/tor/onion` to `<data-dir>/tor/onion.prev`;
-3. removes the auto-generated certificate so it is regenerated with the new SAN;
-4. prints the old address. The new address is generated on the next start.
+2. asks for confirmation (pass `--yes` for scripts);
+3. moves `<data-dir>/tor/onion` to `<data-dir>/tor/onion.prev`;
+4. removes the auto-generated certificate so it is regenerated with the new SAN;
+5. prints the old address. The new address is generated on the next start.
 
 `--purge` deletes the onion keys instead of keeping `onion.prev`.
+
+For tests or a custom location, `E_LITE_TOR=/path/to/tor` overrides the binary
+resolution before `[tor] binary` and the installer bundle.
 
 ## Connecting a wallet
 

@@ -253,6 +253,7 @@ struct Args {
     tor_binary: Option<String>,
     no_tor: bool,
     purge: bool,
+    yes: bool,
     stop_on_exit: Option<bool>,
     restart: Option<bool>,
     log_file: Option<String>,
@@ -380,6 +381,7 @@ fn parse_args() -> R<Args> {
             "--no-tor-auto-cert" => args.tor_auto_cert = Some(false),
             "--no-tor" => args.no_tor = true,
             "--purge" => args.purge = true,
+            "--yes" | "-y" => args.yes = true,
             "--adaptive" => args.adaptive = Some(true),
             "--no-adaptive" => args.adaptive = Some(false),
             "--no-p2p" => args.no_p2p = true,
@@ -1007,7 +1009,13 @@ fn run() -> R<()> {
         Command::Run => cmd_run(&cfg, chain),
         Command::Status => cmd_status(&cfg, chain, args.json),
         Command::Core => cmd_core(&cfg, chain, args.subcommand.as_deref()),
-        Command::Onion => cmd_onion(&cfg, chain, args.subcommand.as_deref(), args.purge),
+        Command::Onion => cmd_onion(
+            &cfg,
+            chain,
+            args.subcommand.as_deref(),
+            args.purge,
+            args.yes,
+        ),
         Command::ExportSnapshot => cmd_export(&cfg, chain, args.output.as_deref()),
         Command::ImportSnapshot => cmd_import(&cfg, chain, args.input.as_deref()),
         Command::Help | Command::Version => unreachable!(),
@@ -1122,6 +1130,7 @@ TOR / ONION:
     --tor-socks-port <n>    managed Tor SOCKS port (0 = auto)
     --tor-binary <path>     Tor binary (empty = bundled bundle, then PATH)
     --purge                 onion reset: delete keys instead of keeping onion.prev
+    --yes, -y               onion reset: do not ask for confirmation
 
 LOGGING:
     --log-file <path>       application log (default <data-dir>/e-lite.log)
@@ -1573,7 +1582,7 @@ fn cmd_core(cfg: &Config, chain: Chain, action: Option<&str>) -> R<()> {
     }
 }
 
-fn cmd_onion(cfg: &Config, chain: Chain, action: Option<&str>, purge: bool) -> R<()> {
+fn cmd_onion(cfg: &Config, chain: Chain, action: Option<&str>, purge: bool, yes: bool) -> R<()> {
     match action.unwrap_or("show") {
         "show" => {
             let s = tor::status(cfg, chain);
@@ -1607,6 +1616,19 @@ fn cmd_onion(cfg: &Config, chain: Chain, action: Option<&str>, purge: bool) -> R
             Ok(())
         }
         "reset" => {
+            if !yes {
+                eprint!(
+                    "This generates a new onion address and invalidates the current one. Continue? [y/N] "
+                );
+                let mut answer = String::new();
+                std::io::stdin()
+                    .read_line(&mut answer)
+                    .map_err(|e| format!("cannot read confirmation: {e}"))?;
+                if !matches!(answer.trim(), "y" | "Y" | "yes" | "YES") {
+                    println!("aborted; pass --yes for non-interactive use");
+                    return Ok(());
+                }
+            }
             let old = tor::reset(cfg, chain, purge)?;
             println!("old onion: {old}");
             if purge {
@@ -4213,6 +4235,9 @@ fn cmd_status(cfg: &Config, chain: Chain, as_json: bool) -> R<()> {
         "onion_plain_port": cfg.tor.onion_port,
         "onion_tls_port": if cfg.tor.tls { cfg.tor.onion_tls_port } else { 0 },
         "tor_bootstrapped": false,
+        "tuning": {
+            "cache_mib": tuning::memory_budget(cfg).cache_start_mib,
+        },
         "memory": {
             "total_mib": tuning::memory_info().total_mib.unwrap_or(0),
             "available_mib": tuning::memory_info().available_mib,

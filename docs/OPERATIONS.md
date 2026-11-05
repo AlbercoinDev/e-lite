@@ -197,8 +197,8 @@ If `[server] tls_listen` is empty, it defaults to `127.0.0.1:50002` when Tor TLS
 is enabled.
 
 ```bash
-e-lite onion show  --network mainnet
-e-lite onion reset --network mainnet --yes   # stop e-lite first
+e-lite onion show  --network mainnet --allow-mainnet
+e-lite onion reset --network mainnet --allow-mainnet --yes   # stop e-lite first
 ```
 
 `reset` moves the onion keys to `<data-dir>/tor/onion.prev`; the next start

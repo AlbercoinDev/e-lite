@@ -188,9 +188,9 @@ the managed Tor overrides it only when it is unset or still the default
 `127.0.0.1:9050`.
 
 ```bash
-e-lite onion show  --network mainnet
-e-lite onion reset --network mainnet --yes
-e-lite onion reset --network mainnet --yes --purge   # delete instead of onion.prev
+e-lite onion show  --network mainnet --allow-mainnet
+e-lite onion reset --network mainnet --allow-mainnet --yes
+e-lite onion reset --network mainnet --allow-mainnet --yes --purge   # delete instead of onion.prev
 e-lite run --network mainnet --allow-mainnet --no-tor
 ```
 
