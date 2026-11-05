@@ -221,8 +221,8 @@ and TOML arrays are parsed as TOML.
 
 - indexed height and percentage of Core's `headers`;
 - Core blocks/headers and percentage, plus verification progress during IBD;
-- lag, blocks/s, tx/s, elapsed time and read/decode/wait/apply/commit metrics,
-  plus `commit/blk`;
+- lag, blocks/s, tx/s, elapsed time and read/decode/prefetch/wait/apply/commit
+  metrics, plus `commit/blk`;
 - a milestone line every `milestone_blocks` or `milestone_seconds` (whichever
   happens first) with interval throughput and disk usage for e-lite and Core.
 

@@ -180,6 +180,37 @@ pub struct PreparedBlock {
     out_script_hashes: Vec<Vec<ScriptHash>>,
 }
 
+/// Prevouts resolved from the committed UTXO set before apply. A speculative
+/// superset is fine: apply consults the in-memory group overlay first and falls
+/// back to a point lookup for anything absent.
+pub type PrefetchedPrevouts = HashMap<Outpoint, UtxoValue>;
+
+/// Resolve the prevouts a block will need, in one batch. This is safe to run in
+/// a reader thread while another block is being applied: it reads committed
+/// state only, and misses are resolved from the overlay during apply. Skipping
+/// outputs created by the same block is what makes the speculation sound.
+pub fn prefetch_prevouts(store: &Store, prepared: &PreparedBlock) -> Result<PrefetchedPrevouts> {
+    let created_txids: HashSet<Hash32> = prepared.txids.iter().copied().collect();
+    let mut needed: HashSet<Outpoint> = HashSet::with_capacity(prepared.txids.len());
+    for tx in &prepared.block.txdata {
+        for input in &tx.input {
+            if input.previous_output.is_null() {
+                continue;
+            }
+            let op = Outpoint {
+                txid: hash_from_txid(&input.previous_output.txid)?,
+                vout: input.previous_output.vout,
+            };
+            if created_txids.contains(&op.txid) {
+                continue;
+            }
+            needed.insert(op);
+        }
+    }
+    let needed: Vec<Outpoint> = needed.into_iter().collect();
+    Ok(store.get_utxos(&needed)?)
+}
+
 fn compute_out_script_hashes(block: &bitcoin::Block) -> Vec<Vec<ScriptHash>> {
     block
         .txdata
@@ -273,6 +304,7 @@ pub fn apply_block(
         overlay,
         batch,
         store_undo,
+        None,
     )
 }
 
@@ -285,6 +317,23 @@ pub fn apply_prepared(
     batch: &mut WriteBatch,
     store_undo: bool,
 ) -> Result<ApplyOutcome> {
+    apply_prepared_with_prefetch(
+        store, height, prepared, prev_tip, overlay, batch, store_undo, None,
+    )
+}
+
+/// Apply a prepared block using prevouts already fetched in a reader thread.
+#[allow(clippy::too_many_arguments)]
+pub fn apply_prepared_with_prefetch(
+    store: &Store,
+    height: u32,
+    prepared: &PreparedBlock,
+    prev_tip: Option<IndexedTip>,
+    overlay: &mut GroupOverlay,
+    batch: &mut WriteBatch,
+    store_undo: bool,
+    prefetched: Option<&PrefetchedPrevouts>,
+) -> Result<ApplyOutcome> {
     apply_inner(
         store,
         height,
@@ -296,6 +345,7 @@ pub fn apply_prepared(
         overlay,
         batch,
         store_undo,
+        prefetched,
     )
 }
 
@@ -311,6 +361,7 @@ fn apply_inner(
     overlay: &mut GroupOverlay,
     batch: &mut WriteBatch,
     store_undo: bool,
+    prefetched: Option<&PrefetchedPrevouts>,
 ) -> Result<ApplyOutcome> {
     // --- continuity -------------------------------------------------------
     let prev_hash = hash_from_blockhash(&block.header.prev_blockhash)?;
@@ -337,31 +388,39 @@ fn apply_inner(
         });
     }
 
-    // Prefetch every prevout that is not created inside this block in one
+    // Prevouts come from the reader-thread prefetch when available; otherwise
+    // resolve every prevout that is not created inside this block in one
     // RocksDB multi-get. Outputs created in this block are resolved through the
     // group overlay, and outputs already spent in this group must stay missing.
-    let created_txids: HashSet<Hash32> = txids.iter().copied().collect();
-    let mut needed: HashSet<Outpoint> = HashSet::with_capacity(txids.len());
-    for tx in &block.txdata {
-        for input in &tx.input {
-            if input.previous_output.is_null() {
-                continue;
+    let fetched;
+    let prefetched: &PrefetchedPrevouts = match prefetched {
+        Some(map) => map,
+        None => {
+            let created_txids: HashSet<Hash32> = txids.iter().copied().collect();
+            let mut needed: HashSet<Outpoint> = HashSet::with_capacity(txids.len());
+            for tx in &block.txdata {
+                for input in &tx.input {
+                    if input.previous_output.is_null() {
+                        continue;
+                    }
+                    let op = Outpoint {
+                        txid: hash_from_txid(&input.previous_output.txid)?,
+                        vout: input.previous_output.vout,
+                    };
+                    if created_txids.contains(&op.txid)
+                        || overlay.contains_created(&op)
+                        || overlay.contains_deleted(&op)
+                    {
+                        continue;
+                    }
+                    needed.insert(op);
+                }
             }
-            let op = Outpoint {
-                txid: hash_from_txid(&input.previous_output.txid)?,
-                vout: input.previous_output.vout,
-            };
-            if created_txids.contains(&op.txid)
-                || overlay.contains_created(&op)
-                || overlay.contains_deleted(&op)
-            {
-                continue;
-            }
-            needed.insert(op);
+            let needed: Vec<Outpoint> = needed.into_iter().collect();
+            fetched = store.get_utxos(&needed)?;
+            &fetched
         }
-    }
-    let needed: Vec<Outpoint> = needed.into_iter().collect();
-    let prefetched = store.get_utxos(&needed)?;
+    };
 
     let txnum_base = prev_tip.map(|t| t.txnum).unwrap_or(0);
     let header_bytes: [u8; HEADER_LEN] = {
@@ -402,7 +461,7 @@ fn apply_inner(
                 txid: hash_from_txid(&input.previous_output.txid)?,
                 vout: input.previous_output.vout,
             };
-            let utxo = overlay.get_with(store, &op, &prefetched)?.ok_or_else(|| {
+            let utxo = overlay.get_with(store, &op, prefetched)?.ok_or_else(|| {
                 IndexError::PrevoutMissing {
                     txid: op.txid.to_hex(),
                     vout: op.vout,
@@ -630,7 +689,21 @@ mod tests {
         let mut tip = store.committed_tip()?;
         for (i, block) in blocks.iter().enumerate() {
             let height = start_height + i as u32;
-            let out = apply_block(store, height, block, tip, &mut overlay, &mut batch, true)?;
+            // Mirror the daemon: decode/validate and resolve prevouts outside
+            // apply, then apply from the speculative prefetch.
+            let raw = bitcoin::consensus::serialize(block);
+            let prepared = prepare_block_bytes(&raw, &block.block_hash().to_string(), height)?;
+            let prevouts = prefetch_prevouts(store, &prepared)?;
+            let out = apply_prepared_with_prefetch(
+                store,
+                height,
+                &prepared,
+                tip,
+                &mut overlay,
+                &mut batch,
+                true,
+                Some(&prevouts),
+            )?;
             all_txids.extend_from_slice(&out.txids);
             tip = Some(out.tip);
         }

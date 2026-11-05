@@ -1,5 +1,30 @@
 # Changelog
 
+## 0.1.0-alpha.23 — 2026-11-05
+
+### Apply path: overlap UTXO reads with the indexer pipeline
+
+Mainnet bulk indexing was dominated by `apply` (300 ms–2 s per block) while
+block reads, decode and prefetch waits stayed near zero. `apply` was doing every
+prevout lookup serially in the single apply thread, so random UTXO reads could
+not overlap with anything.
+
+- **Speculative prevout prefetch in reader threads.** Each reader now resolves a
+  block's prevouts from the committed UTXO set immediately after decoding, while
+  the apply thread works on an earlier block. The prefetched set is a superset
+  (it ignores group-local creations/deletions); apply still consults the
+  in-memory group overlay first and falls back to a point lookup for any miss,
+  so correctness does not depend on the speculation. New `prefetch` figure in
+  the progress line isolates this cost from `apply`.
+- **RocksDB atomic flush** across the seven column families: one flush point and
+  fewer, larger L0 files instead of seven independent flushes, which cuts
+  compaction write amplification on multi-CF batches.
+- **Compaction shape for bulk ingest**: 2 MiB compaction readahead and a 512 MiB
+  level-1 base.
+- Tests: the oracle-parity suites now drive the production
+  `prepare → prefetch → apply_prepared_with_prefetch` path, including blocks
+  that spend outputs created earlier in the same uncommitted group.
+
 ## 0.1.0-alpha.22 — 2026-11-05
 
 ### Faster bulk indexing, readiness and wallet banner

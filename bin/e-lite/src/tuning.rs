@@ -107,6 +107,7 @@ pub struct Tunables {
     pub apply_ms: AtomicU64,
     pub decode_ms: AtomicU64,
     pub wait_ms: AtomicU64,
+    pub prefetch_ms: AtomicU64,
     pub commit_ewma: AtomicU64,
     pub tx_per_sec: AtomicU64,
     pub blocks_per_sec: AtomicU64,
@@ -228,6 +229,7 @@ impl Tunables {
             apply_ms: AtomicU64::new(0),
             decode_ms: AtomicU64::new(0),
             wait_ms: AtomicU64::new(0),
+            prefetch_ms: AtomicU64::new(0),
             commit_ewma: AtomicU64::new(0),
             tx_per_sec: AtomicU64::new(0),
             blocks_per_sec: AtomicU64::new(0),
@@ -265,6 +267,9 @@ impl Tunables {
     }
     pub fn wait_ms(&self) -> u64 {
         self.wait_ms.load(Ordering::Relaxed)
+    }
+    pub fn prefetch_ms(&self) -> u64 {
+        self.prefetch_ms.load(Ordering::Relaxed)
     }
 
     /// Apply cache capacity and mutable RocksDB options to an open store.
@@ -324,6 +329,9 @@ impl Tunables {
     }
     pub fn record_wait(&self, d: Duration) {
         ewma(&self.wait_ms, d.as_millis() as u64);
+    }
+    pub fn record_prefetch(&self, d: Duration) {
+        ewma(&self.prefetch_ms, d.as_millis() as u64);
     }
     pub fn record_commit(&self, d: Duration) {
         ewma(&self.commit_ewma, d.as_millis() as u64);

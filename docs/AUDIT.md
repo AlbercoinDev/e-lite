@@ -1,7 +1,7 @@
 # Code audit
 
-**Base:** `0.1.0-alpha.21` → published `0.1.0-alpha.22` · **Scope:** `bin/e-lite`, `crates/*` (25 Rust files,
-~17.2k lines) · **Status:** findings fixed in `0.1.0-alpha.22` where noted.
+**Base:** `0.1.0-alpha.22` → published `0.1.0-alpha.23` · **Scope:** `bin/e-lite`, `crates/*` (25 Rust files,
+~17.3k lines) · **Status:** findings fixed in `0.1.0-alpha.23` where noted.
 
 This audit is not a claim of formal verification. It records static checks,
 manual review areas, concrete findings and residual risks.
@@ -50,6 +50,7 @@ Additional checks performed:
 | AUD-029 | P2 | Bulk scheduling | `bin/e-lite/src/main.rs` | Core could download during e-lite's bulk catch-up, competing for disk; pausing until the tip would reconnect peers late. | Default full pause plus `core_resume_ahead_blocks = 5000` pre-warm; relative 20k guard afterwards. |
 | AUD-030 | P2 | Commit durability | `crates/el-store`, `bin/e-lite` | Two fsyncs per commit made bulk indexing slower than necessary. | `commit_sync=auto`: `txids` in bulk (txids.dat still fsynced, startup truncates extras), `always` live. |
 | AUD-031 | P3 | Readiness/banner | `crates/el-serve` | Wallets had no clear READY signal and a static banner. | Dynamic `READY`/`FULLY SYNCED` log/status/metrics and INDEXING/READY banner templates, optional file with placeholders. |
+| AUD-032 | P2 | Indexing throughput | `crates/el-index`, `bin/e-lite`, `crates/el-store` | Mainnet alpha.22 logs showed `apply` growing from ~300 ms to >1.5 s per block with `read`/`decode`/`wait` near zero: every prevout multi-get ran serially in the single apply thread, and the apply thread was also the only consumer of the reader pipeline. | Reader threads now prefetch each block's prevouts (`prefetch_prevouts`) while apply works on the previous block; apply uses the overlay first and falls back to a point lookup, so speculative misses are harmless. RocksDB `atomic_flush` and a larger L1/compaction readahead reduce multi-CF write amplification. Oracle-parity tests cover the prefetch path; `e2e_regtest`, `e2e_pruned_ibd`, `e2e_launch_core` pass. |
 
 ## Residual risks and intentional limits
 

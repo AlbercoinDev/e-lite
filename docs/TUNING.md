@@ -60,6 +60,7 @@ The indexer records EWMA values for:
 
 - block-read latency (`read_ms`),
 - block decode/hash latency (`decode_ms`),
+- prevout prefetch latency (`prefetch_ms`),
 - pipeline wait (`wait_ms`),
 - `apply_block` latency (`apply_ms`),
 - commit + fsync latency (`commit_ms`) and `commit/blk`,
@@ -68,6 +69,16 @@ The indexer records EWMA values for:
 They are exported in `/status` under `tuning` and in `/metrics` as
 `e_lite_tuning_*`, `e_lite_tx_per_sec`, `e_lite_blocks_per_sec` and
 `e_lite_commit_ms`.
+
+On HDDs and small hosts, prevout lookups were the largest part of `apply`:
+RocksDB point reads for one block ran serially in the apply thread. Since
+alpha.23 the reader threads resolve a block's prevouts speculatively before it
+reaches apply, so random UTXO reads overlap with the previous block's work. The
+result is a superset (group-local creations/deletions are ignored); apply uses
+the group overlay first and falls back to a point lookup, so the pipeline never
+depends on the speculation. If `prefetch` is high and `apply` is low, the disk
+is the limit; if `prefetch` is low and `apply` is high, the remaining cost is
+CPU/HashMap/history work.
 
 ## What it changes
 

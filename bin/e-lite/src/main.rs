@@ -7,7 +7,10 @@ mod tuning;
 use config::{Config, CoreManage};
 use core_supervisor::{CoreStartOutcome, CoreSupervisor};
 use el_chain::ReaderTracker;
-use el_index::{apply_prepared, prepare_block_bytes, prune_undo, rewind_to, GroupOverlay};
+use el_index::{
+    apply_prepared_with_prefetch, prefetch_prevouts, prepare_block_bytes, prune_undo, rewind_to,
+    GroupOverlay,
+};
 use el_mempool::Mempool;
 use el_model::{Chain, Hash32, IndexedTip, NetworkIdentity, ScriptHash};
 use el_rawtx::{CoreBlockSource, RawtxConfig, Resolver};
@@ -1440,7 +1443,8 @@ fn bind_ok(addr: &str) -> bool {
 
 const CATCH_UP_BLOCKS: u64 = 512;
 
-type FetchResult = std::result::Result<(u64, el_index::PreparedBlock), String>;
+type FetchResult =
+    std::result::Result<(u64, el_index::PreparedBlock, el_index::PrefetchedPrevouts), String>;
 type PendingMap = std::collections::BTreeMap<usize, FetchResult>;
 
 struct MilestoneState {
@@ -2198,6 +2202,7 @@ impl Indexer {
             let core = self.core.clone();
             let bulk = self.bulk.clone();
             let resolver = self.resolver.clone();
+            let store = Arc::clone(&self.store);
             let tunables = Arc::clone(&self.tunables);
             let pruneheight = info.pruneheight;
             let hashes = Arc::clone(&hashes);
@@ -2228,7 +2233,19 @@ impl Indexer {
                         let decode_started = Instant::now();
                         let prepared = prepare_block_bytes(&bytes, &expected_hash, height as u32);
                         tunables.record_decode(decode_started.elapsed());
-                        prepared.map(|p| (height, p)).map_err(|e| e.to_string())
+                        match prepared {
+                            // Resolve prevouts here, in parallel with the apply
+                            // thread, so random UTXO reads do not serialise the
+                            // whole pipeline. Missing entries fall back to the
+                            // overlay/point lookup during apply.
+                            Ok(p) => {
+                                let prefetch_started = Instant::now();
+                                let prevouts = prefetch_prevouts(&store, &p);
+                                tunables.record_prefetch(prefetch_started.elapsed());
+                                prevouts.map(|m| (height, p, m)).map_err(|e| e.to_string())
+                            }
+                            Err(e) => Err(e.to_string()),
+                        }
                     }
                     Err(e) => Err(e),
                 };
@@ -2276,7 +2293,7 @@ impl Indexer {
                 paused_by_disk = true;
                 break;
             }
-            let (height, prepared) = match item {
+            let (height, prepared, prevouts) = match item {
                 Ok(v) => v,
                 Err(e) => {
                     result = Err(e.into());
@@ -2292,7 +2309,7 @@ impl Indexer {
                 .saturating_add(self.cfg.index.reorg_window as u64)
                 .saturating_add(64)
                 >= core_tip;
-            match apply_prepared(
+            match apply_prepared_with_prefetch(
                 &self.store,
                 height as u32,
                 &prepared,
@@ -2300,6 +2317,7 @@ impl Indexer {
                 &mut overlay,
                 &mut batch,
                 keep_undo,
+                Some(&prevouts),
             ) {
                 Ok(out) => {
                     group_txids.extend_from_slice(&out.txids);
@@ -2552,13 +2570,14 @@ impl Indexer {
         };
         let read_ms = self.tunables.read_ms.load(Ordering::Relaxed);
         let decode_ms = self.tunables.decode_ms();
+        let prefetch_ms = self.tunables.prefetch_ms();
         let wait_ms = self.tunables.wait_ms();
         let apply_ms = self.tunables.apply_ms.load(Ordering::Relaxed);
         let commit_ms = self.tunables.commit_ewma.load(Ordering::Relaxed);
         let commit_per_block = commit_ms / self.tunables.batch_blocks().max(1) as u64;
         eprintln!(
             "[e-lite] height {} ({})  txnum {}  core {}/{} ({})  prune {}  lag {}  \
-             {:.1} blocks/s  {:.0} tx/s  elapsed {}  read {}ms decode {}ms wait {}ms \
+             {:.1} blocks/s  {:.0} tx/s  elapsed {}  read {}ms decode {}ms prefetch {}ms wait {}ms \
              apply {}ms commit {}ms commit/blk {}ms{}",
             tip.height,
             pct(tip.height as u64, core_headers),
@@ -2573,6 +2592,7 @@ impl Indexer {
             format_uptime(self.progress_started.elapsed()),
             read_ms,
             decode_ms,
+            prefetch_ms,
             wait_ms,
             apply_ms,
             commit_ms,

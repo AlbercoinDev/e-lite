@@ -166,12 +166,20 @@ impl Store {
         opts.set_wal_bytes_per_sync(1024 * 1024);
         opts.set_write_buffer_size(per_cf_write);
         opts.set_max_write_buffer_number(max_buffers as i32);
+        // Every block writes to most column families in one batch. Flushing them
+        // together produces fewer, larger L0 files and much less compaction
+        // write amplification than seven independent flushes.
+        opts.set_atomic_flush(true);
         let mut descriptors = Vec::new();
         for name in CF_NAMES {
             let mut cf_opts = Options::default();
             cf_opts.set_compression_type(DBCompressionType::Lz4);
             cf_opts.set_write_buffer_size(per_cf_write);
             cf_opts.set_max_write_buffer_number(max_buffers as i32);
+            // Bulky sequential ingest: read compaction input in large chunks and
+            // keep level 1 big enough that compaction does not run constantly.
+            cf_opts.set_compaction_readahead_size(2 * 1024 * 1024);
+            cf_opts.set_max_bytes_for_level_base(512 * 1024 * 1024);
             let mut table = BlockBasedOptions::default();
             table.set_block_cache(&cache);
             table.set_bloom_filter(10.0, true);
