@@ -1,7 +1,7 @@
 # Code audit
 
-**Base:** `0.1.0-alpha.23` → published `0.1.0-alpha.24` · **Scope:** `bin/e-lite`, `crates/*` (25 Rust files,
-~18k lines) · **Status:** findings fixed in `0.1.0-alpha.24` where noted.
+**Base:** `0.1.0-alpha.24` → published `0.1.0-alpha.25` · **Scope:** `bin/e-lite`, `crates/*` (25 Rust files,
+~18k lines) · **Status:** findings fixed in `0.1.0-alpha.25` where noted.
 
 This audit is not a claim of formal verification. It records static checks,
 manual review areas, concrete findings and residual risks.
@@ -56,6 +56,7 @@ Additional checks performed:
 | AUD-033 | P2 | Memory budget | `bin/e-lite/src/tuning.rs`, `bin/e-lite/src/main.rs` | The block cache was fixed at a profile value (`RAM/4`) and `cache_mib` was locked; the machine's real `MemAvailable` and page cache were only consulted below 512 MiB. On an 8 GiB host with Core, the cache could neither use spare RAM nor adapt to pressure. | New hot policy: 75 % ceiling, `max(1024, RAM/8)` reserve, memtables `RAM/8`, page-cache floor, 256 MiB steps/25 % shrink with hysteresis; `cache_mib` is a maximum; critical pressure overrides it; pre-resume shrink. Unit tests for the budget/actions and a status/log budget line. |
 | AUD-034 | P1 | Inbound onion | `bin/e-lite/src/tor.rs`, `bin/e-lite/src/main.rs` | The new managed Tor publishes Electrum on an onion; like the plain listener it has no client authentication or rate limiting. A leaked address gives full query access. | Loopback-only targets, v3 onion keys 0700, explicit warning in logs/docs, `mode=off`/`--no-tor`, address treated as a secret. Residual risk documented in `AUD-010`. |
 | AUD-035 | P2 | Installer supply chain | `install.sh`, `bin/e-lite/src/tor.rs` | The installer downloads a Tor expert bundle and e-lite later executes it; a compromised download would run as the user. | Pinned bundle version and SHA-256 in the installer; download from the Tor Project over TLS; fallback to `tor` in `PATH`; `doctor` shows the resolved binary. |
+| AUD-036 | P1 | Onion with wildcard listener | `bin/e-lite/src/tor.rs` | Binding Electrum to `0.0.0.0` (a common LAN setup) made the onion refuse to publish (`non-loopback target`), so users saw no onion address. | Wildcard listeners are mapped to loopback targets (`0.0.0.0`→`127.0.0.1`, `[::]`→`[::1]`); explicit `target_plain`/`target_tls` overrides; effective ports/targets persisted in `tor/state` for accurate `onion show`. |
 
 ## Residual risks and intentional limits
 

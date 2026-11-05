@@ -251,6 +251,8 @@ struct Args {
     tor_onion_tls_port: Option<u16>,
     tor_socks_port: Option<u16>,
     tor_binary: Option<String>,
+    tor_target_plain: Option<String>,
+    tor_target_tls: Option<String>,
     no_tor: bool,
     purge: bool,
     yes: bool,
@@ -373,6 +375,8 @@ fn parse_args() -> R<Args> {
             }
             "--tor-socks-port" => args.tor_socks_port = Some(value("--tor-socks-port")?.parse()?),
             "--tor-binary" => args.tor_binary = Some(value("--tor-binary")?),
+            "--tor-target-plain" => args.tor_target_plain = Some(value("--tor-target-plain")?),
+            "--tor-target-tls" => args.tor_target_tls = Some(value("--tor-target-tls")?),
             "--tor-plain" => args.tor_plain = Some(true),
             "--no-tor-plain" => args.tor_plain = Some(false),
             "--tor-tls" => args.tor_tls = Some(true),
@@ -637,6 +641,12 @@ fn effective_config(args: &Args) -> R<(Config, Chain)> {
     }
     if let Some(v) = &args.tor_binary {
         cfg.tor.binary = v.clone();
+    }
+    if let Some(v) = &args.tor_target_plain {
+        cfg.tor.target_plain = v.clone();
+    }
+    if let Some(v) = &args.tor_target_tls {
+        cfg.tor.target_tls = v.clone();
     }
     if args.no_tor {
         cfg.tor.mode = "off".to_string();
@@ -1128,7 +1138,9 @@ TOR / ONION:
     --tor-onion-port <n>    onion virtual port for plain (default 50001)
     --tor-onion-tls-port <n> onion virtual port for TLS (default 50002)
     --tor-socks-port <n>    managed Tor SOCKS port (0 = auto)
-    --tor-binary <path>     Tor binary (empty = bundled bundle, then PATH)
+    --tor-binary <path>     Tor binary (empty = installer bundle, then PATH)
+    --tor-target-plain <addr> loopback target for the plain onion port
+    --tor-target-tls <addr> loopback target for the TLS onion port
     --purge                 onion reset: delete keys instead of keeping onion.prev
     --yes, -y               onion reset: do not ask for confirmation
 
@@ -1498,10 +1510,17 @@ fn cmd_doctor(cfg: &Config, chain: Chain) -> R<()> {
         }
     }
     match &tor_status.onion {
-        Some(addr) => println!(
-            "tor onion: {addr}:{} (plain), {}:{} (tls)",
-            cfg.tor.onion_port, addr, cfg.tor.onion_tls_port
-        ),
+        Some(addr) => {
+            println!(
+                "tor onion: {addr}:{} (plain){}",
+                tor_status.plain_port,
+                if let Some(port) = tor_status.tls_port {
+                    format!(", :{port} (tls)")
+                } else {
+                    String::new()
+                }
+            );
+        }
         None => println!("tor onion: not created yet (it is created on `run`/`serve`)"),
     }
     if cfg.tor.managed() {
@@ -1599,14 +1618,18 @@ fn cmd_onion(cfg: &Config, chain: Chain, action: Option<&str>, purge: bool, yes:
                     .unwrap_or_else(|| "-".to_string()),
                 if s.running { "running" } else { "not running" }
             );
-            println!("plain:      {} -> {}", s.target_plain, cfg.tor.onion_port);
-            println!("tls:        {} -> {}", s.target_tls, cfg.tor.onion_tls_port);
+            println!("plain:      {} -> {}", s.target_plain, s.plain_port);
+            if let Some(port) = s.tls_port {
+                println!("tls:        {} -> {}", s.target_tls, port);
+            } else {
+                println!("tls:        disabled");
+            }
             match &s.onion {
                 Some(addr) => {
                     println!("onion:      {addr}");
-                    println!("connect:    {addr}:{} (plain)", cfg.tor.onion_port);
-                    if cfg.tor.tls {
-                        println!("connect:    {addr}:{} (tls)", cfg.tor.onion_tls_port);
+                    println!("connect:    {addr}:{} (plain)", s.plain_port);
+                    if let Some(port) = s.tls_port {
+                        println!("connect:    {addr}:{port} (tls)");
                     }
                 }
                 None => {

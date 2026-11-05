@@ -181,6 +181,8 @@ e-lite run --network mainnet --allow-mainnet \
 | `--tor-onion-tls-port <n>` | `tor.onion_tls_port` | `50002` |
 | `--tor-socks-port <n>` | `tor.socks_port` | `0` (9050 if free, else 19050+) |
 | `--tor-binary <path>` | `tor.binary` | installer bundle, then PATH |
+| `--tor-target-plain <addr>` | `tor.target_plain` | `server.listen` (wildcard mapped to loopback) |
+| `--tor-target-tls <addr>` | `tor.target_tls` | `server.tls_listen` (wildcard mapped to loopback) |
 
 `mode = managed` starts e-lite's own Tor and publishes Electrum as an onion
 service. `--tor-socks <addr>` (in the previous table) remains the rawtx proxy;

@@ -1,9 +1,9 @@
 # Session handoff
 
 **Updated:** 2026-11-05
-**Latest published release:** `0.1.0-alpha.24`
-**Release:** https://github.com/AlbercoinDev/e-lite/releases/tag/v0.1.0-alpha.24
-**Main commit at handoff:** `6823794` (`alpha.24: resolve the Tor bundle in system installs`)
+**Latest published release:** `0.1.0-alpha.25`
+**Release:** https://github.com/AlbercoinDev/e-lite/releases/tag/v0.1.0-alpha.25
+**Main commit at handoff:** `8376782` (`alpha.25: onion with wildcard Electrum listeners`)
 
 This file is the short “where we are” for a new session. The invariants live in
 [`AGENTS.md`](../AGENTS.md) and [`PROJECT_MEMORY.md`](PROJECT_MEMORY.md); the
@@ -41,7 +41,8 @@ no repitas contexto ni rehagas decisiones ya documentadas.
   available on `[server] tls_listen` with `tls_cert`/`tls_key`; the PEM files are
   reloaded when they change. `[tor] mode = "managed"` (default) runs e-lite's own
   Tor and publishes plain 50001 + TLS 50002 as a v3 onion; TLS uses an
-  auto-generated self-signed certificate when none is configured. There is no
+  auto-generated self-signed certificate when none is configured. Wildcard
+  listeners (`0.0.0.0`/`[::]`) are mapped to loopback onion targets. There is no
   client authentication or rate limiting; treat the onion address as a secret.
 - Core RPC is HTTP; LAN/WAN requires SSH/VPN.
 - Rawtx resolution is local Core -> validated cache -> P2P/Esplora (whole blocks,
@@ -60,6 +61,17 @@ no repitas contexto ni rehagas decisiones ya documentadas.
   the onion setup, reset and security.
 - `docs/ROADMAP.md` contains future features/improvements. Do not present them as
   available.
+
+## Last audit/fixes (alpha.25)
+
+- **Onion with wildcard listeners**: `--listen 0.0.0.0:50001` /
+  `--tls-listen 0.0.0.0:50002` now publish the onion with loopback targets
+  (`127.0.0.1`) instead of refusing. `[tor] target_plain`/`target_tls` override
+  the target; the effective ports/targets are saved in `<data-dir>/tor/state`
+  so `e-lite onion show` is accurate even when the daemon used CLI flags.
+- Evidence: unit tests for wildcard/IPv6 mapping and torrc targets; a manual
+  `run` with `0.0.0.0` created the onion and `onion show` reported the custom
+  ports; fmt/clippy/workspace tests.
 
 ## Last audit/fixes (alpha.24)
 

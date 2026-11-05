@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.1.0-alpha.25 — 2026-11-05
+
+### Onion works with wildcard Electrum listeners
+
+Binding Electrum to `0.0.0.0` (or `[::]`) made the onion service fail with
+`refusing to publish non-loopback target`. The wildcard socket already accepts
+loopback connections, so the onion can safely target `127.0.0.1` (or `[::1]`).
+
+- **Wildcard mapping**: `0.0.0.0:PORT` → `127.0.0.1:PORT` and
+  `[::]:PORT` → `[::1]:PORT` for both the plain and TLS onion ports. A specific
+  non-loopback address is still refused.
+- **Explicit targets**: `[tor] target_plain`/`target_tls` (and
+  `--tor-target-plain`/`--tor-target-tls`) override the listener-derived target.
+- **Accurate `onion show`**: e-lite persists the effective ports/targets in
+  `<data-dir>/tor/state`, so `e-lite onion show` reports the real onion ports
+  even when the daemon was started with CLI flags.
+- Tests: wildcard/IPv6 mapping, explicit target rendering, and `onion show`
+  with a state file.
+
 ## 0.1.0-alpha.24 — 2026-11-05
 
 ### Adaptive memory and a managed Tor onion service

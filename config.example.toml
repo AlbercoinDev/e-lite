@@ -85,6 +85,8 @@ socks_port = 0                      # managed Tor SOCKS; 0 = 9050 if free, else 
 binary = ""                         # "" = installer bundle, then `tor` in PATH
 start_timeout_seconds = 120
 # data_dir = ""                     # default <data-dir>/tor
+# target_plain = ""                 # default server.listen; 0.0.0.0 maps to 127.0.0.1
+# target_tls = ""                   # default server.tls_listen; 0.0.0.0 maps to 127.0.0.1
 
 [metrics]
 enabled = true

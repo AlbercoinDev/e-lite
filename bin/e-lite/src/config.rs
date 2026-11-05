@@ -275,6 +275,12 @@ pub struct TorCfg {
     /// Tor home. Empty = `<data-dir>/tor`.
     #[serde(default)]
     pub data_dir: String,
+    /// Optional loopback target for the plain onion port. Empty = [server] listen.
+    #[serde(default)]
+    pub target_plain: String,
+    /// Optional loopback target for the TLS onion port. Empty = [server] tls_listen.
+    #[serde(default)]
+    pub target_tls: String,
 }
 
 impl TorCfg {
@@ -296,6 +302,8 @@ impl Default for TorCfg {
             binary: String::new(),
             start_timeout_seconds: d_tor_timeout(),
             data_dir: String::new(),
+            target_plain: String::new(),
+            target_tls: String::new(),
         }
     }
 }

@@ -63,6 +63,8 @@ socks_port = 0               # 0 = 9050 if free, else 19050+
 binary = ""                  # "" = installer bundle, then `tor` in PATH
 start_timeout_seconds = 120
 # data_dir = ""              # default <data-dir>/tor
+# target_plain = ""          # default server.listen; 0.0.0.0 maps to 127.0.0.1
+# target_tls = ""            # default server.tls_listen; 0.0.0.0 maps to 127.0.0.1
 ```
 
 CLI equivalents:
@@ -74,6 +76,12 @@ e-lite run --network mainnet --allow-mainnet \
 ```
 
 Use `--no-tor` to disable Tor for one run.
+
+If the Electrum listener binds a wildcard (`0.0.0.0:50001` or `[::]:50001`),
+the onion target is automatically the loopback address (`127.0.0.1:50001` or
+`[::1]:50001`): the wildcard socket accepts loopback connections, so this is
+safe. A specific non-loopback address is refused unless you set a reachable
+loopback `target_plain`/`target_tls`.
 
 If `[server] tls_listen` is empty and `[tor] tls = true`, the effective TLS
 listener becomes `127.0.0.1:50002`. If that port is busy, e-lite logs a warning

@@ -42,26 +42,41 @@ impl Drop for TorRuntime {
 
 /// Whether a target is safe to publish: only loopback listeners.
 pub fn loopback_target(addr: &str) -> Result<(), String> {
+    effective_target(addr).map(|_| ())
+}
+
+/// Turn a listener address into a loopback target Tor can connect to. Wildcard
+/// listeners (`0.0.0.0`, `[::]`) accept loopback connections, so their onion
+/// target is the loopback address; a specific non-loopback address is refused.
+pub fn effective_target(addr: &str) -> Result<String, String> {
     let addr = addr.trim();
     let (host, port) = addr
         .rsplit_once(':')
         .ok_or_else(|| format!("target {addr:?} is not host:port"))?;
-    if port.parse::<u16>().is_err() {
-        return Err(format!("target {addr:?} has an invalid port"));
-    }
-    if host.eq_ignore_ascii_case("localhost") {
-        return Ok(());
-    }
-    let host = host.trim_start_matches('[').trim_end_matches(']');
-    let ip: IpAddr = host
+    let port: u16 = port
         .parse()
-        .map_err(|_| format!("target {addr:?} must be an IP or localhost"))?;
-    if !ip.is_loopback() {
-        return Err(format!(
-            "refusing to publish non-loopback target {addr:?}; bind Electrum to 127.0.0.1"
-        ));
-    }
-    Ok(())
+        .map_err(|_| format!("target {addr:?} has an invalid port"))?;
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    let mapped = match host {
+        "0.0.0.0" => format!("127.0.0.1:{port}"),
+        "::" => format!("[::1]:{port}"),
+        _ => {
+            if host.eq_ignore_ascii_case("localhost") {
+                return Ok(format!("localhost:{port}"));
+            }
+            let ip: IpAddr = host
+                .parse()
+                .map_err(|_| format!("target {addr:?} must be an IP or localhost"))?;
+            if !ip.is_loopback() {
+                return Err(format!(
+                    "refusing to publish non-loopback target {addr:?}; bind Electrum to \
+                     127.0.0.1/0.0.0.0 or set [tor] target_plain/target_tls to a loopback target"
+                ));
+            }
+            format!("{ip}:{port}")
+        }
+    };
+    Ok(mapped)
 }
 
 fn valid_onion(addr: &str) -> bool {
@@ -78,16 +93,25 @@ pub fn read_hostname(tor_dir: &Path) -> Option<String> {
 }
 
 fn target_for(cfg: &Config, tls: bool) -> Result<String, String> {
-    let target = if tls {
+    let configured = if tls {
+        cfg.tor.target_tls.trim()
+    } else {
+        cfg.tor.target_plain.trim()
+    };
+    let listener = if tls {
         cfg.server.tls_listen.trim()
     } else {
         cfg.server.listen.trim()
     };
+    let target = if !configured.is_empty() {
+        configured
+    } else {
+        listener
+    };
     if target.is_empty() {
         return Err("empty Electrum target".to_string());
     }
-    loopback_target(target)?;
-    Ok(target.to_string())
+    effective_target(target)
 }
 
 fn render_torrc(cfg: &Config, tor_dir: &Path, socks_port: u16) -> Result<String, String> {
@@ -382,6 +406,20 @@ pub fn spawn(
     let torrc = render_torrc(cfg, &tor_dir, socks)?;
     let torrc_path = tor_dir.join("torrc");
     write_private(&torrc_path, torrc.as_bytes())?;
+    let target_plain = target_for(cfg, false)?;
+    let target_tls = if cfg.tor.tls && cfg.server.tls_enabled() {
+        Some(target_for(cfg, true)?)
+    } else {
+        None
+    };
+    write_state(
+        &tor_dir,
+        cfg.tor.onion_port,
+        target_tls.as_ref().map(|_| cfg.tor.onion_tls_port),
+        &target_plain,
+        target_tls.as_deref(),
+        &format!("127.0.0.1:{socks}"),
+    );
     // Keep the Tor log bounded; it is append-only across restarts.
     let log_path = tor_dir.join("tor.log");
     if fs::metadata(&log_path).map(|m| m.len()).unwrap_or(0) > 10 * 1024 * 1024 {
@@ -543,6 +581,8 @@ pub struct TorStatus {
     pub running: bool,
     pub target_plain: String,
     pub target_tls: String,
+    pub plain_port: u16,
+    pub tls_port: Option<u16>,
 }
 
 fn read_socks_from_torrc(tor_dir: &Path) -> Option<String> {
@@ -553,14 +593,75 @@ fn read_socks_from_torrc(tor_dir: &Path) -> Option<String> {
     })
 }
 
+fn write_state(
+    tor_dir: &Path,
+    plain_port: u16,
+    tls_port: Option<u16>,
+    target_plain: &str,
+    target_tls: Option<&str>,
+    socks: &str,
+) {
+    let mut text = format!("plain_port={plain_port}\ntarget_plain={target_plain}\nsocks={socks}\n");
+    if let Some(port) = tls_port {
+        text.push_str(&format!("tls_port={port}\n"));
+    }
+    if let Some(target) = target_tls {
+        text.push_str(&format!("target_tls={target}\n"));
+    }
+    let _ = write_private(&tor_dir.join("state"), text.as_bytes());
+}
+
+#[derive(Default)]
+struct SavedState {
+    plain_port: Option<u16>,
+    tls_port: Option<u16>,
+    target_plain: Option<String>,
+    target_tls: Option<String>,
+    socks: Option<String>,
+}
+
+fn read_state(tor_dir: &Path) -> SavedState {
+    let mut out = SavedState::default();
+    let Ok(text) = fs::read_to_string(tor_dir.join("state")) else {
+        return out;
+    };
+    for line in text.lines() {
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        let value = value.trim().to_string();
+        match key.trim() {
+            "plain_port" => out.plain_port = value.parse().ok(),
+            "tls_port" => out.tls_port = value.parse().ok(),
+            "target_plain" => out.target_plain = Some(value),
+            "target_tls" => out.target_tls = Some(value),
+            "socks" => out.socks = Some(value),
+            _ => {}
+        }
+    }
+    out
+}
+
 pub fn status(cfg: &Config, chain: Chain) -> TorStatus {
     let tor_dir = cfg.tor_dir(chain);
     let pid = read_pid(&tor_dir.join("tor.pid"));
     let running = pid.map(pid_alive).unwrap_or(false);
+    let saved = read_state(&tor_dir);
+    let has_state = saved.plain_port.is_some();
+    let plain_port = saved.plain_port.unwrap_or(cfg.tor.onion_port);
+    let tls_port = saved.tls_port.or_else(|| {
+        if !has_state && cfg.tor.tls && cfg.server.tls_enabled() {
+            Some(cfg.tor.onion_tls_port)
+        } else {
+            None
+        }
+    });
     TorStatus {
         mode: cfg.tor.mode.clone(),
         binary: resolve_binary(cfg),
-        socks: if cfg.tor.socks_port > 0 {
+        socks: if let Some(socks) = saved.socks.clone().filter(|s| !s.is_empty()) {
+            socks
+        } else if cfg.tor.socks_port > 0 {
             format!("127.0.0.1:{}", cfg.tor.socks_port)
         } else {
             read_socks_from_torrc(&tor_dir).unwrap_or_else(|| "auto".to_string())
@@ -568,12 +669,22 @@ pub fn status(cfg: &Config, chain: Chain) -> TorStatus {
         onion: read_hostname(&tor_dir),
         pid,
         running,
-        target_plain: cfg.server.listen.clone(),
-        target_tls: if cfg.server.tls_listen.trim().is_empty() {
-            DEFAULT_TLS_LISTEN.to_string()
+        target_plain: saved
+            .target_plain
+            .filter(|s| !s.is_empty())
+            .or_else(|| target_for(cfg, false).ok())
+            .unwrap_or_else(|| cfg.server.listen.clone()),
+        target_tls: if tls_port.is_some() {
+            saved
+                .target_tls
+                .filter(|s| !s.is_empty())
+                .or_else(|| target_for(cfg, true).ok())
+                .unwrap_or_else(|| DEFAULT_TLS_LISTEN.to_string())
         } else {
-            cfg.server.tls_listen.clone()
+            String::new()
         },
+        plain_port,
+        tls_port,
     }
 }
 
@@ -650,12 +761,37 @@ mod tests {
     }
 
     #[test]
-    fn non_loopback_targets_are_rejected() {
-        assert!(loopback_target("127.0.0.1:50001").is_ok());
-        assert!(loopback_target("localhost:50001").is_ok());
-        assert!(loopback_target("[::1]:50001").is_ok());
-        assert!(loopback_target("0.0.0.0:50001").is_err());
-        assert!(loopback_target("192.168.1.2:50001").is_err());
+    fn wildcard_listeners_are_mapped_to_loopback_targets() {
+        assert_eq!(
+            effective_target("0.0.0.0:50001").unwrap(),
+            "127.0.0.1:50001"
+        );
+        assert_eq!(effective_target("[::]:50001").unwrap(), "[::1]:50001");
+        assert_eq!(
+            effective_target("127.0.0.1:50001").unwrap(),
+            "127.0.0.1:50001"
+        );
+        assert_eq!(
+            effective_target("localhost:50001").unwrap(),
+            "localhost:50001"
+        );
+        assert!(effective_target("192.168.1.2:50001").is_err());
+        assert!(effective_target("0.0.0.0").is_err());
+    }
+
+    #[test]
+    fn torrc_maps_wildcard_listeners_and_honours_explicit_targets() {
+        let (mut cfg, dir) = temp_cfg("wildcard");
+        cfg.server.listen = "0.0.0.0:50001".to_string();
+        cfg.server.tls_listen = "0.0.0.0:50002".to_string();
+        let text = render_torrc(&cfg, &dir, 19_050).unwrap();
+        assert!(text.contains("HiddenServicePort 50001 127.0.0.1:50001"));
+        assert!(text.contains("HiddenServicePort 50002 127.0.0.1:50002"));
+
+        cfg.tor.target_plain = "127.0.0.1:49001".to_string();
+        let text = render_torrc(&cfg, &dir, 19_050).unwrap();
+        assert!(text.contains("HiddenServicePort 50001 127.0.0.1:49001"));
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
