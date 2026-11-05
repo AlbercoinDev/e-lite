@@ -102,7 +102,11 @@ data dir/network require restart.
 
 - [ ] Installer works on a clean Debian/LXC and updates without touching config.
 - [ ] `--with-core` installs/updates the latest official Core.
+- [ ] Installer downloads/verifies the Tor bundle; `--without-tor` skips it.
 - [ ] `e-lite --version` matches the release.
+- [ ] Managed Tor creates `<addr>.onion:50001` and `:50002`; the TLS certificate SAN includes the onion.
+- [ ] `e-lite onion show` prints the address; `onion reset` (stopped) changes it on the next start.
+- [ ] The memory budget line appears, the cache grows in steps, and page cache stays above the reserve.
 - [ ] From-zero pruned sync reaches `READY` with `prune_mib=1`.
 - [ ] `pruneheight` stays at or below `indexed_height - 288`.
 - [ ] No `NEEDS_RECOVERY` / prune gap.

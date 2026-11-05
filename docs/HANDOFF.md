@@ -1,9 +1,9 @@
 # Session handoff
 
 **Updated:** 2026-11-05
-**Latest published release:** `0.1.0-alpha.23`
-**Release:** https://github.com/AlbercoinDev/e-lite/releases/tag/v0.1.0-alpha.23
-**Main commit at handoff:** `d391cff` (`alpha.23: prefetch prevouts in reader threads`)
+**Latest published release:** `0.1.0-alpha.24`
+**Release:** https://github.com/AlbercoinDev/e-lite/releases/tag/v0.1.0-alpha.24
+**Main commit at handoff:** `ca66967` (`alpha.24: adaptive memory and managed Tor onion`)
 
 This file is the short “where we are” for a new session. The invariants live in
 [`AGENTS.md`](../AGENTS.md) and [`PROJECT_MEMORY.md`](PROJECT_MEMORY.md); the
@@ -39,21 +39,50 @@ no repitas contexto ni rehagas decisiones ya documentadas.
 - Snapshots are optional and are not needed for the from-zero flow.
 - Electrum is plain TCP on `127.0.0.1:50001` by default. Optional TLS is
   available on `[server] tls_listen` with `tls_cert`/`tls_key`; the PEM files are
-  reloaded when they change. There is no client authentication or rate limiting.
+  reloaded when they change. `[tor] mode = "managed"` (default) runs e-lite's own
+  Tor and publishes plain 50001 + TLS 50002 as a v3 onion; TLS uses an
+  auto-generated self-signed certificate when none is configured. There is no
+  client authentication or rate limiting; treat the onion address as a secret.
 - Core RPC is HTTP; LAN/WAN requires SSH/VPN.
 - Rawtx resolution is local Core -> validated cache -> P2P/Esplora (whole blocks,
-  Tor-first, decoys, verified).
+  Tor-first via the managed Tor, decoys, verified).
 - Adaptive profiles and `SIGUSR1` hot reload are implemented:
   `auto|hdd|ssd|nvme|manual`, readers capped at 4/8/16, cgroup memory aware,
-  explicit overrides locked. Every knob is also available via CLI and `--set`
-  (see `docs/CLI.md`).
-- RocksDB memory is budgeted globally (`RAM/16`, 64 MiB..1 GiB) across the 7 CFs;
-  background jobs are capped by the CPU count.
+  explicit readers/commit overrides locked. Every knob is also available via CLI
+  and `--set` (see `docs/CLI.md`).
+- Memory: reserve `max(1024 MiB, RAM/8)`, ceiling 75 % of RAM, memtables `RAM/8`,
+  page-cache floor, cache grows +256 MiB / 30 s and shrinks 25 % under pressure;
+  `cache_mib` is a maximum. Background jobs are capped by the CPU count.
 - `run` waits for Core RPC before starting P2P/mempool/listeners; `serve` is the
-  offline mode. Shutdown joins background threads before stopping Core.
-- `docs/FEATURES.md` is the current-feature source of truth.
+  offline mode. Shutdown joins background threads and stops managed Tor before
+  stopping Core.
+- `docs/FEATURES.md` is the current-feature source of truth. `docs/TOR.md` covers
+  the onion setup, reset and security.
 - `docs/ROADMAP.md` contains future features/improvements. Do not present them as
   available.
+
+## Last audit/fixes (alpha.24)
+
+- **Adaptive memory budget**: 75 % ceiling, `max(1024, RAM/8)` reserve,
+  memtables `RAM/8`, page-cache floor, 256 MiB growth / 25 % shrink with
+  two-sample hysteresis; `cache_mib` is a maximum and critical pressure can
+  lower it; pre-resume shrink when Core is about to download again.
+- **Managed Tor + onion**: e-lite runs its own Tor by default, publishes plain
+  50001 and TLS 50002 onion ports, auto-generates a self-signed TLS certificate
+  with the onion SAN, and exposes `e-lite onion show|reset`.
+- **Installer Tor bundle**: downloads the official Tor expert bundle (pinned
+  version + SHA-256) into `<prefix>/lib/e-lite/tor`; `--without-tor` skips it and
+  `tor` in PATH is the fallback. Indexing continues with a warning if no binary
+  exists.
+- **Snapshots** exclude `tor/` and `tls/` (onion and private keys are not index
+  data); a restored snapshot starts with a new onion address.
+- Evidence: `cargo test --workspace` (memory policy, torrc, onion validation,
+  self-signed SAN/permissions, fake-Tor lifecycle, reset), the ignored
+  `managed_tor_real_binary_creates_onion` with the real bundle, `e2e_regtest`,
+  `e2e_pruned_ibd`, `e2e_launch_core`, installer with/without Tor, and a manual
+  `run` showing `Tor onion: ...:50001 (plain), :50002 (tls)` + `Tor ready`.
+- **Not claimed**: no real mainnet memory benchmark for alpha.24 yet; the
+  operator still validates the cache growth and commit behavior on the VM.
 
 ## Last audit/fixes (alpha.23)
 
