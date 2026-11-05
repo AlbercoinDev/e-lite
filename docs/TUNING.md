@@ -68,7 +68,7 @@ The indexer records EWMA values for:
 
 They are exported in `/status` under `tuning` and in `/metrics` as
 `e_lite_tuning_*`, `e_lite_tx_per_sec`, `e_lite_blocks_per_sec` and
-`e_lite_commit_ms`.
+`e_lite_commit_ms`. `prefetch_ms` is shown in the progress line only.
 
 On HDDs and small hosts, prevout lookups were the largest part of `apply`:
 RocksDB point reads for one block ran serially in the apply thread. Since

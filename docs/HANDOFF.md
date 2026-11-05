@@ -1,9 +1,9 @@
 # Session handoff
 
 **Updated:** 2026-11-05
-**Latest published release:** `0.1.0-alpha.22`
-**Release:** https://github.com/AlbercoinDev/e-lite/releases/tag/v0.1.0-alpha.22
-**Main commit at handoff:** `112758c` (`alpha.22: fast bulk defaults, READY status and wallet banner`)
+**Latest published release:** `0.1.0-alpha.23`
+**Release:** https://github.com/AlbercoinDev/e-lite/releases/tag/v0.1.0-alpha.23
+**Main commit at handoff:** `d391cff` (`alpha.23: prefetch prevouts in reader threads`)
 
 This file is the short “where we are” for a new session. The invariants live in
 [`AGENTS.md`](../AGENTS.md) and [`PROJECT_MEMORY.md`](PROJECT_MEMORY.md); the
@@ -54,6 +54,25 @@ no repitas contexto ni rehagas decisiones ya documentadas.
 - `docs/FEATURES.md` is the current-feature source of truth.
 - `docs/ROADMAP.md` contains future features/improvements. Do not present them as
   available.
+
+## Last audit/fixes (alpha.23)
+
+- **Prevout prefetch in reader threads**: alpha.22 mainnet logs showed `apply`
+  growing from ~300 ms to >1.5 s per block while `read`/`decode`/`wait` stayed
+  near zero. The single apply thread was doing every UTXO point lookup
+  serially. Readers now resolve a speculative prevout superset while the
+  previous block is applied; apply still checks the group overlay first and
+  falls back to a point lookup, so speculation cannot change the result.
+  `prefetch` is a new progress-line figure (not exported to `/status`).
+- **RocksDB write amplification**: `atomic_flush` across the 7 CFs (one flush
+  point, fewer/larger L0 files), 2 MiB compaction readahead and a 512 MiB L1.
+- Evidence: oracle-parity tests now run through
+  `prepare → prefetch → apply_prepared_with_prefetch` (including spends of
+  outputs created earlier in the same uncommitted group), `cargo test
+  --workspace`, `e2e_regtest`, `e2e_pruned_ibd`, `e2e_launch_core`.
+- **Not claimed**: no measured mainnet speedup yet. The next real run should
+  report `prefetch` vs `apply`; if `prefetch` is high and `apply` low, the disk
+  is the limit, not the pipeline.
 
 ## Last audit/fixes (alpha.22)
 
@@ -194,6 +213,6 @@ kill -USR1 "$(pgrep -f 'e-lite run')"
 `cargo fmt --check`, clippy, workspace tests and the local regtest e2e
 (`launch_core`, `pruned_ibd`, `regtest` with plain + TLS Electrum, clean
 startup/shutdown/memory assertions, `e-lite.log` presence and milestone checks)
-passed on the alpha.22 code. Release artifacts and `SHA256SUMS` for alpha.22
+passed on the alpha.23 code. Release artifacts and `SHA256SUMS` for alpha.23
 were verified. Full signet/testnet4 acceptance is still operator-run; results
 belong in `docs/GETTING-STARTED.md`/release notes when available.
