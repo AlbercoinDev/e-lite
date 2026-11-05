@@ -112,7 +112,9 @@ or `adaptive` in the TOML, send `SIGUSR1` and verify the values in `/status`.
 - [ ] `/status` shows real RAM/cgroup figures and the configured cache, not a false 0 MiB.
 - [ ] Progress shows height/Core percentages and a milestone every 10k blocks or 6 h.
 - [ ] `<data-dir>/e-lite.log` contains the same lines as the console (start/stop, progress, milestones).
-- [ ] Prune gate runs at most every 10k safe blocks by default (or immediately on low disk).
+- [ ] `READY`/`FULLY SYNCED` appears in the log/status and `server.banner` shows INDEXING then READY.
+- [ ] Custom `banner_file` is created if missing and its placeholders are substituted.
+- [ ] Prune gate runs at most every 10k safe blocks by default, and is deferred above 50 GiB free.
 - [ ] `--profile hdd|ssd|nvme|manual` and `--set` work without a config file.
 - [ ] Raw tx works from Core/cache; pruned fallback is explicit if unavailable.
 - [ ] Disk-low pauses downloads; indexing continues until the critical floor.

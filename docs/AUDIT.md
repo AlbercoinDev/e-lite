@@ -1,7 +1,7 @@
 # Code audit
 
-**Base:** `0.1.0-alpha.20` → published `0.1.0-alpha.21` · **Scope:** `bin/e-lite`, `crates/*` (25 Rust files,
-~16.9k lines) · **Status:** findings fixed in `0.1.0-alpha.21` where noted.
+**Base:** `0.1.0-alpha.21` → published `0.1.0-alpha.22` · **Scope:** `bin/e-lite`, `crates/*` (25 Rust files,
+~17.2k lines) · **Status:** findings fixed in `0.1.0-alpha.22` where noted.
 
 This audit is not a claim of formal verification. It records static checks,
 manual review areas, concrete findings and residual risks.
@@ -46,6 +46,10 @@ Additional checks performed:
 | AUD-025 | P2 | Bulk lag guard | `bin/e-lite/src/main.rs` | Absolute `max_bulk_lag_blocks` paused Core immediately on a 300k backlog and kept it paused until lag ≤10k, freezing Core's own sync for hours. | Window is relative to the lag baseline and follows it; resumes at half the growth window. |
 | AUD-026 | P1 | Bulk lag guard | `bin/e-lite/src/main.rs` | While paused, the relative baseline also followed the decreasing lag, so every indexed block lowered the resume threshold and Core resumed on the next check. The guard effectively never held. | `bulk_lag_window` takes `paused`; the baseline is frozen while paused and only follows the lag down while downloading. Unit test `bulk_lag_window_bounds_additional_growth`. |
 | AUD-027 | P3 | Test reliability | `crates/el-store/src/lib.rs` | Global failpoint state was shared by tests running in parallel; `reopen_keeps_tip...` could fail when another test injected `BEFORE_COMMIT`. | Test mutex serializes failpoint/commit tests; repeated local runs and CI pass. |
+| AUD-028 | P3 | Metrics | `bin/e-lite/src/tuning.rs`, `crates/el-store` | The cache-hit metric was always unknown, so the progress line showed a misleading `0%`/`?` and the controller could not use it. | Metric and cache-growth branch removed; `--cache-mib` and the block cache remain. |
+| AUD-029 | P2 | Bulk scheduling | `bin/e-lite/src/main.rs` | Core could download during e-lite's bulk catch-up, competing for disk; pausing until the tip would reconnect peers late. | Default full pause plus `core_resume_ahead_blocks = 5000` pre-warm; relative 20k guard afterwards. |
+| AUD-030 | P2 | Commit durability | `crates/el-store`, `bin/e-lite` | Two fsyncs per commit made bulk indexing slower than necessary. | `commit_sync=auto`: `txids` in bulk (txids.dat still fsynced, startup truncates extras), `always` live. |
+| AUD-031 | P3 | Readiness/banner | `crates/el-serve` | Wallets had no clear READY signal and a static banner. | Dynamic `READY`/`FULLY SYNCED` log/status/metrics and INDEXING/READY banner templates, optional file with placeholders. |
 
 ## Residual risks and intentional limits
 

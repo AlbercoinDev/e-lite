@@ -110,8 +110,7 @@ pub struct Stats {
     pub tuning_wait_ms: AtomicU64,
     pub tuning_commit_ms_ewma: AtomicU64,
     pub tuning_tx_per_sec: AtomicU64,
-    pub tuning_cache_hit_pct: AtomicU64,
-    pub tuning_cache_known: AtomicBool,
+    pub tuning_blocks_per_sec: AtomicU64,
     pub tuning_profile: AtomicU64,
     pub tuning_adaptive: AtomicBool,
     pub tuning_background_jobs: AtomicU64,
@@ -159,8 +158,7 @@ impl Default for Stats {
             tuning_wait_ms: AtomicU64::new(0),
             tuning_commit_ms_ewma: AtomicU64::new(0),
             tuning_tx_per_sec: AtomicU64::new(0),
-            tuning_cache_hit_pct: AtomicU64::new(0),
-            tuning_cache_known: AtomicBool::new(false),
+            tuning_blocks_per_sec: AtomicU64::new(0),
             tuning_profile: AtomicU64::new(0),
             tuning_adaptive: AtomicBool::new(false),
             tuning_background_jobs: AtomicU64::new(0),
@@ -554,13 +552,78 @@ pub struct Shared {
     pub dirty_scripts: DirtyScripts,
     pub data_dir: std::path::PathBuf,
     pub core_datadir: std::path::PathBuf,
+    pub log_file: PathBuf,
     pub listen: String,
     pub tls_listen: Option<String>,
+    pub banner_file: Option<PathBuf>,
     pub max_clients: usize,
     pub state: AtomicU8,
     pub shutdown: Arc<AtomicBool>,
     pub lock: Arc<RwLock<()>>,
     pub stats: Stats,
+}
+
+/// Coherent readiness view shared by the banner, `/status` and logs.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SyncStatus {
+    pub ready: bool,
+    pub at_core_tip: bool,
+    pub fully_synced: bool,
+    pub offline: bool,
+    pub height: u64,
+    pub headers: u64,
+    pub core_height: u64,
+    pub pruneheight: u64,
+    pub core_ibd: bool,
+    pub verification: f64,
+    pub lag: u64,
+    pub percent: f64,
+    pub core_percent: f64,
+    pub blocks_per_sec: u64,
+}
+
+impl Shared {
+    pub fn sync_status(&self) -> SyncStatus {
+        let height = self
+            .store
+            .committed_tip()
+            .ok()
+            .flatten()
+            .map(|t| t.height as u64)
+            .unwrap_or_else(|| self.stats.indexed_height.load(Ordering::Relaxed));
+        let headers = self.stats.core_headers.load(Ordering::Relaxed);
+        let core_height = self.stats.core_height.load(Ordering::Relaxed);
+        let core_ibd = self.stats.core_ibd.load(Ordering::Relaxed);
+        let verification =
+            self.stats.core_verification_bps.load(Ordering::Relaxed) as f64 / 10_000.0;
+        let offline = self.get_state() == state::CORE_UNAVAILABLE;
+        let at_core_tip = core_height > 0 && height.saturating_add(1) >= core_height;
+        let fully_synced = !core_ibd && headers > 0 && height.saturating_add(1) >= headers;
+        let ready = at_core_tip || (offline && height > 0);
+        let pct = |value: u64, total: u64| {
+            if total == 0 {
+                0.0
+            } else {
+                (value as f64 / total as f64 * 100.0).min(100.0)
+            }
+        };
+        SyncStatus {
+            ready,
+            at_core_tip,
+            fully_synced,
+            offline,
+            height,
+            headers,
+            core_height,
+            pruneheight: self.stats.core_pruneheight.load(Ordering::Relaxed),
+            core_ibd,
+            verification,
+            lag: core_height.saturating_sub(height),
+            percent: pct(height, headers),
+            core_percent: pct(core_height, headers),
+            blocks_per_sec: self.stats.tuning_blocks_per_sec.load(Ordering::Relaxed),
+        }
+    }
 }
 
 impl Shared {
@@ -609,6 +672,7 @@ impl Shared {
         };
         let core_height = self.stats.core_height.load(Ordering::Relaxed);
         let pruneheight = self.stats.core_pruneheight.load(Ordering::Relaxed);
+        let sync = self.sync_status();
         let rawtx = self.resolver.stats();
         let id = self.identity();
         let mem = self.mempool.read();
@@ -627,6 +691,11 @@ impl Shared {
             "core_headers": self.stats.core_headers.load(Ordering::Relaxed),
             "core_verification_progress": self.stats.core_verification_bps.load(Ordering::Relaxed) as f64
                 / 10_000.0,
+            "ready": sync.ready,
+            "at_core_tip": sync.at_core_tip,
+            "fully_synced": sync.fully_synced,
+            "offline": sync.offline,
+            "blocks_per_sec": sync.blocks_per_sec,
             "lag_blocks": core_height.saturating_sub(height),
             "retention_blocks": core_height.saturating_sub(pruneheight),
             "txnum": txnum,
@@ -668,8 +737,7 @@ impl Shared {
                 "wait_ms_ewma": self.stats.tuning_wait_ms.load(Ordering::Relaxed),
                 "commit_ms_ewma": self.stats.tuning_commit_ms_ewma.load(Ordering::Relaxed),
                 "tx_per_sec": self.stats.tuning_tx_per_sec.load(Ordering::Relaxed),
-                "cache_hit_pct": self.stats.tuning_cache_hit_pct.load(Ordering::Relaxed),
-                "cache_hit_known": self.stats.tuning_cache_known.load(Ordering::Relaxed),
+                "blocks_per_sec": self.stats.tuning_blocks_per_sec.load(Ordering::Relaxed),
                 "profile": match self.stats.tuning_profile.load(Ordering::Relaxed) {
                     1 => "hdd", 2 => "ssd", 3 => "nvme", 4 => "manual", _ => "auto"
                 },
@@ -770,10 +838,7 @@ pub fn dispatch_for(
     match method {
         "server.version" => server_version(params),
         "server.ping" => Ok(Value::Null),
-        "server.banner" => Ok(json!(format!(
-            "e-lite {} — no wallet registration",
-            VERSION
-        ))),
+        "server.banner" => Ok(json!(banner_text(shared))),
         "server.donation_address" => Ok(json!("")),
         "server.peers.subscribe" => Ok(json!([])),
         "server.features" => server_features(shared),
@@ -914,6 +979,212 @@ fn server_version(params: &Value) -> RpcResult<Value> {
         )));
     }
     Ok(json!([format!("e-lite {VERSION}"), PROTOCOL_MAX]))
+}
+
+pub const DEFAULT_BANNER_TEMPLATE: &str = r#"# e-lite wallet banner template
+# Placeholders: {version} {network} {state} {height} {headers} {percent} {bar}
+# {core_height} {core_percent} {lag} {blocks_per_sec} {tx_per_sec} {eta}
+# {prune} {pruneheight} {listen} {tls} {log_file} {uptime} {ready} {ready_note}
+# Sections: [indexing] while the index catches up, [ready] when usable.
+
+[indexing]
+e-lite {version} · {network} · {state}
+{bar} {percent}
+height {height} / {headers} · Core {core_height} ({core_percent})
+lag {lag} · {blocks_per_sec} blk/s · ETA {eta}
+Electrum {listen}{tls}
+Some wallet queries may be unavailable until caught up.
+
+[ready]
+==============================================
+   e-lite  ·  {state}  ·  {network}
+   height {height} / {headers}  ({percent})
+   Electrum {listen}{tls}
+   {ready_note}
+==============================================
+"#;
+
+const BANNER_MAX_BYTES: u64 = 32 * 1024;
+
+/// Create the configured banner file with the default template if it does not
+/// exist yet. A relative path is resolved by the caller.
+pub fn ensure_banner_file(path: &Path) -> std::io::Result<()> {
+    if path.exists() {
+        return Ok(());
+    }
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)?;
+        }
+    }
+    std::fs::write(path, DEFAULT_BANNER_TEMPLATE)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o644));
+    }
+    Ok(())
+}
+
+fn banner_text(shared: &Shared) -> String {
+    let status = shared.sync_status();
+    let (default_indexing, default_ready) = split_banner(DEFAULT_BANNER_TEMPLATE);
+    let (custom_indexing, custom_ready) = shared
+        .banner_file
+        .as_ref()
+        .and_then(|path| read_banner(path))
+        .unwrap_or((None, None));
+    let template = if status.ready {
+        custom_ready.or(default_ready).unwrap_or_default()
+    } else {
+        custom_indexing.or(default_indexing).unwrap_or_default()
+    };
+    render_banner(&template, shared, &status)
+}
+
+fn read_banner(path: &Path) -> Option<(Option<String>, Option<String>)> {
+    let meta = std::fs::metadata(path).ok()?;
+    if meta.len() > BANNER_MAX_BYTES {
+        return None;
+    }
+    let text = std::fs::read_to_string(path).ok()?;
+    Some(split_banner(&text))
+}
+
+/// Split a template into `[indexing]` and `[ready]` sections. A file without
+/// section headers is used for both states.
+fn split_banner(text: &str) -> (Option<String>, Option<String>) {
+    let mut indexing = String::new();
+    let mut ready = String::new();
+    let mut current: Option<u8> = None;
+    let mut saw_section = false;
+    for line in text.lines() {
+        match line.trim() {
+            "[indexing]" => {
+                current = Some(0);
+                saw_section = true;
+            }
+            "[ready]" => {
+                current = Some(1);
+                saw_section = true;
+            }
+            _ => match current {
+                Some(0) => {
+                    indexing.push_str(line);
+                    indexing.push('\n');
+                }
+                Some(1) => {
+                    ready.push_str(line);
+                    ready.push('\n');
+                }
+                _ => {}
+            },
+        }
+    }
+    if !saw_section {
+        return (Some(text.to_string()), Some(text.to_string()));
+    }
+    let out = |s: String| if s.trim().is_empty() { None } else { Some(s) };
+    (out(indexing), out(ready))
+}
+
+fn render_banner(template: &str, shared: &Shared, status: &SyncStatus) -> String {
+    let state = if status.fully_synced {
+        "FULLY SYNCED"
+    } else if status.ready && status.offline {
+        "READY (offline)"
+    } else if status.ready && status.core_ibd {
+        "READY (Core verifying)"
+    } else if status.ready {
+        "READY"
+    } else {
+        "INDEXING"
+    };
+    let ready_note = if status.fully_synced {
+        "Fully synced. Wallet ready to use."
+    } else if status.offline {
+        "Offline cached index; Core is unavailable."
+    } else if status.core_ibd {
+        "Ready for the indexed height; Core is still verifying."
+    } else {
+        "Wallet ready to use."
+    };
+    let tls = shared
+        .tls_listen
+        .as_ref()
+        .map(|addr| format!(" · SSL {addr}"))
+        .unwrap_or_default();
+    let bar = progress_bar(status.percent);
+    let eta = eta_text(status.lag, status.blocks_per_sec);
+    let network = shared.identity().chain.name().to_string();
+    let tx_per_sec = shared.stats.tuning_tx_per_sec.load(Ordering::Relaxed);
+    template
+        .replace("{version}", VERSION)
+        .replace("{network}", &network)
+        .replace("{state}", state)
+        .replace("{height}", &format_num(status.height))
+        .replace("{headers}", &format_num(status.headers))
+        .replace("{percent}", &format!("{:.1}%", status.percent))
+        .replace("{bar}", &bar)
+        .replace("{core_height}", &format_num(status.core_height))
+        .replace("{core_percent}", &format!("{:.1}%", status.core_percent))
+        .replace("{lag}", &format_num(status.lag))
+        .replace("{blocks_per_sec}", &status.blocks_per_sec.to_string())
+        .replace("{tx_per_sec}", &tx_per_sec.to_string())
+        .replace("{eta}", &eta)
+        .replace("{pruneheight}", &format_num(status.pruneheight))
+        .replace("{prune}", &format_num(status.pruneheight))
+        .replace("{listen}", &shared.listen)
+        .replace("{tls}", &tls)
+        .replace("{log_file}", &shared.log_file.display().to_string())
+        .replace("{uptime}", &uptime_text(shared.stats.started.elapsed()))
+        .replace("{ready}", if status.ready { "yes" } else { "no" })
+        .replace("{ready_note}", ready_note)
+}
+
+fn progress_bar(percent: f64) -> String {
+    const WIDTH: usize = 30;
+    let filled = ((percent.clamp(0.0, 100.0) / 100.0) * WIDTH as f64).round() as usize;
+    format!("[{}{}]", "#".repeat(filled), "-".repeat(WIDTH - filled))
+}
+
+fn format_num(value: u64) -> String {
+    let s = value.to_string();
+    let mut out = String::with_capacity(s.len() + s.len() / 3);
+    for (i, c) in s.chars().enumerate() {
+        if i > 0 && (s.len() - i) % 3 == 0 {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    out
+}
+
+fn eta_text(lag: u64, blocks_per_sec: u64) -> String {
+    if lag == 0 {
+        return "0m".to_string();
+    }
+    if blocks_per_sec == 0 {
+        return "unknown".to_string();
+    }
+    let secs = lag / blocks_per_sec.max(1);
+    if secs >= 3600 {
+        format!("{}h {:02}m", secs / 3600, (secs % 3600) / 60)
+    } else if secs >= 60 {
+        format!("{}m {:02}s", secs / 60, secs % 60)
+    } else {
+        format!("{secs}s")
+    }
+}
+
+fn uptime_text(d: std::time::Duration) -> String {
+    let secs = d.as_secs();
+    format!(
+        "{}h {:02}m {:02}s",
+        secs / 3600,
+        (secs % 3600) / 60,
+        secs % 60
+    )
 }
 
 fn server_features(shared: &Shared) -> RpcResult<Value> {
@@ -2063,6 +2334,32 @@ fn metrics_text(shared: &Shared) -> String {
         st["tuning"]["tx_per_sec"].as_u64().unwrap_or(0),
     );
     line(
+        "e_lite_blocks_per_sec",
+        "Indexed blocks per second (EWMA)",
+        "gauge",
+        st["tuning"]["blocks_per_sec"].as_u64().unwrap_or(0),
+    );
+    line(
+        "e_lite_ready",
+        "1 when the index has caught up to Core's validated blocks",
+        "gauge",
+        if st["ready"].as_bool().unwrap_or(false) {
+            1
+        } else {
+            0
+        },
+    );
+    line(
+        "e_lite_fully_synced",
+        "1 when Core is out of IBD and the index is at the network tip",
+        "gauge",
+        if st["fully_synced"].as_bool().unwrap_or(false) {
+            1
+        } else {
+            0
+        },
+    );
+    line(
         "e_lite_commit_ms",
         "Commit latency (EWMA)",
         "gauge",
@@ -2209,6 +2506,20 @@ mod tests {
         let v = json!([sh.to_electrum_hex()]);
         assert_eq!(param_scripthash(&v).unwrap(), sh);
         assert!(param_scripthash(&json!(["zz"])).is_err());
+    }
+
+    #[test]
+    fn banner_sections_and_formatting() {
+        let (indexing, ready) =
+            split_banner("[indexing]\nINDEX {height}\n[ready]\nREADY {percent}\n");
+        assert_eq!(indexing.as_deref(), Some("INDEX {height}\n"));
+        assert_eq!(ready.as_deref(), Some("READY {percent}\n"));
+        let (both, _) = split_banner("plain {state}\n");
+        assert_eq!(both.as_deref(), Some("plain {state}\n"));
+        assert_eq!(progress_bar(50.0), "[###############---------------]");
+        assert_eq!(format_num(974_584), "974,584");
+        assert_eq!(eta_text(0, 10), "0m");
+        assert_eq!(eta_text(100, 0), "unknown");
     }
 
     #[test]

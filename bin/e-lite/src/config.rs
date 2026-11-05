@@ -145,6 +145,9 @@ pub struct IndexCfg {
     /// Let the event-driven controller adjust readers/commit/cache.
     #[serde(default = "d_true")]
     pub adaptive: bool,
+    /// Commit/fsync policy: auto | always | txids.
+    #[serde(default = "d_commit_sync")]
+    pub commit_sync: String,
     /// Commit interval in milliseconds. 0 selects the profile/default.
     #[serde(default)]
     pub commit_interval_ms: u64,
@@ -177,6 +180,7 @@ impl Default for IndexCfg {
             batch_blocks: d_batch(),
             profile: d_profile(),
             adaptive: d_true(),
+            commit_sync: d_commit_sync(),
             commit_interval_ms: 0,
             prefetch_blocks: 0,
             write_buffer_mib: 0,
@@ -203,6 +207,10 @@ pub struct ServerCfg {
     /// PEM private key matching `tls_cert`.
     #[serde(default)]
     pub tls_key: String,
+    /// Optional wallet banner template. Empty uses the built-in templates.
+    /// If set and missing, e-lite creates it with the default template.
+    #[serde(default)]
+    pub banner_file: String,
     #[serde(default = "d_clients")]
     pub max_clients: usize,
 }
@@ -220,6 +228,7 @@ impl Default for ServerCfg {
             tls_listen: String::new(),
             tls_cert: String::new(),
             tls_key: String::new(),
+            banner_file: String::new(),
             max_clients: d_clients(),
         }
     }
@@ -297,8 +306,19 @@ pub struct PruningCfg {
     /// Opt-in download throttle for manual pruning / bulk catch-up. When the
     /// index lags Core by more than this many blocks during IBD, e-lite pauses
     /// Core's P2P until the index halves the gap. 0 disables it.
-    #[serde(default)]
+    #[serde(default = "d_max_bulk_lag")]
     pub max_bulk_lag_blocks: u32,
+    /// Pause Core during a long bulk catch-up and pre-warm its networking when
+    /// the index is close to catching up.
+    #[serde(default = "d_true")]
+    pub pause_core_during_bulk: bool,
+    /// Resume Core's networking this many blocks before the tip so peers can
+    /// reconnect while e-lite finishes the catch-up.
+    #[serde(default = "d_core_resume_ahead")]
+    pub core_resume_ahead_blocks: u32,
+    /// Skip normal pruning while free space is at or above this many GiB.
+    #[serde(default = "d_prune_defer_free")]
+    pub prune_defer_free_gib: u64,
     /// Minimum safe-height gain between `pruneblockchain` requests. Core
     /// prunes whole files, so a small value produces no-op calls and flushes.
     #[serde(default = "d_min_gain")]
@@ -322,7 +342,10 @@ impl Default for PruningCfg {
             critical_free_gib: d_critical_free(),
             max_core_lag_blocks: d_max_lag(),
             allow_auto_prune: false,
-            max_bulk_lag_blocks: 0,
+            max_bulk_lag_blocks: d_max_bulk_lag(),
+            pause_core_during_bulk: true,
+            core_resume_ahead_blocks: d_core_resume_ahead(),
+            prune_defer_free_gib: d_prune_defer_free(),
             min_gain_blocks: d_min_gain(),
             prune_interval_seconds: d_prune_interval(),
             repair_max_gap_blocks: d_repair_max_gap(),
@@ -402,6 +425,9 @@ fn d_profile() -> String {
 fn d_milestone_blocks() -> u64 {
     10_000
 }
+fn d_commit_sync() -> String {
+    "auto".to_string()
+}
 fn d_milestone_seconds() -> u64 {
     21_600
 }
@@ -437,6 +463,15 @@ fn d_max_lag() -> u32 {
 }
 fn d_min_gain() -> u32 {
     10_000
+}
+fn d_max_bulk_lag() -> u32 {
+    20_000
+}
+fn d_core_resume_ahead() -> u32 {
+    5_000
+}
+fn d_prune_defer_free() -> u64 {
+    50
 }
 fn d_prune_interval() -> u64 {
     30
@@ -587,6 +622,20 @@ impl Config {
         }
     }
 
+    /// Optional wallet banner template. Relative paths live in the data dir.
+    pub fn app_banner_file(&self, chain: Chain) -> Option<PathBuf> {
+        let path = self.server.banner_file.trim();
+        if path.is_empty() {
+            return None;
+        }
+        let path = PathBuf::from(path);
+        Some(if path.is_absolute() {
+            path
+        } else {
+            self.data_dir(chain).join(path)
+        })
+    }
+
     pub fn pid_file(&self, chain: Chain) -> PathBuf {
         self.data_dir(chain).join("core-child.pid")
     }
@@ -605,6 +654,9 @@ impl Config {
             && !(500..=30_000).contains(&self.index.commit_interval_ms)
         {
             return Err("[index] commit_interval_ms must be 0 or 500..30000".to_string());
+        }
+        if !matches!(self.index.commit_sync.as_str(), "auto" | "always" | "txids") {
+            return Err("[index] commit_sync must be auto, always or txids".to_string());
         }
         if self.server.max_clients == 0 {
             return Err("[server] max_clients must be >= 1".to_string());

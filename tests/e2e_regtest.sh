@@ -48,9 +48,17 @@ grep -q "%" "$RUN/index.log" || { cat "$RUN/index.log"; exit 1; }
 test -f "$DATA/e-lite.log" || { echo "missing e-lite.log"; exit 1; }
 grep -q "tuning profile" "$DATA/e-lite.log" || { cat "$DATA/e-lite.log"; exit 1; }
 
+cat >"$DATA/banner.txt" <<'EOF'
+[indexing]
+CUSTOM INDEX {height} {percent} {state}
+[ready]
+CUSTOM READY {height} {percent} {state}
+EOF
+
 "$BIN" run "${COMMON[@]}" --no-follow --reorg-window 8 \
   --listen "127.0.0.1:$ELECTRUM_PORT" --metrics "127.0.0.1:$METRICS_PORT" \
   --tls-listen "127.0.0.1:$TLS_PORT" --tls-cert "$TLS_DIR/cert.pem" --tls-key "$TLS_DIR/key.pem" \
+  --banner-file "$DATA/banner.txt" \
   >"$RUN/serve.log" 2>&1 &
 echo $! >"$RUN/serve.pid"
 for _ in $(seq 1 100); do
@@ -75,6 +83,7 @@ mem = st["memory"]
 assert mem["total_mib"] > 0, mem
 assert mem["available_mib"] > 0, mem
 assert st["tuning"]["cache_mib"] >= 128, st["tuning"]
+assert st["ready"] is True and st["fully_synced"] is True, st
 print("memory accounting OK:", mem["total_mib"], mem["available_mib"], "MiB")
 PY
 
@@ -111,6 +120,8 @@ assert call(8, "blockchain.transaction.get", [txid]) == raw1
 assert call(9, "blockchain.transaction.get_merkle", [txid, txheight])["pos"] >= 0
 assert call(10, "blockchain.transaction.id_from_pos", [txheight, 0, False]) == txid
 assert call(11, "blockchain.scripthash.get_history", ["00"*32]) == []
+banner = call(12, "server.banner", [])
+assert "CUSTOM" in banner and str(height) in banner, banner
 print("electrum queries OK")
 PY
 
@@ -166,6 +177,7 @@ echo "shutdown exit=$RC"
 grep -q "stopped at" "$RUN/serve.log" || { cat "$RUN/serve.log"; exit 1; }
 grep -q "started at" "$DATA/e-lite.log" || { tail -40 "$DATA/e-lite.log"; exit 1; }
 grep -q "stopped at" "$DATA/e-lite.log" || { tail -40 "$DATA/e-lite.log"; exit 1; }
+grep -qE "READY|FULLY SYNCED" "$DATA/e-lite.log" || { tail -40 "$DATA/e-lite.log"; exit 1; }
 if tail -n 5 "$RUN/serve.log" | grep -qE "Connection refused|mempool refresh"; then
   echo "unexpected shutdown error in serve.log:" >&2
   cat "$RUN/serve.log" >&2

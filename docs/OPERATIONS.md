@@ -187,8 +187,14 @@ stream {
 
 Manual mode: the prune gate uses min(`index - 288`, readers, `tip - 288`) and
 throttles requests. By default it evaluates pruning every **10,000** safe blocks
-(`min_gain_blocks`), which keeps disk churn low; low disk still triggers an
-emergency prune. Core may return a lower height because it prunes whole files.
+(`min_gain_blocks`) and defers normal pruning while free space is at or above
+**50 GiB** (`prune_defer_free_gib`); low disk still triggers an emergency prune.
+Core may return a lower height because it prunes whole files.
+
+During a long bulk catch-up, Core is paused by default
+(`pause_core_during_bulk`). It resumes early, `core_resume_ahead_blocks` (5,000)
+before the tip, so peers reconnect while e-lite finishes; the relative
+`max_bulk_lag_blocks` (20,000) guard bounds additional separation afterwards.
 
 Automatic mode: a 224-block lag guard, fast tip checks and a bounded verified
 gap-repair path protect the index. It is opt-in.
@@ -246,6 +252,11 @@ max_mib = 64
 Core's own log is separate: `<data-dir>/bitcoind.log` (or `[core] log_file`), and
 `e-lite core logs` prints its tail.
 
+`server.banner` uses built-in INDEXING/READY templates. Configure
+`[server] banner_file` (or `--banner-file`) to customize the wallet banner; the
+file is created with the default `[indexing]`/`[ready]` sections if missing.
+The protocol has no banner push, so a connected wallet may need to reconnect.
+
 ## Monitoring
 
 ```bash
@@ -256,10 +267,11 @@ curl -s http://127.0.0.1:9184/status | python3 -m json.tool
 curl -s http://127.0.0.1:9184/metrics | grep -E 'e_lite_(lag|tuning|tx_per_sec|commit)'
 ```
 
-Useful fields: `state`, `indexed_height`, `core_height`, `lag_blocks`,
-`retention_blocks`, `core.pruneheight`, `disk_free_bytes`, `disk_low`,
-`memory`, `tuning` (`read_ms_ewma`, `decode_ms_ewma`, `wait_ms_ewma`,
-`apply_ms_ewma`, `commit_ms_ewma`, `cache_hit_pct`/`cache_hit_known`).
+Useful fields: `state`, `ready`, `at_core_tip`, `fully_synced`, `offline`,
+`indexed_height`, `core_height`, `lag_blocks`, `retention_blocks`,
+`core.pruneheight`, `disk_free_bytes`, `disk_low`, `memory`, `tuning`
+(`read_ms_ewma`, `decode_ms_ewma`, `wait_ms_ewma`, `apply_ms_ewma`,
+`commit_ms_ewma`, `tx_per_sec`, `blocks_per_sec`).
 
 ## Troubleshooting
 

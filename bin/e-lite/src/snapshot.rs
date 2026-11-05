@@ -118,6 +118,7 @@ fn add_tree<W: Write>(builder: &mut tar::Builder<W>, base: &Path, dir: &Path) ->
             || name == "LOCK"
             || name == "e-lite.log"
             || name == "e-lite.log.1"
+            || name == "banner.txt"
             || name == "core-paused-by-e-lite"
         {
             continue;

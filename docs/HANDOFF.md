@@ -3,7 +3,8 @@
 **Updated:** 2026-11-05
 **Latest published release:** `0.1.0-alpha.21`
 **Release:** https://github.com/AlbercoinDev/e-lite/releases/tag/v0.1.0-alpha.21
-**Main commit at handoff:** `b49be46` (`alpha.21: serialize failpoint store tests`)
+**Working version:** `0.1.0-alpha.22` (unreleased: fast bulk, READY, banner)
+**Main commit at handoff:** `PENDING`
 
 This file is the short “where we are” for a new session. The invariants live in
 [`AGENTS.md`](../AGENTS.md) and [`PROJECT_MEMORY.md`](PROJECT_MEMORY.md); the
@@ -55,6 +56,26 @@ no repitas contexto ni rehagas decisiones ya documentadas.
 - `docs/ROADMAP.md` contains future features/improvements. Do not present them as
   available.
 
+## Last audit/fixes (alpha.22)
+
+- **Cache metric removed**; `--cache-mib` and the block cache remain.
+- **`commit_sync = auto`**: `txids` in bulk/IBD, `always` live. `txids.dat`
+  is always fsynced; startup truncates extras.
+- **Core bulk pause + pre-warm**: pause during bulk, resume 5,000 blocks early
+  so peers reconnect, then relative 20k guard.
+- **Prune deferred above 50 GiB free**; normal cadence every 10k safe blocks;
+  emergency low-disk prune remains.
+- **READY / FULLY SYNCED** in log, `/status`, `/metrics`, `e-lite status`.
+- **Wallet banner**: built-in INDEXING/READY templates plus optional
+  `[server] banner_file` with `[indexing]`/`[ready]` and placeholders.
+- **Apply micro-opts**: output script hashes precomputed in readers, txid set,
+  reused buffers.
+- `scripts/benchmark-index.sh` for real A/B runs.
+
+Evidence: `CHANGELOG.md`, `docs/CLI.md`, `docs/TUNING.md`,
+`cargo test --workspace`, `tests/e2e_regtest.sh` (banner/READY + log),
+`tests/e2e_pruned_ibd.sh`.
+
 ## Last audit/fixes (alpha.21)
 
 - **Deterministic store tests**: global failpoint tests are serialized with a
@@ -84,8 +105,8 @@ no repitas contexto ni rehagas decisiones ya documentadas.
 - **Commit**: skip `prune_undo` when the group has no undo; bulk interval up to
   30 s and batch up to 4096; controller shrinks the batch when commit dominates
   the interval.
-- **Metrics**: `decode_ms`, `wait_ms`, `cache_hit_known` (`?` when unknown);
-  RocksDB lightweight statistics enabled.
+- **Metrics**: `decode_ms`, `wait_ms`; the cache-hit metric added in alpha.19
+  was removed in alpha.22 because RocksDB did not report it reliably.
 - **Bulk guard is relative**: `--max-bulk-lag-blocks` bounds additional growth
   from the baseline, so a 300k backlog no longer freezes Core for the whole
   catch-up.

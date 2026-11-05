@@ -56,6 +56,10 @@ Never treat a version number in this file as authoritative over the code/tag.
   pruning every 10,000 safe blocks by default (low disk bypasses it).
 - `prune_mib >= 550` requires `[pruning] allow_auto_prune = true`.
 - Snapshots are optional; they are never required by the from-zero flow.
+- Long bulk catch-up pauses Core by default and resumes 5,000 blocks early to
+  pre-warm peers; normal prune is deferred above 50 GiB free.
+- `commit_sync = auto` relaxes the RocksDB fsync in bulk; `txids.dat` is always
+  fsynced and live mode is strict.
 - Electrum listens on `127.0.0.1:50001` (plain) by default. Optional TLS uses a
   separate listener (`tls_listen`). Neither listener authenticates clients; do
   not expose them publicly without a tunnel/firewall/access plan.

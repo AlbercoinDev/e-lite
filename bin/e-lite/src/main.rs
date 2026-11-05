@@ -50,6 +50,36 @@ fn format_local_time(t: SystemTime) -> String {
     )
 }
 
+fn readiness_line(shared: &Shared, sync: &el_serve::SyncStatus, tls: &str, fully: bool) -> String {
+    let log = shared.log_file.display();
+    if fully {
+        format!(
+            "[e-lite] FULLY SYNCED: height {}/{}; Electrum {}{}; log {}",
+            sync.height, sync.headers, shared.listen, tls, log
+        )
+    } else if sync.offline {
+        format!(
+            "[e-lite] READY (offline): cached index at height {}; Core unavailable; \
+             Electrum {}{}; log {}",
+            sync.height, shared.listen, tls, log
+        )
+    } else {
+        let note = if sync.core_ibd {
+            format!(
+                "Core still in IBD, verify {:.1}%",
+                sync.verification * 100.0
+            )
+        } else {
+            "Core caught up".to_string()
+        };
+        format!(
+            "[e-lite] READY: index caught up to Core at height {} ({} headers; {}); \
+             Electrum {}{}; log {}",
+            sync.height, sync.headers, note, shared.listen, tls, log
+        )
+    }
+}
+
 fn format_uptime(d: Duration) -> String {
     if d.as_secs() < 60 {
         return format!("{:.1}s", d.as_secs_f64());
@@ -181,6 +211,7 @@ struct Args {
     adaptive: Option<bool>,
     cache_mib: Option<u64>,
     commit_interval_ms: Option<u64>,
+    commit_sync: Option<String>,
     prefetch_blocks: Option<usize>,
     write_buffer_mib: Option<u64>,
     background_jobs: Option<usize>,
@@ -188,12 +219,16 @@ struct Args {
     milestone_seconds: Option<u64>,
     max_core_lag_blocks: Option<u32>,
     max_bulk_lag_blocks: Option<u32>,
+    pause_core_during_bulk: Option<bool>,
+    core_resume_ahead_blocks: Option<u32>,
+    prune_defer_free_gib: Option<u64>,
     min_gain_blocks: Option<u32>,
     prune_interval_seconds: Option<u64>,
     poll_seconds: Option<u64>,
     repair_max_gap_blocks: Option<u32>,
     critical_free_gib: Option<u64>,
     max_clients: Option<usize>,
+    banner_file: Option<String>,
     core_args: Vec<String>,
     p2p_peers: Option<String>,
     no_p2p: bool,
@@ -255,6 +290,7 @@ fn parse_args() -> R<Args> {
             "--commit-interval-ms" => {
                 args.commit_interval_ms = Some(value("--commit-interval-ms")?.parse()?)
             }
+            "--commit-sync" => args.commit_sync = Some(value("--commit-sync")?),
             "--prefetch-blocks" => {
                 args.prefetch_blocks = Some(value("--prefetch-blocks")?.parse()?)
             }
@@ -276,6 +312,14 @@ fn parse_args() -> R<Args> {
             "--max-bulk-lag-blocks" => {
                 args.max_bulk_lag_blocks = Some(value("--max-bulk-lag-blocks")?.parse()?)
             }
+            "--pause-core-during-bulk" => args.pause_core_during_bulk = Some(true),
+            "--no-pause-core-during-bulk" => args.pause_core_during_bulk = Some(false),
+            "--core-resume-ahead-blocks" => {
+                args.core_resume_ahead_blocks = Some(value("--core-resume-ahead-blocks")?.parse()?)
+            }
+            "--prune-defer-free-gib" => {
+                args.prune_defer_free_gib = Some(value("--prune-defer-free-gib")?.parse()?)
+            }
             "--min-gain-blocks" => {
                 args.min_gain_blocks = Some(value("--min-gain-blocks")?.parse()?)
             }
@@ -290,6 +334,7 @@ fn parse_args() -> R<Args> {
                 args.critical_free_gib = Some(value("--critical-free-gib")?.parse()?)
             }
             "--max-clients" => args.max_clients = Some(value("--max-clients")?.parse()?),
+            "--banner-file" => args.banner_file = Some(value("--banner-file")?),
             "--core-arg" => args.core_args.push(value("--core-arg")?),
             "--p2p-peers" => args.p2p_peers = Some(value("--p2p-peers")?),
             "--decoys" => args.decoys = Some(value("--decoys")?.parse()?),
@@ -441,6 +486,9 @@ fn effective_config(args: &Args) -> R<(Config, Chain)> {
     if let Some(v) = args.commit_interval_ms {
         cfg.index.commit_interval_ms = v;
     }
+    if let Some(v) = &args.commit_sync {
+        cfg.index.commit_sync = v.clone();
+    }
     if let Some(v) = args.prefetch_blocks {
         cfg.index.prefetch_blocks = v;
     }
@@ -462,6 +510,15 @@ fn effective_config(args: &Args) -> R<(Config, Chain)> {
     if let Some(v) = args.max_bulk_lag_blocks {
         cfg.pruning.max_bulk_lag_blocks = v;
     }
+    if let Some(v) = args.pause_core_during_bulk {
+        cfg.pruning.pause_core_during_bulk = v;
+    }
+    if let Some(v) = args.core_resume_ahead_blocks {
+        cfg.pruning.core_resume_ahead_blocks = v;
+    }
+    if let Some(v) = args.prune_defer_free_gib {
+        cfg.pruning.prune_defer_free_gib = v;
+    }
     if let Some(v) = args.min_gain_blocks {
         cfg.pruning.min_gain_blocks = v;
     }
@@ -479,6 +536,9 @@ fn effective_config(args: &Args) -> R<(Config, Chain)> {
     }
     if let Some(v) = args.max_clients {
         cfg.server.max_clients = v;
+    }
+    if let Some(v) = &args.banner_file {
+        cfg.server.banner_file = v.clone();
     }
     if !args.core_args.is_empty() {
         cfg.core.extra_args.extend(args.core_args.iter().cloned());
@@ -944,6 +1004,7 @@ TUNING (all networks):
     --write-buffer-mib <n>  total RocksDB memtable budget (0 = RAM/16)
     --background-jobs <n>   RocksDB jobs (0 = profile, capped by CPUs)
     --commit-interval-ms <n> commit/fsync interval (0 = profile; 500..30000)
+    --commit-sync <mode>    auto | always | txids (bulk durability tradeoff)
     --prefetch-blocks <n>   UTXO prefetch depth (reserved; 0 = default)
     --milestone-blocks <n>  progress report every N blocks (0 = off)
     --milestone-seconds <n> progress report every N seconds (0 = off)
@@ -951,6 +1012,10 @@ TUNING (all networks):
 PRUNING AND CORE:
     --max-core-lag-blocks <n>   auto-prune download limit (0 = off)
     --max-bulk-lag-blocks <n>   opt-in manual/bulk limit (0 = off)
+    --pause-core-during-bulk    pause Core during a long catch-up (default)
+    --no-pause-core-during-bulk disable the full bulk pause
+    --core-resume-ahead-blocks <n> resume Core this early to pre-warm peers
+    --prune-defer-free-gib <n>  skip normal prune above this free space (default 50)
     --min-gain-blocks <n>       minimum safe-height gain between prunes (default 10000)
     --prune-interval-seconds <n> minimum time between prunes
     --poll-seconds <n>          supervisor poll interval
@@ -963,6 +1028,7 @@ PRUNING AND CORE:
 
 RAWTX, SERVER AND TLS:
     --max-clients <n>       Electrum client limit
+    --banner-file <path>    wallet banner template (created if missing)
     --p2p-peers <a,b>       comma-separated P2P peers for rawtx/repair
     --no-p2p                disable the P2P rawtx/repair source
     --no-esplora            disable the Esplora rawtx/repair source
@@ -1412,6 +1478,8 @@ struct Indexer {
     milestone: Mutex<MilestoneState>,
     milestone_sizes_running: Arc<AtomicBool>,
     bulk_lag_baseline: AtomicU64,
+    bulk_started: AtomicBool,
+    bulk_full_pause: AtomicBool,
 }
 
 impl Drop for Indexer {
@@ -1486,6 +1554,8 @@ impl Indexer {
             }),
             milestone_sizes_running: Arc::new(AtomicBool::new(false)),
             bulk_lag_baseline: AtomicU64::new(u64::MAX),
+            bulk_started: AtomicBool::new(false),
+            bulk_full_pause: AtomicBool::new(false),
         }
     }
 
@@ -1791,6 +1861,12 @@ impl Indexer {
         Ok(())
     }
 
+    /// `auto`: relax the RocksDB fsync during bulk/IBD and return to strict
+    /// durability when the index is live. `txids.dat` is fsynced either way.
+    fn commit_sync(&self, ibd: bool, height: u64, core_tip: u64) -> bool {
+        commit_sync_policy(&self.cfg.index.commit_sync, ibd, height, core_tip)
+    }
+
     fn commit_group(
         &self,
         batch: WriteBatch,
@@ -1798,6 +1874,7 @@ impl Indexer {
         txids: &[Hash32],
         last_block_ms: u64,
         prune_undo_records: bool,
+        sync: bool,
     ) -> R<()> {
         let mut batch = batch;
         if prune_undo_records {
@@ -1811,7 +1888,7 @@ impl Indexer {
         {
             let _g = self.lock.write().map_err(|_| "lock poisoned")?;
             let commit_started = Instant::now();
-            let result = self.store.commit(batch, tip, txids);
+            let result = self.store.commit_with_sync(batch, tip, txids, sync);
             self.tunables.record_commit(commit_started.elapsed());
             if let Err(e) = result {
                 // Whatever happened, keep the flat file aligned with the DB.
@@ -1865,6 +1942,8 @@ impl Indexer {
         let limit = if bulk_limit > 0 {
             if !info.initialblockdownload {
                 self.bulk_lag_baseline.store(u64::MAX, Ordering::Relaxed);
+                self.bulk_started.store(false, Ordering::Relaxed);
+                self.bulk_full_pause.store(false, Ordering::Relaxed);
                 if paused && self.core.set_network_active(true).is_ok() {
                     self.lag_paused.store(false, Ordering::Relaxed);
                     self.mark_paused(false);
@@ -1877,17 +1956,40 @@ impl Indexer {
                 return;
             }
             is_bulk = true;
-            // Bound *additional* separation, not the absolute lag. With a
-            // 300k-block backlog, an absolute 20k threshold would freeze Core
-            // for the whole catch-up. The baseline follows the lowest lag seen
-            // while Core is downloading, so Core works in phases.
-            let baseline = self.bulk_lag_baseline.load(Ordering::Relaxed);
-            let (new_baseline, pause_at, resume_at) =
-                bulk_lag_window(lag, baseline, bulk_limit, paused);
-            self.bulk_lag_baseline
-                .store(new_baseline, Ordering::Relaxed);
-            bulk_resume = Some(resume_at);
-            pause_at
+            let ahead = self.cfg.pruning.core_resume_ahead_blocks as u64;
+            if self.cfg.pruning.pause_core_during_bulk {
+                let first = !self.bulk_started.swap(true, Ordering::SeqCst);
+                if first && lag > ahead {
+                    self.bulk_full_pause.store(true, Ordering::SeqCst);
+                }
+                if self.bulk_full_pause.load(Ordering::SeqCst) {
+                    // Full bulk pause: keep Core stopped until the index is
+                    // close enough; then the common resume path pre-warms P2P.
+                    bulk_resume = Some(ahead);
+                    ahead.max(1)
+                } else {
+                    let baseline = self.bulk_lag_baseline.load(Ordering::Relaxed);
+                    let (new_baseline, pause_at, resume_at) =
+                        bulk_lag_window(lag, baseline, bulk_limit, paused);
+                    self.bulk_lag_baseline
+                        .store(new_baseline, Ordering::Relaxed);
+                    bulk_resume = Some(resume_at);
+                    pause_at
+                }
+            } else {
+                self.bulk_started.store(true, Ordering::Relaxed);
+                // Bound *additional* separation, not the absolute lag. With a
+                // 300k-block backlog, an absolute 20k threshold would freeze Core
+                // for the whole catch-up. The baseline follows the lowest lag seen
+                // while Core is downloading, so Core works in phases.
+                let baseline = self.bulk_lag_baseline.load(Ordering::Relaxed);
+                let (new_baseline, pause_at, resume_at) =
+                    bulk_lag_window(lag, baseline, bulk_limit, paused);
+                self.bulk_lag_baseline
+                    .store(new_baseline, Ordering::Relaxed);
+                bulk_resume = Some(resume_at);
+                pause_at
+            }
         } else {
             if !info.pruned {
                 if paused && self.core.set_network_active(true).is_ok() {
@@ -1941,7 +2043,12 @@ impl Indexer {
                         sh.stats.core_network_active.store(false, Ordering::Relaxed);
                         sh.set_state(state::PAUSE_DOWNLOAD);
                     }
-                    if is_bulk {
+                    if is_bulk && self.bulk_full_pause.load(Ordering::SeqCst) {
+                        eprintln!(
+                            "[e-lite] bulk: paused Core downloads until {limit} blocks remain \
+                             (lag {lag})"
+                        );
+                    } else if is_bulk {
                         eprintln!(
                             "[e-lite] lag {lag} blocks (baseline {baseline}, max growth \
                              {bulk_limit}, reader {reader_pressure}): paused Core downloads \
@@ -1966,6 +2073,7 @@ impl Indexer {
                 Ok(_) => {
                     self.lag_paused.store(false, Ordering::Relaxed);
                     self.mark_paused(false);
+                    let prewarm = is_bulk && self.bulk_full_pause.swap(false, Ordering::SeqCst);
                     if is_bulk {
                         self.bulk_lag_baseline.store(lag, Ordering::Relaxed);
                     }
@@ -1973,7 +2081,14 @@ impl Indexer {
                         sh.stats.core_network_active.store(true, Ordering::Relaxed);
                         sh.set_state(state::READY);
                     }
-                    eprintln!("[e-lite] lag down to {lag} blocks: resumed Core downloads");
+                    if prewarm {
+                        eprintln!(
+                            "[e-lite] pre-warming Core networking at lag {lag} blocks \
+                             (peers reconnect while the index finishes)"
+                        );
+                    } else {
+                        eprintln!("[e-lite] lag down to {lag} blocks: resumed Core downloads");
+                    }
                 }
                 Err(e) => eprintln!("[e-lite] cannot resume Core downloads: {e}"),
             }
@@ -2241,12 +2356,15 @@ impl Indexer {
                 || group_started.elapsed() >= self.tunables.commit_interval();
             if commit_due {
                 let current = tip.expect("tip set");
+                let sync =
+                    self.commit_sync(info.initialblockdownload, current.height as u64, core_tip);
                 if let Err(e) = self.commit_group(
                     std::mem::take(&mut batch),
                     &current,
                     &group_txids,
                     last_ms,
                     group_undo,
+                    sync,
                 ) {
                     result = Err(e);
                     break;
@@ -2259,6 +2377,10 @@ impl Indexer {
                 self.tunables.record_tx_rate(
                     ((current.txnum.saturating_sub(self.progress_start_txnum)) as f64 / rate_secs)
                         as u64,
+                );
+                self.tunables.record_blocks_rate(
+                    ((current.height as u64).saturating_sub(self.progress_start_height) as f64
+                        / rate_secs) as u64,
                 );
                 if let Some(sh) = &self.shared {
                     self.tunables.publish(&sh.stats);
@@ -2288,12 +2410,14 @@ impl Indexer {
 
         if result.is_ok() && count > 0 && !paused_by_disk && !self.disk_guard() {
             let current = tip.expect("tip set");
+            let sync = self.commit_sync(info.initialblockdownload, current.height as u64, core_tip);
             self.commit_group(
                 std::mem::take(&mut batch),
                 &current,
                 &group_txids,
                 last_ms,
                 group_undo,
+                sync,
             )?;
             committed_height = current.height as u64;
             let (live_core, live_prune) = self.live_core_and_prune(info.blocks, info.pruneheight);
@@ -2301,6 +2425,10 @@ impl Indexer {
             self.tunables.record_tx_rate(
                 ((current.txnum.saturating_sub(self.progress_start_txnum)) as f64 / rate_secs)
                     as u64,
+            );
+            self.tunables.record_blocks_rate(
+                ((current.height as u64).saturating_sub(self.progress_start_height) as f64
+                    / rate_secs) as u64,
             );
             if let Some(sh) = &self.shared {
                 self.tunables.publish(&sh.stats);
@@ -2427,15 +2555,11 @@ impl Indexer {
         let wait_ms = self.tunables.wait_ms();
         let apply_ms = self.tunables.apply_ms.load(Ordering::Relaxed);
         let commit_ms = self.tunables.commit_ewma.load(Ordering::Relaxed);
-        let cache = if self.tunables.cache_known() {
-            format!("{}%", self.tunables.cache_hit_pct.load(Ordering::Relaxed))
-        } else {
-            "?".to_string()
-        };
+        let commit_per_block = commit_ms / self.tunables.batch_blocks().max(1) as u64;
         eprintln!(
             "[e-lite] height {} ({})  txnum {}  core {}/{} ({})  prune {}  lag {}  \
              {:.1} blocks/s  {:.0} tx/s  elapsed {}  read {}ms decode {}ms wait {}ms \
-             apply {}ms commit {}ms cache {}{}",
+             apply {}ms commit {}ms commit/blk {}ms{}",
             tip.height,
             pct(tip.height as u64, core_headers),
             tip.txnum,
@@ -2452,7 +2576,7 @@ impl Indexer {
             wait_ms,
             apply_ms,
             commit_ms,
-            cache,
+            commit_per_block,
             if ibd {
                 format!("  (core in IBD, verify {:.1}%)", verification * 100.0)
             } else {
@@ -2534,6 +2658,14 @@ fn milestone_due(
     by_blocks || by_time
 }
 
+fn commit_sync_policy(mode: &str, ibd: bool, height: u64, core_tip: u64) -> bool {
+    match mode {
+        "always" => true,
+        "txids" => false,
+        _ => !(ibd || height.saturating_add(1_000) < core_tip),
+    }
+}
+
 /// Bulk lag guard window. `u64::MAX` means "no baseline yet". The baseline
 /// follows the lowest lag seen **while Core is downloading**. While paused it
 /// must stay fixed; otherwise every block indexed would lower the resume
@@ -2591,6 +2723,13 @@ fn supervisor_config(cfg: &Config, can_control_core: bool) -> el_chain::Supervis
         core_recent_margin: 288,
         min_gain: cfg.pruning.min_gain_blocks,
         prune_interval: Duration::from_secs(cfg.pruning.prune_interval_seconds),
+        prune_defer_free_bytes: {
+            let gib = cfg
+                .pruning
+                .prune_defer_free_gib
+                .max(cfg.pruning.min_free_gib);
+            (gib > 0).then_some(gib.saturating_mul(GIB_BYTES))
+        },
     }
 }
 
@@ -3035,13 +3174,15 @@ fn index_loop(
         .unwrap_or_else(Instant::now);
     let mut last_height = u64::MAX;
     let mut was_ready = false;
+    let mut was_fully_synced = false;
     let mut backoff = 1u64;
     let mut loading_logged = false;
     eprintln!(
-        "[e-lite] tuning profile={} readers={} commit={}ms batch={} cache={}MiB jobs={} prefetch={} adaptive={}",
+        "[e-lite] tuning profile={} readers={} commit={}ms commit_sync={} batch={} cache={}MiB jobs={} prefetch={} adaptive={}",
         idx.tunables.profile().name(),
         idx.tunables.readers(),
         idx.tunables.commit_ms(),
+        cfg.index.commit_sync,
         idx.tunables.batch_blocks(),
         idx.tunables.cache_mib(),
         idx.tunables.background_jobs(),
@@ -3100,10 +3241,29 @@ fn index_loop(
                         state::BUILDING
                     };
                     sh.set_state(next);
-                    if caught_up && !was_ready {
-                        println!("index caught up at height {height}");
+                    let sync = sh.sync_status();
+                    let tls = sh
+                        .tls_listen
+                        .as_ref()
+                        .map(|addr| format!(" · SSL {addr}"))
+                        .unwrap_or_default();
+                    let print_fully = sync.fully_synced && !was_fully_synced;
+                    let print_ready = sync.ready && !was_ready && !print_fully;
+                    if print_fully {
+                        eprintln!("{}", readiness_line(sh, &sync, &tls, true));
+                    } else if print_ready {
+                        eprintln!("{}", readiness_line(sh, &sync, &tls, false));
                     }
-                    was_ready = caught_up;
+                    if sync.fully_synced {
+                        was_fully_synced = true;
+                        was_ready = true;
+                    } else if sync.ready {
+                        was_ready = true;
+                        was_fully_synced = false;
+                    } else {
+                        was_ready = false;
+                        was_fully_synced = false;
+                    }
                 }
                 if stop_at_tip {
                     let core_tip = idx.core.blockchain_info()?.blocks;
@@ -3340,6 +3500,38 @@ fn build_shared(
 ) -> R<Arc<Shared>> {
     let core = core_client(cfg, chain)?;
     let resolver = build_resolver(cfg, chain, &store, &core)?;
+    let log_file = cfg.app_log_file(chain);
+    let banner_file = cfg.app_banner_file(chain);
+    if let Some(path) = &banner_file {
+        if let Err(e) = el_serve::ensure_banner_file(path) {
+            eprintln!(
+                "[e-lite] WARNING: cannot create banner template {}: {e}",
+                path.display()
+            );
+        }
+    }
+    let stats = Stats::default();
+    if let Ok(Some(tip)) = store.committed_tip() {
+        stats
+            .indexed_height
+            .store(tip.height as u64, Ordering::Relaxed);
+        stats.txnum.store(tip.txnum, Ordering::Relaxed);
+    }
+    if let Ok(info) = core.blockchain_info() {
+        stats.core_height.store(info.blocks, Ordering::Relaxed);
+        stats.core_headers.store(info.headers, Ordering::Relaxed);
+        stats
+            .core_pruneheight
+            .store(info.pruneheight, Ordering::Relaxed);
+        stats.core_pruned.store(info.pruned, Ordering::Relaxed);
+        stats
+            .core_ibd
+            .store(info.initialblockdownload, Ordering::Relaxed);
+        stats.core_verification_bps.store(
+            (info.verificationprogress.clamp(0.0, 1.0) * 10_000.0) as u64,
+            Ordering::Relaxed,
+        );
+    }
     let shared = Arc::new(Shared {
         store,
         core,
@@ -3357,17 +3549,19 @@ fn build_shared(
         dirty_scripts: el_serve::DirtyScripts::new(),
         data_dir: cfg.data_dir(chain),
         core_datadir: cfg.core_datadir(),
+        log_file,
         listen: cfg.server.listen.clone(),
         tls_listen: if cfg.server.tls_enabled() {
             Some(cfg.server.tls_listen.clone())
         } else {
             None
         },
+        banner_file,
         max_clients: cfg.server.max_clients,
         state: std::sync::atomic::AtomicU8::new(state::WAITING_FOR_CORE),
         shutdown: shutdown_flag(),
         lock: Arc::new(RwLock::new(())),
-        stats: Stats::default(),
+        stats,
     });
     publish_memory(&shared);
     Ok(shared)
@@ -3554,15 +3748,31 @@ fn cmd_serve(cfg: &Config, chain: Chain) -> R<()> {
             tip
         }
     };
-    if tip >= core_tip && (core_reachable || tip > 0) && !core_ibd {
-        shared.set_state(state::READY);
-    } else if !core_reachable && tip == 0 {
+    if !core_reachable {
         shared.set_state(state::CORE_UNAVAILABLE);
-        eprintln!("[e-lite] Core is unavailable and the index is empty; waiting for Core data");
+        if tip == 0 {
+            eprintln!("[e-lite] Core is unavailable and the index is empty; waiting for Core data");
+        } else {
+            eprintln!("[e-lite] Core is unavailable; serving the cached index (height {tip})");
+        }
+    } else if tip >= core_tip && !core_ibd {
+        shared.set_state(state::READY);
     } else {
         shared.set_state(state::BUILDING);
         eprintln!(
             "[e-lite] index is behind or Core is in IBD (indexed {tip}, core {core_tip}); queries will fail until caught up. Use `e-lite run` to index and serve."
+        );
+    }
+    let sync = shared.sync_status();
+    if sync.ready {
+        let tls = shared
+            .tls_listen
+            .as_ref()
+            .map(|addr| format!(" · SSL {addr}"))
+            .unwrap_or_default();
+        eprintln!(
+            "{}",
+            readiness_line(&shared, &sync, &tls, sync.fully_synced)
         );
     }
     println!(
@@ -3731,6 +3941,13 @@ fn print_status_human(v: &serde_json::Value) {
         "network   {}   state {}",
         v.get("network").and_then(|x| x.as_str()).unwrap_or("?"),
         v.get("state").and_then(|x| x.as_str()).unwrap_or("?")
+    );
+    println!(
+        "sync      ready {}   at Core tip {}   fully synced {}   offline {}",
+        v["ready"].as_bool().unwrap_or(false),
+        v["at_core_tip"].as_bool().unwrap_or(false),
+        v["fully_synced"].as_bool().unwrap_or(false),
+        v["offline"].as_bool().unwrap_or(false)
     );
     println!(
         "index     height {}   txnum {}   lag {}",
@@ -3928,6 +4145,15 @@ mod tests {
         assert!(!milestone_due(10_000, 10_001, hour, 0, 0));
         // Both disabled means never.
         assert!(!milestone_due(0, 1_000_000, hour, 0, 0));
+    }
+
+    #[test]
+    fn commit_sync_auto_relaxes_only_in_bulk() {
+        assert!(!commit_sync_policy("auto", true, 100_000, 200_000));
+        assert!(!commit_sync_policy("auto", false, 100_000, 200_000));
+        assert!(commit_sync_policy("auto", false, 200_000, 200_000));
+        assert!(commit_sync_policy("always", true, 100_000, 200_000));
+        assert!(!commit_sync_policy("txids", false, 200_000, 200_000));
     }
 
     #[test]

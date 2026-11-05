@@ -109,8 +109,7 @@ pub struct Tunables {
     pub wait_ms: AtomicU64,
     pub commit_ewma: AtomicU64,
     pub tx_per_sec: AtomicU64,
-    pub cache_hit_pct: AtomicU64,
-    cache_known: AtomicBool,
+    pub blocks_per_sec: AtomicU64,
 
     last_change: Mutex<Instant>,
 }
@@ -231,8 +230,7 @@ impl Tunables {
             wait_ms: AtomicU64::new(0),
             commit_ewma: AtomicU64::new(0),
             tx_per_sec: AtomicU64::new(0),
-            cache_hit_pct: AtomicU64::new(0),
-            cache_known: AtomicBool::new(false),
+            blocks_per_sec: AtomicU64::new(0),
             last_change: Mutex::new(
                 Instant::now()
                     .checked_sub(Duration::from_secs(120))
@@ -261,9 +259,6 @@ impl Tunables {
     }
     pub fn prefetch_blocks(&self) -> usize {
         self.prefetch_blocks.load(Ordering::Relaxed)
-    }
-    pub fn cache_known(&self) -> bool {
-        self.cache_known.load(Ordering::Relaxed)
     }
     pub fn decode_ms(&self) -> u64 {
         self.decode_ms.load(Ordering::Relaxed)
@@ -336,8 +331,8 @@ impl Tunables {
     pub fn record_tx_rate(&self, tx_per_sec: u64) {
         ewma(&self.tx_per_sec, tx_per_sec);
     }
-    pub fn record_cache_hit_pct(&self, pct: u64) {
-        ewma(&self.cache_hit_pct, pct);
+    pub fn record_blocks_rate(&self, blocks_per_sec: u64) {
+        ewma(&self.blocks_per_sec, blocks_per_sec);
     }
 
     fn apply_profile_defaults(&self, profile: Profile) {
@@ -503,13 +498,6 @@ impl Tunables {
                 return Some("memory pressure".to_string());
             }
         }
-        if let Some(pct) = store.cache_hit_pct() {
-            self.cache_known.store(true, Ordering::Relaxed);
-            self.record_cache_hit_pct(pct);
-        } else {
-            self.cache_known.store(false, Ordering::Relaxed);
-        }
-
         let mut action = None;
 
         // Commit/fsync pain: amortise with larger groups on slow storage. Avoid
@@ -576,23 +564,6 @@ impl Tunables {
             action = Some(format!("read latency {read_ms}ms: readers -> {v}"));
         }
 
-        // Cache misses and memory headroom.
-        if action.is_none() && !self.cache_locked.load(Ordering::Relaxed) {
-            let hit = self.cache_hit_pct.load(Ordering::Relaxed);
-            if hit > 0 && hit < 60 && mem_available > 1024 && self.cache_mib() < self.max_cache_mib
-            {
-                let v = (self.cache_mib() * 5 / 4).min(self.max_cache_mib);
-                self.cache_mib.store(v, Ordering::Relaxed);
-                store.set_cache_bytes(v.saturating_mul(1024 * 1024) as usize);
-                action = Some(format!("cache hit {hit}%: cache -> {v} MiB"));
-            } else if mem_available < 512 && self.cache_mib() > self.min_cache_mib {
-                let v = (self.cache_mib() * 3 / 4).max(self.min_cache_mib);
-                self.cache_mib.store(v, Ordering::Relaxed);
-                store.set_cache_bytes(v.saturating_mul(1024 * 1024) as usize);
-                action = Some(format!("low RAM: cache -> {v} MiB"));
-            }
-        }
-
         if let Some(reason) = &action {
             if let Ok(mut last) = self.last_change.lock() {
                 *last = Instant::now();
@@ -639,13 +610,10 @@ impl Tunables {
         stats
             .tuning_tx_per_sec
             .store(self.tx_per_sec.load(Ordering::Relaxed), Ordering::Relaxed);
-        stats.tuning_cache_hit_pct.store(
-            self.cache_hit_pct.load(Ordering::Relaxed),
+        stats.tuning_blocks_per_sec.store(
+            self.blocks_per_sec.load(Ordering::Relaxed),
             Ordering::Relaxed,
         );
-        stats
-            .tuning_cache_known
-            .store(self.cache_known.load(Ordering::Relaxed), Ordering::Relaxed);
         stats
             .tuning_profile
             .store(self.profile().code() as u64, Ordering::Relaxed);

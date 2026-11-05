@@ -45,6 +45,8 @@ a separate listener is implemented; authentication and rate limiting are not.
   real RAM, and every knob can be overridden from the CLI or `--set`.
 - `run`/`index`/`serve` keep an application log at `<data-dir>/e-lite.log` with
   the same lines as the console.
+- Ready state is `READY` at Core's validated tip and `FULLY SYNCED` at the
+  network headers; the wallet banner mirrors it.
 - Rawtx external lookup is block-based, validated, Tor-first and decoy-enhanced.
 
 ## Audit and release

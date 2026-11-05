@@ -62,12 +62,12 @@ The indexer records EWMA values for:
 - block decode/hash latency (`decode_ms`),
 - pipeline wait (`wait_ms`),
 - `apply_block` latency (`apply_ms`),
-- commit + fsync latency (`commit_ms`),
-- indexed transactions per second,
-- RocksDB block-cache hit percentage (`?` when the counter is unavailable).
+- commit + fsync latency (`commit_ms`) and `commit/blk`,
+- indexed blocks and transactions per second.
 
 They are exported in `/status` under `tuning` and in `/metrics` as
-`e_lite_tuning_*`, `e_lite_tx_per_sec` and `e_lite_commit_ms`.
+`e_lite_tuning_*`, `e_lite_tx_per_sec`, `e_lite_blocks_per_sec` and
+`e_lite_commit_ms`.
 
 ## What it changes
 
@@ -81,8 +81,9 @@ Only these hot fields are adjusted automatically:
   slow and commit is less than half of the interval; if commit dominates the
   interval (>75%), the batch shrinks instead. The bulk maximum is 30 s / 4096
   blocks, with the usual crash-window tradeoff.
-- `cache_mib`: grows when the cache hit rate is low and RAM is available;
-  shrinks when `MemAvailable` is low.
+- `cache_mib`: shrinks under real memory pressure; the cache-hit metric was
+  removed because RocksDB did not expose it reliably. `--cache-mib` still sets
+  the block cache.
 
 The controller runs at most once every 30 seconds. It is inhibited while the
 disk guard is active, during a prune-gap repair, during a reorg and during
@@ -161,19 +162,19 @@ investigating.
 ## Long catch-up and Core separation
 
 With `prune_mib = 1` (manual pruning), Core can download faster than e-lite
-indexes. The prune gate now evaluates pruning every `min_gain_blocks` safe
-blocks (default **10,000**) to avoid constant disk churn; low disk still
-triggers an emergency prune. The opt-in lag guard:
+indexes. By default e-lite pauses Core during the long bulk catch-up and resumes
+it `core_resume_ahead_blocks` (5,000) before the tip, so peers reconnect while
+e-lite finishes. After that, `max_bulk_lag_blocks` (20,000) bounds additional
+growth relative to the lowest lag seen and resumes at half.
 
-```bash
-e-lite run --max-bulk-lag-blocks 20000 ...
-```
-
-pauses Core's P2P when the lag grows 20,000 blocks above the baseline seen while
-Core was downloading, and resumes when it falls halfway back. This bounds
-additional separation instead of freezing Core for an entire 300k-block
-catch-up. `0` (default) disables it. `--core-arg` can also reduce Core's own
+Normal pruning runs every `min_gain_blocks` safe blocks (default **10,000**) and
+is deferred while free space is at or above `prune_defer_free_gib` (50 GiB).
+Low-disk emergency pruning still runs. `--core-arg` can also reduce Core's
 memory/IO footprint (for example `--core-arg=-dbcache=128`).
+
+`commit_sync = auto` (default) uses `txids` durability during bulk/IBD and
+strict `always` when live. `txids` still fsyncs `txids.dat`; a crash can only
+lose the last interval, which is reindexed from Core.
 
 ## Application log
 

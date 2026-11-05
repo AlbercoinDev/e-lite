@@ -164,10 +164,6 @@ impl Store {
         opts.set_max_background_jobs(store_opts.background_jobs.max(1));
         opts.set_bytes_per_sync(1024 * 1024);
         opts.set_wal_bytes_per_sync(1024 * 1024);
-        // Lightweight statistics make the block-cache hit/miss counters
-        // available to the adaptive controller without timer/histogram cost.
-        opts.enable_statistics();
-        opts.set_statistics_level(rocksdb::statistics::StatsLevel::ExceptHistogramOrTimers);
         opts.set_write_buffer_size(per_cf_write);
         opts.set_max_write_buffer_number(max_buffers as i32);
         let mut descriptors = Vec::new();
@@ -227,27 +223,6 @@ impl Store {
     pub fn set_background_jobs(&self, jobs: usize) -> Result<()> {
         let jobs = jobs.clamp(1, 32);
         self.set_db_option("max_background_jobs", &jobs.to_string())
-    }
-
-    pub fn property(&self, name: &str) -> Option<String> {
-        self.db.property_value(name).ok().flatten()
-    }
-
-    /// Approximate cache hit percentage from RocksDB counters.
-    pub fn cache_hit_pct(&self) -> Option<u64> {
-        let hit = self
-            .property("rocksdb.block.cache.hit")?
-            .parse::<u64>()
-            .ok()?;
-        let miss = self
-            .property("rocksdb.block.cache.miss")?
-            .parse::<u64>()
-            .ok()?;
-        let total = hit.saturating_add(miss);
-        if total == 0 {
-            return None;
-        }
-        Some(hit.saturating_mul(100) / total)
     }
 
     fn cf(&self, name: &str) -> Result<&rocksdb::ColumnFamily> {
@@ -643,6 +618,19 @@ impl Store {
 
     /// Append txids (fsync), then atomically commit the batch plus the new tip.
     pub fn commit(&self, batch: WriteBatch, tip: &IndexedTip, txids: &[Hash32]) -> Result<()> {
+        self.commit_with_sync(batch, tip, txids, true)
+    }
+
+    /// Durability policy for bulk catch-up: `txids.dat` is always fsynced
+    /// before the tip, so a crash can lose the last RocksDB batch but never
+    /// corrupt the index. Startup truncates extra txids to the recovered tip.
+    pub fn commit_with_sync(
+        &self,
+        batch: WriteBatch,
+        tip: &IndexedTip,
+        txids: &[Hash32],
+        sync: bool,
+    ) -> Result<()> {
         if txids.len() as u64 > tip.txnum {
             return err(format!(
                 "commit has {} txids but tip.txnum is {}",
@@ -659,7 +647,7 @@ impl Store {
 
         let mut batch = batch;
         self.put_tip(&mut batch, tip)?;
-        self.write_batch(batch, true)?;
+        self.write_batch(batch, sync)?;
 
         if failpoints::get() == failpoints::AFTER_COMMIT {
             return err("failpoint: after_commit (db committed)");

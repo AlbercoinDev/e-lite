@@ -58,6 +58,7 @@ version          print version
 | `--write-buffer-mib <n>` | `index.write_buffer_mib` | `0` (RAM/16) |
 | `--background-jobs <n>` | `index.background_jobs` | `0` (profile, capped by CPUs) |
 | `--commit-interval-ms <n>` | `index.commit_interval_ms` | `0` (profile; 500..30000) |
+| `--commit-sync <mode>` | `index.commit_sync` | `auto` (`txids` in bulk, `always` live) |
 | `--prefetch-blocks <n>` | `index.prefetch_blocks` | `0` (reserved) |
 | `--batch <n>` | `index.batch_blocks` | `256`/profile |
 | `--reorg-window <n>` | `index.reorg_window` | `288` |
@@ -110,7 +111,11 @@ e-lite run --network mainnet --allow-mainnet \
 | Flag | TOML field | Default |
 |---|---|---|
 | `--max-core-lag-blocks <n>` | `pruning.max_core_lag_blocks` | `192` (auto-prune only) |
-| `--max-bulk-lag-blocks <n>` | `pruning.max_bulk_lag_blocks` | `0` (off) |
+| `--max-bulk-lag-blocks <n>` | `pruning.max_bulk_lag_blocks` | `20000` |
+| `--pause-core-during-bulk` | `pruning.pause_core_during_bulk` | `true` |
+| `--no-pause-core-during-bulk` | same | disable the full bulk pause |
+| `--core-resume-ahead-blocks <n>` | `pruning.core_resume_ahead_blocks` | `5000` |
+| `--prune-defer-free-gib <n>` | `pruning.prune_defer_free_gib` | `50` |
 | `--min-gain-blocks <n>` | `pruning.min_gain_blocks` | `10000` |
 | `--prune-interval-seconds <n>` | `pruning.prune_interval_seconds` | `30` |
 | `--poll-seconds <n>` | `pruning.poll_seconds` | `10` |
@@ -120,11 +125,19 @@ e-lite run --network mainnet --allow-mainnet \
 | `--stop-on-exit` / `--no-stop-on-exit` | `core.stop_on_exit` | `true` |
 | `--restart` / `--no-restart` | `core.restart` | `true` |
 
-`--max-bulk-lag-blocks` pauses Core's P2P when a managed, pruned Core is in IBD
-and the index lags more than N blocks **beyond the lowest lag seen while Core was
-downloading**; it resumes at half that growth. It bounds additional separation
-and disk contention without freezing Core for an entire large catch-up. `0`
-disables it. It is independent of the automatic-pruning safety limit.
+By default (`pause_core_during_bulk = true`), a long bulk catch-up pauses
+Core's P2P until `core_resume_ahead_blocks` remain (5,000). It then resumes
+Core early so peers reconnect while e-lite finishes; after that,
+`max_bulk_lag_blocks` (20,000) bounds additional growth relative to the lowest
+lag seen and resumes at half. Use `--no-pause-core-during-bulk` for the relative
+guard only.
+
+`commit_sync = auto` relaxes the RocksDB fsync during bulk/IBD (`txids.dat` is
+still fsynced, so a crash only reindexes the last interval) and returns to
+strict `sync=true` when live. Use `always` or `txids` to force a policy.
+
+Normal pruning is deferred while free space is at or above
+`prune_defer_free_gib` (50 GiB). Low-disk emergency pruning still runs.
 
 Low-RAM Core example:
 
@@ -138,6 +151,7 @@ e-lite run --network mainnet --allow-mainnet \
 | Flag | TOML field | Default |
 |---|---|---|
 | `--max-clients <n>` | `server.max_clients` | `32` |
+| `--banner-file <path>` | `server.banner_file` | built-in templates |
 | `--p2p-peers <a,b>` | `rawtx.p2p_peers` | discovered from Core |
 | `--no-p2p` | `rawtx.use_p2p=false` | enabled |
 | `--no-esplora` | `rawtx.use_esplora=false` | enabled |
@@ -148,6 +162,26 @@ e-lite run --network mainnet --allow-mainnet \
 | `--no-rawtx` | `rawtx.enabled=false` | enabled |
 | `--tls-listen <addr>` | `server.tls_listen` | disabled |
 | `--tls-cert`, `--tls-key` | `server.tls_cert`, `server.tls_key` | none |
+
+## Wallet banner
+
+`server.banner` returns a dynamic banner. Built-in templates show `INDEXING`
+with height/percent/bar/ETA, or `READY`/`FULLY SYNCED` with the Electrum
+endpoints. Set `--banner-file <path>` (or `[server] banner_file`) to customize:
+
+- the file is created with the default template if it does not exist;
+- a relative path is resolved inside the network `data-dir`;
+- `[indexing]` and `[ready]` sections are used for each state;
+- a file without sections is used for both;
+- placeholders: `{version}`, `{network}`, `{state}`, `{height}`, `{headers}`,
+  `{percent}`, `{bar}`, `{core_height}`, `{core_percent}`, `{lag}`,
+  `{blocks_per_sec}`, `{tx_per_sec}`, `{eta}`, `{prune}`, `{pruneheight}`,
+  `{listen}`, `{tls}`, `{log_file}`, `{uptime}`, `{ready}`, `{ready_note}`;
+- the file is read on each `server.banner` request (max 32 KiB), so edits apply
+  without restart; wallets that cache the banner may need to reconnect.
+
+The protocol has no banner push: the authoritative readiness signal is the log
+line (`READY`/`FULLY SYNCED`), `/status` and `e-lite status`.
 
 ## Logging
 
@@ -187,8 +221,8 @@ and TOML arrays are parsed as TOML.
 
 - indexed height and percentage of Core's `headers`;
 - Core blocks/headers and percentage, plus verification progress during IBD;
-- lag, blocks/s, tx/s, elapsed time and read/decode/wait/apply/commit/cache
-  metrics (`cache ?` means RocksDB did not report the counter);
+- lag, blocks/s, tx/s, elapsed time and read/decode/wait/apply/commit metrics,
+  plus `commit/blk`;
 - a milestone line every `milestone_blocks` or `milestone_seconds` (whichever
   happens first) with interval throughput and disk usage for e-lite and Core.
 

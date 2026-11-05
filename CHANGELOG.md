@@ -1,5 +1,32 @@
 # Changelog
 
+## 0.1.0-alpha.22 — 2026-11-05
+
+### Faster bulk indexing, readiness and wallet banner
+
+- **Removed the cache-hit metric** (progress/status/metrics/controller). It was
+  never reliable; `--cache-mib` and the RocksDB block cache remain.
+- **`commit_sync = auto` (default)**: fsyncs `txids.dat` and relaxes the
+  RocksDB fsync during bulk/IBD; returns to strict sync when live. A crash can
+  only require reindexing the last interval, never corrupt the index.
+- **Core bulk scheduling**: `pause_core_during_bulk = true` pauses Core during
+  the long catch-up, resumes `core_resume_ahead_blocks` (5,000) before the tip so
+  peers reconnect, then applies the relative 20k guard.
+- **Prune deferral**: normal pruning is skipped while free space is at or above
+  `prune_defer_free_gib` (50 GiB); emergency low-disk pruning remains. Normal
+  cadence stays every 10,000 safe blocks.
+- **READY / FULLY SYNCED**: one-time log lines, `/status` fields, metrics and
+  `e-lite status` output. `READY` means the index reached Core's validated tip;
+  `FULLY SYNCED` means Core is out of IBD and the index reached the headers.
+- **Wallet banner**: dynamic `server.banner` with built-in INDEXING/READY
+  templates and optional `[server] banner_file` (auto-created with
+  `[indexing]`/`[ready]` sections and placeholders).
+- **Apply micro-optimizations**: output script hashes precomputed in readers,
+  txid set instead of all outpoints, reused effect/drain buffers.
+- **Benchmark helper**: `scripts/benchmark-index.sh`.
+- Tests: commit policy, prune deferral, banner sections/formatting, readiness
+  log/banner in regtest e2e.
+
 ## 0.1.0-alpha.21 — 2026-11-05
 
 ### Test reliability

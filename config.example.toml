@@ -32,7 +32,8 @@ reorg_window = 288                  # undo records kept for reorgs
 batch_blocks = 256                  # blocks per atomic commit (initial; adaptive may change)
 profile = "auto"                    # auto | hdd | ssd | nvme | manual
 adaptive = true                     # event-driven readers/commit/cache tuning
-commit_interval_ms = 0              # 0 = profile default (500..10000 when set)
+commit_sync = "auto"                # auto | always | txids (bulk durability tradeoff)
+commit_interval_ms = 0              # 0 = profile default (500..30000 when set)
 prefetch_blocks = 0                 # reserved for the UTXO prefetch pipeline
 write_buffer_mib = 0                # total RocksDB memtable budget; 0 = RAM/16
 background_jobs = 0                 # RocksDB jobs; 0 = profile, capped by CPU count
@@ -45,8 +46,10 @@ min_free_gib = 10                   # pause Core downloads below this; indexing 
 critical_free_gib = 1               # also pause indexing below this hard floor (0 = never)
 max_core_lag_blocks = 192           # automatic pruning only; hard-capped at 224
 allow_auto_prune = false            # required for prune_mib >= 550; not for from-zero
-max_bulk_lag_blocks = 0             # opt-in: pause Core downloads when the lag grows this
-                                    # many blocks above its baseline during IBD (0 = disabled)
+max_bulk_lag_blocks = 20000         # relative growth window after the bulk pause
+pause_core_during_bulk = true       # pause Core during a long catch-up
+core_resume_ahead_blocks = 5000     # resume early so peers reconnect
+prune_defer_free_gib = 50           # skip normal prune while this much space is free
 min_gain_blocks = 10000              # evaluate/execute prune every ~10k safe blocks
 prune_interval_seconds = 30         # minimum time between prune requests (low disk bypasses)
 repair_max_gap_blocks = 2048        # auto-repair a prune gap from verified sources
@@ -63,6 +66,9 @@ max_clients = 32
 # tls_listen = "127.0.0.1:50002"
 # tls_cert = "/etc/e-lite/tls/fullchain.pem"
 # tls_key = "/etc/e-lite/tls/privkey.pem"
+# Optional wallet banner template. Empty = built-in banners. If set and missing,
+# e-lite creates it with [indexing]/[ready] sections and placeholders.
+# banner_file = "banner.txt"
 
 [metrics]
 enabled = true

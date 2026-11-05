@@ -16,6 +16,9 @@ available**.
 | Full node `prune_mib=0` | experimental | no pruning |
 | Automatic pruning `>=550` + opt-in | experimental | hard lag cap + verified gap repair |
 | Parallel decode/txid/Merkle | experimental | readers prepare blocks; apply does UTXO/batch |
+| Commit sync policy | experimental | `auto` (txids in bulk, strict live), `always`, `txids` |
+| Prune cadence and deferral | experimental | every 10k safe blocks; deferred above 50 GiB |
+| Core bulk pause + peer warm-up | experimental | pause during bulk; resume 5k blocks early |
 | Disk guard with download/index split | experimental | cgroup/LXC aware |
 | Adaptive profiles and hot reload | experimental | `auto/hdd/ssd/nvme/manual`, `SIGUSR1` |
 | Global RocksDB memory budget | experimental | `RAM/16` memtables, `RAM/4` cache, CPU-capped jobs |
@@ -72,6 +75,8 @@ available**.
 |---|---|---|
 | `/status`, `/metrics`, `/healthz` | experimental | loopback by default; memory and TLS counters |
 | Application log `e-lite.log` | experimental | tee of console; rotation; `--log-file`/`--no-log-file` |
+| Wallet banner | experimental | built-in INDEXING/READY + template file |
+| READY / FULLY SYNCED status | experimental | log, `/status`, `/metrics`, `e-lite status` |
 | Ordered startup/shutdown | experimental | `run` waits for Core; threads joined before Core stop |
 | CLI overrides and `--set` | stable | every TOML field; see `docs/CLI.md` |
 | Progress percentages and milestones | experimental | height/Core %, 10k blocks or 6 h; disk usage |

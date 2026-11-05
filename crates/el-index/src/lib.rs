@@ -177,6 +177,20 @@ pub struct PreparedBlock {
     block: bitcoin::Block,
     block_hash: Hash32,
     txids: Vec<Hash32>,
+    out_script_hashes: Vec<Vec<ScriptHash>>,
+}
+
+fn compute_out_script_hashes(block: &bitcoin::Block) -> Vec<Vec<ScriptHash>> {
+    block
+        .txdata
+        .iter()
+        .map(|tx| {
+            tx.output
+                .iter()
+                .map(|out| ScriptHash::from_script(out.script_pubkey.as_bytes()))
+                .collect()
+        })
+        .collect()
 }
 
 fn compute_txids(block: &bitcoin::Block) -> Result<Vec<Hash32>> {
@@ -213,10 +227,21 @@ pub fn prepare_block_bytes(
     }
     let txids = compute_txids(&block)?;
     validate_merkle(&block, &txids, height)?;
+    let out_script_hashes = block
+        .txdata
+        .iter()
+        .map(|tx| {
+            tx.output
+                .iter()
+                .map(|out| ScriptHash::from_script(out.script_pubkey.as_bytes()))
+                .collect()
+        })
+        .collect();
     Ok(PreparedBlock {
         block,
         block_hash,
         txids,
+        out_script_hashes,
     })
 }
 
@@ -236,8 +261,18 @@ pub fn apply_block(
     let block_hash = hash_from_blockhash(&block.block_hash())?;
     let txids = compute_txids(block)?;
     validate_merkle(block, &txids, height)?;
+    let out_script_hashes = compute_out_script_hashes(block);
     apply_inner(
-        store, height, block, block_hash, &txids, prev_tip, overlay, batch, store_undo,
+        store,
+        height,
+        block,
+        block_hash,
+        &txids,
+        &out_script_hashes,
+        prev_tip,
+        overlay,
+        batch,
+        store_undo,
     )
 }
 
@@ -256,6 +291,7 @@ pub fn apply_prepared(
         &prepared.block,
         prepared.block_hash,
         &prepared.txids,
+        &prepared.out_script_hashes,
         prev_tip,
         overlay,
         batch,
@@ -270,6 +306,7 @@ fn apply_inner(
     block: &bitcoin::Block,
     block_hash: Hash32,
     txids: &[Hash32],
+    out_script_hashes: &[Vec<ScriptHash>],
     prev_tip: Option<IndexedTip>,
     overlay: &mut GroupOverlay,
     batch: &mut WriteBatch,
@@ -303,16 +340,8 @@ fn apply_inner(
     // Prefetch every prevout that is not created inside this block in one
     // RocksDB multi-get. Outputs created in this block are resolved through the
     // group overlay, and outputs already spent in this group must stay missing.
-    let mut created_in_block: HashSet<Outpoint> = HashSet::new();
-    for (txid, tx) in txids.iter().zip(&block.txdata) {
-        for vout in 0..tx.output.len() {
-            created_in_block.insert(Outpoint {
-                txid: *txid,
-                vout: vout as u32,
-            });
-        }
-    }
-    let mut needed: HashSet<Outpoint> = HashSet::new();
+    let created_txids: HashSet<Hash32> = txids.iter().copied().collect();
+    let mut needed: HashSet<Outpoint> = HashSet::with_capacity(txids.len());
     for tx in &block.txdata {
         for input in &tx.input {
             if input.previous_output.is_null() {
@@ -322,7 +351,7 @@ fn apply_inner(
                 txid: hash_from_txid(&input.previous_output.txid)?,
                 vout: input.previous_output.vout,
             };
-            if created_in_block.contains(&op)
+            if created_txids.contains(&op.txid)
                 || overlay.contains_created(&op)
                 || overlay.contains_deleted(&op)
             {
@@ -345,16 +374,18 @@ fn apply_inner(
         h
     };
 
-    let mut touched_scripts: HashSet<ScriptHash> = HashSet::new();
+    let mut touched_scripts: HashSet<ScriptHash> = HashSet::with_capacity(txids.len());
     let mut undo = UndoRecord {
         height,
         block_hash,
         ..Default::default()
     };
     // script -> (received, spent, flags)
-    let mut effects: HashMap<ScriptHash, HistoryEffect> = HashMap::new();
+    let mut effects: HashMap<ScriptHash, HistoryEffect> =
+        HashMap::with_capacity(txids.len().saturating_mul(2));
     // outputs created inside this very block (for undo de-duplication)
     let mut created_here: HashMap<Outpoint, ScriptHash> = HashMap::new();
+    let mut drained: Vec<(ScriptHash, HistoryEffect)> = Vec::new();
 
     for (pos, tx) in block.txdata.iter().enumerate() {
         let txid = txids[pos];
@@ -402,7 +433,11 @@ fn apply_inner(
         // outputs
         for (vout, out) in tx.output.iter().enumerate() {
             let script = out.script_pubkey.as_bytes();
-            let script_hash = ScriptHash::from_script(script);
+            let script_hash = out_script_hashes
+                .get(pos)
+                .and_then(|v| v.get(vout))
+                .copied()
+                .unwrap_or_else(|| ScriptHash::from_script(script));
             let value_sat = out.value.to_sat();
             let e = effects.entry(script_hash).or_default();
             e.received_sat = e.received_sat.saturating_add(value_sat);
@@ -433,19 +468,20 @@ fn apply_inner(
             }
         }
 
-        let mut drained: Vec<(ScriptHash, HistoryEffect)> = effects.drain().collect();
+        drained.extend(effects.drain());
         drained.sort_by_key(|e| e.0);
-        for (script_hash, effect) in drained {
-            touched_scripts.insert(script_hash);
-            store.put_history(batch, script_hash, height, tx_pos, &effect)?;
+        for (script_hash, effect) in &drained {
+            touched_scripts.insert(*script_hash);
+            store.put_history(batch, *script_hash, height, tx_pos, effect)?;
             if store_undo {
                 undo.history.push(UndoHistory {
-                    script_hash,
+                    script_hash: *script_hash,
                     height,
                     tx_pos,
                 });
             }
         }
+        drained.clear();
 
         store.put_occurrence(batch, txid, height, tx_pos)?;
         if store_undo {

@@ -4,7 +4,7 @@
 any `scriptPubKey` in the active chain without registering wallets. Core remains
 the authority for consensus and the active chain; e-lite never invents data.
 
-> **Status: `v0.1.0-alpha.21` — experimental, no funds.**
+> **Status: `v0.1.0-alpha.22` — experimental, no funds.**
 > Test on regtest/signet/testnet4 before mainnet.
 > Electrum is plain TCP on loopback by default. Optional TLS is available on a
 > separate listener; there is no client authentication (use a firewall/VPN/Tor).
@@ -41,7 +41,8 @@ e-lite run    --network signet --manage managed \
 Electrum/Sparrow: `127.0.0.1:50001` (plain). Optional TLS: configure
 `[server] tls_listen`/`tls_cert`/`tls_key` and connect to that port with SSL.
 Status and metrics: `http://127.0.0.1:9184/status` and `/metrics`. The same
-console output is written to `<data-dir>/e-lite.log`.
+console output is written to `<data-dir>/e-lite.log`. Wallets see a dynamic
+INDEXING/READY banner; customize it with `[server] banner_file`.
 
 All tuning is available without a config file:
 

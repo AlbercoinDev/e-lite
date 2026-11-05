@@ -123,6 +123,9 @@ pub struct SupervisorConfig {
     /// Minimum wall-clock interval between prune requests. Emergency pruning
     /// on low disk bypasses this.
     pub prune_interval: Duration,
+    /// Skip normal pruning while free space is at or above this many bytes.
+    /// Emergency pruning (below `disk_low_bytes`) still runs.
+    pub prune_defer_free_bytes: Option<u64>,
 }
 
 impl Default for SupervisorConfig {
@@ -136,6 +139,7 @@ impl Default for SupervisorConfig {
             core_recent_margin: 288,
             min_gain: 288,
             prune_interval: Duration::from_secs(30),
+            prune_defer_free_bytes: None,
         }
     }
 }
@@ -285,7 +289,15 @@ impl Supervisor {
         // a minimum wall-clock interval. It runs even while Core downloads are
         // paused for disk pressure: draining the index and pruning is how we
         // recover free space. Low disk bypasses the interval (emergency prune).
-        if self.cfg.prune_enabled && input.core_pruned {
+        // With plenty of free space, normal pruning is pure I/O churn.
+        // Emergency (low-disk) pruning remains active below the threshold.
+        let defer_prune = self
+            .cfg
+            .prune_defer_free_bytes
+            .zip(input.free_bytes)
+            .map(|(threshold, free)| free >= threshold)
+            .unwrap_or(false);
+        if self.cfg.prune_enabled && input.core_pruned && !defer_prune {
             let safe = safe_prune_height(
                 input.committed_height,
                 input.readers_min,
@@ -372,6 +384,7 @@ mod tests {
             core_recent_margin: 10,
             min_gain: 5,
             prune_interval: Duration::ZERO,
+            prune_defer_free_bytes: None,
         }
     }
 
@@ -404,6 +417,22 @@ mod tests {
         assert!(s.force_disk_pause().is_empty());
         assert_eq!(s.disk_tick(Some(250)), vec![Action::ResumeDownloads]);
         assert!(!s.paused());
+    }
+
+    #[test]
+    fn prune_is_deferred_while_free_space_is_high() {
+        let mut c = cfg();
+        c.prune_defer_free_bytes = Some(500);
+        let mut s = Supervisor::new(c);
+        let mut i = input(100, 200);
+        i.core_pruneheight = 0;
+        i.free_bytes = Some(1000);
+        assert!(s.tick(&i).is_empty(), "high free space defers pruning");
+        i.free_bytes = Some(400);
+        assert!(
+            s.tick(&i).iter().any(|a| matches!(a, Action::Prune(_))),
+            "below the threshold the normal prune gate runs"
+        );
     }
 
     #[test]
