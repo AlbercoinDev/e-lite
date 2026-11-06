@@ -80,6 +80,32 @@ pub fn effective_target(addr: &str) -> Result<String, String> {
     Ok(mapped)
 }
 
+fn listener_port(addr: &str) -> Option<u16> {
+    let (_, port) = addr.trim().rsplit_once(':')?;
+    port.parse::<u16>().ok().filter(|p| *p > 0)
+}
+
+/// Onion virtual ports. Explicit `[tor] onion_port`/`onion_tls_port` win;
+/// otherwise they mirror the Electrum listener ports, so `--listen 0.0.0.0:51001`
+/// and `--tls-listen 0.0.0.0:51002` produce `:51001` and `:51002` on the onion.
+pub fn effective_onion_ports(cfg: &Config) -> (u16, Option<u16>) {
+    let plain = if cfg.tor.onion_port > 0 {
+        cfg.tor.onion_port
+    } else {
+        listener_port(&cfg.server.listen).unwrap_or(50001)
+    };
+    let tls = if cfg.tor.tls && cfg.server.tls_enabled() {
+        Some(if cfg.tor.onion_tls_port > 0 {
+            cfg.tor.onion_tls_port
+        } else {
+            listener_port(&cfg.server.tls_listen).unwrap_or(50002)
+        })
+    } else {
+        None
+    };
+    (plain, tls)
+}
+
 fn valid_onion(addr: &str) -> bool {
     let Some(name) = addr.strip_suffix(".onion") else {
         return false;
@@ -123,7 +149,18 @@ fn render_torrc(cfg: &Config, tor_dir: &Path, socks_port: u16) -> Result<String,
         tor_dir.join("data").display()
     ));
     out.push_str(&format!("SocksPort 127.0.0.1:{socks_port}\n"));
+    let (plain_port, tls_port) = effective_onion_ports(cfg);
     if cfg.tor.plain || cfg.tor.tls {
+        if cfg.tor.plain {
+            if let Some(tls_port) = tls_port {
+                if plain_port == tls_port {
+                    return Err(format!(
+                        "onion plain and TLS ports are both {plain_port}; set a different \
+                         [tor] onion_port or onion_tls_port"
+                    ));
+                }
+            }
+        }
         out.push_str(&format!(
             "HiddenServiceDir {}\n",
             tor_dir.join("onion").display()
@@ -131,14 +168,14 @@ fn render_torrc(cfg: &Config, tor_dir: &Path, socks_port: u16) -> Result<String,
         if cfg.tor.plain {
             out.push_str(&format!(
                 "HiddenServicePort {} {}\n",
-                cfg.tor.onion_port,
+                plain_port,
                 target_for(cfg, false)?
             ));
         }
-        if cfg.tor.tls && cfg.server.tls_enabled() {
+        if let Some(tls_port) = tls_port {
             out.push_str(&format!(
                 "HiddenServicePort {} {}\n",
-                cfg.tor.onion_tls_port,
+                tls_port,
                 target_for(cfg, true)?
             ));
         }
@@ -465,16 +502,17 @@ pub fn spawn(
     let torrc = render_torrc(cfg, &tor_dir, socks)?;
     let torrc_path = tor_dir.join("torrc");
     write_private(&torrc_path, torrc.as_bytes())?;
+    let (plain_port, tls_port) = effective_onion_ports(cfg);
     let target_plain = target_for(cfg, false)?;
-    let target_tls = if cfg.tor.tls && cfg.server.tls_enabled() {
+    let target_tls = if tls_port.is_some() {
         Some(target_for(cfg, true)?)
     } else {
         None
     };
     write_state(
         &tor_dir,
-        cfg.tor.onion_port,
-        target_tls.as_ref().map(|_| cfg.tor.onion_tls_port),
+        plain_port,
+        tls_port,
         &target_plain,
         target_tls.as_deref(),
         &format!("127.0.0.1:{socks}"),
@@ -575,13 +613,12 @@ fn supervise(
                             eprintln!("[e-lite] WARNING: cannot refresh TLS certificate: {e}");
                         }
                     }
+                    let (plain_port, tls_port) = effective_onion_ports(&cfg);
                     eprintln!(
-                        "[e-lite] Tor onion: {addr}:{} (plain){}",
-                        cfg.tor.onion_port,
-                        if cfg.tor.tls {
-                            format!(", :{} (tls)", cfg.tor.onion_tls_port)
-                        } else {
-                            String::new()
+                        "[e-lite] Tor onion: {addr}:{plain_port} (plain){}",
+                        match tls_port {
+                            Some(port) => format!(", :{port} (tls)"),
+                            None => String::new(),
                         }
                     );
                     announced = true;
@@ -719,14 +756,9 @@ pub fn status(cfg: &Config, chain: Chain) -> TorStatus {
     let running = pid.map(pid_alive).unwrap_or(false);
     let saved = read_state(&tor_dir);
     let has_state = saved.plain_port.is_some();
-    let plain_port = saved.plain_port.unwrap_or(cfg.tor.onion_port);
-    let tls_port = saved.tls_port.or_else(|| {
-        if !has_state && cfg.tor.tls && cfg.server.tls_enabled() {
-            Some(cfg.tor.onion_tls_port)
-        } else {
-            None
-        }
-    });
+    let (eff_plain, eff_tls) = effective_onion_ports(cfg);
+    let plain_port = saved.plain_port.unwrap_or(eff_plain);
+    let tls_port = saved.tls_port.or(if has_state { None } else { eff_tls });
     TorStatus {
         mode: cfg.tor.mode.clone(),
         binary: resolve_binary(cfg),
@@ -816,6 +848,21 @@ mod tests {
         cfg.server.listen = "127.0.0.1:50001".to_string();
         cfg.server.tls_listen = "127.0.0.1:50002".to_string();
         (cfg, dir)
+    }
+
+    #[test]
+    fn onion_ports_mirror_the_electrum_listeners_unless_overridden() {
+        let (mut cfg, dir) = temp_cfg("ports");
+        cfg.server.listen = "0.0.0.0:51001".to_string();
+        cfg.server.tls_listen = "0.0.0.0:51002".to_string();
+        assert_eq!(effective_onion_ports(&cfg), (51001, Some(51002)));
+        let text = render_torrc(&cfg, &dir, 19_050).unwrap();
+        assert!(text.contains("HiddenServicePort 51001 127.0.0.1:51001"));
+        assert!(text.contains("HiddenServicePort 51002 127.0.0.1:51002"));
+
+        cfg.tor.onion_port = 60001;
+        assert_eq!(effective_onion_ports(&cfg), (60001, Some(51002)));
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

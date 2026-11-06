@@ -1,9 +1,9 @@
 # Session handoff
 
 **Updated:** 2026-11-06
-**Latest published release:** `0.1.0-alpha.25.1`
-**Release:** https://github.com/AlbercoinDev/e-lite/releases/tag/v0.1.0-alpha.25.1
-**Main commit at handoff:** `28ff70a` (`alpha.25.1: load the bundled Tor libraries`)
+**Latest published release:** `0.1.0-alpha.25.2`
+**Release:** https://github.com/AlbercoinDev/e-lite/releases/tag/v0.1.0-alpha.25.2
+**Main commit at handoff:** `b9406ad` (`alpha.25.2: onion ports mirror the Electrum listeners`)
 
 This file is the short “where we are” for a new session. The invariants live in
 [`AGENTS.md`](../AGENTS.md) and [`PROJECT_MEMORY.md`](PROJECT_MEMORY.md); the
@@ -63,6 +63,17 @@ no repitas contexto ni rehagas decisiones ya documentadas.
   the onion setup, reset and security.
 - `docs/ROADMAP.md` contains future features/improvements. Do not present them as
   available.
+
+## Last audit/fixes (alpha.25.2)
+
+- **Onion ports mirror the listeners**: `[tor] onion_port`/`onion_tls_port`
+  default to 0 = same as `server.listen`/`server.tls_listen`, so
+  `--listen 0.0.0.0:51001 --tls-listen 0.0.0.0:51002` publishes `:51001` and
+  `:51002` on the onion instead of 50001/50002. Explicit values still win; the
+  startup log, torrc, state file, `/status` and `onion show` use the effective
+  ports.
+- Evidence: unit tests for listener mirroring/override; a manual `run` with
+  51001/51002 showed the matching onion ports.
 
 ## Last audit/fixes (alpha.25.1)
 

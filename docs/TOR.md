@@ -57,8 +57,8 @@ mode = "managed"             # managed | off
 plain = true                 # publish 50001
 tls = true                   # publish 50002
 tls_auto_cert = true         # self-signed cert if tls_cert/tls_key are empty
-onion_port = 50001
-onion_tls_port = 50002
+onion_port = 0               # 0 = same as server.listen
+onion_tls_port = 0           # 0 = same as server.tls_listen
 socks_port = 0               # 0 = 9050 if free, else 19050+
 binary = ""                  # "" = installer bundle, then `tor` in PATH
 start_timeout_seconds = 120
@@ -82,6 +82,11 @@ the onion target is automatically the loopback address (`127.0.0.1:50001` or
 `[::1]:50001`): the wildcard socket accepts loopback connections, so this is
 safe. A specific non-loopback address is refused unless you set a reachable
 loopback `target_plain`/`target_tls`.
+
+`onion_port` and `onion_tls_port` default to `0`, meaning "use the same port as
+the Electrum listener". With `--listen 0.0.0.0:51001 --tls-listen 0.0.0.0:51002`
+the onion is published as `<addr>.onion:51001` and `<addr>.onion:51002`. Set an
+explicit value to publish a different virtual port.
 
 If `[server] tls_listen` is empty and `[tor] tls = true`, the effective TLS
 listener becomes `127.0.0.1:50002`. If that port is busy, e-lite logs a warning

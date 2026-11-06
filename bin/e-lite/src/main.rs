@@ -1135,8 +1135,8 @@ TOR / ONION:
     --tor-tls / --no-tor-tls        publish the TLS Electrum port on the onion
     --tor-auto-cert / --no-tor-auto-cert
                             self-signed TLS certificate when none is configured
-    --tor-onion-port <n>    onion virtual port for plain (default 50001)
-    --tor-onion-tls-port <n> onion virtual port for TLS (default 50002)
+    --tor-onion-port <n>    onion virtual port for plain (0 = same as listen)
+    --tor-onion-tls-port <n> onion virtual port for TLS (0 = same as tls-listen)
     --tor-socks-port <n>    managed Tor SOCKS port (0 = auto)
     --tor-binary <path>     Tor binary (empty = installer bundle, then PATH)
     --tor-target-plain <addr> loopback target for the plain onion port
@@ -3848,12 +3848,8 @@ fn build_shared(
             None
         },
         onion: Mutex::new(None),
-        onion_plain_port: cfg.tor.onion_port,
-        onion_tls_port: if cfg.tor.tls && cfg.server.tls_enabled() {
-            cfg.tor.onion_tls_port
-        } else {
-            0
-        },
+        onion_plain_port: tor::effective_onion_ports(cfg).0,
+        onion_tls_port: tor::effective_onion_ports(cfg).1.unwrap_or(0),
         banner_file,
         max_clients: cfg.server.max_clients,
         state: std::sync::atomic::AtomicU8::new(state::WAITING_FOR_CORE),
@@ -4267,8 +4263,8 @@ fn cmd_status(cfg: &Config, chain: Chain, as_json: bool) -> R<()> {
         "disk_free_bytes": el_serve::disk_free_bytes(&cfg.data_dir(chain)),
         "data_dir": cfg.data_dir(chain).display().to_string(),
         "onion": tor::read_hostname(&cfg.tor_dir(chain)).unwrap_or_default(),
-        "onion_plain_port": cfg.tor.onion_port,
-        "onion_tls_port": if cfg.tor.tls { cfg.tor.onion_tls_port } else { 0 },
+        "onion_plain_port": tor::effective_onion_ports(cfg).0,
+        "onion_tls_port": tor::effective_onion_ports(cfg).1.unwrap_or(0),
         "tor_bootstrapped": false,
         "tuning": {
             "cache_mib": tuning::memory_budget(cfg).cache_start_mib,

@@ -313,11 +313,11 @@ fn d_tor_mode() -> String {
 }
 
 fn d_onion_port() -> u16 {
-    50001
+    0
 }
 
 fn d_onion_tls_port() -> u16 {
-    50002
+    0
 }
 
 fn d_tor_timeout() -> u64 {
@@ -772,10 +772,10 @@ impl Config {
         if !matches!(self.tor.mode.as_str(), "managed" | "off") {
             return Err("[tor] mode must be managed or off".to_string());
         }
-        if self.tor.onion_port == 0 || self.tor.onion_tls_port == 0 {
-            return Err("[tor] onion_port/onion_tls_port must be >= 1".to_string());
-        }
-        if self.tor.tls && self.tor.onion_tls_port == self.tor.onion_port {
+        if self.tor.onion_port > 0
+            && self.tor.onion_tls_port > 0
+            && self.tor.onion_port == self.tor.onion_tls_port
+        {
             return Err("[tor] onion_tls_port must differ from onion_port".to_string());
         }
         if self.server.max_clients == 0 {

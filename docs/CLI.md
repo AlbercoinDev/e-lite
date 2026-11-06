@@ -177,8 +177,8 @@ e-lite run --network mainnet --allow-mainnet \
 | `--tor-plain` / `--no-tor-plain` | `tor.plain` | `true` |
 | `--tor-tls` / `--no-tor-tls` | `tor.tls` | `true` |
 | `--tor-auto-cert` / `--no-tor-auto-cert` | `tor.tls_auto_cert` | `true` |
-| `--tor-onion-port <n>` | `tor.onion_port` | `50001` |
-| `--tor-onion-tls-port <n>` | `tor.onion_tls_port` | `50002` |
+| `--tor-onion-port <n>` | `tor.onion_port` | `0` (same as `server.listen`) |
+| `--tor-onion-tls-port <n>` | `tor.onion_tls_port` | `0` (same as `server.tls_listen`) |
 | `--tor-socks-port <n>` | `tor.socks_port` | `0` (9050 if free, else 19050+) |
 | `--tor-binary <path>` | `tor.binary` | installer bundle, then PATH |
 | `--tor-target-plain <addr>` | `tor.target_plain` | `server.listen` (wildcard mapped to loopback) |

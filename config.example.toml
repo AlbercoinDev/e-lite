@@ -79,8 +79,8 @@ mode = "managed"
 plain = true                        # publish the plain Electrum port (50001)
 tls = true                          # publish the TLS Electrum port (50002)
 tls_auto_cert = true                # self-signed cert when tls_cert/tls_key are empty
-onion_port = 50001                  # virtual onion port for plain
-onion_tls_port = 50002              # virtual onion port for TLS
+onion_port = 0                      # 0 = same as the plain Electrum listener
+onion_tls_port = 0                  # 0 = same as the TLS listener
 socks_port = 0                      # managed Tor SOCKS; 0 = 9050 if free, else 19050+
 binary = ""                         # "" = installer bundle, then `tor` in PATH
 start_timeout_seconds = 120

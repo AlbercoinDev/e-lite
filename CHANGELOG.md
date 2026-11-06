@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.1.0-alpha.25.2 — 2026-11-06
+
+### Patch: onion ports mirror the Electrum listeners
+
+`--listen 0.0.0.0:51001 --tls-listen 0.0.0.0:51002` still published the onion
+on the default 50001/50002 because `[tor] onion_port`/`onion_tls_port` had fixed
+defaults.
+
+- `onion_port` and `onion_tls_port` now default to **0 = same port as the
+  Electrum listener**. The example above publishes `<addr>.onion:51001` and
+  `:51002`.
+- Explicit `[tor] onion_port`/`onion_tls_port` still override the mirrored
+  ports; a collision between the two is rejected.
+- The startup log, `torrc`, persisted `tor/state`, `/status` and
+  `e-lite onion show` all use the effective ports.
+- Tests: listener mirroring (51001/51002), explicit override, and torrc
+  rendering.
+
 ## 0.1.0-alpha.25.1 — 2026-11-06
 
 ### Patch: load the bundled Tor libraries
