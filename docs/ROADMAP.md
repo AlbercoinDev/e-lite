@@ -7,7 +7,7 @@ acceptance signal that would move it to `FEATURES.md`.
 
 | Priority | Item | Why / acceptance |
 |---|---|---|
-| P1 | Authentication and rate limiting for non-loopback Electrum | Electrum has no standard client authentication; a token/basic policy or mTLS is not wallet-compatible. At minimum add per-client request budgets and document firewall/IP allowlist/VPN/Tor. TLS on a separate listener is already implemented. |
+| P3 | Wallet-compatible authentication | Electrum has no standard client authentication; a token/basic policy or mTLS is not wallet-compatible. Per-client rate limiting is implemented (alpha.28); access control still belongs to firewall/IP allowlist/VPN/Tor. |
 | P1 | Core RPC over TLS or a documented authenticated tunnel | avoids cleartext credentials on LAN/WAN. Could be native TLS or a mandatory SSH/VPN recipe with tests. |
 | P2 | Onion service packaging | publish Electrum over Tor without exposing a clearnet port. |
 | P2 | Derived `spends` index (outpoint performance) | 1.7 resolves spent outpoints on demand from script history with no extra index writes. If profiling shows it is hot, add a derived `spends` CF (outpoint → spender) with a schema/undo plan and snapshot handling; never on the hot apply path without a benchmark. |
@@ -47,7 +47,7 @@ acceptance signal that would move it to `FEATURES.md`.
 
 | Priority | Item | Why / acceptance |
 |---|---|---|
-| P1 | Systemd unit and service hardening | `Restart=always`, resource limits, no privileges; documented. |
+| P3 (optional) | Systemd unit and service hardening | **Optional, not a release blocker.** A user can request it; `Restart=always`, resource limits and no privileges, documented. |
 | P2 | Container image (Docker/Podman) | reproducible runtime, mounts for Core/index; no secrets baked in. |
 | P2 | Electrum/Sparrow matrix | scripted versions for 1.4; document known limitations. |
 | P2 | Core version matrix | test oldest supported and latest official; fail clearly. |

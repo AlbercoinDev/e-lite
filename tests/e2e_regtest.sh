@@ -79,6 +79,7 @@ curl -sf "http://127.0.0.1:$METRICS_PORT/status" >"$RUN/status.json"
 curl -sf "http://127.0.0.1:$METRICS_PORT/metrics" >"$RUN/metrics.txt"
 grep -q '"state":"READY"' "$RUN/status.json"
 grep -q 'e_lite_indexed_height' "$RUN/metrics.txt"
+grep -q 'e_lite_rate_limited_total' "$RUN/metrics.txt"
 python3 - "$RUN/status.json" <<'PY'
 import json, sys
 st = json.load(open(sys.argv[1]))
@@ -88,6 +89,8 @@ assert mem["available_mib"] > 0, mem
 assert st["tuning"]["cache_mib"] >= 128, st["tuning"]
 assert "public_servers" in st, st
 assert isinstance(st["public_servers"], list), st
+assert st["rate_limit_rps"] == 0, st  # loopback-only e2e: auto-disabled
+assert st["rate_burst"] == 300, st
 assert st["ready"] is True and st["fully_synced"] is True, st
 print("memory accounting OK:", mem["total_mib"], mem["available_mib"], "MiB")
 PY

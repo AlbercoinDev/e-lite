@@ -42,6 +42,7 @@ available**.
 | Outpoint status/subscriptions | experimental | protocol 1.7; on-demand history scan, no extra index writes |
 | Scriptpubkey methods | experimental | protocol 1.7; scripthash logic with dict results and `10001` |
 | TLS Electrum | experimental | opt-in `tls_listen`; PEM cert/key; reload on change; no client auth |
+| Rate limiting | experimental | per-client token bucket; auto for non-loopback; no client auth |
 | Silent payments BIP352 | **gate** | explicit error; no indexer |
 
 ### Electrum methods currently implemented

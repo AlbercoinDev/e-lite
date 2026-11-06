@@ -157,6 +157,8 @@ e-lite run --network mainnet --allow-mainnet \
 | Flag | TOML field | Default |
 |---|---|---|
 | `--max-clients <n>` | `server.max_clients` | `32` |
+| `--set server.rate_limit=<n>` | `server.rate_limit` | auto: `50` when non-loopback, off on loopback |
+| `--set server.rate_burst=<n>` | `server.rate_burst` | `300` |
 | `--banner-file <path>` | `server.banner_file` | built-in templates |
 | `--p2p-peers <a,b>` | `rawtx.p2p_peers` | discovered from Core |
 | `--no-p2p` | `rawtx.use_p2p=false` | enabled |

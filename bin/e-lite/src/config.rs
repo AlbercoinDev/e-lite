@@ -248,6 +248,13 @@ pub struct ServerCfg {
     pub banner_file: String,
     #[serde(default = "d_clients")]
     pub max_clients: usize,
+    /// Per-client request rate (requests/second). `None` = auto: enabled only
+    /// for non-loopback listeners. `Some(0)` disables the limiter.
+    #[serde(default)]
+    pub rate_limit: Option<u64>,
+    /// Per-client burst capacity for the rate limiter.
+    #[serde(default)]
+    pub rate_burst: Option<u64>,
 }
 
 impl ServerCfg {
@@ -265,6 +272,8 @@ impl Default for ServerCfg {
             tls_key: String::new(),
             banner_file: String::new(),
             max_clients: d_clients(),
+            rate_limit: None,
+            rate_burst: None,
         }
     }
 }
@@ -990,6 +999,23 @@ mod tests {
     #[test]
     fn prune_gain_default_is_ten_thousand_blocks() {
         assert_eq!(Config::default().pruning.min_gain_blocks, 10_000);
+    }
+
+    #[test]
+    fn rate_limit_config_is_optional() {
+        let cfg = Config::default();
+        assert_eq!(cfg.server.rate_limit, None);
+        assert_eq!(cfg.server.rate_burst, None);
+        let cfg = Config::load_with_overrides(
+            None,
+            &[
+                "server.rate_limit=0".to_string(),
+                "server.rate_burst=50".to_string(),
+            ],
+        )
+        .unwrap();
+        assert_eq!(cfg.server.rate_limit, Some(0));
+        assert_eq!(cfg.server.rate_burst, Some(50));
     }
 
     #[test]

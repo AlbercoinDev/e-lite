@@ -1,5 +1,27 @@
 # Changelog
 
+## 0.1.0-alpha.28 — 2026-11-06
+
+### Per-client Electrum rate limiting
+
+Defends a non-loopback Electrum listener from request bursts without pretending
+to authenticate wallets.
+
+- New `[server] rate_limit` (requests/second per client) and
+  `[server] rate_burst`. Absent/`None` means auto: **enabled at 50 req/s with a
+  300 burst** when any listener is non-loopback, **disabled on loopback**.
+  Explicit `0` disables it; any positive value forces it.
+- One token bucket per connection; every JSON-RPC line costs one token. When the
+  budget is exhausted the server returns `-32000 "rate limit exceeded; slow
+  down"` and keeps the connection open. Notifications still get no response.
+- The notifier (subscriptions) does not consume the bucket.
+- `/status` exposes `rate_limit_rps`, `rate_burst` and `rate_limited`;
+  `/metrics` adds `e_lite_rate_limited_total`.
+- Docs: `config.example.toml`, `CLI.md`, `FEATURES.md`, `ROADMAP.md` (systemd is
+  now explicitly optional, not a release blocker) and `AUDIT.md` (AUD-010/015).
+- Tests: token-bucket unit test, a burst over a real socket that is limited but
+  keeps the connection alive, and config parsing.
+
 ## 0.1.0-alpha.27.2 — 2026-11-06
 
 ### Patch: enable the verified mempool.space onion

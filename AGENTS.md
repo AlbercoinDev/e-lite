@@ -67,6 +67,11 @@ Never treat a version number in this file as authoritative over the code/tag.
   auto-generated self-signed certificate when none is configured. Neither
   listener authenticates clients; the onion address is the access secret. Do not
   expose them publicly without a tunnel/firewall/access plan.
+- Electrum rate limiting is a per-connection token bucket, not authentication:
+  `rate_limit` defaults to auto (enabled only when a listener is non-loopback),
+  `0` disables it, and `rate_burst` defaults to 300. Never add token/mTLS auth
+  to the Electrum listener: wallets do not support it. Access control remains
+  firewall/allowlist/VPN/Tor.
 - Public servers are not compiled into the binary: they live in the editable
   `public-servers.toml` next to `config.toml`. A first run copies the shipped
   template; a missing file means local data only (fail closed), never a hidden

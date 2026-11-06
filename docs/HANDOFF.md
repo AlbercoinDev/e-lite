@@ -1,9 +1,9 @@
 # Session handoff
 
 **Updated:** 2026-11-06
-**Latest published release:** `0.1.0-alpha.27.2`
-**Release:** https://github.com/AlbercoinDev/e-lite/releases/tag/v0.1.0-alpha.27.2
-**Main commit at handoff:** tag `v0.1.0-alpha.27.2`
+**Latest published release:** `0.1.0-alpha.28`
+**Release:** https://github.com/AlbercoinDev/e-lite/releases/tag/v0.1.0-alpha.28
+**Main commit at handoff:** tag `v0.1.0-alpha.28`
 
 This file is the short “where we are” for a new session. The invariants live in
 [`AGENTS.md`](../AGENTS.md) and [`PROJECT_MEMORY.md`](PROJECT_MEMORY.md); the
@@ -45,7 +45,9 @@ no repitas contexto ni rehagas decisiones ya documentadas.
   listeners (`0.0.0.0`/`[::]`) are mapped to loopback onion targets. The
   installer-provisioned Tor bundle is launched with `LD_LIBRARY_PATH` pointing
   at its own libraries. There is no client authentication or rate limiting;
-  treat the onion address as a secret.
+  treat the onion address as a secret. Per-client rate limiting is active by
+  default on non-loopback listeners (50 req/s, burst 300; `[server] rate_limit`
+  and `rate_burst`; `0` disables). It is not authentication.
 - Electrum 1.4–1.7 is implemented and negotiated per connection: numeric
   `server.version`, verbose `transaction.get` with block context, notification
   suppression, real `scripthash.unsubscribe`, canonical mempool status order,
@@ -73,6 +75,17 @@ no repitas contexto ni rehagas decisiones ya documentadas.
   the onion setup, reset and security.
 - `docs/ROADMAP.md` contains future features/improvements. Do not present them as
   available.
+
+## Last change (alpha.28)
+
+- **Per-client rate limiting**: one token bucket per connection; 50 req/s with
+  burst 300 on non-loopback listeners, disabled on loopback, `0` disables.
+  Exhausted requests get `-32000 "rate limit exceeded; slow down"` and the
+  connection stays open.
+- `/status` exposes `rate_limit_rps`, `rate_burst`, `rate_limited`; `/metrics`
+  adds `e_lite_rate_limited_total`.
+- No client authentication: this is defense-in-depth; firewall/allowlist/VPN/Tor
+  remain the access control. Systemd is explicitly optional in the roadmap.
 
 ## Last change (alpha.27.2)
 
@@ -381,7 +394,7 @@ kill -USR1 "$(pgrep -f 'e-lite run')"
 (`launch_core`, `pruned_ibd`, `regtest` with plain + TLS Electrum, clean
 startup/shutdown/memory assertions, `e-lite.log` presence, 1.6 and 1.7
 negotiation on the same instance, scriptpubkey/outpoint checks, outpoint
-notification, real testmempoolaccept and the Sparrow sequence with confirmed
-verbose transaction) passed on the alpha.27 code. Full signet/testnet4 acceptance
+notification, real testmempoolaccept, the rate-limit burst test and the Sparrow
+sequence with confirmed verbose transaction) passed on the alpha.28 code. Full signet/testnet4 acceptance
 is still operator-run; results belong in `docs/GETTING-STARTED.md`/release notes
 when available.

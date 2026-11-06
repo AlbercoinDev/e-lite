@@ -824,6 +824,54 @@ fn notifications_are_not_answered() {
 }
 
 #[test]
+fn rate_limit_rejects_bursts_but_keeps_the_connection() {
+    use std::io::{BufRead, BufReader, Write};
+    use std::net::{TcpListener, TcpStream};
+
+    let (fx, _script, _txid) = fixture();
+    fx.shared.clients.set_rate_limit(1, 2);
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    el_serve::start_listener_on(listener, Arc::clone(&fx.shared), None);
+
+    let sock = TcpStream::connect(addr).unwrap();
+    sock.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    let mut writer = sock.try_clone().unwrap();
+    let mut reader = BufReader::new(sock);
+    let mut write = |value: Value| {
+        writer.write_all(value.to_string().as_bytes()).unwrap();
+        writer.write_all(b"\n").unwrap();
+        writer.flush().unwrap();
+    };
+    let mut read = || {
+        let mut line = String::new();
+        reader.read_line(&mut line).unwrap();
+        serde_json::from_str::<Value>(&line).unwrap()
+    };
+
+    write(json!({"jsonrpc":"2.0","id":1,"method":"server.version","params":["test","1.4"]}));
+    assert!(read()["result"].is_array());
+
+    let mut limited = false;
+    for id in 2..=6 {
+        write(json!({"jsonrpc":"2.0","id":id,"method":"server.ping","params":[]}));
+        let response = read();
+        if response["error"]["message"]
+            .as_str()
+            .unwrap_or("")
+            .contains("rate limit")
+        {
+            limited = true;
+        }
+    }
+    assert!(limited, "burst must hit the per-client rate limit");
+    std::thread::sleep(Duration::from_millis(1100));
+    write(json!({"jsonrpc":"2.0","id":10,"method":"server.ping","params":[]}));
+    let response = read();
+    assert_eq!(response["result"], Value::Null, "{response}");
+}
+
+#[test]
 fn server_version_negotiation_and_connection_lifecycle() {
     use std::io::{BufRead, BufReader, Write};
     use std::net::{TcpListener, TcpStream};

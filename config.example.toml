@@ -60,6 +60,10 @@ poll_seconds = 10
 [server]
 listen = "127.0.0.1:50001"
 max_clients = 32
+# Per-client Electrum request budget. Absent = auto: enabled only when a
+# listener is non-loopback. 0 disables it. Burst defaults to 300.
+# rate_limit = 50                  # requests/second per client
+# rate_burst = 300                 # initial burst tokens per client
 # Optional TLS listener. Empty disables TLS; the plain listener keeps working.
 # The certificate is validated against the hostname the client connects to, so
 # a public-domain certificate only works when the wallet uses that name (use

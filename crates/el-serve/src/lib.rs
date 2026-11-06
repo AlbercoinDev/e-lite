@@ -99,6 +99,7 @@ pub struct Stats {
     pub txnum: AtomicU64,
     pub requests_total: AtomicU64,
     pub errors_total: AtomicU64,
+    pub rate_limited: AtomicU64,
     pub clients: AtomicUsize,
     pub last_block_ms: AtomicU64,
     pub notifier_runs: AtomicU64,
@@ -153,6 +154,7 @@ impl Default for Stats {
             txnum: AtomicU64::new(0),
             requests_total: AtomicU64::new(0),
             errors_total: AtomicU64::new(0),
+            rate_limited: AtomicU64::new(0),
             clients: AtomicUsize::new(0),
             last_block_ms: AtomicU64::new(0),
             notifier_runs: AtomicU64::new(0),
@@ -466,6 +468,43 @@ fn file_mtime(path: &Path) -> Option<SystemTime> {
     std::fs::metadata(path).and_then(|m| m.modified()).ok()
 }
 
+#[derive(Debug)]
+pub struct RateLimit {
+    tokens: f64,
+    capacity: f64,
+    refill_per_sec: f64,
+    last: Instant,
+}
+
+impl RateLimit {
+    fn new(capacity: u64, refill_per_sec: u64) -> Self {
+        let capacity = capacity.max(1) as f64;
+        Self {
+            tokens: capacity,
+            capacity,
+            refill_per_sec: refill_per_sec as f64,
+            last: Instant::now(),
+        }
+    }
+
+    /// `true` when the request may proceed. A zero refill rate disables the
+    /// limiter (loopback-only listeners by default).
+    fn acquire(&mut self, now: Instant) -> bool {
+        if self.refill_per_sec <= 0.0 {
+            return true;
+        }
+        let elapsed = now.saturating_duration_since(self.last).as_secs_f64();
+        self.tokens = (self.tokens + elapsed * self.refill_per_sec).min(self.capacity);
+        self.last = now;
+        if self.tokens >= 1.0 {
+            self.tokens -= 1.0;
+            true
+        } else {
+            false
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct OutpointSub {
     pub script: ScriptHash,
@@ -481,6 +520,8 @@ pub struct ClientState {
     pub spk_subs: Mutex<HashSet<ScriptHash>>,
     /// Outpoint subscriptions from `blockchain.outpoint.subscribe`.
     pub outpoints: Mutex<HashMap<(Hash32, u32), OutpointSub>>,
+    /// Per-connection request budget (rate limiting).
+    pub budget: Mutex<RateLimit>,
     pub headers: AtomicBool,
     pub last_height: AtomicU64,
     pub alive: AtomicBool,
@@ -523,11 +564,27 @@ impl ClientState {
 pub struct ClientRegistry {
     next: AtomicU64,
     clients: Mutex<HashMap<u64, Arc<ClientState>>>,
+    rate_limit_rps: AtomicU64,
+    rate_burst: AtomicU64,
 }
 
 impl ClientRegistry {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Configure the per-connection budget. A zero rate disables it.
+    pub fn set_rate_limit(&self, requests_per_sec: u64, burst: u64) {
+        self.rate_limit_rps
+            .store(requests_per_sec, Ordering::Relaxed);
+        self.rate_burst.store(burst.max(1), Ordering::Relaxed);
+    }
+
+    pub fn rate_limit(&self) -> (u64, u64) {
+        (
+            self.rate_limit_rps.load(Ordering::Relaxed),
+            self.rate_burst.load(Ordering::Relaxed),
+        )
     }
 
     pub fn register(&self, wire: Wire) -> Arc<ClientState> {
@@ -539,6 +596,10 @@ impl ClientRegistry {
             subs: Mutex::new(HashMap::new()),
             spk_subs: Mutex::new(HashSet::new()),
             outpoints: Mutex::new(HashMap::new()),
+            budget: Mutex::new(RateLimit::new(
+                self.rate_burst.load(Ordering::Relaxed),
+                self.rate_limit_rps.load(Ordering::Relaxed),
+            )),
             headers: AtomicBool::new(false),
             last_height: AtomicU64::new(0),
             alive: AtomicBool::new(true),
@@ -756,6 +817,9 @@ impl Shared {
             "max_clients": self.max_clients as u64,
             "requests_total": self.stats.requests_total.load(Ordering::Relaxed),
             "errors_total": self.stats.errors_total.load(Ordering::Relaxed),
+            "rate_limited": self.stats.rate_limited.load(Ordering::Relaxed),
+            "rate_limit_rps": self.clients.rate_limit().0,
+            "rate_burst": self.clients.rate_limit().1,
             "last_block_ms": self.stats.last_block_ms.load(Ordering::Relaxed),
             "uptime_seconds": self.stats.started.elapsed().as_secs(),
             "listen": self.listen,
@@ -2983,6 +3047,33 @@ pub fn process_line_for(
         }
     };
     let params = request.get("params").cloned().unwrap_or(json!([]));
+    let allowed = client
+        .map(|c| {
+            c.budget
+                .lock()
+                .map(|mut budget| budget.acquire(Instant::now()))
+                .unwrap_or(true)
+        })
+        .unwrap_or(true);
+    if !allowed {
+        shared.stats.rate_limited.fetch_add(1, Ordering::Relaxed);
+        shared.stats.errors_total.fetch_add(1, Ordering::Relaxed);
+        return LineOutcome {
+            response: if is_notification {
+                None
+            } else {
+                Some(json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "error": {
+                        "code": -32000,
+                        "message": "rate limit exceeded; slow down"
+                    },
+                }))
+            },
+            close: false,
+        };
+    }
     if method != "server.version" {
         if let Some(c) = client {
             c.saw_message.store(true, Ordering::SeqCst);
@@ -3241,6 +3332,12 @@ fn metrics_text(shared: &Shared) -> String {
         g("errors_total"),
     );
     line(
+        "e_lite_rate_limited_total",
+        "Requests rejected by the per-client rate limit",
+        "counter",
+        g("rate_limited"),
+    );
+    line(
         "e_lite_last_block_ms",
         "Duration of the last applied block",
         "gauge",
@@ -3355,6 +3452,22 @@ mod tests {
                 "errors": [{"txid": "aa", "error": "min relay fee not met"}]
             })
         );
+    }
+
+    #[test]
+    fn rate_limit_burst_and_refill() {
+        let start = Instant::now();
+        let mut limit = RateLimit::new(2, 1);
+        assert!(limit.acquire(start));
+        assert!(limit.acquire(start));
+        assert!(!limit.acquire(start));
+        assert!(limit.acquire(start + Duration::from_secs(1)));
+        assert!(!limit.acquire(start + Duration::from_secs(1)));
+
+        let mut disabled = RateLimit::new(1, 0);
+        for _ in 0..10 {
+            assert!(disabled.acquire(start));
+        }
     }
 
     #[test]

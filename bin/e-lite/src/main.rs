@@ -3792,6 +3792,16 @@ fn build_resolver(
     ))
 }
 
+fn effective_rate_limit(cfg: &Config) -> (u64, u64) {
+    let exposed = !is_loopback_listen(&cfg.server.listen)
+        || (cfg.server.tls_enabled() && !is_loopback_listen(&cfg.server.tls_listen));
+    let rate = cfg
+        .server
+        .rate_limit
+        .unwrap_or(if exposed { 50 } else { 0 });
+    (rate, cfg.server.rate_burst.unwrap_or(300))
+}
+
 fn build_shared(
     cfg: &Config,
     chain: Chain,
@@ -3867,6 +3877,13 @@ fn build_shared(
         lock: Arc::new(RwLock::new(())),
         stats,
     });
+    let (rate_limit, rate_burst) = effective_rate_limit(cfg);
+    shared.clients.set_rate_limit(rate_limit, rate_burst);
+    if rate_limit > 0 {
+        eprintln!(
+            "[e-lite] Electrum rate limit: {rate_limit} req/s per client, burst {rate_burst}"
+        );
+    }
     publish_memory(&shared);
     Ok(shared)
 }
@@ -4581,6 +4598,26 @@ mod tests {
         assert_eq!(format_uptime(Duration::from_millis(500)), "0.5s");
         assert_eq!(format_uptime(Duration::from_secs(59)), "59.0s");
         assert_eq!(format_uptime(Duration::from_secs(3661)), "1h 01m 01s");
+    }
+
+    #[test]
+    fn rate_limit_defaults_follow_listener_exposure() {
+        let mut cfg = Config::default();
+        assert_eq!(effective_rate_limit(&cfg), (0, 300), "loopback is off");
+
+        cfg.server.listen = "0.0.0.0:50001".to_string();
+        assert_eq!(effective_rate_limit(&cfg), (50, 300), "exposed is on");
+
+        cfg.server.rate_limit = Some(0);
+        assert_eq!(effective_rate_limit(&cfg), (0, 300), "explicit 0 disables");
+
+        cfg.server.rate_limit = Some(10);
+        cfg.server.rate_burst = Some(5);
+        assert_eq!(effective_rate_limit(&cfg), (10, 5));
+
+        let mut cfg = Config::default();
+        cfg.server.tls_listen = "0.0.0.0:50002".to_string();
+        assert_eq!(effective_rate_limit(&cfg), (50, 300), "exposed TLS on");
     }
 
     #[test]
