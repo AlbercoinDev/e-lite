@@ -3,7 +3,7 @@
 **Updated:** 2026-11-06
 **Latest published release:** `0.1.0-alpha.25.2`
 **Release:** https://github.com/AlbercoinDev/e-lite/releases/tag/v0.1.0-alpha.25.2
-**Main commit at handoff:** `b9406ad` (`alpha.25.2: onion ports mirror the Electrum listeners`)
+**Main commit at handoff:** `792f25c` (`alpha.25.2: onion ports mirror the Electrum listeners`)
 
 This file is the short “where we are” for a new session. The invariants live in
 [`AGENTS.md`](../AGENTS.md) and [`PROJECT_MEMORY.md`](PROJECT_MEMORY.md); the
