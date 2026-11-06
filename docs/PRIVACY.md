@@ -53,7 +53,7 @@ Shipped defaults (verified 2026-11-06):
 
 | Network | Default Esplora bases |
 |---|---|
-| mainnet | `https://blockstream.info/api`, `https://mempool.space/api` (mempool onion included but commented until a real-Tor e2e verifies it) |
+| mainnet | `https://blockstream.info/api`, `https://mempool.space/api`, `http://mempoolhqx4isw62xs7abwphsq7ldayuidyx2v2oethdhhj6mlo2r6ad.onion/api` (Tor; verified 2026-11-06) |
 | signet | `https://mempool.space/signet/api`, `https://blockstream.info/signet/api` |
 | testnet4 | `https://mempool.space/testnet4/api`, `https://blockstream.info/testnet4/api` |
 | regtest | none |

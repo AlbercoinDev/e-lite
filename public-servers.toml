@@ -18,18 +18,18 @@
 #   https://mempool.space/signet/api                 (signet)
 #   https://blockstream.info/testnet4/api            (testnet4)
 #   https://mempool.space/testnet4/api               (testnet4)
+#   mempool.space onion /api (Tor, block 9 hash verified and byte-identical
+#   to the clearnet response).
 
 [mainnet]
 esplora = [
     "https://blockstream.info/api",
     "https://mempool.space/api",
     # mempool.space official onion (from the mempool project's docker/backend
-    # config). Keep it commented until an e2e with a real Tor verifies the
-    # Esplora `/api` path on the onion.
-    # "http://mempoolhqx4isw62xs7abwphsq7ldayuidyx2v2oethdhhj6mlo2r6ad.onion/api",
-    # Blockstream API onion candidate. Also requires a real-Tor verification
-    # before it is enabled by default.
-    # "http://explorernuoc63nz27r73r7jvj7x4k4orrio3hu7tucrehgw7zu4ftnd2cfad.onion/api",
+    # config). Verified over Tor on 2026-11-06 with GET /api/block/<hash>/raw.
+    "http://mempoolhqx4isw62xs7abwphsq7ldayuidyx2v2oethdhhj6mlo2r6ad.onion/api",
+    # Blockstream API onion candidate did not resolve over Tor on 2026-11-06;
+    # it is intentionally not enabled.
 ]
 
 [signet]

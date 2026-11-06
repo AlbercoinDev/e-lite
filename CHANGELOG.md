@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.1.0-alpha.27.2 — 2026-11-06
+
+### Patch: enable the verified mempool.space onion
+
+Verified over Tor 0.4.9.15 on 2026-11-06: the official mempool.space onion
+returns the raw block for block 9, the double-SHA256 matches the requested hash,
+and the bytes are identical to the clearnet response.
+
+- The mempool.space onion `/api` endpoint is now enabled by default in
+  `public-servers.toml`.
+- The Blockstream API onion candidate did not resolve over Tor (SOCKS5 cannot
+  connect) and stays disabled; enabling it requires a future verification.
+- Existing `public-servers.toml` files are never rewritten, so only new/first-run
+  installs get the enabled onion; edit the file to add it manually if needed.
+
 ## 0.1.0-alpha.27.1 — 2026-11-06
 
 ### Patch: 1.7 scriptpubkey notifications

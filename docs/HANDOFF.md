@@ -1,9 +1,9 @@
 # Session handoff
 
 **Updated:** 2026-11-06
-**Latest published release:** `0.1.0-alpha.27.1`
-**Release:** https://github.com/AlbercoinDev/e-lite/releases/tag/v0.1.0-alpha.27.1
-**Main commit at handoff:** tag `v0.1.0-alpha.27.1`
+**Latest published release:** `0.1.0-alpha.27.2`
+**Release:** https://github.com/AlbercoinDev/e-lite/releases/tag/v0.1.0-alpha.27.2
+**Main commit at handoff:** tag `v0.1.0-alpha.27.2`
 
 This file is the short “where we are” for a new session. The invariants live in
 [`AGENTS.md`](../AGENTS.md) and [`PROJECT_MEMORY.md`](PROJECT_MEMORY.md); the
@@ -73,6 +73,16 @@ no repitas contexto ni rehagas decisiones ya documentadas.
   the onion setup, reset and security.
 - `docs/ROADMAP.md` contains future features/improvements. Do not present them as
   available.
+
+## Last change (alpha.27.2)
+
+- Verified the official mempool.space onion over Tor 0.4.9.15: block 9 raw bytes
+  match the requested hash and are identical to clearnet. It is now enabled in
+  the shipped `public-servers.toml`.
+- The Blockstream API onion candidate did not resolve over Tor and remains
+  disabled.
+- Existing user files are never rewritten; only first-run/new installs get the
+  enabled onion.
 
 ## Last change (alpha.27.1)
 
