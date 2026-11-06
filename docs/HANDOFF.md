@@ -3,7 +3,7 @@
 **Updated:** 2026-11-06
 **Latest published release:** `0.1.0-alpha.25.1`
 **Release:** https://github.com/AlbercoinDev/e-lite/releases/tag/v0.1.0-alpha.25.1
-**Main commit at handoff:** `60abce0` (`alpha.25.1: load the bundled Tor libraries`)
+**Main commit at handoff:** `28ff70a` (`alpha.25.1: load the bundled Tor libraries`)
 
 This file is the short “where we are” for a new session. The invariants live in
 [`AGENTS.md`](../AGENTS.md) and [`PROJECT_MEMORY.md`](PROJECT_MEMORY.md); the
