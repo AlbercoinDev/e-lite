@@ -1,9 +1,9 @@
 # Session handoff
 
 **Updated:** 2026-11-06
-**Latest published release:** `0.1.0-alpha.29.1`
-**Release:** https://github.com/AlbercoinDev/e-lite/releases/tag/v0.1.0-alpha.29.1
-**Main commit at handoff:** tag `v0.1.0-alpha.29.1`
+**Latest published release:** `0.1.0-alpha.29.2`
+**Release:** https://github.com/AlbercoinDev/e-lite/releases/tag/v0.1.0-alpha.29.2
+**Main commit at handoff:** tag `v0.1.0-alpha.29.2`
 
 This file is the short “where we are” for a new session. The invariants live in
 [`AGENTS.md`](../AGENTS.md) and [`PROJECT_MEMORY.md`](PROJECT_MEMORY.md); the
@@ -77,6 +77,14 @@ no repitas contexto ni rehagas decisiones ya documentadas.
   the onion setup, reset and security.
 - `docs/ROADMAP.md` contains future features/improvements. Do not present them as
   available.
+
+## Last change (alpha.29.2)
+
+- Readiness probes now validate `/block-height/0` against the **indexed
+  network genesis** (`run`/`serve`) or the known chain genesis (`doctor`).
+  A provider serving another network is marked unhealthy with a `genesis
+  mismatch` error and cannot open the wallet gate.
+- Tests cover the matching and mismatching genesis; no protocol/schema change.
 
 ## Last change (alpha.29.1)
 

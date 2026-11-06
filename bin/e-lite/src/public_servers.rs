@@ -52,7 +52,12 @@ pub struct ProbeOutcome {
 /// Probe the providers and wait (up to `cfg.public_servers.ready_timeout_seconds`)
 /// until at least one answers. Uses `/block-height/0`: a constant, public query
 /// that never contains wallet data.
-pub fn probe(cfg: &Config, urls: &[String], wait_for_ready: bool) -> ProbeOutcome {
+pub fn probe(
+    cfg: &Config,
+    urls: &[String],
+    wait_for_ready: bool,
+    expected_genesis: Option<&str>,
+) -> ProbeOutcome {
     if urls.is_empty() {
         return ProbeOutcome::default();
     }
@@ -88,6 +93,7 @@ pub fn probe(cfg: &Config, urls: &[String], wait_for_ready: bool) -> ProbeOutcom
             direct.as_ref(),
             allow_clearnet,
             fallback,
+            expected_genesis,
         );
         if outcome.ready || !wait_for_ready || Instant::now() >= deadline {
             if !outcome.ready && wait_for_ready {
@@ -112,6 +118,7 @@ fn probe_once(
     direct: Option<&reqwest::blocking::Client>,
     allow_clearnet: bool,
     fallback: bool,
+    expected_genesis: Option<&str>,
 ) -> ProbeOutcome {
     let mut outcome = ProbeOutcome::default();
     for url in urls {
@@ -138,6 +145,14 @@ fn probe_once(
                 let hash = body.trim();
                 if hash.len() != 64 || !hash.bytes().all(|b| b.is_ascii_hexdigit()) {
                     return Err("unexpected block-height response".to_string());
+                }
+                if let Some(expected) = expected_genesis {
+                    if !hash.eq_ignore_ascii_case(expected) {
+                        return Err(format!(
+                            "genesis mismatch: provider serves {hash}, expected {expected} \
+                             (wrong network)"
+                        ));
+                    }
                 }
                 Ok(())
             };
@@ -430,13 +445,59 @@ mod tests {
         cfg.rawtx.allow_clearnet = false;
         cfg.rawtx.tor_fallback_clearnet = true;
         cfg.public_servers.probe_timeout_seconds = 3;
-        let outcome = probe(&cfg, &[format!("http://{addr}")], false);
+        let expected = "00".repeat(32);
+        let outcome = probe(
+            &cfg,
+            &[format!("http://{addr}")],
+            false,
+            Some(expected.as_str()),
+        );
         assert!(outcome.ready, "{outcome:?}");
         assert!(outcome.statuses[0].healthy);
         assert!(
             outcome.clearnet_fallback,
             "no Tor must surface the fallback"
         );
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn probe_rejects_a_wrong_network_genesis() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = std::thread::spawn(move || {
+            let (mut sock, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 4096];
+            let _ = sock.read(&mut buf);
+            let body = "11".repeat(32);
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            sock.write_all(response.as_bytes()).unwrap();
+        });
+
+        let mut cfg = Config::default();
+        cfg.rawtx.tor_socks = None;
+        cfg.rawtx.allow_clearnet = true;
+        cfg.public_servers.probe_timeout_seconds = 3;
+        let expected = "00".repeat(32);
+        let outcome = probe(
+            &cfg,
+            &[format!("http://{addr}")],
+            false,
+            Some(expected.as_str()),
+        );
+        assert!(!outcome.ready, "{outcome:?}");
+        assert!(outcome.statuses[0]
+            .error
+            .as_deref()
+            .unwrap_or("")
+            .contains("genesis mismatch"));
         handle.join().unwrap();
     }
 

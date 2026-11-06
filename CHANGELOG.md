@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.1.0-alpha.29.2 — 2026-11-06
+
+### Patch: provider readiness checks the network genesis
+
+The readiness probe accepted any 64-hex `/block-height/0` response, so a
+provider serving a different network could pass the gate and let wallets open
+against the wrong chain.
+
+- `public_servers::probe` now receives the expected genesis (the indexed
+  `NetworkIdentity` in `run`/`serve`; the known chain genesis in `doctor` when
+  available).
+- A provider whose `/block-height/0` differs is marked unhealthy with
+  `genesis mismatch ... (wrong network)` and cannot satisfy `require_ready`.
+- Tests: healthy provider with the expected genesis and a provider returning a
+  different genesis (gate rejects it). Existing 1.4/1.6/1.7 regtest e2e remains
+  green.
+- No protocol or schema changes.
+
 ## 0.1.0-alpha.29.1 — 2026-11-06
 
 ### Patch: provider readiness and clearnet fallback

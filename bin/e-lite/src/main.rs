@@ -1229,7 +1229,8 @@ fn cmd_doctor(cfg: &Config, chain: Chain) -> R<()> {
         for url in &public.endpoints {
             println!("  esplora: {url}");
         }
-        let probe = public_servers::probe(cfg, &public.endpoints, false);
+        let expected = chain.known_genesis().map(|g| g.to_hex());
+        let probe = public_servers::probe(cfg, &public.endpoints, false, expected.as_deref());
         for status in &probe.statuses {
             println!(
                 "  probe: {} healthy={} via={} {}ms{}",
@@ -3944,7 +3945,8 @@ fn refresh_providers(shared: &Shared, cfg: &Config, wait: bool) {
     if !cfg.rawtx.enabled || !cfg.rawtx.use_esplora || shared.public_servers.is_empty() {
         return;
     }
-    let probe = public_servers::probe(cfg, &shared.public_servers, wait);
+    let expected = shared.identity().genesis.to_hex();
+    let probe = public_servers::probe(cfg, &shared.public_servers, wait, Some(expected.as_str()));
     if probe.clearnet_fallback {
         eprintln!(
             "[e-lite] WARNING: Tor is unavailable; using clearnet public providers (operator IP exposed)"
