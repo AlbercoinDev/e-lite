@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.1.0-alpha.29 — 2026-11-06
+
+### Core RPC exposure guard
+
+Core RPC is HTTP only and has no native TLS. e-lite now makes the cleartext
+LAN/WAN risk visible and enforceable.
+
+- Startup/commands warn when `rpc_url` is non-loopback: credentials cross the
+  link in clear text; use an SSH/VPN tunnel.
+- `[core] require_loopback_rpc = true` makes a non-loopback `rpc_url` a fatal
+  configuration error with instructions (SSH forward + `127.0.0.1`).
+- `doctor` prints the RPC transport (`loopback` or `non-loopback, cleartext`).
+- `/status` adds `core_rpc_loopback`.
+- Documentation: SSH tunnel recipe, config example, CLI table, privacy notes.
+- Roadmap cleanup: remove the completed rate-limit/UTXO-prefetch/Core-RPC rows;
+  systemd remains optional.
+- No change for the default loopback Core setup.
+
 ## 0.1.0-alpha.28 — 2026-11-06
 
 ### Per-client Electrum rate limiting

@@ -1,9 +1,9 @@
 # Session handoff
 
 **Updated:** 2026-11-06
-**Latest published release:** `0.1.0-alpha.28`
-**Release:** https://github.com/AlbercoinDev/e-lite/releases/tag/v0.1.0-alpha.28
-**Main commit at handoff:** tag `v0.1.0-alpha.28`
+**Latest published release:** `0.1.0-alpha.29`
+**Release:** https://github.com/AlbercoinDev/e-lite/releases/tag/v0.1.0-alpha.29
+**Main commit at handoff:** tag `v0.1.0-alpha.29`
 
 This file is the short “where we are” for a new session. The invariants live in
 [`AGENTS.md`](../AGENTS.md) and [`PROJECT_MEMORY.md`](PROJECT_MEMORY.md); the
@@ -75,6 +75,15 @@ no repitas contexto ni rehagas decisiones ya documentadas.
   the onion setup, reset and security.
 - `docs/ROADMAP.md` contains future features/improvements. Do not present them as
   available.
+
+## Last change (alpha.29)
+
+- **Core RPC exposure guard**: warning on non-loopback `rpc_url`;
+  `[core] require_loopback_rpc = true` makes it fatal; `doctor` prints the
+  transport and `/status` exposes `core_rpc_loopback`.
+- No native Core RPC TLS; the documented path is an SSH/VPN tunnel.
+- Roadmap cleanup: rate limiting, Core RPC guard and UTXO prefetch are done;
+  systemd stays optional.
 
 ## Last change (alpha.28)
 
@@ -394,7 +403,8 @@ kill -USR1 "$(pgrep -f 'e-lite run')"
 (`launch_core`, `pruned_ibd`, `regtest` with plain + TLS Electrum, clean
 startup/shutdown/memory assertions, `e-lite.log` presence, 1.6 and 1.7
 negotiation on the same instance, scriptpubkey/outpoint checks, outpoint
-notification, real testmempoolaccept, the rate-limit burst test and the Sparrow
-sequence with confirmed verbose transaction) passed on the alpha.28 code. Full signet/testnet4 acceptance
+notification, real testmempoolaccept, the rate-limit burst test, the strict
+Core RPC check and the Sparrow sequence with confirmed verbose transaction)
+passed on the alpha.29 code. Full signet/testnet4 acceptance
 is still operator-run; results belong in `docs/GETTING-STARTED.md`/release notes
 when available.

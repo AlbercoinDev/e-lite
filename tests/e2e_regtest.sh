@@ -38,6 +38,11 @@ $CLI -rpcwallet=e2e generatetoaddress 101 "$ADDR" >/dev/null
 HEIGHT=$($CLI getblockcount)
 
 COMMON=(--network regtest --core-datadir "$CORE" --core-rpc "http://127.0.0.1:$RPC_PORT" --data-dir "$DATA" --min-free-gib 1 --public-servers "$RUN/public-servers.toml")
+if "$BIN" doctor "${COMMON[@]}" --core-rpc "http://192.0.2.1:8332" \
+  --set core.require_loopback_rpc=true >/dev/null 2>&1; then
+  echo "strict Core RPC check did not reject a non-loopback endpoint" >&2
+  exit 1
+fi
 "$BIN" init "${COMMON[@]}"
 "$BIN" doctor "${COMMON[@]}" --listen "127.0.0.1:$ELECTRUM_PORT" --metrics "127.0.0.1:$METRICS_PORT" \
   --tls-listen "127.0.0.1:$TLS_PORT" --tls-cert "$TLS_DIR/cert.pem" --tls-key "$TLS_DIR/key.pem" \
@@ -91,6 +96,7 @@ assert "public_servers" in st, st
 assert isinstance(st["public_servers"], list), st
 assert st["rate_limit_rps"] == 0, st  # loopback-only e2e: auto-disabled
 assert st["rate_burst"] == 300, st
+assert st["core_rpc_loopback"] is True, st
 assert st["ready"] is True and st["fully_synced"] is True, st
 print("memory accounting OK:", mem["total_mib"], mem["available_mib"], "MiB")
 PY

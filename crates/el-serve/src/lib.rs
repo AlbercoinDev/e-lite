@@ -797,6 +797,7 @@ impl Shared {
             "indexed_height": height,
             "core_height": core_height,
             "core_headers": self.stats.core_headers.load(Ordering::Relaxed),
+            "core_rpc_loopback": self.core.is_loopback(),
             "core_verification_progress": self.stats.core_verification_bps.load(Ordering::Relaxed) as f64
                 / 10_000.0,
             "ready": sync.ready,

@@ -84,7 +84,14 @@ manage = "external"
 rpc_url = "http://127.0.0.1:38332"
 ```
 
-Maintenance only; never expose Core RPC directly to the Internet.
+Maintenance only; never expose Core RPC directly to the Internet. e-lite warns
+when `rpc_url` is non-loopback. Set `[core] require_loopback_rpc = true` to make
+that a fatal error and force the tunnel:
+
+```toml
+[core]
+require_loopback_rpc = true
+```
 
 ## Startup and shutdown
 

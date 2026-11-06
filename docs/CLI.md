@@ -38,6 +38,7 @@ version          print version
 | `--network <name>` | `auto`, `regtest`, `signet`, `testnet4`, `mainnet` |
 | `--data-dir <path>` | index directory |
 | `--core-rpc <url>` | Core RPC URL (HTTP; use SSH/VPN for WAN) |
+| `--set core.require_loopback_rpc=true` | refuse a non-loopback Core RPC endpoint |
 | `--rpc-user`, `--rpc-password`, `--cookie-file` | Core credentials |
 | `--core-datadir <path>`, `--blocks-dir <path>` | Core datadir / block files |
 | `--block-source <src>` | `auto`, `rpc`, `files` |

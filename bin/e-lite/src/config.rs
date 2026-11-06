@@ -125,6 +125,11 @@ pub struct CoreCfg {
     /// Log file for a Core process launched by e-lite.
     #[serde(default)]
     pub log_file: Option<String>,
+    /// Refuse a non-loopback `rpc_url`. Core RPC is HTTP only, so credentials
+    /// would cross LAN/WAN in cleartext; use an SSH/VPN tunnel or leave this off
+    /// and accept the warning.
+    #[serde(default)]
+    pub require_loopback_rpc: bool,
 }
 
 impl Default for CoreCfg {
@@ -144,6 +149,7 @@ impl Default for CoreCfg {
             restart: true,
             stop_on_exit: true,
             log_file: None,
+            require_loopback_rpc: false,
         }
     }
 }
@@ -1016,6 +1022,15 @@ mod tests {
         .unwrap();
         assert_eq!(cfg.server.rate_limit, Some(0));
         assert_eq!(cfg.server.rate_burst, Some(50));
+    }
+
+    #[test]
+    fn require_loopback_rpc_parses() {
+        assert!(!Config::default().core.require_loopback_rpc);
+        let cfg =
+            Config::load_with_overrides(None, &["core.require_loopback_rpc=true".to_string()])
+                .unwrap();
+        assert!(cfg.core.require_loopback_rpc);
     }
 
     #[test]

@@ -685,6 +685,20 @@ fn effective_config(args: &Args) -> R<(Config, Chain)> {
             "mainnet requires explicit opt-in: pass --allow-mainnet or set [safety] allow_mainnet = true",
         );
     }
+    let rpc_url = cfg.rpc_url(chain);
+    if !el_rpc::rpc_url_is_loopback(&rpc_url) {
+        if cfg.core.require_loopback_rpc {
+            return fail(format!(
+                "[core] require_loopback_rpc = true, but rpc_url {rpc_url} is not loopback. \
+                 Use an SSH/VPN tunnel and point rpc_url at 127.0.0.1, or disable the strict flag."
+            ));
+        }
+        eprintln!(
+            "[e-lite] WARNING: Core RPC is {rpc_url} (non-loopback) over cleartext HTTP. \
+             The user/password cross the LAN/WAN in clear text; use an SSH/VPN tunnel. \
+             Set [core] require_loopback_rpc = true to make this fatal."
+        );
+    }
     Ok((cfg, chain))
 }
 
@@ -1220,6 +1234,14 @@ fn cmd_doctor(cfg: &Config, chain: Chain) -> R<()> {
     let core = match core_client(cfg, chain) {
         Ok(c) => {
             println!("core rpc: {}", cfg.rpc_url(chain));
+            println!(
+                "core rpc transport: HTTP ({}). Core has no native TLS; use an SSH/VPN tunnel for LAN/WAN.",
+                if el_rpc::rpc_url_is_loopback(&cfg.rpc_url(chain)) {
+                    "loopback"
+                } else {
+                    "non-loopback, cleartext"
+                }
+            );
             c
         }
         Err(e) => {

@@ -11,6 +11,7 @@ available**.
 | Networks: regtest, signet, testnet4, mainnet | experimental | mainnet requires explicit opt-in |
 | Core `external`, `auto`, `managed` | experimental | only owned Core can be paused/pruned/stopped |
 | Local Core, LAN Core, WAN via SSH/VPN | experimental | RPC-only for LAN/WAN; no remote block files |
+| Core RPC exposure guard | experimental | warns on non-loopback; `require_loopback_rpc` makes it fatal; no native TLS |
 | Block source `files`, `rpc`, `auto` | experimental | files reads `blk*.dat`, XOR aware, read-only |
 | From-zero pruned IBD with `prune_mib=1` | experimental | manual prune gate; default 10k safe-block gain |
 | Full node `prune_mib=0` | experimental | no pruning |

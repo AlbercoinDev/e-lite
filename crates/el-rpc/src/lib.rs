@@ -106,6 +106,11 @@ impl CoreClient {
         })
     }
 
+    /// Whether this client is connected to a loopback RPC endpoint.
+    pub fn is_loopback(&self) -> bool {
+        is_loopback_host(&self.host)
+    }
+
     fn post(&self, body: &str) -> Result<(u16, Vec<u8>)> {
         let addr = format!("{}:{}", self.host, self.port);
         let sockaddr = addr
@@ -490,6 +495,23 @@ fn d_true() -> bool {
     true
 }
 
+/// True when the configured RPC URL points at a loopback host. Used to warn
+/// about cleartext credentials on LAN/WAN links (Core RPC has no TLS).
+pub fn rpc_url_is_loopback(url: &str) -> bool {
+    match parse_url(url, 8332) {
+        Ok((host, _)) => is_loopback_host(&host),
+        Err(_) => false,
+    }
+}
+
+fn is_loopback_host(host: &str) -> bool {
+    host == "localhost"
+        || host == "::1"
+        || host == "[::1]"
+        || host.starts_with("127.")
+        || host == "[::ffff:127.0.0.1]"
+}
+
 fn parse_url(url: &str, default_port: u16) -> Result<(String, u16)> {
     let rest = url.strip_prefix("http://").ok_or_else(|| {
         CoreError(format!(
@@ -706,6 +728,17 @@ mod tests {
         );
         assert!(parse_url("https://127.0.0.1:18443", 8332).is_err());
         assert!(parse_url("http://127.0.0.1:18443/wallet/x", 8332).is_err());
+    }
+
+    #[test]
+    fn detects_loopback_rpc_hosts() {
+        assert!(rpc_url_is_loopback("http://127.0.0.1:8332"));
+        assert!(rpc_url_is_loopback("http://127.8.9.10:8332"));
+        assert!(rpc_url_is_loopback("http://localhost:8332"));
+        assert!(rpc_url_is_loopback("http://[::1]:8332"));
+        assert!(!rpc_url_is_loopback("http://192.168.1.10:8332"));
+        assert!(!rpc_url_is_loopback("http://0.0.0.0:8332"));
+        assert!(!rpc_url_is_loopback("https://127.0.0.1:8332"));
     }
 
     #[test]

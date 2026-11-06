@@ -16,6 +16,8 @@ core_datadir = "/home/USER/.bitcoin"
 # rpc_user = ""                     # remote Core credentials
 # rpc_password = ""
 # cookie_file = ""                  # explicit cookie; overrides core_datadir
+# require_loopback_rpc = false      # true: refuse a non-loopback rpc_url
+#                                   # (Core RPC is HTTP; use SSH/VPN for LAN/WAN)
 timeout_seconds = 30
 prune_mib = 1                       # 1 = manual pruning (safe from zero); 0 = full node;
                                     # >=550 = automatic pruning, requires allow_auto_prune

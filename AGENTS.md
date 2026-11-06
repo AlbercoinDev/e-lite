@@ -93,7 +93,9 @@ Never treat a version number in this file as authoritative over the code/tag.
   the block cache in 256 MiB steps under `MemAvailable` + page-cache pressure.
   `cache_mib` is a maximum, not a lock. Before Core resumes downloads after a
   bulk pause, the cache shrinks to the live budget.
-- Core RPC is HTTP; LAN/WAN use requires SSH/VPN.
+- Core RPC is HTTP; LAN/WAN use requires SSH/VPN. e-lite warns on a non-loopback
+  `rpc_url`; `[core] require_loopback_rpc = true` makes it fatal. There is no
+  native Core RPC TLS.
 - RocksDB memory is budgeted globally (`RAM/8` for memtables within the memory
   budget, cache starts at `RAM/4` and adapts), background jobs are CPU-capped,
   and every knob is available via CLI/`--set`.

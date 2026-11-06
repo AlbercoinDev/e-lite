@@ -8,7 +8,6 @@ acceptance signal that would move it to `FEATURES.md`.
 | Priority | Item | Why / acceptance |
 |---|---|---|
 | P3 | Wallet-compatible authentication | Electrum has no standard client authentication; a token/basic policy or mTLS is not wallet-compatible. Per-client rate limiting is implemented (alpha.28); access control still belongs to firewall/IP allowlist/VPN/Tor. |
-| P1 | Core RPC over TLS or a documented authenticated tunnel | avoids cleartext credentials on LAN/WAN. Could be native TLS or a mandatory SSH/VPN recipe with tests. |
 | P2 | Onion service packaging | publish Electrum over Tor without exposing a clearnet port. |
 | P2 | Derived `spends` index (outpoint performance) | 1.7 resolves spent outpoints on demand from script history with no extra index writes. If profiling shows it is hot, add a derived `spends` CF (outpoint → spender) with a schema/undo plan and snapshot handling; never on the hot apply path without a benchmark. |
 | P2 | BIP352 silent payments | schema v2 for prevout pubkeys, in-memory scan keys, labels/notifications; never log/persist keys. |
@@ -18,7 +17,6 @@ acceptance signal that would move it to `FEATURES.md`.
 
 | Priority | Item | Why / acceptance |
 |---|---|---|
-| P1 | UTXO prefetch pipeline | prefetch next block’s prevouts into a bounded cache; overlay wins. |
 | P2 | HDD sequential mode/readahead | fewer readers in file order, `fadvise`/readahead; A/B on HDD. |
 | P2 | Adaptive controller v2 | queue-wait metrics, compaction/RocksDB signals, safer AIMD, benchmark profiles. Commit-share and CPU-capped readers are already in place. |
 | P2 | Parallel compaction/job tuning | expose/test mutable RocksDB options per profile. |
