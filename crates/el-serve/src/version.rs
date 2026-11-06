@@ -81,15 +81,23 @@ impl fmt::Display for ProtocolVersion {
 /// Lowest and highest protocol versions this build can serve.
 ///
 /// 1.4.1 only changes AuxPoW header truncation (irrelevant on Bitcoin) and
-/// 1.4.2 adds `blockchain.scripthash.unsubscribe` (implemented).  1.4.3 only
-/// adds a Namecoin method, so it is deliberately not listed.
+/// 1.4.2 adds `blockchain.scripthash.unsubscribe` (implemented). 1.6 adds the
+/// `headers` array, `mempool.get_info`, `estimatefee(mode)` and
+/// `broadcast_package`. 1.4.3 only adds a Namecoin method, so it is deliberately
+/// not listed.
 pub const SERVER_MIN: ProtocolVersion = ProtocolVersion::new(1, 4, 0);
-pub const SERVER_MAX: ProtocolVersion = ProtocolVersion::new(1, 4, 2);
+pub const V1_4_2: ProtocolVersion = ProtocolVersion::new(1, 4, 2);
+pub const V1_6: ProtocolVersion = ProtocolVersion::new(1, 6, 0);
+pub const SERVER_MAX: ProtocolVersion = V1_6;
 
-/// Implemented protocol versions, sorted ascending.  Add a version here only
+/// Implemented protocol versions, sorted ascending. Add a version here only
 /// after every method it documents is implemented and tested.
 pub const SERVER_VERSIONS: &[ProtocolVersion] =
-    &[SERVER_MIN, ProtocolVersion::new(1, 4, 1), SERVER_MAX];
+    &[SERVER_MIN, ProtocolVersion::new(1, 4, 1), V1_4_2, V1_6];
+
+/// Versions that do not require `server.version` to be the first message.
+pub const PRE_1_6_VERSIONS: &[ProtocolVersion] =
+    &[SERVER_MIN, ProtocolVersion::new(1, 4, 1), V1_4_2];
 
 #[cfg(test)]
 mod tests {
@@ -147,18 +155,18 @@ mod tests {
             ProtocolVersion::highest_available(version(1, 4, 3), SERVER_VERSIONS),
             Some(version(1, 4, 2))
         );
-        // 1.5 was skipped and 1.6 is not implemented yet: previous available.
+        // 1.5 was skipped: stay on 1.4.2 even though 1.6 exists.
         assert_eq!(
             ProtocolVersion::highest_available(version(1, 5, 0), SERVER_VERSIONS),
             Some(version(1, 4, 2))
         );
         assert_eq!(
             ProtocolVersion::highest_available(version(1, 6, 0), SERVER_VERSIONS),
-            Some(version(1, 4, 2))
+            Some(version(1, 6, 0))
         );
         assert_eq!(
             ProtocolVersion::highest_available(version(1, 7, 0), SERVER_VERSIONS),
-            Some(version(1, 4, 2))
+            Some(version(1, 6, 0))
         );
         assert_eq!(
             ProtocolVersion::highest_available(version(1, 3, 9), SERVER_VERSIONS),
@@ -170,7 +178,7 @@ mod tests {
     fn future_versions_fall_back_to_the_previous_available_one() {
         let version = ProtocolVersion::new;
         let mut available = SERVER_VERSIONS.to_vec();
-        available.push(version(1, 6, 0));
+        available.push(version(1, 7, 0));
         assert_eq!(
             ProtocolVersion::highest_available(version(1, 4, 3), &available),
             Some(version(1, 4, 2)),
@@ -186,7 +194,7 @@ mod tests {
         );
         assert_eq!(
             ProtocolVersion::highest_available(version(1, 7, 0), &available),
-            Some(version(1, 6, 0))
+            Some(version(1, 7, 0))
         );
     }
 
@@ -195,5 +203,8 @@ mod tests {
         assert!(SERVER_VERSIONS.windows(2).all(|pair| pair[0] < pair[1]));
         assert_eq!(SERVER_VERSIONS.first(), Some(&SERVER_MIN));
         assert_eq!(SERVER_VERSIONS.last(), Some(&SERVER_MAX));
+        assert!(PRE_1_6_VERSIONS.windows(2).all(|pair| pair[0] < pair[1]));
+        assert_eq!(PRE_1_6_VERSIONS.last(), Some(&V1_4_2));
+        assert!(!PRE_1_6_VERSIONS.contains(&V1_6));
     }
 }

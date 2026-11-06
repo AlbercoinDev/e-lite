@@ -1,5 +1,33 @@
 # Changelog
 
+## 0.1.0-alpha.26 — 2026-11-06
+
+### Electrum 1.6 compatibility
+
+The server now negotiates 1.4–1.6 and serves the 1.6 method shapes to clients
+that ask for 1.6. 1.4 clients keep the previous responses on the same instance.
+
+- **`blockchain.block.headers`** returns `headers` (an array of hex headers)
+  for 1.6 clients; 1.4 clients keep the concatenated `hex` string. `count`,
+  `max`, `root` and `branch` are unchanged.
+- **`server.version` first** is enforced for 1.6: if another message arrives
+  before it, negotiation is capped at 1.4.2 instead of advertising 1.6.
+- **`mempool.get_info`** returns `mempoolminfee`, `minrelaytxfee` and
+  `incrementalrelayfee` from Core.
+- **`blockchain.estimatefee(number, mode)`** accepts `unset`, `economical` or
+  `conservative`, passes the mode to Core and caches per `(target, mode)`.
+  Invalid modes are `-32602`.
+- **`blockchain.transaction.broadcast_package`** wraps Core `submitpackage`.
+  The stable response is `{"success": bool, "errors": [{"txid", "error"}]}`;
+  `verbose=true` returns Core's dictionary. Requires protocol 1.6.
+- Version negotiation still downgrades gaps (`1.4.3`, `1.5`) to `1.4.2` and
+  future versions to the newest implemented version below them.
+- Tests: 1.6 negotiation and first-message cap, headers shape per version,
+  `mempool.get_info`, fee modes and a real parent+child package broadcast in
+  `tests/e2e_electrum16.py`.
+
+1.7 remains unimplemented and is not advertised.
+
 ## 0.1.0-alpha.25.4 — 2026-11-06
 
 ### Patch: negotiate down instead of disconnecting

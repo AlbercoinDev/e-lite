@@ -193,7 +193,7 @@ fn electrum_14_fixtures() {
     );
     assert_eq!(r["result"]["hash_function"], "sha256");
     assert_eq!(r["result"]["protocol_min"], "1.4");
-    assert_eq!(r["result"]["protocol_max"], "1.4.2");
+    assert_eq!(r["result"]["protocol_max"], "1.6");
 
     let r = call(s, 3, "server.ping", json!([]));
     assert!(r["result"].is_null());
@@ -314,14 +314,22 @@ fn incompatible_protocol_is_rejected() {
 #[test]
 fn future_protocol_versions_fall_back_to_the_previous_available() {
     let (fx, _, _) = fixture();
-    for (id, requested) in ["1.4.3", "1.5", "1.6", "1.7"].into_iter().enumerate() {
+    for (id, (requested, expected)) in [
+        ("1.4.3", "1.4.2"),
+        ("1.5", "1.4.2"),
+        ("1.6", "1.6"),
+        ("1.7", "1.6"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
         let r = call(
             &fx.shared,
             id as u64,
             "server.version",
             json!(["test", requested]),
         );
-        assert_eq!(r["result"][1], "1.4.2", "{requested}: {r}");
+        assert_eq!(r["result"][1], expected, "{requested}: {r}");
     }
     let r = call(
         &fx.shared,
@@ -329,7 +337,7 @@ fn future_protocol_versions_fall_back_to_the_previous_available() {
         "server.version",
         json!(["test", ["1.5", "1.7"]]),
     );
-    assert_eq!(r["result"][1], "1.4.2", "{r}");
+    assert_eq!(r["result"][1], "1.6", "{r}");
 }
 
 #[test]
@@ -513,6 +521,20 @@ fn fee_and_mempool_methods_never_return_method_not_found() {
     assert!(r["result"].as_f64().unwrap() > 0.0, "{r}");
     let r = call(&fx.shared, 3, "mempool.get_fee_histogram", json!([]));
     assert_eq!(r["result"], json!([]), "{r}");
+    let r = call(&fx.shared, 5, "mempool.get_info", json!([]));
+    assert_ne!(
+        r["error"]["code"], -32601,
+        "mempool.get_info must be implemented: {r}"
+    );
+    let r = call(
+        &fx.shared,
+        6,
+        "blockchain.estimatefee",
+        json!([2, "economical"]),
+    );
+    assert!(r["result"].as_f64().unwrap() > 0.0, "{r}");
+    let r = call(&fx.shared, 7, "blockchain.estimatefee", json!([2, "bogus"]));
+    assert_eq!(r["error"]["code"], -32602, "{r}");
     let r = call(
         &fx.shared,
         4,
@@ -582,6 +604,36 @@ fn tls_listener_completes_handshake_and_serves() {
     let notification: Value = serde_json::from_str(&line).unwrap();
     assert_eq!(notification["method"], "e-lite.test.notification");
     assert_eq!(notification["params"], json!(["ok"]));
+}
+
+#[test]
+fn block_headers_shape_depends_on_the_negotiated_version() {
+    let (fx, _script, _txid) = fixture();
+    let v16 = el_serve::ProtocolVersion::new(1, 6, 0);
+    let r = el_serve::dispatch_for(
+        &fx.shared,
+        None,
+        v16,
+        "blockchain.block.headers",
+        &json!([0, 10]),
+    )
+    .unwrap();
+    assert_eq!(r["count"], 1);
+    assert_eq!(r["headers"].as_array().unwrap().len(), 1, "{r}");
+    assert!(r.get("hex").is_none(), "{r}");
+
+    let v14 = el_serve::ProtocolVersion::new(1, 4, 0);
+    let r = el_serve::dispatch_for(
+        &fx.shared,
+        None,
+        v14,
+        "blockchain.block.headers",
+        &json!([0, 10]),
+    )
+    .unwrap();
+    assert_eq!(r["count"], 1);
+    assert!(r["hex"].is_string(), "{r}");
+    assert!(r.get("headers").is_none(), "{r}");
 }
 
 #[test]
@@ -658,6 +710,63 @@ fn server_version_negotiation_and_connection_lifecycle() {
     );
     let response = read();
     assert_eq!(response["result"], json!(false), "{response}");
+
+    // A non-version first message caps negotiation at 1.4.2 even if the client
+    // asks for 1.6: 1.6 requires server.version to be the first message.
+    let sock3 = TcpStream::connect(addr).unwrap();
+    sock3
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    let mut writer3 = sock3.try_clone().unwrap();
+    let mut reader3 = BufReader::new(sock3);
+    writer3
+        .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"server.ping\",\"params\":[]}\n")
+        .unwrap();
+    writer3.flush().unwrap();
+    let mut line = String::new();
+    reader3.read_line(&mut line).unwrap();
+    writer3
+        .write_all(
+            b"{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"server.version\",\"params\":[\"late\",\"1.6\"]}\n",
+        )
+        .unwrap();
+    writer3.flush().unwrap();
+    line.clear();
+    reader3.read_line(&mut line).unwrap();
+    let response: Value = serde_json::from_str(&line).unwrap();
+    assert_eq!(
+        response["result"][1], "1.4.2",
+        "a late server.version must not negotiate 1.6: {response}"
+    );
+
+    // A fresh 1.6 connection gets the 1.6 headers shape.
+    let sock4 = TcpStream::connect(addr).unwrap();
+    sock4
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    let mut writer4 = sock4.try_clone().unwrap();
+    let mut reader4 = BufReader::new(sock4);
+    writer4
+        .write_all(
+            b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"server.version\",\"params\":[\"modern\",\"1.6\"]}\n",
+        )
+        .unwrap();
+    writer4.flush().unwrap();
+    let mut line = String::new();
+    reader4.read_line(&mut line).unwrap();
+    let response: Value = serde_json::from_str(&line).unwrap();
+    assert_eq!(response["result"][1], "1.6", "{response}");
+    writer4
+        .write_all(
+            b"{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"blockchain.block.headers\",\"params\":[0,2]}\n",
+        )
+        .unwrap();
+    writer4.flush().unwrap();
+    line.clear();
+    reader4.read_line(&mut line).unwrap();
+    let response: Value = serde_json::from_str(&line).unwrap();
+    assert!(response["result"]["headers"].is_array(), "{response}");
+    assert!(response["result"].get("hex").is_none(), "{response}");
 
     // A connection with no common protocol gets the error and is closed.
     let sock2 = TcpStream::connect(addr).unwrap();

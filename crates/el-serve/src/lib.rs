@@ -25,7 +25,9 @@ use std::sync::{Arc, Mutex, RwLock, RwLockReadGuard};
 use std::time::{Duration, Instant, SystemTime};
 
 mod version;
-pub use version::{ProtocolVersion, SERVER_MAX, SERVER_MIN, SERVER_VERSIONS};
+pub use version::{
+    ProtocolVersion, PRE_1_6_VERSIONS, SERVER_MAX, SERVER_MIN, SERVER_VERSIONS, V1_6,
+};
 
 /// Electrum clients ask for a script's full history. A script with millions of
 /// entries would hold the index lock for too long; keep a generous cap that
@@ -33,7 +35,10 @@ pub use version::{ProtocolVersion, SERVER_MAX, SERVER_MIN, SERVER_VERSIONS};
 pub const MAX_HISTORY_ENTRIES: usize = 100_000;
 
 pub const PROTOCOL_MIN: &str = "1.4";
-pub const PROTOCOL_MAX: &str = "1.4.2";
+pub const PROTOCOL_MAX: &str = "1.6";
+/// Fee-estimate cache key: (confirmation target, Core estimate mode).
+type FeeEstimateKey = (u32, Option<String>);
+type FeeEstimateCache = HashMap<FeeEstimateKey, (f64, Instant)>;
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const MAX_HEADERS_CHUNK: usize = 2016;
 /// Hard limit for a single Electrum JSON-RPC line. Prevents an unauthenticated
@@ -471,6 +476,10 @@ pub struct ClientState {
     pub tls: bool,
     /// Protocol version negotiated by the first `server.version` call.
     pub protocol: Mutex<Option<ProtocolVersion>>,
+    /// True once any message other than `server.version` has been seen. 1.6+
+    /// requires version negotiation to be the first message; older traffic
+    /// caps the connection at 1.4.2.
+    pub saw_message: AtomicBool,
 }
 
 impl ClientState {
@@ -522,6 +531,7 @@ impl ClientRegistry {
             alive: AtomicBool::new(true),
             tls,
             protocol: Mutex::new(None),
+            saw_message: AtomicBool::new(false),
         });
         if let Ok(mut c) = self.clients.lock() {
             c.insert(id, Arc::clone(&state));
@@ -559,7 +569,7 @@ pub struct Shared {
     pub resolver: Arc<Resolver>,
     pub mempool: Arc<RwLock<Mempool>>,
     pub relayfee: Mutex<f64>,
-    pub fee_estimates: Mutex<HashMap<u32, (f64, Instant)>>,
+    pub fee_estimates: Mutex<FeeEstimateCache>,
     pub error_log: Mutex<HashMap<String, Instant>>,
     pub clients: Arc<ClientRegistry>,
     pub readers: Arc<ReaderTracker>,
@@ -875,7 +885,7 @@ pub fn dispatch(shared: &Shared, method: &str, params: &Value) -> RpcResult<Valu
 pub fn dispatch_for(
     shared: &Shared,
     client: Option<&Arc<ClientState>>,
-    _version: ProtocolVersion,
+    version: ProtocolVersion,
     method: &str,
     params: &Value,
 ) -> RpcResult<Value> {
@@ -887,6 +897,7 @@ pub fn dispatch_for(
         "server.peers.subscribe" => Ok(json!([])),
         "server.add_peer" => Ok(json!(false)),
         "server.features" => server_features(shared),
+        "mempool.get_info" => mempool_info(shared),
         _ => {
             // Everything else reads the index: enforce a consistent tip and a
             // non-misleading state. The read lock is taken per method and is
@@ -903,7 +914,7 @@ pub fn dispatch_for(
                 }
                 "blockchain.block.headers" => {
                     let _g = read_guard(shared)?;
-                    block_headers(shared, params)
+                    block_headers(shared, params, version)
                 }
                 "blockchain.scripthash.get_history" => {
                     let _g = read_guard(shared)?;
@@ -939,6 +950,9 @@ pub fn dispatch_for(
                 "blockchain.estimatefee" => estimate_fee(shared, params),
                 "blockchain.block.stats" => block_stats(shared, params),
                 "blockchain.transaction.broadcast" => broadcast_transaction(shared, params),
+                "blockchain.transaction.broadcast_package" => {
+                    broadcast_package(shared, params, version)
+                }
                 "blockchain.silentpayments.subscribe" | "blockchain.silentpayments.unsubscribe" => {
                     silent_payments(shared, method)
                 }
@@ -1006,7 +1020,12 @@ fn server_version(params: &Value, client: Option<&Arc<ClientState>>) -> RpcResul
     let arr = params
         .as_array()
         .ok_or_else(|| RpcError::invalid("server.version expects [client, protocol]"))?;
-    let negotiated = negotiate_protocol(arr.get(1))?;
+    // 1.6 mandates that this is the first message. If the connection already
+    // sent something else, negotiate only up to 1.4.2 instead of disconnecting.
+    let allow_1_6 = client
+        .map(|c| !c.saw_message.load(Ordering::SeqCst))
+        .unwrap_or(true);
+    let negotiated = negotiate_protocol(arr.get(1), allow_1_6)?;
     if let Some(c) = client {
         let mut slot = c
             .protocol
@@ -1025,7 +1044,7 @@ fn server_version(params: &Value, client: Option<&Arc<ClientState>>) -> RpcResul
 
 /// Resolve the requested client range against the versions this build serves.
 /// A missing request means the protocol default, 1.4.
-fn negotiate_protocol(requested: Option<&Value>) -> RpcResult<ProtocolVersion> {
+fn negotiate_protocol(requested: Option<&Value>, allow_1_6: bool) -> RpcResult<ProtocolVersion> {
     let (client_min, client_max) = match requested {
         None => (SERVER_MIN, SERVER_MIN),
         Some(Value::String(value)) => {
@@ -1057,11 +1076,15 @@ fn negotiate_protocol(requested: Option<&Value>) -> RpcResult<ProtocolVersion> {
         return Err(RpcError::invalid("protocol range is inverted"));
     }
     // Deliberately lenient: a client asking for a future or skipped version
-    // (1.5, 1.6 before it is implemented, 1.7) is served the newest version we
-    // actually implement below it.  We only refuse clients that cannot speak
-    // 1.4 at all.  The negotiated version is returned, so a compliant client
-    // knows which shape to expect.
-    ProtocolVersion::highest_available(client_max, SERVER_VERSIONS).ok_or_else(|| {
+    // (1.5, 1.7) is served the newest version we actually implement below it.
+    // We only refuse clients that cannot speak 1.4 at all.  The negotiated
+    // version is returned, so a compliant client knows which shape to expect.
+    let available = if allow_1_6 {
+        SERVER_VERSIONS
+    } else {
+        PRE_1_6_VERSIONS
+    };
+    ProtocolVersion::highest_available(client_max, available).ok_or_else(|| {
         RpcError::server(format!(
             "no supported protocol at or below {client_max}; server supports \
              {PROTOCOL_MIN}-{PROTOCOL_MAX}"
@@ -1377,7 +1400,7 @@ fn block_header(shared: &Shared, params: &Value) -> RpcResult<Value> {
     }))
 }
 
-fn block_headers(shared: &Shared, params: &Value) -> RpcResult<Value> {
+fn block_headers(shared: &Shared, params: &Value, version: ProtocolVersion) -> RpcResult<Value> {
     let start = param_u32(params, 0)?;
     let count = param_u32(params, 1)?.min(MAX_HEADERS_CHUNK as u32);
     let cp_height = params
@@ -1385,7 +1408,7 @@ fn block_headers(shared: &Shared, params: &Value) -> RpcResult<Value> {
         .and_then(|a| a.get(2))
         .and_then(|v| v.as_u64())
         .unwrap_or(0);
-    let mut hexs = String::new();
+    let mut headers = Vec::new();
     let mut got = 0u32;
     for h in start..start.saturating_add(count) {
         match shared
@@ -1394,17 +1417,26 @@ fn block_headers(shared: &Shared, params: &Value) -> RpcResult<Value> {
             .map_err(|e| RpcError::server(e.to_string()))?
         {
             Some(rec) => {
-                hexs.push_str(&hex::encode(rec.header));
+                headers.push(hex::encode(rec.header));
                 got += 1;
             }
             None => break,
         }
     }
-    let mut result = json!({
-        "count": got,
-        "hex": hexs,
-        "max": MAX_HEADERS_CHUNK,
-    });
+    // 1.6 changed the response from one concatenated `hex` string to a list.
+    let mut result = if version >= V1_6 {
+        json!({
+            "count": got,
+            "headers": headers,
+            "max": MAX_HEADERS_CHUNK,
+        })
+    } else {
+        json!({
+            "count": got,
+            "hex": headers.concat(),
+            "max": MAX_HEADERS_CHUNK,
+        })
+    };
     if cp_height != 0 && got > 0 {
         let last = start + got - 1;
         let (root, branch) = checkpoint_proof(shared, last, cp_height as u32)?;
@@ -1706,6 +1738,18 @@ fn transaction_get(shared: &Shared, params: &Value) -> RpcResult<Value> {
     }
 }
 
+fn mempool_info(shared: &Shared) -> RpcResult<Value> {
+    let info = shared
+        .core
+        .mempool_info()
+        .map_err(|e| RpcError::server(format!("mempool info: {e}")))?;
+    Ok(json!({
+        "mempoolminfee": info.mempoolminfee,
+        "minrelaytxfee": info.minrelaytxfee,
+        "incrementalrelayfee": info.incrementalrelayfee,
+    }))
+}
+
 fn fee_histogram(shared: &Shared) -> RpcResult<Value> {
     let mem = shared
         .mempool
@@ -1743,12 +1787,25 @@ fn relay_fee(shared: &Shared) -> RpcResult<Value> {
 
 fn estimate_fee(shared: &Shared, params: &Value) -> RpcResult<Value> {
     let target = param_u32(params, 0)?.clamp(1, 1008);
+    let mode = params
+        .as_array()
+        .and_then(|a| a.get(1))
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    if let Some(mode) = &mode {
+        if !matches!(mode.as_str(), "unset" | "economical" | "conservative") {
+            return Err(RpcError::invalid(
+                "estimatefee mode must be unset, economical or conservative",
+            ));
+        }
+    }
+    let key = (target, mode.clone());
     {
         let cache = shared
             .fee_estimates
             .lock()
             .map_err(|_| RpcError::server("fee lock poisoned"))?;
-        if let Some((value, at)) = cache.get(&target) {
+        if let Some((value, at)) = cache.get(&key) {
             if at.elapsed() < Duration::from_secs(30) {
                 return Ok(json!(value));
             }
@@ -1756,7 +1813,7 @@ fn estimate_fee(shared: &Shared, params: &Value) -> RpcResult<Value> {
     }
 
     let mut value = None;
-    if let Ok(estimate) = shared.core.estimate_smart_fee(target) {
+    if let Ok(estimate) = shared.core.estimate_smart_fee(target, mode.as_deref()) {
         if let Some(rate) = estimate.feerate {
             if rate > 0.0 {
                 value = Some(rate);
@@ -1778,7 +1835,7 @@ fn estimate_fee(shared: &Shared, params: &Value) -> RpcResult<Value> {
         .fee_estimates
         .lock()
         .map_err(|_| RpcError::server("fee lock poisoned"))?
-        .insert(target, (value, Instant::now()));
+        .insert(key, (value, Instant::now()));
     Ok(json!(value))
 }
 
@@ -1801,6 +1858,70 @@ fn broadcast_transaction(shared: &Shared, params: &Value) -> RpcResult<Value> {
         .send_raw_transaction(hex)
         .map_err(|e| RpcError::server(e.to_string()))?;
     Ok(json!(txid))
+}
+
+fn broadcast_package(
+    shared: &Shared,
+    params: &Value,
+    version: ProtocolVersion,
+) -> RpcResult<Value> {
+    if version < V1_6 {
+        return Err(RpcError::method(
+            "blockchain.transaction.broadcast_package requires protocol 1.6",
+        ));
+    }
+    let args = params
+        .as_array()
+        .ok_or_else(|| RpcError::invalid("expected [raw_txs, verbose]"))?;
+    let raw = args
+        .first()
+        .and_then(Value::as_array)
+        .ok_or_else(|| RpcError::invalid("expected an array of raw transactions"))?;
+    let mut raw_txs = Vec::with_capacity(raw.len());
+    for tx in raw {
+        raw_txs.push(
+            tx.as_str()
+                .ok_or_else(|| RpcError::invalid("raw transactions must be hex strings"))?
+                .to_string(),
+        );
+    }
+    if raw_txs.is_empty() {
+        return Err(RpcError::invalid(
+            "broadcast_package expects a non-empty array of raw transactions",
+        ));
+    }
+    let verbose = args.get(1).and_then(Value::as_bool).unwrap_or(false);
+    let result = shared
+        .core
+        .submit_package(&raw_txs)
+        .map_err(|e| RpcError::server(format!("submitpackage: {e}")))?;
+    Ok(if verbose {
+        result
+    } else {
+        submit_package_summary(&result)
+    })
+}
+
+/// Convert Core's `submitpackage` response to the stable 1.6 shape:
+/// `{"success": bool, "errors": [{"txid", "error"}, ...]}`.
+fn submit_package_summary(core: &Value) -> Value {
+    let success = core.get("package_msg").and_then(Value::as_str) == Some("success");
+    let mut errors = Vec::new();
+    if let Some(results) = core.get("tx-results").and_then(Value::as_object) {
+        for result in results.values() {
+            if let Some(error) = result.get("error").and_then(Value::as_str) {
+                errors.push(json!({
+                    "txid": result.get("txid").cloned().unwrap_or(Value::Null),
+                    "error": error,
+                }));
+            }
+        }
+    }
+    if errors.is_empty() {
+        json!({ "success": success })
+    } else {
+        json!({ "success": success, "errors": errors })
+    }
 }
 
 fn silent_payments(shared: &Shared, method: &str) -> RpcResult<Value> {
@@ -2368,6 +2489,11 @@ pub fn process_line_for(
         }
     };
     let params = request.get("params").cloned().unwrap_or(json!([]));
+    if method != "server.version" {
+        if let Some(c) = client {
+            c.saw_message.store(true, Ordering::SeqCst);
+        }
+    }
     let version = negotiated_client_version(client);
     match dispatch_for(shared, client, version, method, &params) {
         Ok(result) => LineOutcome {
@@ -2660,17 +2786,24 @@ mod tests {
         assert!(server_version(&json!(["client", ["1.4", "1.4"]]), None).is_ok());
         assert!(server_version(&json!(["client", "1.2"]), None).is_err());
         assert!(server_version(&json!(["client", ["1.0", "1.2"]]), None).is_err());
-        // Future, skipped or not-yet-implemented versions fall back to 1.4.2.
-        for requested in ["1.4.3", "1.5", "1.6", "1.7"] {
+        // Gaps and future versions fall back to the previous available one.
+        for requested in ["1.4.3", "1.5"] {
             assert_eq!(
                 server_version(&json!(["client", requested]), None).unwrap()[1],
                 json!("1.4.2"),
-                "{requested} must fall back to the previous available version"
+                "{requested} must fall back to 1.4.2"
+            );
+        }
+        for requested in ["1.6", "1.7"] {
+            assert_eq!(
+                server_version(&json!(["client", requested]), None).unwrap()[1],
+                json!("1.6"),
+                "{requested} must negotiate the newest available version below it"
             );
         }
         assert_eq!(
             server_version(&json!(["client", ["1.5", "1.7"]]), None).unwrap()[1],
-            json!("1.4.2")
+            json!("1.6")
         );
         // An inverted range is a parameter error, not a version mismatch.
         assert_eq!(
@@ -2700,6 +2833,29 @@ mod tests {
         assert_eq!(decoded["time"], json!(0));
         assert_eq!(decoded["blocktime"], json!(0));
         assert_eq!(decoded["in_active_chain"], json!(true));
+    }
+
+    #[test]
+    fn submit_package_summary_maps_core_errors() {
+        let success = json!({
+            "package_msg": "success",
+            "tx-results": {"wtxid": {"txid": "aa"}}
+        });
+        assert_eq!(submit_package_summary(&success), json!({"success": true}));
+
+        let failure = json!({
+            "package_msg": "transaction failed",
+            "tx-results": {
+                "wtxid": {"txid": "aa", "error": "min relay fee not met"}
+            }
+        });
+        assert_eq!(
+            submit_package_summary(&failure),
+            json!({
+                "success": false,
+                "errors": [{"txid": "aa", "error": "min relay fee not met"}]
+            })
+        );
     }
 
     #[test]

@@ -1,9 +1,9 @@
 # Session handoff
 
 **Updated:** 2026-11-06
-**Latest published release:** `0.1.0-alpha.25.4`
-**Release:** https://github.com/AlbercoinDev/e-lite/releases/tag/v0.1.0-alpha.25.4
-**Main commit at handoff:** tag `v0.1.0-alpha.25.4`
+**Latest published release:** `0.1.0-alpha.26`
+**Release:** https://github.com/AlbercoinDev/e-lite/releases/tag/v0.1.0-alpha.26
+**Main commit at handoff:** tag `v0.1.0-alpha.26`
 
 This file is the short “where we are” for a new session. The invariants live in
 [`AGENTS.md`](../AGENTS.md) and [`PROJECT_MEMORY.md`](PROJECT_MEMORY.md); the
@@ -46,12 +46,14 @@ no repitas contexto ni rehagas decisiones ya documentadas.
   installer-provisioned Tor bundle is launched with `LD_LIBRARY_PATH` pointing
   at its own libraries. There is no client authentication or rate limiting;
   treat the onion address as a secret.
-- Electrum 1.4–1.4.2 is implemented and negotiated per connection: numeric
+- Electrum 1.4–1.6 is implemented and negotiated per connection: numeric
   `server.version`, verbose `transaction.get` with block context, notification
-  suppression, real `scripthash.unsubscribe` and canonical mempool status
-  order. A request for an unimplemented/skipped version falls back to the newest
-  implemented version at or below it. The next compatibility step is 1.6, then
-  1.7 (which needs an outpoint spend index).
+  suppression, real `scripthash.unsubscribe`, canonical mempool status order,
+  1.6 headers arrays, `mempool.get_info`, `estimatefee(mode)` and
+  `broadcast_package`. A request for an unimplemented/skipped version falls back
+  to the newest implemented version at or below it; 1.6 requires
+  `server.version` as the first message. The next compatibility step is 1.7
+  (which needs an outpoint spend index).
 - Core RPC is HTTP; LAN/WAN requires SSH/VPN.
 - Rawtx resolution is local Core -> validated cache -> P2P/Esplora (whole blocks,
   Tor-first via the managed Tor, decoys, verified).
@@ -69,6 +71,22 @@ no repitas contexto ni rehagas decisiones ya documentadas.
   the onion setup, reset and security.
 - `docs/ROADMAP.md` contains future features/improvements. Do not present them as
   available.
+
+## Last change (alpha.26)
+
+- **Electrum 1.6 compatibility** (AUD-042): `protocol_max = "1.6"`.
+  `blockchain.block.headers` returns `headers: []` for 1.6 clients while 1.4
+  clients keep `hex`; `server.version` must be the first message for 1.6 (a late
+  negotiation is capped at 1.4.2).
+- **`mempool.get_info`** exposes `mempoolminfee`, `minrelaytxfee` and
+  `incrementalrelayfee`.
+- **`blockchain.estimatefee(number, mode)`** passes `unset|economical|
+  conservative` to Core and caches per `(target, mode)`.
+- **`blockchain.transaction.broadcast_package`** wraps `submitpackage` with the
+  stable `{success, errors}` result; `verbose=true` returns Core's object.
+- **Tests**: real parent+child package in `tests/e2e_electrum16.py`, 1.6/1.4
+  headers on the same instance, first-message cap, fee modes and mempool info.
+- 1.7 remains unimplemented and is not advertised.
 
 ## Last change (alpha.25.4)
 
@@ -276,8 +294,8 @@ Performance/storage (P2, benchmark first):
 
 Compatibility (P2/P3):
 
-- Electrum 1.6, then 1.7 (outpoint spend index), BIP352 silent payments
-  (schema v2 needed).
+- Electrum 1.7 (outpoint spend index), BIP352 silent payments (schema v2
+  needed).
 - Systemd unit/container image.
 - ARM64/more distros.
 
@@ -314,7 +332,8 @@ kill -USR1 "$(pgrep -f 'e-lite run')"
 
 `cargo fmt --check`, clippy, workspace tests and the local regtest e2e
 (`launch_core`, `pruned_ibd`, `regtest` with plain + TLS Electrum, clean
-startup/shutdown/memory assertions, `e-lite.log` presence, 1.4.2 negotiation
-and the Sparrow sequence with confirmed verbose transaction) passed on the
-alpha.25.3 code. Full signet/testnet4 acceptance is still operator-run; results
-belong in `docs/GETTING-STARTED.md`/release notes when available.
+startup/shutdown/memory assertions, `e-lite.log` presence, 1.6 negotiation and
+headers on the same instance, and the Sparrow sequence with confirmed verbose
+transaction) passed on the alpha.26 code. Full signet/testnet4 acceptance is
+still operator-run; results belong in `docs/GETTING-STARTED.md`/release notes
+when available.

@@ -1,7 +1,7 @@
 # Code audit
 
-**Base:** `0.1.0-alpha.25.3` → published `0.1.0-alpha.25.4` · **Scope:** `bin/e-lite`, `crates/*` (26 Rust files,
-~18k lines) · **Status:** findings fixed in `0.1.0-alpha.25.4` where noted.
+**Base:** `0.1.0-alpha.25.4` → published `0.1.0-alpha.26` · **Scope:** `bin/e-lite`, `crates/*` (26 Rust files,
+~18k lines) · **Status:** findings fixed in `0.1.0-alpha.26` where noted.
 
 This audit is not a claim of formal verification. It records static checks,
 manual review areas, concrete findings and residual risks.
@@ -60,6 +60,7 @@ Additional checks performed:
 | AUD-037 | P1 | Managed Tor startup | `bin/e-lite/src/tor.rs` | The expert bundle's `tor` has no RPATH; on Debian 13.7 without `libevent-2.1.so.7` it exited 127 and e-lite retried forever, so no onion was created. | Launch Tor with `LD_LIBRARY_PATH` prepended with its own directory (inherited value preserved); print the last `tor.log` lines on unexpected exit; `doctor` runs `tor --version` with the same environment. Reproduced in a Debian 12 container (127 before, 0.4.9.15 after). |
 | AUD-038 | P1 | Onion ports | `bin/e-lite/src/tor.rs`, `bin/e-lite/src/config.rs` | `onion_port`/`onion_tls_port` defaulted to 50001/50002, so a user with `--listen 51001 --tls-listen 51002` saw the onion on 50001/50002 and connected to the wrong port. | 0 now means "same as the Electrum listener"; effective ports are used in torrc, the startup log, `tor/state`, `/status` and `onion show`; explicit overrides still work. |
 | AUD-039 | P2 | Electrum 1.4 conformance | `crates/el-serve/src/lib.rs`, `crates/el-serve/src/version.rs` | `server.version` compared versions as strings, returned the server maximum instead of the negotiated version, accepted repeated calls, never closed on incompatible ranges, and answered JSON-RPC notifications. `transaction.get(verbose)` lacked `blockhash`/`confirmations`/`time`, and `scripthash.unsubscribe` always returned `true`. | Numeric `ProtocolVersion` negotiation (1.4–1.4.2, first call only, close on no overlap), notification suppression, verbose tx decoration from the index, real unsubscribe result, `server.add_peer`, canonical mempool order. Tests in `version.rs`, `protocol.rs` and `e2e_sparrow.py`. |
+| AUD-042 | P2 | Electrum 1.6 | `crates/el-serve/src/lib.rs`, `crates/el-rpc/src/lib.rs` | 1.6 clients expect `blockchain.block.headers` to return a `headers` array, plus `mempool.get_info`, `estimatefee(mode)` and `broadcast_package`. Serving the 1.4 shape or advertising 1.6 without those methods would break clients. | Version-aware headers shape; `server.version`-first cap for 1.6 (late negotiation stays 1.4.2); Core `getmempoolinfo` mapping; fee mode with per-mode cache; `submitpackage` wrapper with stable `{success, errors}` result. Tests: 1.6 negotiation/headers, protocol unit tests, real parent+child package in `tests/e2e_electrum16.py`. |
 
 ## Residual risks and intentional limits
 
@@ -74,7 +75,7 @@ Additional checks performed:
 | AUD-016 | P3 | Code layout | `bin/e-lite/src/main.rs` still holds CLI, indexer, disk guard, metrics wiring and helpers. | `tuning`, `config`, `snapshot`, `core_supervisor` already split; further extraction is refactor-only, not required for correctness. |
 | AUD-017 | P3 | Docs drift | Historically `prune=550`, `lag 512`, snapshots and TLS claims appeared inconsistently. | Documentation rewritten in alpha.16; `AGENTS.md`/`docs/PROJECT_MEMORY.md` enforce consistency. |
 | AUD-040 | P3 | Fee estimate | `blockchain.estimatefee` returns a relayfee/mempool fallback instead of `-1` when Core has no estimate; the protocol allows `-1`. | Intentional compatibility choice: some wallets (Sparrow) treat `-1` as a send failure. Documented in `docs/FEATURES.md`; revisit if wallets handle `-1` correctly. |
-| AUD-041 | P3 | Version negotiation | The spec says to close when client and server ranges do not intersect. e-lite instead downgrades to the newest implemented version at or below the client maximum, so a client requesting `1.5`/`1.6`/`1.7` still connects on `1.4.2`. | Deliberate leniency for wallet compatibility; the negotiated version is returned so a compliant client adapts. Only a client maximum below 1.4 is refused. Tests cover the matrix; documented in `AGENTS.md`/`FEATURES.md`. |
+| AUD-041 | P3 | Version negotiation | The spec says to close when client and server ranges do not intersect. e-lite instead downgrades to the newest implemented version at or below the client maximum, so a client requesting `1.4.3`/`1.5` connects on `1.4.2` and `1.7` on `1.6`. | Deliberate leniency for wallet compatibility; the negotiated version is returned so a compliant client adapts. Only a client maximum below 1.4 is refused. Tests cover the matrix; documented in `AGENTS.md`/`FEATURES.md`. |
 
 ## Reviewed and considered correct
 

@@ -348,6 +348,11 @@ impl CoreClient {
         self.call("sendrawtransaction", serde_json::json!([tx_hex]))
     }
 
+    /// Submit a child-with-parents package (Bitcoin Core 28+).
+    pub fn submit_package(&self, raw_txs: &[String]) -> Result<serde_json::Value> {
+        self.call("submitpackage", serde_json::json!([raw_txs]))
+    }
+
     pub fn raw_mempool_verbose(&self) -> Result<std::collections::HashMap<String, MempoolEntry>> {
         self.call("getrawmempool", serde_json::json!([true]))
     }
@@ -356,8 +361,12 @@ impl CoreClient {
         self.call("getmempoolinfo", serde_json::json!([]))
     }
 
-    pub fn estimate_smart_fee(&self, target: u32) -> Result<EstimateSmartFee> {
-        self.call("estimatesmartfee", serde_json::json!([target]))
+    pub fn estimate_smart_fee(&self, target: u32, mode: Option<&str>) -> Result<EstimateSmartFee> {
+        let params = match mode {
+            Some(mode) => serde_json::json!([target, mode]),
+            None => serde_json::json!([target]),
+        };
+        self.call("estimatesmartfee", params)
     }
 
     pub fn block_stats(&self, height: u64) -> Result<serde_json::Value> {
@@ -411,6 +420,8 @@ pub struct MempoolInfo {
     pub mempoolminfee: f64,
     #[serde(default)]
     pub minrelaytxfee: f64,
+    #[serde(default)]
+    pub incrementalrelayfee: f64,
     #[serde(default)]
     pub size: u64,
 }
