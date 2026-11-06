@@ -10,7 +10,7 @@ acceptance signal that would move it to `FEATURES.md`.
 | P1 | Authentication and rate limiting for non-loopback Electrum | Electrum has no standard client authentication; a token/basic policy or mTLS is not wallet-compatible. At minimum add per-client request budgets and document firewall/IP allowlist/VPN/Tor. TLS on a separate listener is already implemented. |
 | P1 | Core RPC over TLS or a documented authenticated tunnel | avoids cleartext credentials on LAN/WAN. Could be native TLS or a mandatory SSH/VPN recipe with tests. |
 | P2 | Onion service packaging | publish Electrum over Tor without exposing a clearnet port. |
-| P2 | Electrum 1.7 | feature negotiation and new methods; only when tested against Sparrow/Electrum. |
+| P2 | Electrum 1.6 / 1.7 | 1.4–1.4.2 is implemented. 1.6 needs `headers: []`, `mempool.get_info`, `estimatefee(mode)` and `broadcast_package`; 1.7 needs `scriptpubkey.*`, outpoint subscriptions (new `spends` index), `testmempoolaccept`, `mempool.recent` and the new `server.ping`. Only advertise a version after all its methods pass the wallet matrix. |
 | P2 | BIP352 silent payments | schema v2 for prevout pubkeys, in-memory scan keys, labels/notifications; never log/persist keys. |
 | P3 | ARM64 builds and more distros | release artifacts + CI. |
 

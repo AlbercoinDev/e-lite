@@ -104,8 +104,13 @@ impl Mempool {
     }
 
     /// Unconfirmed transactions touching `script`: (txid, fee, electrum height).
+    ///
+    /// The order is the canonical Electrum status order: `(-height, txid)`, so
+    /// height 0 (all inputs confirmed) comes before height -1 (unconfirmed
+    /// parent), then by txid.  The status hash and `get_mempool` must agree.
     pub fn history(&self, script: ScriptHash) -> Vec<(Hash32, u64, i32)> {
-        self.by_script
+        let mut out: Vec<(Hash32, u64, i32)> = self
+            .by_script
             .get(&script)
             .map(|v| {
                 v.iter()
@@ -116,7 +121,9 @@ impl Mempool {
                     })
                     .collect()
             })
-            .unwrap_or_default()
+            .unwrap_or_default();
+        out.sort_by(|a, b| b.2.cmp(&a.2).then_with(|| a.0.cmp(&b.0)));
+        out
     }
 
     /// Net unconfirmed balance change for `script` (received - spent).
@@ -404,6 +411,28 @@ mod tests {
             outputs: Vec::new(),
             height,
         }
+    }
+
+    #[test]
+    fn history_orders_mempool_by_height_then_txid() {
+        let script = ScriptHash::from_script(b"order");
+        let tx0a = Hash32([0x0a; 32]);
+        let tx0b = Hash32([0x0b; 32]);
+        let txm1 = Hash32([0x01; 32]);
+
+        let mut mem = Mempool::new();
+        mem.txs.insert(txm1, fake_tx(txm1, &[script], -1));
+        mem.txs.insert(tx0a, fake_tx(tx0a, &[script], 0));
+        mem.txs.insert(tx0b, fake_tx(tx0b, &[script], 0));
+        // Deliberately out of order: `history` must canonicalise it.
+        mem.by_script.insert(script, vec![txm1, tx0a, tx0b]);
+
+        let order: Vec<Hash32> = mem
+            .history(script)
+            .into_iter()
+            .map(|(txid, _, _)| txid)
+            .collect();
+        assert_eq!(order, vec![tx0a, tx0b, txm1]);
     }
 
     #[test]

@@ -155,6 +155,17 @@ while time.time() < deadline:
 assert bal2["confirmed"] > 0 and bal2["unconfirmed"] == 0, bal2
 print("confirmed after mine:", hit[0]["height"], bal2)
 
+# Verbose lookup after confirmation must carry chain context (blockhash,
+# confirmations, time) so wallets do not show the tx as unconfirmed.
+vtx_confirmed = call(23, "blockchain.transaction.get", [txid, True])
+assert vtx_confirmed["confirmations"] >= 1, vtx_confirmed
+assert vtx_confirmed["blockhash"] == cli("getblockhash", str(hit[0]["height"])), vtx_confirmed
+assert vtx_confirmed["hex"] == signed, "verbose hex must match the broadcast transaction"
+assert vtx_confirmed["time"] > 0, vtx_confirmed
+assert vtx_confirmed["blocktime"] == vtx_confirmed["time"], vtx_confirmed
+assert vtx_confirmed["in_active_chain"] is True, vtx_confirmed
+print("verbose confirmed tx OK")
+
 # --- transaction merkle proof must reach the block's merkle root ---
 import hashlib
 

@@ -6,6 +6,7 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+bitcoin.workspace = true
 el-model = { path = "../el-model" }
 el-store = { path = "../el-store" }
 el-rpc = { path = "../el-rpc" }
@@ -19,5 +20,4 @@ hex.workspace = true
 rustls.workspace = true
 
 [dev-dependencies]
-bitcoin.workspace = true
 filetime.workspace = true

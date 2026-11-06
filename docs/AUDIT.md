@@ -1,7 +1,7 @@
 # Code audit
 
-**Base:** `0.1.0-alpha.25.1` → published `0.1.0-alpha.25.2` · **Scope:** `bin/e-lite`, `crates/*` (25 Rust files,
-~18k lines) · **Status:** findings fixed in `0.1.0-alpha.25.2` where noted.
+**Base:** `0.1.0-alpha.25.2` → published `0.1.0-alpha.25.3` · **Scope:** `bin/e-lite`, `crates/*` (26 Rust files,
+~18k lines) · **Status:** findings fixed in `0.1.0-alpha.25.3` where noted.
 
 This audit is not a claim of formal verification. It records static checks,
 manual review areas, concrete findings and residual risks.
@@ -59,6 +59,7 @@ Additional checks performed:
 | AUD-036 | P1 | Onion with wildcard listener | `bin/e-lite/src/tor.rs` | Binding Electrum to `0.0.0.0` (a common LAN setup) made the onion refuse to publish (`non-loopback target`), so users saw no onion address. | Wildcard listeners are mapped to loopback targets (`0.0.0.0`→`127.0.0.1`, `[::]`→`[::1]`); explicit `target_plain`/`target_tls` overrides; effective ports/targets persisted in `tor/state` for accurate `onion show`. |
 | AUD-037 | P1 | Managed Tor startup | `bin/e-lite/src/tor.rs` | The expert bundle's `tor` has no RPATH; on Debian 13.7 without `libevent-2.1.so.7` it exited 127 and e-lite retried forever, so no onion was created. | Launch Tor with `LD_LIBRARY_PATH` prepended with its own directory (inherited value preserved); print the last `tor.log` lines on unexpected exit; `doctor` runs `tor --version` with the same environment. Reproduced in a Debian 12 container (127 before, 0.4.9.15 after). |
 | AUD-038 | P1 | Onion ports | `bin/e-lite/src/tor.rs`, `bin/e-lite/src/config.rs` | `onion_port`/`onion_tls_port` defaulted to 50001/50002, so a user with `--listen 51001 --tls-listen 51002` saw the onion on 50001/50002 and connected to the wrong port. | 0 now means "same as the Electrum listener"; effective ports are used in torrc, the startup log, `tor/state`, `/status` and `onion show`; explicit overrides still work. |
+| AUD-039 | P2 | Electrum 1.4 conformance | `crates/el-serve/src/lib.rs`, `crates/el-serve/src/version.rs` | `server.version` compared versions as strings, returned the server maximum instead of the negotiated version, accepted repeated calls, never closed on incompatible ranges, and answered JSON-RPC notifications. `transaction.get(verbose)` lacked `blockhash`/`confirmations`/`time`, and `scripthash.unsubscribe` always returned `true`. | Numeric `ProtocolVersion` negotiation (1.4–1.4.2, first call only, close on no overlap), notification suppression, verbose tx decoration from the index, real unsubscribe result, `server.add_peer`, canonical mempool order. Tests in `version.rs`, `protocol.rs` and `e2e_sparrow.py`. |
 
 ## Residual risks and intentional limits
 
@@ -72,6 +73,7 @@ Additional checks performed:
 | AUD-015 | P2 | Electrum concurrency | One OS thread per client; no per-client token bucket. | `max_clients`, read/write timeouts, 1 MiB request cap. |
 | AUD-016 | P3 | Code layout | `bin/e-lite/src/main.rs` still holds CLI, indexer, disk guard, metrics wiring and helpers. | `tuning`, `config`, `snapshot`, `core_supervisor` already split; further extraction is refactor-only, not required for correctness. |
 | AUD-017 | P3 | Docs drift | Historically `prune=550`, `lag 512`, snapshots and TLS claims appeared inconsistently. | Documentation rewritten in alpha.16; `AGENTS.md`/`docs/PROJECT_MEMORY.md` enforce consistency. |
+| AUD-040 | P3 | Fee estimate | `blockchain.estimatefee` returns a relayfee/mempool fallback instead of `-1` when Core has no estimate; the protocol allows `-1`. | Intentional compatibility choice: some wallets (Sparrow) treat `-1` as a send failure. Documented in `docs/FEATURES.md`; revisit if wallets handle `-1` correctly. |
 
 ## Reviewed and considered correct
 

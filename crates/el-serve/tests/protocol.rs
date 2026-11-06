@@ -192,7 +192,8 @@ fn electrum_14_fixtures() {
         Chain::Regtest.known_genesis().unwrap().to_hex()
     );
     assert_eq!(r["result"]["hash_function"], "sha256");
-    assert_eq!(r["result"]["protocol_max"], "1.4");
+    assert_eq!(r["result"]["protocol_min"], "1.4");
+    assert_eq!(r["result"]["protocol_max"], "1.4.2");
 
     let r = call(s, 3, "server.ping", json!([]));
     assert!(r["result"].is_null());
@@ -256,6 +257,9 @@ fn electrum_14_fixtures() {
 
     let r = call(s, 14, "does.not.exist", json!([]));
     assert_eq!(r["error"]["code"], -32601);
+
+    let r = call(s, 15, "server.add_peer", json!([{}]));
+    assert_eq!(r["result"], json!(false), "{r}");
 }
 
 #[test]
@@ -557,4 +561,103 @@ fn tls_listener_completes_handshake_and_serves() {
     let notification: Value = serde_json::from_str(&line).unwrap();
     assert_eq!(notification["method"], "e-lite.test.notification");
     assert_eq!(notification["params"], json!(["ok"]));
+}
+
+#[test]
+fn notifications_are_not_answered() {
+    let (fx, _script, _txid) = fixture();
+    let outcome = el_serve::process_line_for(
+        &fx.shared,
+        None,
+        r#"{"jsonrpc":"2.0","method":"server.ping","params":[]}"#,
+    );
+    assert!(
+        outcome.response.is_none(),
+        "notification must not be answered"
+    );
+    assert!(!outcome.close);
+
+    let outcome = el_serve::process_line_for(
+        &fx.shared,
+        None,
+        r#"{"jsonrpc":"2.0","id":1,"method":"server.ping","params":[]}"#,
+    );
+    assert_eq!(outcome.response.unwrap()["result"], Value::Null);
+}
+
+#[test]
+fn server_version_negotiation_and_connection_lifecycle() {
+    use std::io::{BufRead, BufReader, Write};
+    use std::net::{TcpListener, TcpStream};
+
+    let (fx, script, _txid) = fixture();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    el_serve::start_listener_on(listener, Arc::clone(&fx.shared), None);
+
+    let sock = TcpStream::connect(addr).unwrap();
+    sock.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    let mut writer = sock.try_clone().unwrap();
+    let mut reader = BufReader::new(sock);
+
+    let mut send = |value: Value| {
+        writer.write_all(value.to_string().as_bytes()).unwrap();
+        writer.write_all(b"\n").unwrap();
+        writer.flush().unwrap();
+    };
+    let mut read = || {
+        let mut line = String::new();
+        reader.read_line(&mut line).unwrap();
+        serde_json::from_str::<Value>(&line).unwrap()
+    };
+
+    send(
+        json!({"jsonrpc":"2.0","id":1,"method":"server.version","params":["test",["1.4","1.4.2"]]}),
+    );
+    let response = read();
+    assert_eq!(response["result"][1], "1.4.2", "{response}");
+
+    send(json!({"jsonrpc":"2.0","id":2,"method":"server.version","params":["test","1.4"]}));
+    let response = read();
+    assert_eq!(response["error"]["code"], -32600, "{response}");
+
+    let sh = script.to_electrum_hex();
+    send(json!({"jsonrpc":"2.0","id":3,"method":"blockchain.scripthash.subscribe","params":[sh]}));
+    let response = read();
+    assert!(response["result"].is_string(), "{response}");
+
+    send(
+        json!({"jsonrpc":"2.0","id":4,"method":"blockchain.scripthash.unsubscribe","params":[sh]}),
+    );
+    let response = read();
+    assert_eq!(response["result"], json!(true), "{response}");
+
+    send(
+        json!({"jsonrpc":"2.0","id":5,"method":"blockchain.scripthash.unsubscribe","params":[sh]}),
+    );
+    let response = read();
+    assert_eq!(response["result"], json!(false), "{response}");
+
+    // A connection with no common protocol gets the error and is closed.
+    let sock2 = TcpStream::connect(addr).unwrap();
+    sock2
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    let mut writer2 = sock2.try_clone().unwrap();
+    let mut reader2 = BufReader::new(sock2);
+    writer2
+        .write_all(br#"{"jsonrpc":"2.0","id":1,"method":"server.version","params":["old","1.2"]}"#)
+        .unwrap();
+    writer2.write_all(b"\n").unwrap();
+    writer2.flush().unwrap();
+    let mut line = String::new();
+    reader2.read_line(&mut line).unwrap();
+    let response: Value = serde_json::from_str(&line).unwrap();
+    assert_eq!(response["error"]["code"], -32000, "{response}");
+    line.clear();
+    assert_eq!(
+        reader2.read_line(&mut line).unwrap(),
+        0,
+        "server must close after a fatal version mismatch"
+    );
 }

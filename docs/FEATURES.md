@@ -37,14 +37,14 @@ available**.
 | Block stats | experimental | local |
 | Broadcast | experimental | via Core |
 | Raw transaction get | experimental | local Core -> cache -> P2P/Esplora |
-| Electrum 1.4 negotiation | experimental | 1.7 not implemented |
+| Electrum 1.4 negotiation | experimental | negotiates 1.4–1.4.2 numerically; 1.6/1.7 not implemented |
 | TLS Electrum | experimental | opt-in `tls_listen`; PEM cert/key; reload on change; no client auth |
 | Silent payments BIP352 | **gate** | explicit error; no indexer |
 
 ### Electrum methods currently implemented
 
 `server.version`, `server.features`, `server.ping`, `server.banner`,
-`server.donation_address`, `server.peers.subscribe`,
+`server.donation_address`, `server.peers.subscribe`, `server.add_peer`,
 `blockchain.headers.subscribe`, `blockchain.block.header`,
 `blockchain.block.headers`, `blockchain.scripthash.get_history`,
 `blockchain.scripthash.get_balance`, `blockchain.scripthash.listunspent`,
@@ -96,7 +96,7 @@ available**.
 |---|---|
 | Debian 12+/LMDE 6+, x86_64 | supported |
 | Bitcoin Core 28+ | supported; tested with 32.x |
-| Electrum protocol 1.4 | supported |
+| Electrum protocol 1.4–1.4.2 | supported |
 | Electrum/Sparrow wallets | tested on regtest; broader matrix pending |
 | ARM64 | not published |
 | Windows/macOS | not supported |

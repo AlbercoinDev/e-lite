@@ -1,5 +1,35 @@
 # Changelog
 
+## 0.1.0-alpha.25.3 — 2026-11-06
+
+### Patch: Electrum 1.4 protocol conformance
+
+Finishes the 1.4 surface before starting 1.6/1.7. No schema, config or index
+changes; existing wallets keep working and negotiate the same version.
+
+- **`server.version` negotiation**: versions are parsed numerically (`1.4`,
+  `1.4.2`, …), the server advertises and returns the negotiated version, only
+  the first call on a connection is accepted, extra arguments are tolerated, and
+  a client with no common version receives the error and is disconnected.
+- **`server.features`** now advertises `protocol_min = "1.4"` and
+  `protocol_max = "1.4.2"` (1.4.2 adds `scripthash.unsubscribe`, already
+  implemented; 1.4.3 is Namecoin-only and is not advertised).
+- **`blockchain.transaction.get(txid, true)`**: confirmed transactions now carry
+  `hex`, `blockhash`, `confirmations`, `time`, `blocktime` and
+  `in_active_chain`, which Core's `decoderawtransaction` does not provide.
+  Mempool responses are normalised with `confirmations: 0`.
+- **JSON-RPC notifications**: a request without `id` is executed without
+  sending a response (required by 1.7 `server.ping` compatibility and correct
+  JSON-RPC behaviour).
+- **`blockchain.scripthash.unsubscribe`** returns `true` only if the scripthash
+  was subscribed; a second call returns `false`.
+- **`server.add_peer`** returns `false` instead of `method not found`.
+- **Mempool order**: history, `get_mempool` and the status hash use the
+  canonical `(-height, txid)` order, so the status is deterministic before 1.6.
+- **Tests**: version negotiation/close, notification handling, unsubscribe,
+  verbose transaction decoration, canonical mempool order, and the Sparrow e2e
+  now checks the confirmed verbose fields.
+
 ## 0.1.0-alpha.25.2 — 2026-11-06
 
 ### Patch: onion ports mirror the Electrum listeners

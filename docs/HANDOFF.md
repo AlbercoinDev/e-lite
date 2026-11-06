@@ -1,9 +1,9 @@
 # Session handoff
 
 **Updated:** 2026-11-06
-**Latest published release:** `0.1.0-alpha.25.2`
-**Release:** https://github.com/AlbercoinDev/e-lite/releases/tag/v0.1.0-alpha.25.2
-**Main commit at handoff:** `792f25c` (`alpha.25.2: onion ports mirror the Electrum listeners`)
+**Latest published release:** `0.1.0-alpha.25.3`
+**Release:** https://github.com/AlbercoinDev/e-lite/releases/tag/v0.1.0-alpha.25.3
+**Main commit at handoff:** `93387f0` (`alpha.25.3: finish Electrum 1.4.2 conformance`)
 
 This file is the short “where we are” for a new session. The invariants live in
 [`AGENTS.md`](../AGENTS.md) and [`PROJECT_MEMORY.md`](PROJECT_MEMORY.md); the
@@ -46,6 +46,11 @@ no repitas contexto ni rehagas decisiones ya documentadas.
   installer-provisioned Tor bundle is launched with `LD_LIBRARY_PATH` pointing
   at its own libraries. There is no client authentication or rate limiting;
   treat the onion address as a secret.
+- Electrum 1.4–1.4.2 is implemented and negotiated per connection: numeric
+  `server.version`, verbose `transaction.get` with block context, notification
+  suppression, real `scripthash.unsubscribe` and canonical mempool status
+  order. The next compatibility step is 1.6, then 1.7 (which needs an outpoint
+  spend index).
 - Core RPC is HTTP; LAN/WAN requires SSH/VPN.
 - Rawtx resolution is local Core -> validated cache -> P2P/Esplora (whole blocks,
   Tor-first via the managed Tor, decoys, verified).
@@ -63,6 +68,25 @@ no repitas contexto ni rehagas decisiones ya documentadas.
   the onion setup, reset and security.
 - `docs/ROADMAP.md` contains future features/improvements. Do not present them as
   available.
+
+## Last change (alpha.25.3)
+
+- **Electrum 1.4 conformance** (AUD-039): numeric version negotiation
+  (`1.4`–`1.4.2`), first `server.version` only, close on incompatible ranges,
+  and `server.features` advertises the new range.
+- **Verbose transactions**: `blockchain.transaction.get(txid, true)` on a
+  confirmed transaction now includes `hex`, `blockhash`, `confirmations`,
+  `time`, `blocktime` and `in_active_chain`; mempool responses carry
+  `confirmations: 0`.
+- **JSON-RPC notifications** are not answered; `scripthash.unsubscribe` returns
+  the real boolean; `server.add_peer` returns `false`.
+- **Mempool status order** is canonical `(-height, txid)` and deterministic.
+- No schema, config or index changes. 1.6/1.7 remain unimplemented and are not
+  advertised.
+
+Evidence: `docs/AUDIT.md` (AUD-039), `CHANGELOG.md`, `cargo test --workspace`,
+`tests/e2e_regtest.sh` (plain + TLS + Sparrow sequence with confirmed verbose
+transaction).
 
 ## Last audit/fixes (alpha.25.2)
 
@@ -240,7 +264,8 @@ Performance/storage (P2, benchmark first):
 
 Compatibility (P2/P3):
 
-- Electrum 1.7, BIP352 silent payments (schema v2 needed).
+- Electrum 1.6, then 1.7 (outpoint spend index), BIP352 silent payments
+  (schema v2 needed).
 - Systemd unit/container image.
 - ARM64/more distros.
 
@@ -277,7 +302,7 @@ kill -USR1 "$(pgrep -f 'e-lite run')"
 
 `cargo fmt --check`, clippy, workspace tests and the local regtest e2e
 (`launch_core`, `pruned_ibd`, `regtest` with plain + TLS Electrum, clean
-startup/shutdown/memory assertions, `e-lite.log` presence and milestone checks)
-passed on the alpha.23 code. Release artifacts and `SHA256SUMS` for alpha.23
-were verified. Full signet/testnet4 acceptance is still operator-run; results
+startup/shutdown/memory assertions, `e-lite.log` presence, 1.4.2 negotiation
+and the Sparrow sequence with confirmed verbose transaction) passed on the
+alpha.25.3 code. Full signet/testnet4 acceptance is still operator-run; results
 belong in `docs/GETTING-STARTED.md`/release notes when available.

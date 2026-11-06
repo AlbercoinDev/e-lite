@@ -7,7 +7,7 @@
 
 use el_chain::ReaderTracker;
 use el_mempool::Mempool;
-use el_model::{merkle_branch, Hash32, NetworkIdentity, ScriptHash};
+use el_model::{merkle_branch, BlockRecord, Hash32, NetworkIdentity, ScriptHash};
 use el_rawtx::Resolver;
 use el_rpc::CoreClient;
 use el_store::Store;
@@ -24,13 +24,16 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock, RwLockReadGuard};
 use std::time::{Duration, Instant, SystemTime};
 
+mod version;
+pub use version::{ProtocolVersion, SERVER_MAX, SERVER_MIN};
+
 /// Electrum clients ask for a script's full history. A script with millions of
 /// entries would hold the index lock for too long; keep a generous cap that
 /// still protects the server from pathological scripts.
 pub const MAX_HISTORY_ENTRIES: usize = 100_000;
 
 pub const PROTOCOL_MIN: &str = "1.4";
-pub const PROTOCOL_MAX: &str = "1.4";
+pub const PROTOCOL_MAX: &str = "1.4.2";
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const MAX_HEADERS_CHUNK: usize = 2016;
 /// Hard limit for a single Electrum JSON-RPC line. Prevents an unauthenticated
@@ -466,6 +469,8 @@ pub struct ClientState {
     pub last_height: AtomicU64,
     pub alive: AtomicBool,
     pub tls: bool,
+    /// Protocol version negotiated by the first `server.version` call.
+    pub protocol: Mutex<Option<ProtocolVersion>>,
 }
 
 impl ClientState {
@@ -516,6 +521,7 @@ impl ClientRegistry {
             last_height: AtomicU64::new(0),
             alive: AtomicBool::new(true),
             tls,
+            protocol: Mutex::new(None),
         });
         if let Ok(mut c) = self.clients.lock() {
             c.insert(id, Arc::clone(&state));
@@ -816,6 +822,8 @@ pub fn disk_free_bytes(path: &std::path::Path) -> u64 {
 pub struct RpcError {
     pub code: i64,
     pub message: String,
+    /// Set when the connection must be closed after sending the error.
+    pub close: bool,
 }
 
 impl RpcError {
@@ -823,6 +831,7 @@ impl RpcError {
         RpcError {
             code,
             message: message.into(),
+            close: false,
         }
     }
     fn invalid(msg: impl Into<String>) -> Self {
@@ -833,6 +842,11 @@ impl RpcError {
     }
     fn server(msg: impl Into<String>) -> Self {
         Self::new(-32000, msg)
+    }
+    /// Mark this error as fatal for the connection.
+    fn closing(mut self) -> Self {
+        self.close = true;
+        self
     }
 }
 
@@ -855,21 +869,23 @@ fn log_rpc_error(shared: &Shared, method: &str, code: i64) {
 }
 
 pub fn dispatch(shared: &Shared, method: &str, params: &Value) -> RpcResult<Value> {
-    dispatch_for(shared, None, method, params)
+    dispatch_for(shared, None, SERVER_MIN, method, params)
 }
 
 pub fn dispatch_for(
     shared: &Shared,
     client: Option<&Arc<ClientState>>,
+    _version: ProtocolVersion,
     method: &str,
     params: &Value,
 ) -> RpcResult<Value> {
     match method {
-        "server.version" => server_version(params),
+        "server.version" => server_version(params, client),
         "server.ping" => Ok(Value::Null),
         "server.banner" => Ok(json!(banner_text(shared))),
         "server.donation_address" => Ok(json!("")),
         "server.peers.subscribe" => Ok(json!([])),
+        "server.add_peer" => Ok(json!(false)),
         "server.features" => server_features(shared),
         _ => {
             // Everything else reads the index: enforce a consistent tip and a
@@ -906,14 +922,16 @@ pub fn dispatch_for(
                     scripthash_subscribe(shared, client, params)
                 }
                 "blockchain.scripthash.unsubscribe" => {
-                    if let Some(c) = client {
-                        if let Ok(script) = param_scripthash(params) {
-                            if let Ok(mut subs) = c.subs.lock() {
-                                subs.remove(&script);
-                            }
-                        }
-                    }
-                    Ok(json!(true))
+                    let script = param_scripthash(params)?;
+                    let removed = client
+                        .and_then(|c| {
+                            c.subs
+                                .lock()
+                                .ok()
+                                .map(|mut subs| subs.remove(&script).is_some())
+                        })
+                        .unwrap_or(false);
+                    Ok(json!(removed))
                 }
                 "blockchain.scripthash.get_mempool" => scripthash_mempool(shared, params),
                 "mempool.get_fee_histogram" => fee_histogram(shared),
@@ -984,30 +1002,63 @@ fn check_ready(shared: &Shared) -> RpcResult<()> {
     }
 }
 
-fn server_version(params: &Value) -> RpcResult<Value> {
+fn server_version(params: &Value, client: Option<&Arc<ClientState>>) -> RpcResult<Value> {
     let arr = params
         .as_array()
         .ok_or_else(|| RpcError::invalid("server.version expects [client, protocol]"))?;
-    let requested = arr.get(1);
-    let compatible = match requested {
-        None => true,
-        Some(Value::String(v)) => v == PROTOCOL_MIN || v == PROTOCOL_MAX,
+    let negotiated = negotiate_protocol(arr.get(1))?;
+    if let Some(c) = client {
+        let mut slot = c
+            .protocol
+            .lock()
+            .map_err(|_| RpcError::server("client lock poisoned"))?;
+        if slot.is_some() {
+            return Err(RpcError::new(
+                -32600,
+                "server.version already negotiated on this connection",
+            ));
+        }
+        *slot = Some(negotiated);
+    }
+    Ok(json!([format!("e-lite {VERSION}"), negotiated.to_string()]))
+}
+
+/// Resolve the requested client range against the versions this build serves.
+/// A missing request means the protocol default, 1.4.
+fn negotiate_protocol(requested: Option<&Value>) -> RpcResult<ProtocolVersion> {
+    let (client_min, client_max) = match requested {
+        None => (SERVER_MIN, SERVER_MIN),
+        Some(Value::String(value)) => {
+            let version = ProtocolVersion::parse(value).map_err(RpcError::invalid)?;
+            (version, version)
+        }
         Some(Value::Array(range)) => {
             let min = range
                 .first()
                 .and_then(|v| v.as_str())
-                .unwrap_or(PROTOCOL_MIN);
-            let max = range.get(1).and_then(|v| v.as_str()).unwrap_or(min);
-            !(max < PROTOCOL_MIN || min > PROTOCOL_MAX)
+                .ok_or_else(|| RpcError::invalid("protocol range expects [min, max]"))?;
+            let min = ProtocolVersion::parse(min).map_err(RpcError::invalid)?;
+            let max = match range.get(1) {
+                Some(Value::String(value)) => {
+                    ProtocolVersion::parse(value).map_err(RpcError::invalid)?
+                }
+                None => min,
+                Some(_) => return Err(RpcError::invalid("protocol range expects string versions")),
+            };
+            (min, max)
         }
-        _ => false,
+        Some(_) => {
+            return Err(RpcError::invalid(
+                "protocol must be a version string or [min, max]",
+            ))
+        }
     };
-    if !compatible {
-        return Err(RpcError::server(format!(
+    ProtocolVersion::negotiate(client_min, client_max, SERVER_MIN, SERVER_MAX).ok_or_else(|| {
+        RpcError::server(format!(
             "unsupported protocol; server supports {PROTOCOL_MIN}-{PROTOCOL_MAX}"
-        )));
-    }
-    Ok(json!([format!("e-lite {VERSION}"), PROTOCOL_MAX]))
+        ))
+        .closing()
+    })
 }
 
 pub const DEFAULT_BANNER_TEMPLATE: &str = r#"# e-lite wallet banner template
@@ -1521,6 +1572,37 @@ fn scripthash_subscribe(
     }
 }
 
+/// Turn Core's `decoderawtransaction` result into the verbose object wallets
+/// expect from `blockchain.transaction.get(txid, true)`: Core's decoder lacks
+/// the chain context that `getrawtransaction` adds.
+fn decorate_verbose_tx(
+    decoded: &mut Value,
+    raw: &str,
+    block: &BlockRecord,
+    tip: u32,
+) -> RpcResult<()> {
+    let header: bitcoin::block::Header = bitcoin::consensus::encode::deserialize(&block.header)
+        .map_err(|e| {
+            RpcError::server(format!(
+                "invalid indexed header at height {}: {e}",
+                block.height
+            ))
+        })?;
+    let obj = decoded
+        .as_object_mut()
+        .ok_or_else(|| RpcError::server("decoderawtransaction returned a non-object"))?;
+    obj.insert("hex".to_string(), json!(raw));
+    obj.insert("blockhash".to_string(), json!(block.hash.to_hex()));
+    obj.insert(
+        "confirmations".to_string(),
+        json!(u64::from(tip.saturating_sub(block.height)) + 1),
+    );
+    obj.insert("time".to_string(), json!(header.time));
+    obj.insert("blocktime".to_string(), json!(header.time));
+    obj.insert("in_active_chain".to_string(), json!(true));
+    Ok(())
+}
+
 fn transaction_get(shared: &Shared, params: &Value) -> RpcResult<Value> {
     let txid = params
         .as_array()
@@ -1563,15 +1645,38 @@ fn transaction_get(shared: &Shared, params: &Value) -> RpcResult<Value> {
                     .raw_tx(txid_hash, height)
                     .map_err(|e| RpcError::server(e.to_string()))?
             };
-            return shared
+            let mut decoded = shared
                 .core
                 .decode_raw_transaction(&raw)
-                .map_err(|e| RpcError::server(format!("rawtx decode: {e}")));
+                .map_err(|e| RpcError::server(format!("rawtx decode: {e}")))?;
+            let (block, tip) = {
+                let _g = read_guard(shared)?;
+                let block = shared
+                    .store
+                    .get_block(height)
+                    .map_err(|e| RpcError::server(e.to_string()))?
+                    .ok_or_else(|| RpcError::server(format!("block {height} missing")))?;
+                let tip = shared
+                    .store
+                    .committed_tip()
+                    .map_err(|e| RpcError::server(e.to_string()))?
+                    .map(|t| t.height)
+                    .unwrap_or(height);
+                (block, tip)
+            };
+            decorate_verbose_tx(&mut decoded, &raw, &block, tip)?;
+            return Ok(decoded);
         }
-        return shared
+        let mut value = shared
             .core
             .raw_transaction_json(txid, blockhash.as_deref())
-            .map_err(|e| RpcError::server(format!("rawtx unavailable: {e}")));
+            .map_err(|e| RpcError::server(format!("rawtx unavailable: {e}")))?;
+        if let Some(obj) = value.as_object_mut() {
+            if !obj.contains_key("confirmations") {
+                obj.insert("confirmations".to_string(), json!(0));
+            }
+        }
+        return Ok(value);
     }
 
     match occ.first().copied() {
@@ -2177,54 +2282,108 @@ fn client_loop(shared: &Shared, client: &Arc<ClientState>) -> std::io::Result<()
         if line.trim().is_empty() {
             continue;
         }
-        let response = process_line_for(shared, Some(client), &line);
-        if !client.send(&response) {
+        let outcome = process_line_for(shared, Some(client), &line);
+        if let Some(response) = outcome.response {
+            if !client.send(&response) {
+                break;
+            }
+        }
+        if outcome.close {
             break;
         }
     }
     Ok(())
 }
 
-pub fn process_line(shared: &Shared, line: &str) -> Value {
-    process_line_for(shared, None, line)
+/// Result of one line from the wire. Notifications have no response; a fatal
+/// protocol error asks the caller to close the connection after replying.
+pub struct LineOutcome {
+    pub response: Option<Value>,
+    pub close: bool,
 }
 
-pub fn process_line_for(shared: &Shared, client: Option<&Arc<ClientState>>, line: &str) -> Value {
+pub fn process_line(shared: &Shared, line: &str) -> Value {
+    process_line_for(shared, None, line)
+        .response
+        .unwrap_or(Value::Null)
+}
+
+fn negotiated_client_version(client: Option<&Arc<ClientState>>) -> ProtocolVersion {
+    if let Some(c) = client {
+        if let Ok(protocol) = c.protocol.lock() {
+            if let Some(version) = *protocol {
+                return version;
+            }
+        }
+    }
+    SERVER_MIN
+}
+
+pub fn process_line_for(
+    shared: &Shared,
+    client: Option<&Arc<ClientState>>,
+    line: &str,
+) -> LineOutcome {
     shared.stats.requests_total.fetch_add(1, Ordering::Relaxed);
     let request: Value = match serde_json::from_str(line) {
         Ok(v) => v,
         Err(e) => {
             shared.stats.errors_total.fetch_add(1, Ordering::Relaxed);
-            return json!({
-                "jsonrpc": "2.0",
-                "id": Value::Null,
-                "error": {"code": -32700, "message": format!("parse error: {e}")},
-            });
+            return LineOutcome {
+                response: Some(json!({
+                    "jsonrpc": "2.0",
+                    "id": Value::Null,
+                    "error": {"code": -32700, "message": format!("parse error: {e}")},
+                })),
+                close: false,
+            };
         }
     };
+    let is_notification = request
+        .as_object()
+        .map(|obj| !obj.contains_key("id"))
+        .unwrap_or(false);
     let id = request.get("id").cloned().unwrap_or(Value::Null);
     let method = match request.get("method").and_then(|m| m.as_str()) {
         Some(m) => m,
         None => {
             shared.stats.errors_total.fetch_add(1, Ordering::Relaxed);
-            return json!({
-                "jsonrpc": "2.0",
-                "id": id,
-                "error": {"code": -32600, "message": "invalid request"},
-            });
+            return LineOutcome {
+                response: Some(json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "error": {"code": -32600, "message": "invalid request"},
+                })),
+                close: false,
+            };
         }
     };
     let params = request.get("params").cloned().unwrap_or(json!([]));
-    match dispatch_for(shared, client, method, &params) {
-        Ok(result) => json!({"jsonrpc": "2.0", "id": id, "result": result}),
+    let version = negotiated_client_version(client);
+    match dispatch_for(shared, client, version, method, &params) {
+        Ok(result) => LineOutcome {
+            response: if is_notification {
+                None
+            } else {
+                Some(json!({"jsonrpc": "2.0", "id": id, "result": result}))
+            },
+            close: false,
+        },
         Err(e) => {
             shared.stats.errors_total.fetch_add(1, Ordering::Relaxed);
             log_rpc_error(shared, method, e.code);
-            json!({
-                "jsonrpc": "2.0",
-                "id": id,
-                "error": {"code": e.code, "message": e.message},
-            })
+            LineOutcome {
+                response: if is_notification {
+                    None
+                } else {
+                    Some(json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "error": {"code": e.code, "message": e.message},
+                    }))
+                },
+                close: e.close,
+            }
         }
     }
 }
@@ -2482,12 +2641,38 @@ mod tests {
     #[test]
     fn version_negotiation() {
         assert_eq!(
-            server_version(&json!(["client", "1.4"])).unwrap(),
+            server_version(&json!(["client", "1.4"]), None).unwrap(),
             json!([format!("e-lite {VERSION}"), "1.4"])
         );
-        assert!(server_version(&json!(["client", ["1.4", "1.4"]])).is_ok());
-        assert!(server_version(&json!(["client", "1.2"])).is_err());
-        assert!(server_version(&json!(["client", ["1.0", "1.2"]])).is_err());
+        assert_eq!(
+            server_version(&json!(["client", ["1.4", "1.4.2"]]), None).unwrap()[1],
+            json!("1.4.2")
+        );
+        assert!(server_version(&json!(["client", ["1.4", "1.4"]]), None).is_ok());
+        assert!(server_version(&json!(["client", "1.2"]), None).is_err());
+        assert!(server_version(&json!(["client", "1.4.3"]), None).is_err());
+        assert!(server_version(&json!(["client", ["1.0", "1.2"]]), None).is_err());
+        // Extraneous arguments are tolerated for future protocol extensions.
+        assert!(server_version(&json!(["client", "1.4", "junk", 9]), None).is_ok());
+    }
+
+    #[test]
+    fn verbose_transaction_gets_chain_context() {
+        let block = BlockRecord {
+            height: 7,
+            hash: Hash32([0x11; 32]),
+            header: [0u8; 80],
+            tx_count: 1,
+            txnum_base: 0,
+        };
+        let mut decoded = json!({"txid": "aa", "vout": []});
+        decorate_verbose_tx(&mut decoded, "deadbeef", &block, 9).unwrap();
+        assert_eq!(decoded["hex"], json!("deadbeef"));
+        assert_eq!(decoded["blockhash"], json!(block.hash.to_hex()));
+        assert_eq!(decoded["confirmations"], json!(3));
+        assert_eq!(decoded["time"], json!(0));
+        assert_eq!(decoded["blocktime"], json!(0));
+        assert_eq!(decoded["in_active_chain"], json!(true));
     }
 
     #[test]

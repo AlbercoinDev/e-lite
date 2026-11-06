@@ -45,7 +45,8 @@ Never treat a version number in this file as authoritative over the code/tag.
    separate listener is implemented; client authentication and rate limiting are
    not.
 5. Every behaviour change updates documentation, `config.example.toml` and
-   `CHANGELOG.md`.
+   `CHANGELOG.md`. TLS changes must also stay in sync across
+   `config.example.toml`, `docs/TOR.md`, `docs/FEATURES.md` and this file.
 6. Pruning, snapshots, network exposure, privacy and data-loss questions require
    evidence in `docs/AUDIT.md`; do not guess.
 
@@ -66,6 +67,11 @@ Never treat a version number in this file as authoritative over the code/tag.
   auto-generated self-signed certificate when none is configured. Neither
   listener authenticates clients; the onion address is the access secret. Do not
   expose them publicly without a tunnel/firewall/access plan.
+- Electrum protocol versions are negotiated per connection. This build serves
+  1.4–1.4.2 (`server.version` returns the negotiated version). Never raise
+  `protocol_max` until every method of that version (and the previous ones) is
+  implemented and tested: a server advertising a version MUST support all of
+  its methods.
 - The memory budget reserves `max(1024 MiB, RAM/8)` for the OS/Core/page cache,
   caps e-lite at 75 % of total RAM, fixes memtables at `RAM/8`, and grows/shrinks
   the block cache in 256 MiB steps under `MemAvailable` + page-cache pressure.
@@ -80,6 +86,32 @@ Never treat a version number in this file as authoritative over the code/tag.
 - Raw transactions are local-first. External fallback requests whole blocks by
   hash, validates them, uses Tor by default and never sends wallet txids/scripts.
 
+## TLS certificate model (one cert, no SNI)
+
+- Every process serves a single PEM pair for all clients and both listeners (the
+  TLS listener and the published onion TLS port). rustls is built with
+  `with_single_cert`; there is no SNI or per-hostname certificate selection
+  (`crates/el-serve/src/lib.rs`, `build_tls_config`). A wallet validates the cert
+  against the name it connects to: a cert for `example.com` fails for `.onion`
+  and the auto self-signed cert fails for any public hostname.
+- The self-signed cert (`<data-dir>/tls/self-signed.*`) is generated only when
+  both `[server] tls_cert` and `tls_key` are empty (and Tor is managed); its SAN
+  is `localhost`, `127.0.0.1` and the onion address. Operator certificates are
+  never overwritten or regenerated (`bin/e-lite/src/tor.rs`, `ensure_self_signed`).
+- Consequence: a public domain certificate in `[server] tls_cert`/`tls_key`
+  disables the auto onion certificate, and `.onion` wallets then get a hostname
+  mismatch. Pick one identity per instance: auto self-signed (onion), or a
+  domain cert with `[tor] tls = false` / plain-only onion, or an explicit
+  `target_tls` design. Do not "fix" one by breaking the other blindly.
+- Config validation: `tls_listen` requires both PEM files and must differ from
+  `listen`; cert/key without `tls_listen` is an error. Managed Tor auto-enables
+  `127.0.0.1:50002` when `tls_listen` is empty and the port is free.
+- `CertWatcher` reloads changed PEMs by mtime without restart and keeps the old
+  cert if the new pair is invalid (Let's Encrypt renewals need no restart).
+- TLS only encrypts; there is no client auth or rate limiting (AUD-010). A
+  public domain also needs a reachable bind (`0.0.0.0`/IP, not the default
+  loopback) plus a firewall/VPN/allowlist plan.
+
 ## Quality gates
 
 Before claiming completion:
@@ -90,8 +122,22 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 ```
 
+Focused checks when touching a subsystem:
+
+```bash
+cargo test -p el-serve tls   # TLS config, watcher reload
+cargo test -p e-lite tls     # TLS config validation, Tor auto-cert
+```
+
 Plus the relevant integration tests (`tests/e2e_*.sh`) and the install/update
 commands on a clean environment.
+
+Environment facts:
+
+- Build needs `build-essential clang libclang-dev pkg-config` (RocksDB bindgen),
+  matching the `debian:12` CI container.
+- Each `tests/e2e_*.sh` needs `bitcoind` in `PATH` and a debug binary first
+  (`cargo build -p e-lite`); they create their own regtest datadir and ports.
 
 ## Code review rule
 
