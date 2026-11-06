@@ -131,31 +131,55 @@ fn probe_once(
             ..Default::default()
         };
 
-        let attempt =
-            |client: Option<&reqwest::blocking::Client>, via: &str| -> Result<(), String> {
-                let Some(client) = client else {
-                    return Err(format!("no {via} client"));
-                };
-                let response = client.get(&target).send().map_err(|e| e.to_string())?;
-                let status_code = response.status();
-                if !status_code.is_success() {
-                    return Err(format!("HTTP {status_code}"));
-                }
-                let body = response.text().map_err(|e| e.to_string())?;
-                let hash = body.trim();
-                if hash.len() != 64 || !hash.bytes().all(|b| b.is_ascii_hexdigit()) {
-                    return Err("unexpected block-height response".to_string());
-                }
-                if let Some(expected) = expected_genesis {
-                    if !hash.eq_ignore_ascii_case(expected) {
-                        return Err(format!(
-                            "genesis mismatch: provider serves {hash}, expected {expected} \
-                             (wrong network)"
-                        ));
-                    }
-                }
-                Ok(())
+        let attempt = |client: Option<&reqwest::blocking::Client>,
+                       via: &str|
+         -> Result<(), String> {
+            let Some(client) = client else {
+                return Err(format!("no {via} client"));
             };
+            let response = client.get(&target).send().map_err(|e| e.to_string())?;
+            let status_code = response.status();
+            if !status_code.is_success() {
+                return Err(format!("HTTP {status_code}"));
+            }
+            let body = response.text().map_err(|e| e.to_string())?;
+            let hash = body.trim();
+            if hash.len() != 64 || !hash.bytes().all(|b| b.is_ascii_hexdigit()) {
+                return Err("unexpected block-height response".to_string());
+            }
+            if let Some(expected) = expected_genesis {
+                if !hash.eq_ignore_ascii_case(expected) {
+                    return Err(format!(
+                        "genesis mismatch: provider serves {hash}, expected {expected} \
+                             (wrong network)"
+                    ));
+                }
+            }
+            // A provider that cannot serve the genesis block cannot serve
+            // old transactions either. This is a real rawtx probe, not just
+            // an index lookup.
+            let raw_response = client
+                .get(format!("{base}/block/{hash}/raw"))
+                .send()
+                .map_err(|e| format!("raw block: {e}"))?;
+            let status_code = raw_response.status();
+            if !status_code.is_success() {
+                return Err(format!("raw block: HTTP {status_code}"));
+            }
+            let bytes = raw_response
+                .bytes()
+                .map_err(|e| format!("raw block: {e}"))?;
+            if bytes.len() < 80 {
+                return Err("raw block: too short".to_string());
+            }
+            use bitcoin::hashes::Hash as _;
+            let mut computed = bitcoin::hashes::sha256d::Hash::hash(&bytes[..80]).to_byte_array();
+            computed.reverse();
+            if hex::encode(computed) != hash.to_ascii_lowercase() {
+                return Err("raw block: header hash mismatch".to_string());
+            }
+            Ok(())
+        };
 
         if is_onion {
             match attempt(tor, "tor") {
@@ -425,19 +449,29 @@ mod tests {
         use std::io::{Read, Write};
         use std::net::TcpListener;
 
+        let block = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+        let raw_block = bitcoin::consensus::serialize(&block);
+        let hash = block.block_hash().to_string();
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
+        let served_hash = hash.clone();
         let handle = std::thread::spawn(move || {
-            let (mut sock, _) = listener.accept().unwrap();
-            let mut buf = [0u8; 4096];
-            let _ = sock.read(&mut buf);
-            let body = "00".repeat(32);
-            let response = format!(
-                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                body.len(),
-                body
-            );
-            sock.write_all(response.as_bytes()).unwrap();
+            for i in 0..2 {
+                let (mut sock, _) = listener.accept().unwrap();
+                let mut buf = [0u8; 4096];
+                let _ = sock.read(&mut buf);
+                let body = if i == 0 {
+                    served_hash.as_bytes().to_vec()
+                } else {
+                    raw_block.clone()
+                };
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                sock.write_all(response.as_bytes()).unwrap();
+                sock.write_all(&body).unwrap();
+            }
         });
 
         let mut cfg = Config::default();
@@ -445,13 +479,7 @@ mod tests {
         cfg.rawtx.allow_clearnet = false;
         cfg.rawtx.tor_fallback_clearnet = true;
         cfg.public_servers.probe_timeout_seconds = 3;
-        let expected = "00".repeat(32);
-        let outcome = probe(
-            &cfg,
-            &[format!("http://{addr}")],
-            false,
-            Some(expected.as_str()),
-        );
+        let outcome = probe(&cfg, &[format!("http://{addr}")], false, Some(&hash));
         assert!(outcome.ready, "{outcome:?}");
         assert!(outcome.statuses[0].healthy);
         assert!(

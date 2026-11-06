@@ -20,6 +20,7 @@ const PROTOCOL_VERSION: i32 = 70016;
 const MAX_MESSAGE: u32 = 4 * 1024 * 1024 + 1024;
 const NODE_NETWORK: u64 = 1;
 const NODE_NETWORK_LIMITED: u64 = 1 << 10;
+const NODE_WITNESS: u64 = 1 << 3;
 
 pub struct P2pSource {
     peers: Vec<String>,
@@ -27,6 +28,8 @@ pub struct P2pSource {
     timeout: Duration,
     magic: [u8; 4],
     v2: bool,
+    fallback_clearnet: bool,
+    fallback_warned: std::sync::atomic::AtomicBool,
 }
 
 fn sha256d(data: &[u8]) -> [u8; 32] {
@@ -243,6 +246,7 @@ impl P2pSource {
         timeout: Duration,
         chain: Chain,
         v2: bool,
+        fallback_clearnet: bool,
     ) -> Self {
         P2pSource {
             peers,
@@ -250,16 +254,31 @@ impl P2pSource {
             timeout,
             magic: chain.magic(),
             v2,
+            fallback_clearnet,
+            fallback_warned: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
     fn connect_raw(&self, peer: &str) -> Result<TcpStream> {
         let stream = if let Some(proxy) = &self.tor_socks {
             let user = format!("e-lite-{}", rand::random::<u64>());
-            let s =
-                socks::Socks5Stream::connect_with_password(proxy.as_str(), peer, &user, "e-lite")
-                    .map_err(|e| RawtxError::Unavailable(format!("tor connect {peer}: {e}")))?;
-            s.into_inner()
+            match socks::Socks5Stream::connect_with_password(proxy.as_str(), peer, &user, "e-lite")
+            {
+                Ok(s) => s.into_inner(),
+                Err(e) if self.fallback_clearnet => {
+                    if !self
+                        .fallback_warned
+                        .swap(true, std::sync::atomic::Ordering::Relaxed)
+                    {
+                        eprintln!(
+                            "[e-lite] WARNING: Tor connect failed for P2P peer {peer} ({e}); using clearnet (operator IP exposed)"
+                        );
+                    }
+                    TcpStream::connect(peer)
+                        .map_err(|e| RawtxError::Unavailable(format!("connect {peer}: {e}")))?
+                }
+                Err(e) => return Err(RawtxError::Unavailable(format!("tor connect {peer}: {e}"))),
+            }
         } else {
             TcpStream::connect(peer)
                 .map_err(|e| RawtxError::Unavailable(format!("connect {peer}: {e}")))?
@@ -295,8 +314,13 @@ impl P2pSource {
 
     fn fetch_from_v1(&self, peer: &str, hash: &Hash32) -> Result<Vec<u8>> {
         let mut stream = self.connect_raw(peer)?;
-        send_message(&mut stream, self.magic, "version", &version_payload(0, 0))
-            .map_err(|e| RawtxError::Unavailable(format!("{peer} version: {e}")))?;
+        send_message(
+            &mut stream,
+            self.magic,
+            "version",
+            &version_payload(NODE_WITNESS, 0),
+        )
+        .map_err(|e| RawtxError::Unavailable(format!("{peer} version: {e}")))?;
 
         let mut got_version = false;
         let mut services = 0u64;
@@ -355,7 +379,7 @@ impl P2pSource {
             Protocol::new(self.magic, Role::Initiator, None, None, reader, writer)
                 .map_err(|e| RawtxError::Unavailable(format!("{peer} v2 handshake: {e}")))?;
 
-        self.v2_send(&mut protocol, "version", &version_payload(0, 0))?;
+        self.v2_send(&mut protocol, "version", &version_payload(NODE_WITNESS, 0))?;
         let mut got_version = false;
         let mut services = 0u64;
         loop {
@@ -471,6 +495,13 @@ mod tests {
         TxMerkleNode, TxOut, Witness,
     };
     use std::net::TcpListener;
+
+    #[test]
+    fn version_advertises_witness() {
+        let payload = version_payload(NODE_WITNESS, 0);
+        let services = u64::from_le_bytes(payload[4..12].try_into().unwrap());
+        assert_eq!(services & NODE_WITNESS, NODE_WITNESS);
+    }
 
     fn test_block() -> Block {
         let coinbase = Transaction {
@@ -606,6 +637,7 @@ mod tests {
             Duration::from_secs(5),
             Chain::Regtest,
             false,
+            false,
         );
         assert_eq!(src.fetch_block(&hash).unwrap(), bytes);
     }
@@ -622,6 +654,7 @@ mod tests {
             Duration::from_secs(5),
             Chain::Regtest,
             true,
+            false,
         );
         assert_eq!(src.fetch_block(&hash).unwrap(), bytes);
     }
@@ -638,6 +671,7 @@ mod tests {
             Duration::from_secs(5),
             Chain::Regtest,
             true,
+            false,
         );
         assert_eq!(src.fetch_block(&hash).unwrap(), bytes);
     }
@@ -653,6 +687,7 @@ mod tests {
             None,
             Duration::from_secs(5),
             Chain::Regtest,
+            false,
             false,
         );
         assert!(src.fetch_block(&hash).is_err());

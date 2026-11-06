@@ -17,6 +17,8 @@ pub struct EsploraSource {
     fallback_clearnet: bool,
     allow_clearnet: bool,
     fallback_warned: std::sync::atomic::AtomicBool,
+    cooldown: Duration,
+    tor_failures: std::sync::Mutex<std::collections::HashMap<String, std::time::Instant>>,
 }
 
 const MAX_BLOCK_BYTES: u64 = 8 * 1024 * 1024;
@@ -28,6 +30,7 @@ impl EsploraSource {
         allow_clearnet: bool,
         fallback_clearnet: bool,
         timeout: Duration,
+        cooldown: Duration,
     ) -> Result<Self> {
         let tor_client = tor_socks.and_then(|socks| {
             reqwest::blocking::Client::builder()
@@ -81,6 +84,8 @@ impl EsploraSource {
             fallback_clearnet,
             allow_clearnet,
             fallback_warned: std::sync::atomic::AtomicBool::new(false),
+            cooldown,
+            tor_failures: std::sync::Mutex::new(std::collections::HashMap::new()),
         })
     }
 
@@ -123,10 +128,30 @@ impl BlockSource for EsploraSource {
         for idx in order {
             let base = &self.bases[idx];
             let is_onion = base.to_ascii_lowercase().contains(".onion");
+            let tor_cooled = self
+                .tor_failures
+                .lock()
+                .map(|failures| {
+                    failures
+                        .get(base)
+                        .map(|until| *until > std::time::Instant::now())
+                        .unwrap_or(false)
+                })
+                .unwrap_or(false);
             if let Some(client) = &self.tor_client {
-                match Self::fetch_with(client, base, hash) {
-                    Ok(bytes) => return Ok(bytes),
-                    Err(e) => errors.push(e.to_string()),
+                if !tor_cooled {
+                    match Self::fetch_with(client, base, hash) {
+                        Ok(bytes) => return Ok(bytes),
+                        Err(e) => {
+                            if let Ok(mut failures) = self.tor_failures.lock() {
+                                failures.insert(
+                                    base.clone(),
+                                    std::time::Instant::now() + self.cooldown,
+                                );
+                            }
+                            errors.push(e.to_string());
+                        }
+                    }
                 }
             }
             if !is_onion {
@@ -186,6 +211,7 @@ mod tests {
             true, // local test server
             false,
             Duration::from_secs(5),
+            Duration::from_secs(5),
         )
         .unwrap();
         let got = src.fetch_block(&Hash32([0x11; 32])).unwrap();
@@ -201,6 +227,7 @@ mod tests {
             false,
             false,
             Duration::from_secs(5),
+            Duration::from_secs(5),
         );
         assert!(err.is_err());
     }
@@ -213,6 +240,7 @@ mod tests {
             true,
             false,
             Duration::from_secs(5),
+            Duration::from_secs(5),
         );
         assert!(err.is_err());
     }
@@ -224,6 +252,7 @@ mod tests {
             None,
             true,
             false,
+            Duration::from_secs(5),
             Duration::from_secs(5),
         );
         assert!(err.is_err());

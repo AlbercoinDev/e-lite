@@ -105,6 +105,8 @@ decoys = 3                          # extra blocks fetched per real fetch
 tor_socks = "127.0.0.1:9050"        # empty requires allow_clearnet = true
 allow_clearnet = false              # fail closed without Tor; also gates repair
 tor_fallback_clearnet = true        # if Tor fails, use clearnet (IP exposed)
+request_timeout_seconds = 15        # per Esplora block request
+provider_cooldown_seconds = 120     # skip Tor for a provider after a failure
 use_p2p = true                      # minimal P2P client; used for prune-gap repair
 use_esplora = true                  # Esplora block endpoints; used for repair too
 p2p_v2 = true                       # BIP324 encrypted transport, fallback to v1

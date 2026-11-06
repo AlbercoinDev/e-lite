@@ -93,6 +93,10 @@ pub struct RawtxConfig {
     /// If Tor is configured but a request fails, retry the clearnet endpoint
     /// directly. This exposes the operator's IP to the provider.
     pub fallback_clearnet: bool,
+    /// Timeout for a single Esplora block request.
+    pub request_timeout_seconds: u64,
+    /// Skip Tor for a provider after a failed Tor attempt.
+    pub provider_cooldown_seconds: u64,
     pub use_p2p: bool,
     pub use_esplora: bool,
     pub p2p_v2: bool,
@@ -121,8 +125,8 @@ impl Resolver {
 
         if cfg.enabled {
             if cfg.use_p2p && !cfg.p2p_peers.is_empty() {
-                if tor.is_none() && !cfg.allow_clearnet {
-                    // fail closed: no external P2P without Tor
+                if tor.is_none() && !cfg.allow_clearnet && !cfg.fallback_clearnet {
+                    // fail closed: no external P2P without Tor and no fallback
                 } else {
                     external.push(Arc::new(P2pSource::new(
                         cfg.p2p_peers.clone(),
@@ -130,6 +134,7 @@ impl Resolver {
                         cfg.p2p_timeout,
                         cfg.chain,
                         cfg.p2p_v2,
+                        cfg.fallback_clearnet,
                     )));
                 }
             }
@@ -139,7 +144,8 @@ impl Resolver {
                     tor.clone(),
                     cfg.allow_clearnet,
                     cfg.fallback_clearnet,
-                    Duration::from_secs(60),
+                    Duration::from_secs(cfg.request_timeout_seconds.max(1)),
+                    Duration::from_secs(cfg.provider_cooldown_seconds.max(1)),
                 ) {
                     Ok(s) => external.push(Arc::new(s)),
                     Err(e) => eprintln!("[e-lite] esplora disabled: {e}"),

@@ -77,6 +77,10 @@ Never treat a version number in this file as authoritative over the code/tag.
   template; a missing file means local data only (fail closed), never a hidden
   fallback list. Only whole blocks are requested by hash, and clearnet entries
   must be HTTPS (`.onion` over Tor is the only plain-HTTP exception).
+- P2P rawtx must advertise `NODE_WITNESS` (bit 3) in `version`; without it peers
+  strip witnesses from blocks, which looks like a valid block hash but fails the
+  BIP141 check. The background prefetcher enqueues confirmed history heights and
+  must stay bounded/deduplicated; it is an optimisation, never correctness.
 - `run` probes the network's providers (`/block-height/0`) and does not open
   Electrum until at least one answers; `require_ready`/`ready_timeout_seconds`
   control the gate. `tor_fallback_clearnet = true` uses clearnet when Tor is

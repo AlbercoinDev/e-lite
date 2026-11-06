@@ -3815,6 +3815,8 @@ fn build_resolver(
         tor_socks: tor,
         allow_clearnet: cfg.rawtx.allow_clearnet,
         fallback_clearnet: cfg.rawtx.tor_fallback_clearnet,
+        request_timeout_seconds: cfg.rawtx.request_timeout_seconds,
+        provider_cooldown_seconds: cfg.rawtx.provider_cooldown_seconds,
         use_p2p: cfg.rawtx.use_p2p,
         use_esplora: cfg.rawtx.use_esplora,
         p2p_v2: cfg.rawtx.p2p_v2,
@@ -3859,6 +3861,12 @@ fn build_shared(
         public_servers::load(cfg, chain, crate::config_path().as_deref()).endpoints
     };
     let resolver = build_resolver(cfg, chain, &store, &core, public_servers.clone())?;
+    let readers = el_chain::ReaderTracker::new();
+    let prefetch = if resolver.external_sources() > 0 && cfg.rawtx.enabled {
+        el_serve::Prefetcher::new(Arc::clone(&resolver), Arc::clone(&readers), 2, 512)
+    } else {
+        el_serve::Prefetcher::disabled()
+    };
     let log_file = cfg.app_log_file(chain);
     let banner_file = cfg.app_banner_file(chain);
     if let Some(path) = &banner_file {
@@ -3900,12 +3908,13 @@ fn build_shared(
         provider_ready: AtomicBool::new(false),
         tor_ready: AtomicBool::new(false),
         clearnet_fallback: AtomicBool::new(false),
+        prefetch,
         mempool: Arc::new(RwLock::new(Mempool::new())),
         relayfee: Mutex::new(0.0),
         fee_estimates: Mutex::new(std::collections::HashMap::new()),
         error_log: Mutex::new(std::collections::HashMap::new()),
         clients: Arc::new(el_serve::ClientRegistry::new()),
-        readers: el_chain::ReaderTracker::new(),
+        readers,
         silent_payments_enabled: cfg.silent_payments.enabled,
         identity: RwLock::new(identity),
         headers: el_serve::HeaderCache::new(),
@@ -3948,9 +3957,15 @@ fn refresh_providers(shared: &Shared, cfg: &Config, wait: bool) {
     let expected = shared.identity().genesis.to_hex();
     let probe = public_servers::probe(cfg, &shared.public_servers, wait, Some(expected.as_str()));
     if probe.clearnet_fallback {
-        eprintln!(
-            "[e-lite] WARNING: Tor is unavailable; using clearnet public providers (operator IP exposed)"
-        );
+        if probe.tor_ready {
+            eprintln!(
+                "[e-lite] WARNING: some public providers used clearnet because their Tor request failed; see /status"
+            );
+        } else {
+            eprintln!(
+                "[e-lite] WARNING: Tor is unavailable; using clearnet public providers (operator IP exposed)"
+            );
+        }
     }
     if let Ok(mut statuses) = shared.provider_status.lock() {
         *statuses = probe

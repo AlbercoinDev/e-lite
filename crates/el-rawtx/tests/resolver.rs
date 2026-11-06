@@ -141,6 +141,8 @@ fn config(decoys: u32, cache_mib: u64) -> RawtxConfig {
         tor_socks: None,
         allow_clearnet: true,
         fallback_clearnet: false,
+        request_timeout_seconds: 15,
+        provider_cooldown_seconds: 120,
         use_p2p: false,
         use_esplora: false,
         p2p_v2: false,
@@ -302,6 +304,7 @@ fn live_esplora_signet_block() {
         true,
         false,
         Duration::from_secs(30),
+        Duration::from_secs(120),
     )
     .unwrap();
     let bytes = src.fetch_block(&hash).unwrap();
@@ -396,6 +399,7 @@ fn live_esplora_resolver_tip() {
             true,
             false,
             Duration::from_secs(60),
+            Duration::from_secs(120),
         )
         .unwrap(),
     );
@@ -435,6 +439,7 @@ fn live_p2p_regtest() {
         Duration::from_secs(10),
         el_model::Chain::Regtest,
         v2,
+        false,
     );
     let bytes = src.fetch_block(&hash).unwrap();
     let block: Block = bitcoin::consensus::deserialize(&bytes).unwrap();

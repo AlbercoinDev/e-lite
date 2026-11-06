@@ -511,6 +511,12 @@ pub struct RawtxCfg {
     /// Use clearnet when Tor is unavailable or a Tor request fails.
     #[serde(default = "d_true")]
     pub tor_fallback_clearnet: bool,
+    /// Timeout for each Esplora raw-block request.
+    #[serde(default = "d_rawtx_timeout")]
+    pub request_timeout_seconds: u64,
+    /// Skip Tor for a provider after a failed Tor request.
+    #[serde(default = "d_provider_cooldown")]
+    pub provider_cooldown_seconds: u64,
     #[serde(default = "d_true")]
     pub use_p2p: bool,
     #[serde(default = "d_true")]
@@ -533,6 +539,8 @@ impl Default for RawtxCfg {
             tor_socks: d_tor_socks(),
             allow_clearnet: false,
             tor_fallback_clearnet: true,
+            request_timeout_seconds: d_rawtx_timeout(),
+            provider_cooldown_seconds: d_provider_cooldown(),
             use_p2p: true,
             use_esplora: true,
             p2p_v2: true,
@@ -593,6 +601,12 @@ fn d_probe_timeout() -> u64 {
 }
 fn d_ready_timeout() -> u64 {
     60
+}
+fn d_rawtx_timeout() -> u64 {
+    15
+}
+fn d_provider_cooldown() -> u64 {
+    120
 }
 fn d_listen() -> String {
     "127.0.0.1:50001".to_string()

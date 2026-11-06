@@ -169,6 +169,8 @@ e-lite run --network mainnet --allow-mainnet \
 | `--tor-socks <addr>` | `rawtx.tor_socks` | `127.0.0.1:9050` |
 | `--allow-clearnet` | `rawtx.allow_clearnet` | `false` |
 | `--set rawtx.tor_fallback_clearnet=true` | use clearnet when Tor fails | `true` |
+| `--set rawtx.request_timeout_seconds=<n>` | per-provider block timeout | `15` |
+| `--set rawtx.provider_cooldown_seconds=<n>` | skip Tor for a failed provider | `120` |
 | `--set public_servers.require_ready=false` | start without a ready provider | `true` |
 | `--no-rawtx` | `rawtx.enabled=false` | enabled |
 | `--tls-listen <addr>` | `server.tls_listen` | disabled |

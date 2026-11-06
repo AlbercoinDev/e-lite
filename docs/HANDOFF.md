@@ -1,9 +1,9 @@
 # Session handoff
 
-**Updated:** 2026-11-06
-**Latest published release:** `0.1.0-alpha.29.2`
-**Release:** https://github.com/AlbercoinDev/e-lite/releases/tag/v0.1.0-alpha.29.2
-**Main commit at handoff:** tag `v0.1.0-alpha.29.2`
+**Updated:** 2026-11-07
+**Latest published release:** `0.1.0-alpha.29.3`
+**Release:** https://github.com/AlbercoinDev/e-lite/releases/tag/v0.1.0-alpha.29.3
+**Main commit at handoff:** tag `v0.1.0-alpha.29.3`
 
 This file is the short “where we are” for a new session. The invariants live in
 [`AGENTS.md`](../AGENTS.md) and [`PROJECT_MEMORY.md`](PROJECT_MEMORY.md); the
@@ -48,8 +48,10 @@ no repitas contexto ni rehagas decisiones ya documentadas.
   treat the onion address as a secret. Per-client rate limiting is active by
   default on non-loopback listeners (50 req/s, burst 300; `[server] rate_limit`
   and `rate_burst`; `0` disables). It is not authentication. `run` probes the
-  network providers and gates the wallet listeners until one answers; Tor
-  failure falls back to clearnet (`tor_fallback_clearnet`).
+  network providers and gates the wallet listeners until one answers a real
+  genesis block request (`/block-height/0` plus `/block/<genesis>/raw` with a
+  header-hash check); Tor failure falls back to clearnet
+  (`tor_fallback_clearnet`).
 - Electrum 1.4–1.7 is implemented and negotiated per connection: numeric
   `server.version`, verbose `transaction.get` with block context, notification
   suppression, real `scripthash.unsubscribe`, canonical mempool status order,
@@ -77,6 +79,31 @@ no repitas contexto ni rehagas decisiones ya documentadas.
   the onion setup, reset and security.
 - `docs/ROADMAP.md` contains future features/improvements. Do not present them as
   available.
+
+## Last change (alpha.29.3)
+
+- **P2P witness fix**: the `version` message now advertises `NODE_WITNESS`
+  (bit 3) in v1 and v2. Without it peers strip witnesses from served blocks;
+  the block headers/merkle still look valid but BIP141 validation failed with
+  `missing witness reserved value`, leaving wallets on `Retrieving
+  transaction`. This was the real cause of the Sparrow stall, not wallet
+  corruption.
+- **P2P clearnet fallback** when Tor connect fails (`tor_fallback_clearnet`),
+  one-time warning; `.onion` peers still require Tor.
+- **Fast rawtx**: `rawtx.request_timeout_seconds` (15 s, was hard-coded 60) and
+  `rawtx.provider_cooldown_seconds` (120 s) skip a provider's Tor path after a
+  failure instead of waiting per transaction.
+- **History prefetch**: serving `blockchain.scripthash.get_history` enqueues the
+  confirmed heights in a bounded, deduplicated background queue (2 workers), so
+  the following `transaction.get` usually hits the block cache. Optimisation
+  only, disabled when no external sources exist.
+- **Real provider probe**: the readiness gate now also fetches the genesis raw
+  block and verifies its header hash; a provider that cannot serve real blocks
+  does not open the wallet gate. Tor warning distinguishes total Tor failure
+  from per-provider clearnet fallback.
+- Tests: `NODE_WITNESS` payload bit, raw-block probe match/mismatch, Tor
+  fallback state; workspace tests + regtest e2e green. No schema/protocol
+  change.
 
 ## Last change (alpha.29.2)
 
@@ -428,6 +455,6 @@ startup/shutdown/memory assertions, `e-lite.log` presence, 1.6 and 1.7
 negotiation on the same instance, scriptpubkey/outpoint checks, outpoint
 notification, real testmempoolaccept, the rate-limit burst test, the strict
 Core RPC check and the Sparrow sequence with confirmed verbose transaction)
-passed on the alpha.29 code. Full signet/testnet4 acceptance
+passed on the alpha.29.3 code. Full signet/testnet4 acceptance
 is still operator-run; results belong in `docs/GETTING-STARTED.md`/release notes
 when available.

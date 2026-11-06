@@ -21,7 +21,7 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, RwLock, RwLockReadGuard};
+use std::sync::{mpsc, Arc, Mutex, RwLock, RwLockReadGuard};
 use std::time::{Duration, Instant, SystemTime};
 
 mod version;
@@ -637,6 +637,77 @@ impl ClientRegistry {
     }
 }
 
+/// Background block prefetcher for confirmed history entries.
+///
+/// When a wallet asks for a script history, e-lite already knows the heights
+/// (and one txid per height). Fetching those blocks in the background means the
+/// subsequent `blockchain.transaction.get` calls hit the block cache instead of
+/// waiting for a provider. Deduplicated by height, bounded queue, and only used
+/// when external sources exist.
+pub struct Prefetcher {
+    tx: Option<mpsc::SyncSender<(Hash32, u32)>>,
+    seen: Mutex<HashSet<u32>>,
+}
+
+impl Prefetcher {
+    pub fn disabled() -> Self {
+        Self {
+            tx: None,
+            seen: Mutex::new(HashSet::new()),
+        }
+    }
+
+    pub fn new(
+        resolver: Arc<Resolver>,
+        readers: Arc<ReaderTracker>,
+        workers: usize,
+        queue: usize,
+    ) -> Self {
+        let (tx, rx) = mpsc::sync_channel::<(Hash32, u32)>(queue.max(1));
+        let rx = Arc::new(Mutex::new(rx));
+        for _ in 0..workers.max(1) {
+            let resolver = Arc::clone(&resolver);
+            let readers = Arc::clone(&readers);
+            let rx = Arc::clone(&rx);
+            std::thread::spawn(move || loop {
+                let item = {
+                    let guard = match rx.lock() {
+                        Ok(g) => g,
+                        Err(_) => return,
+                    };
+                    guard.recv()
+                };
+                let Ok((txid, height)) = item else {
+                    return;
+                };
+                let _guard = readers.enter(height);
+                let _ = resolver.raw_tx(txid, height);
+            });
+        }
+        Self {
+            tx: Some(tx),
+            seen: Mutex::new(HashSet::new()),
+        }
+    }
+
+    /// Enqueue one txid per block height. Duplicates and a full queue are
+    /// dropped silently: prefetch is an optimisation, never a correctness path.
+    pub fn enqueue(&self, txid: Hash32, height: u32) {
+        let Some(tx) = &self.tx else {
+            return;
+        };
+        let Ok(mut seen) = self.seen.lock() else {
+            return;
+        };
+        if seen.len() >= 20_000 {
+            seen.clear();
+        }
+        if seen.insert(height) {
+            let _ = tx.try_send((txid, height));
+        }
+    }
+}
+
 pub struct Shared {
     pub store: Arc<Store>,
     pub core: CoreClient,
@@ -649,6 +720,7 @@ pub struct Shared {
     pub provider_ready: AtomicBool,
     pub tor_ready: AtomicBool,
     pub clearnet_fallback: AtomicBool,
+    pub prefetch: Prefetcher,
     pub mempool: Arc<RwLock<Mempool>>,
     pub relayfee: Mutex<f64>,
     pub fee_estimates: Mutex<FeeEstimateCache>,
@@ -1645,6 +1717,7 @@ fn history_entries_with_code(
             .store
             .txid_at(txnum)
             .map_err(|e| RpcError::server(e.to_string()))?;
+        shared.prefetch.enqueue(txid, height);
         out.push((
             height,
             tx_pos,

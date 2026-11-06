@@ -1,5 +1,33 @@
 # Changelog
 
+## 0.1.0-alpha.29.3 — 2026-11-07
+
+### Patch: P2P witness, faster rawtx and history prefetch
+
+- **P2P now advertises `NODE_WITNESS`** in `version` (v1 and v2). Without it,
+  peers strip witnesses from blocks; the block hash/merkle still match, so
+  e-lite accepted the bytes but the BIP141 check failed with `missing witness
+  reserved value`. This was the cause of stuck `Retrieving transaction` on
+  signet.
+- **Esplora request timeout** reduced from 60 s to 15 s
+  (`rawtx.request_timeout_seconds`) and **per-provider Tor cooldown**
+  (`rawtx.provider_cooldown_seconds`, default 120 s): after a failed Tor request
+  that provider goes direct instead of waiting a minute per transaction.
+- **P2P clearnet fallback** when Tor fails (`tor_fallback_clearnet`), with a
+  one-time warning.
+- **Readiness probe now fetches the genesis raw block** (`/block/<hash>/raw`)
+  and verifies its header hash, not only `/block-height/0`. A provider that
+  cannot serve real blocks cannot open the wallet gate.
+- **Tor warning fixed**: “Tor unavailable” only when no probe used Tor; partial
+  provider fallback is reported separately.
+- **History block prefetch**: when a script history is served, e-lite enqueues
+  the confirmed heights in a bounded, deduplicated background queue (2 workers)
+  so the subsequent `transaction.get` hits the block cache.
+- Config: `request_timeout_seconds`, `provider_cooldown_seconds`; docs updated.
+- Tests: NODE_WITNESS version payload, raw-block genesis probe (match/mismatch),
+  Tor fallback state; existing 1.4/1.6/1.7 e2e stays green.
+- No schema or protocol changes.
+
 ## 0.1.0-alpha.29.2 — 2026-11-06
 
 ### Patch: provider readiness checks the network genesis
