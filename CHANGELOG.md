@@ -1,5 +1,34 @@
 # Changelog
 
+## 0.1.0-alpha.26.1 — 2026-11-06
+
+### Patch: public providers live in an editable file
+
+Public Esplora endpoints are no longer compiled into the binary. The effective
+list is read from `public-servers.toml` next to `config.toml`; the shipped file
+is the single source of truth.
+
+- **First run / missing file**: e-lite copies the shipped template (config dir,
+  working directory, next to the binary, or `/usr/share/e-lite/`). Existing
+  files are never overwritten. `[public_servers] generate = false` disables
+  creation; a missing file means local data only (fail closed).
+- **Verified defaults** in the template: Blockstream and mempool.space for
+  mainnet, signet and testnet4; the mempool onion is present but commented until
+  a real-Tor e2e verifies the `/api` path. `regtest` is empty.
+- **Validation**: clearnet must be `https://`; plain `http://` is accepted only
+  for `.onion` hosts and still needs Tor. Invalid URLs are warned and skipped.
+- **Precedence**: `[rawtx] esplora_urls` (CLI/`--set`) → `public-servers.toml`
+  → none. There is no hidden fallback list in code.
+- **New `--public-servers <path>`** and `[public_servers]` config
+  (`file`, `generate`).
+- **`/status`** includes the effective `public_servers` list; **`doctor`** shows
+  the resolved file, its source and the endpoints per network.
+- **Packaging**: the template ships in the tarball and `.deb`
+  (`/usr/share/e-lite/public-servers.toml`); `install.sh` copies it to
+  `~/.config/e-lite/` only when absent.
+- Tests: first-run creation, no-overwrite, invalid file, generation disabled,
+  URL validation and an e2e doctor/status check.
+
 ## 0.1.0-alpha.26 — 2026-11-06
 
 ### Electrum 1.6 compatibility

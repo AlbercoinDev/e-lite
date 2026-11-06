@@ -1,0 +1,48 @@
+# public-servers.toml — public providers e-lite may query when local data is missing.
+#
+# This file is the single source of truth for public servers: e-lite has no
+# built-in list. Edit it freely. e-lite only ever requests whole blocks by hash
+# (`GET {base}/block/{hash}/raw`); it never sends txids, scripts or spk_hints.
+#
+# Clearnet entries must use https://. Plain http:// is only accepted for
+# `.onion` hosts and requires Tor (`[rawtx] tor_socks` / managed Tor).
+#
+# If this file is missing on a first run, e-lite copies the shipped template.
+# Existing files are never overwritten. Set [public_servers] generate = false
+# in config.toml if you do not want that.
+#
+# Verified 2026-11-06:
+#   https://blockstream.info/api                     (mainnet)
+#   https://mempool.space/api                        (mainnet)
+#   https://blockstream.info/signet/api              (signet)
+#   https://mempool.space/signet/api                 (signet)
+#   https://blockstream.info/testnet4/api            (testnet4)
+#   https://mempool.space/testnet4/api               (testnet4)
+
+[mainnet]
+esplora = [
+    "https://blockstream.info/api",
+    "https://mempool.space/api",
+    # mempool.space official onion (from the mempool project's docker/backend
+    # config). Keep it commented until an e2e with a real Tor verifies the
+    # Esplora `/api` path on the onion.
+    # "http://mempoolhqx4isw62xs7abwphsq7ldayuidyx2v2oethdhhj6mlo2r6ad.onion/api",
+    # Blockstream API onion candidate. Also requires a real-Tor verification
+    # before it is enabled by default.
+    # "http://explorernuoc63nz27r73r7jvj7x4k4orrio3hu7tucrehgw7zu4ftnd2cfad.onion/api",
+]
+
+[signet]
+esplora = [
+    "https://mempool.space/signet/api",
+    "https://blockstream.info/signet/api",
+]
+
+[testnet4]
+esplora = [
+    "https://mempool.space/testnet4/api",
+    "https://blockstream.info/testnet4/api",
+]
+
+[regtest]
+esplora = []

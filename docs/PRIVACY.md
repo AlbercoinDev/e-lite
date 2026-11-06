@@ -37,20 +37,38 @@ these checks.
 
 ## Default providers
 
-`[rawtx] esplora_urls = []` selects per-network defaults:
+Public servers are **not compiled into e-lite**. The effective list lives in an
+editable file next to the config:
+
+```
+~/.config/e-lite/public-servers.toml
+```
+
+On a first run, or when the file is missing, e-lite copies the shipped template.
+Existing files are never overwritten. If the file and the template are both
+missing, e-lite uses local data only (fail closed). Set
+`[public_servers] generate = false` to disable automatic creation.
+
+Shipped defaults (verified 2026-11-06):
 
 | Network | Default Esplora bases |
 |---|---|
-| mainnet | `https://blockstream.info/api`, `https://mempool.space/api`, mempool.space onion |
-| signet | `https://mempool.space/signet/api` |
-| testnet4 | `https://mempool.space/testnet4/api` |
+| mainnet | `https://blockstream.info/api`, `https://mempool.space/api` (mempool onion included but commented until a real-Tor e2e verifies it) |
+| signet | `https://mempool.space/signet/api`, `https://blockstream.info/signet/api` |
+| testnet4 | `https://mempool.space/testnet4/api`, `https://blockstream.info/testnet4/api` |
 | regtest | none |
+
+Edit that file to add, remove or reorder providers. e-lite only requests whole
+blocks by hash (`GET {base}/block/{hash}/raw`); it never sends txids, scripts or
+`spk_hint` to these servers. Clearnet entries must be `https://`; plain `http://`
+is accepted only for `.onion` hosts and still requires Tor.
 
 P2P peers are discovered from Core's address manager (`getnodeaddresses`) or set
 explicitly with `p2p_peers`. Only peers advertising full `NODE_NETWORK` service
 are used for historical blocks; pruned/limited peers are rejected.
 
-These defaults are **configurable**:
+`[rawtx] esplora_urls` remains a one-off override (CLI/`--set` or config); if it
+is non-empty, it replaces the file for that run:
 
 ```toml
 [rawtx]
@@ -62,9 +80,13 @@ allow_clearnet = false
 use_p2p = true
 use_esplora = true
 p2p_v2 = true
-esplora_urls = []          # empty = defaults above
+esplora_urls = []          # empty = use public-servers.toml
 p2p_peers = []             # empty = discover from local Core
 # allow_clearnet = true is required for clearnet Esplora/P2P without Tor
+
+[public_servers]
+# file = ""               # empty = <config dir>/public-servers.toml
+generate = true           # create it from the shipped template when missing
 ```
 
 ## Tor and clearnet

@@ -4,7 +4,7 @@
 any `scriptPubKey` in the active chain without registering wallets. Core remains
 the authority for consensus and the active chain; e-lite never invents data.
 
-> **Status: `v0.1.0-alpha.26` — experimental, no funds.**
+> **Status: `v0.1.0-alpha.26.1` — experimental, no funds.**
 > Test on regtest/signet/testnet4 before mainnet.
 > Electrum is plain TCP on loopback by default. Optional TLS is available on a
 > separate listener; e-lite also runs its own Tor and publishes an onion service
@@ -99,7 +99,9 @@ See [`docs/CLI.md`](docs/CLI.md) for every flag and `--set` example.
   expose the plain port publicly.
 - Core RPC is HTTP. LAN/WAN use requires SSH/VPN; never expose the RPC port.
 - External rawtx lookup is local-first and Tor-first; it requests whole blocks by
-  hash and validates them. See [`docs/PRIVACY.md`](docs/PRIVACY.md).
+  hash and validates them. Public providers live in the editable
+  `public-servers.toml` (next to `config.toml`), never in the binary. See
+  [`docs/PRIVACY.md`](docs/PRIVACY.md).
 
 ## Tests and release
 

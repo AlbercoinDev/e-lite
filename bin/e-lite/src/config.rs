@@ -39,6 +39,30 @@ pub struct Config {
     pub logging: LoggingCfg,
     #[serde(default)]
     pub tor: TorCfg,
+    #[serde(default)]
+    pub public_servers: PublicServersCfg,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PublicServersCfg {
+    /// Explicit `public-servers.toml` path. Empty uses the file next to the
+    /// active config file.
+    #[serde(default)]
+    pub file: Option<String>,
+    /// Create the file from the shipped template when it is missing on a first
+    /// run. Existing files are never overwritten.
+    #[serde(default = "d_true")]
+    pub generate: bool,
+}
+
+impl Default for PublicServersCfg {
+    fn default() -> Self {
+        Self {
+            file: None,
+            generate: true,
+        }
+    }
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]

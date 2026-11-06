@@ -567,6 +567,9 @@ pub struct Shared {
     pub store: Arc<Store>,
     pub core: CoreClient,
     pub resolver: Arc<Resolver>,
+    /// Effective public Esplora bases for this network (from public-servers.toml
+    /// or the [rawtx] override). Empty means local data only.
+    pub public_servers: Vec<String>,
     pub mempool: Arc<RwLock<Mempool>>,
     pub relayfee: Mutex<f64>,
     pub fee_estimates: Mutex<FeeEstimateCache>,
@@ -809,6 +812,7 @@ impl Shared {
                 "unresolved_inputs": mem_unresolved,
                 "histogram_buckets": mem_buckets,
             },
+            "public_servers": &self.public_servers,
             "rawtx": {
                 "cache_hits": rawtx.cache_hits.load(Ordering::Relaxed),
                 "cache_puts": rawtx.cache_puts.load(Ordering::Relaxed),

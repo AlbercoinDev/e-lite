@@ -145,6 +145,12 @@ else
     install -m 0755 "$TMP/pkg/e-lite" "$PREFIX/.e-lite.new"
     mv -f "$PREFIX/.e-lite.new" "$PREFIX/e-lite"
     CURRENT="$("$PREFIX/e-lite" --version | awk '{print $2}')"
+    CFG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/e-lite"
+    if [ -f "$TMP/pkg/public-servers.toml" ] && [ ! -f "$CFG_DIR/public-servers.toml" ]; then
+      mkdir -p "$CFG_DIR"
+      install -m 0644 "$TMP/pkg/public-servers.toml" "$CFG_DIR/public-servers.toml"
+      log "public servers: installed the default list at $CFG_DIR/public-servers.toml"
+    fi
   fi
   log "e-lite: installed $CURRENT at $PREFIX/e-lite"
 fi

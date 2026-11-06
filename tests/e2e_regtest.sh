@@ -37,10 +37,13 @@ ADDR=$($CLI -rpcwallet=e2e getnewaddress)
 $CLI -rpcwallet=e2e generatetoaddress 101 "$ADDR" >/dev/null
 HEIGHT=$($CLI getblockcount)
 
-COMMON=(--network regtest --core-datadir "$CORE" --core-rpc "http://127.0.0.1:$RPC_PORT" --data-dir "$DATA" --min-free-gib 1)
+COMMON=(--network regtest --core-datadir "$CORE" --core-rpc "http://127.0.0.1:$RPC_PORT" --data-dir "$DATA" --min-free-gib 1 --public-servers "$RUN/public-servers.toml")
 "$BIN" init "${COMMON[@]}"
 "$BIN" doctor "${COMMON[@]}" --listen "127.0.0.1:$ELECTRUM_PORT" --metrics "127.0.0.1:$METRICS_PORT" \
-  --tls-listen "127.0.0.1:$TLS_PORT" --tls-cert "$TLS_DIR/cert.pem" --tls-key "$TLS_DIR/key.pem"
+  --tls-listen "127.0.0.1:$TLS_PORT" --tls-cert "$TLS_DIR/cert.pem" --tls-key "$TLS_DIR/key.pem" \
+  >"$RUN/doctor.log" 2>&1
+grep -q "public servers:" "$RUN/doctor.log" || { cat "$RUN/doctor.log"; exit 1; }
+test -f "$RUN/public-servers.toml" || { echo "public-servers.toml was not created"; exit 1; }
 "$BIN" index "${COMMON[@]}" --no-follow --batch 16 --reorg-window 8 --milestone-blocks 50 \
   >"$RUN/index.log" 2>&1
 grep -q "milestone" "$RUN/index.log" || { cat "$RUN/index.log"; exit 1; }
@@ -83,6 +86,8 @@ mem = st["memory"]
 assert mem["total_mib"] > 0, mem
 assert mem["available_mib"] > 0, mem
 assert st["tuning"]["cache_mib"] >= 128, st["tuning"]
+assert "public_servers" in st, st
+assert isinstance(st["public_servers"], list), st
 assert st["ready"] is True and st["fully_synced"] is True, st
 print("memory accounting OK:", mem["total_mib"], mem["available_mib"], "MiB")
 PY

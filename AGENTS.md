@@ -67,6 +67,11 @@ Never treat a version number in this file as authoritative over the code/tag.
   auto-generated self-signed certificate when none is configured. Neither
   listener authenticates clients; the onion address is the access secret. Do not
   expose them publicly without a tunnel/firewall/access plan.
+- Public servers are not compiled into the binary: they live in the editable
+  `public-servers.toml` next to `config.toml`. A first run copies the shipped
+  template; a missing file means local data only (fail closed), never a hidden
+  fallback list. Only whole blocks are requested by hash, and clearnet entries
+  must be HTTPS (`.onion` over Tor is the only plain-HTTP exception).
 - Electrum protocol versions are negotiated per connection. This build serves
   1.4–1.6 (`server.version` returns the negotiated version). A request for a
   future or skipped version falls back to the newest implemented version at or

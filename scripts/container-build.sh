@@ -24,9 +24,11 @@ strip --strip-unneeded /target/release/e-lite
 rm -rf /tmp/pkg /tmp/tarroot
 mkdir -p /tmp/pkg/DEBIAN /tmp/pkg/usr/bin /tmp/pkg/usr/share/doc/e-lite
 install -m 0755 /target/release/e-lite /tmp/pkg/usr/bin/e-lite
-for f in README.md LICENSE CHANGELOG.md config.example.toml; do
+for f in README.md LICENSE CHANGELOG.md config.example.toml public-servers.toml; do
   install -m 0644 "/src/$f" /tmp/pkg/usr/share/doc/e-lite/"$f"
 done
+install -d -m 0755 /tmp/pkg/usr/share/e-lite
+install -m 0644 /src/public-servers.toml /tmp/pkg/usr/share/e-lite/public-servers.toml
 
 cat > /tmp/pkg/DEBIAN/control <<EOF
 Package: e-lite
@@ -46,7 +48,7 @@ dpkg-deb --build --root-owner-group /tmp/pkg "/out/e-lite_${VERSION}_amd64.deb" 
 
 mkdir -p /tmp/tarroot
 cp /target/release/e-lite /tmp/tarroot/e-lite
-for f in README.md LICENSE CHANGELOG.md config.example.toml; do
+for f in README.md LICENSE CHANGELOG.md config.example.toml public-servers.toml; do
   cp "/src/$f" /tmp/tarroot/"$f"
 done
 tar -czf "/out/e-lite-v${VERSION}-x86_64-unknown-linux-gnu.tar.gz" -C /tmp/tarroot .

@@ -53,15 +53,15 @@ export PATH="$HOME/.local/bin:$PATH"
 ## Pinned version
 
 ```bash
-curl -fsSL https://github.com/AlbercoinDev/e-lite/releases/download/v0.1.0-alpha.26/install.sh \
-  | sh -s -- --version 0.1.0-alpha.26 --yes
+curl -fsSL https://github.com/AlbercoinDev/e-lite/releases/download/v0.1.0-alpha.26.1/install.sh \
+  | sh -s -- --version 0.1.0-alpha.26.1 --yes
 ```
 
 With Core:
 
 ```bash
-curl -fsSL https://github.com/AlbercoinDev/e-lite/releases/download/v0.1.0-alpha.26/install.sh \
-  | sh -s -- --version 0.1.0-alpha.26 --with-core --yes
+curl -fsSL https://github.com/AlbercoinDev/e-lite/releases/download/v0.1.0-alpha.26.1/install.sh \
+  | sh -s -- --version 0.1.0-alpha.26.1 --with-core --yes
 ```
 
 ## System-wide .deb
@@ -119,6 +119,23 @@ The certificate must match the name the wallet uses (not a private IP). See
 [`OPERATIONS.md`](OPERATIONS.md#electrum-tls-optional) for Let's Encrypt reuse,
 renewal without restart, split-DNS and the nginx `stream` alternative. No TLS
 configuration is needed for a local-only setup.
+
+## Public providers
+
+Public Esplora endpoints are not compiled into the binary. They live in the
+editable file next to your config:
+
+```
+~/.config/e-lite/public-servers.toml
+```
+
+The installer copies the shipped template if the file does not exist; e-lite
+also creates it on a first run. Existing files are never overwritten. Edit it to
+add, remove or reorder providers; only whole blocks are requested, by hash.
+Clearnet entries must be `https://`; `.onion` entries use Tor. If the file and
+the template are both missing, e-lite uses local data only (fail closed). Set
+`[public_servers] generate = false` in `config.toml` to disable automatic
+creation.
 
 ## Update safely
 

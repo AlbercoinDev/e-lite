@@ -69,7 +69,7 @@ available**.
 | Auto self-signed onion TLS cert | experimental | SAN includes the onion; reloaded on change |
 | Decoys and random source order | experimental | `decoys=3` default |
 | Block hash/header/Merkle/witness validation | experimental | before serving/caching |
-| Configurable Esplora endpoints | experimental | `esplora_urls` |
+| Configurable Esplora endpoints | experimental | editable `public-servers.toml`; shipped defaults; fail-closed |
 | P2P peers auto/config | experimental | BIP324 v2 + v1 fallback |
 | Prune-gap repair from verified sources | experimental | bounded by `repair_max_gap_blocks` |
 | Silent payments privacy | **not available** | gate only |

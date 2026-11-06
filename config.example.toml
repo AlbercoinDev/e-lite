@@ -102,11 +102,16 @@ use_p2p = true                      # minimal P2P client; used for prune-gap rep
 use_esplora = true                  # Esplora block endpoints; used for repair too
 p2p_v2 = true                       # BIP324 encrypted transport, fallback to v1
 p2p_peers = []                      # empty: discover from local Core
-# esplora_urls = []                 # empty: per-network defaults
-#   mainnet: blockstream/mempool + onion
-#   signet:  https://mempool.space/signet/api
-#   testnet4:https://mempool.space/testnet4/api
-#   regtest: none
+# esplora_urls = []                 # one-off override; normally leave empty and
+#                                   # edit public-servers.toml instead (see below)
+
+[public_servers]
+# Public providers are NOT compiled into e-lite. The file is read from the same
+# directory as this config file (or the path below). If it is missing on a first
+# run, the shipped template is copied. If no template exists, e-lite uses local
+# data only (fail closed).
+# file = ""                         # empty = <config dir>/public-servers.toml
+generate = true                     # create it from the template when missing
 
 [silent_payments]
 enabled = false                     # opt-in gate; BIP352 indexer not included yet

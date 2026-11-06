@@ -34,6 +34,7 @@ version          print version
 | Flag | Meaning |
 |---|---|
 | `--config <path>` | TOML file (default `~/.config/e-lite/config.toml`) |
+| `--public-servers <path>` | provider list (default: `public-servers.toml` next to the config) |
 | `--network <name>` | `auto`, `regtest`, `signet`, `testnet4`, `mainnet` |
 | `--data-dir <path>` | index directory |
 | `--core-rpc <url>` | Core RPC URL (HTTP; use SSH/VPN for WAN) |

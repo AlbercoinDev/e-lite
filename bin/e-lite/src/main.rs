@@ -1,6 +1,7 @@
 mod config;
 mod core_supervisor;
 mod logging;
+mod public_servers;
 mod snapshot;
 mod tor;
 mod tuning;
@@ -183,6 +184,7 @@ struct Args {
     command: Option<Command>,
     subcommand: Option<String>,
     config: Option<String>,
+    public_servers: Option<String>,
     network: Option<String>,
     data_dir: Option<String>,
     rpc_url: Option<String>,
@@ -282,6 +284,7 @@ fn parse_args() -> R<Args> {
             "-h" | "--help" => args.command = Some(Command::Help),
             "--version" | "-V" => args.command = Some(Command::Version),
             "--config" => args.config = Some(value("--config")?),
+            "--public-servers" => args.public_servers = Some(value("--public-servers")?),
             "--network" => args.network = Some(value("--network")?),
             "--data-dir" => args.data_dir = Some(value("--data-dir")?),
             "--core-rpc" => args.rpc_url = Some(value("--core-rpc")?),
@@ -439,6 +442,9 @@ fn effective_config(args: &Args) -> R<(Config, Chain)> {
     let mut cfg = Config::load_with_overrides(args.config.as_deref(), &args.set)?;
     if let Some(n) = &args.network {
         cfg.network.name = n.clone();
+    }
+    if let Some(p) = &args.public_servers {
+        cfg.public_servers.file = Some(p.clone());
     }
     if let Some(d) = &args.data_dir {
         cfg.network.data_dir = Some(d.clone());
@@ -1056,6 +1062,7 @@ COMMANDS:
 
 OPTIONS:
     --config <path>         TOML config file (default ~/.config/e-lite/config.toml)
+    --public-servers <path> public-servers.toml (default: next to the config file)
     --network <name>        auto | regtest | signet | testnet4 | mainnet
     --data-dir <path>       index directory
     --core-rpc <url>        http://host:port (use an SSH/VPN tunnel for WAN)
@@ -1196,6 +1203,19 @@ fn cmd_doctor(cfg: &Config, chain: Chain) -> R<()> {
     println!("e-lite {} doctor", VERSION);
     println!("network: {}", chain.name());
     println!("data dir: {}", cfg.data_dir(chain).display());
+    let public = public_servers::load(cfg, chain, config_path().as_deref());
+    println!(
+        "public servers: {} ({})",
+        public.path.display(),
+        public.source
+    );
+    if !public.configured() {
+        println!("  esplora: none (local data only)");
+    } else {
+        for url in &public.endpoints {
+            println!("  esplora: {url}");
+        }
+    }
 
     let core = match core_client(cfg, chain) {
         Ok(c) => {
@@ -3713,25 +3733,12 @@ fn check_pruned(
     Ok(())
 }
 
-fn default_esplora_urls(chain: Chain) -> Vec<String> {
-    match chain {
-        Chain::Mainnet => vec![
-            "http://mempoolhqx4isw62xs7abwphsq7ldayuidyx2v2oethdhhj6mlo2r6ad.onion/api".to_string(),
-            "https://blockstream.info/api".to_string(),
-            "https://mempool.space/api".to_string(),
-        ],
-        Chain::Testnet4 => vec!["https://mempool.space/testnet4/api".to_string()],
-        Chain::Signet => vec!["https://mempool.space/signet/api".to_string()],
-        Chain::Regtest => Vec::new(),
-    }
-}
-
 fn build_resolver(
     cfg: &Config,
     chain: Chain,
     store: &Arc<Store>,
     core: &CoreClient,
-) -> R<Arc<Resolver>> {
+) -> R<(Arc<Resolver>, Vec<String>)> {
     let mut peers = cfg.rawtx.p2p_peers.clone();
     if cfg.rawtx.enabled && cfg.rawtx.use_p2p && peers.is_empty() {
         match core.node_addresses(64) {
@@ -3758,10 +3765,11 @@ fn build_resolver(
         }
     }
     let tor = cfg.rawtx.tor_socks.clone().filter(|s| !s.trim().is_empty());
-    let esplora_urls = if cfg.rawtx.esplora_urls.is_empty() {
-        default_esplora_urls(chain)
-    } else {
+    let esplora_urls = if !cfg.rawtx.esplora_urls.is_empty() {
         cfg.rawtx.esplora_urls.clone()
+    } else {
+        let resolved = public_servers::load(cfg, chain, crate::config_path().as_deref());
+        resolved.endpoints
     };
     let rc = RawtxConfig {
         enabled: cfg.rawtx.enabled,
@@ -3772,14 +3780,15 @@ fn build_resolver(
         use_p2p: cfg.rawtx.use_p2p,
         use_esplora: cfg.rawtx.use_esplora,
         p2p_v2: cfg.rawtx.p2p_v2,
-        esplora_urls,
+        esplora_urls: esplora_urls.clone(),
         p2p_peers: peers,
         p2p_timeout: Duration::from_secs(cfg.core.timeout_seconds.max(1)),
         chain,
     };
     let resolver = Resolver::new(Arc::clone(store), &rc)?;
-    Ok(Arc::new(
-        resolver.with_local(Arc::new(CoreBlockSource::new(core.clone()))),
+    Ok((
+        Arc::new(resolver.with_local(Arc::new(CoreBlockSource::new(core.clone())))),
+        esplora_urls,
     ))
 }
 
@@ -3790,7 +3799,7 @@ fn build_shared(
     identity: NetworkIdentity,
 ) -> R<Arc<Shared>> {
     let core = core_client(cfg, chain)?;
-    let resolver = build_resolver(cfg, chain, &store, &core)?;
+    let (resolver, public_servers) = build_resolver(cfg, chain, &store, &core)?;
     let log_file = cfg.app_log_file(chain);
     let banner_file = cfg.app_banner_file(chain);
     if let Some(path) = &banner_file {
@@ -3827,6 +3836,7 @@ fn build_shared(
         store,
         core,
         resolver,
+        public_servers,
         mempool: Arc::new(RwLock::new(Mempool::new())),
         relayfee: Mutex::new(0.0),
         fee_estimates: Mutex::new(std::collections::HashMap::new()),

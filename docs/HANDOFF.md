@@ -1,9 +1,9 @@
 # Session handoff
 
 **Updated:** 2026-11-06
-**Latest published release:** `0.1.0-alpha.26`
-**Release:** https://github.com/AlbercoinDev/e-lite/releases/tag/v0.1.0-alpha.26
-**Main commit at handoff:** tag `v0.1.0-alpha.26`
+**Latest published release:** `0.1.0-alpha.26.1`
+**Release:** https://github.com/AlbercoinDev/e-lite/releases/tag/v0.1.0-alpha.26.1
+**Main commit at handoff:** tag `v0.1.0-alpha.26.1`
 
 This file is the short “where we are” for a new session. The invariants live in
 [`AGENTS.md`](../AGENTS.md) and [`PROJECT_MEMORY.md`](PROJECT_MEMORY.md); the
@@ -71,6 +71,21 @@ no repitas contexto ni rehagas decisiones ya documentadas.
   the onion setup, reset and security.
 - `docs/ROADMAP.md` contains future features/improvements. Do not present them as
   available.
+
+## Last change (alpha.26.1)
+
+- **Public providers are file-based**: `public-servers.toml` next to
+  `config.toml` is the only list; there is no compiled-in fallback. A first run
+  copies the shipped template, existing files are never overwritten, and a
+  missing file means local data only.
+- Defaults: Blockstream + mempool.space for mainnet, signet and testnet4;
+  mempool onion present but commented pending a real-Tor verification.
+- Clearnet URLs must be HTTPS; `.onion` is the only plain-HTTP exception and
+  still requires Tor.
+- `/status` exposes the effective list; `doctor` prints the resolved file,
+  source and endpoints. `--public-servers` and `[public_servers]` override the
+  location/generation.
+- Packages ship the template; `install.sh` copies it only when absent.
 
 ## Last change (alpha.26)
 
