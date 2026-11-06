@@ -3,7 +3,7 @@
 **Updated:** 2026-11-06
 **Latest published release:** `0.1.0-alpha.25.3`
 **Release:** https://github.com/AlbercoinDev/e-lite/releases/tag/v0.1.0-alpha.25.3
-**Main commit at handoff:** `93387f0` (`alpha.25.3: finish Electrum 1.4.2 conformance`)
+**Main commit at handoff:** tag `v0.1.0-alpha.25.3`
 
 This file is the short “where we are” for a new session. The invariants live in
 [`AGENTS.md`](../AGENTS.md) and [`PROJECT_MEMORY.md`](PROJECT_MEMORY.md); the
