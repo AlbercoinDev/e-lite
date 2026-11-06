@@ -37,7 +37,7 @@ available**.
 | Block stats | experimental | local |
 | Broadcast | experimental | via Core |
 | Raw transaction get | experimental | local Core -> cache -> P2P/Esplora |
-| Electrum 1.4 negotiation | experimental | negotiates 1.4–1.4.2 numerically; 1.6/1.7 not implemented |
+| Electrum 1.4 negotiation | experimental | negotiates 1.4–1.4.2 numerically; future/skipped versions fall back to the newest implemented version below; 1.6/1.7 not implemented |
 | TLS Electrum | experimental | opt-in `tls_listen`; PEM cert/key; reload on change; no client auth |
 | Silent payments BIP352 | **gate** | explicit error; no indexer |
 

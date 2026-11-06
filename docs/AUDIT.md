@@ -1,7 +1,7 @@
 # Code audit
 
-**Base:** `0.1.0-alpha.25.2` → published `0.1.0-alpha.25.3` · **Scope:** `bin/e-lite`, `crates/*` (26 Rust files,
-~18k lines) · **Status:** findings fixed in `0.1.0-alpha.25.3` where noted.
+**Base:** `0.1.0-alpha.25.3` → published `0.1.0-alpha.25.4` · **Scope:** `bin/e-lite`, `crates/*` (26 Rust files,
+~18k lines) · **Status:** findings fixed in `0.1.0-alpha.25.4` where noted.
 
 This audit is not a claim of formal verification. It records static checks,
 manual review areas, concrete findings and residual risks.
@@ -74,6 +74,7 @@ Additional checks performed:
 | AUD-016 | P3 | Code layout | `bin/e-lite/src/main.rs` still holds CLI, indexer, disk guard, metrics wiring and helpers. | `tuning`, `config`, `snapshot`, `core_supervisor` already split; further extraction is refactor-only, not required for correctness. |
 | AUD-017 | P3 | Docs drift | Historically `prune=550`, `lag 512`, snapshots and TLS claims appeared inconsistently. | Documentation rewritten in alpha.16; `AGENTS.md`/`docs/PROJECT_MEMORY.md` enforce consistency. |
 | AUD-040 | P3 | Fee estimate | `blockchain.estimatefee` returns a relayfee/mempool fallback instead of `-1` when Core has no estimate; the protocol allows `-1`. | Intentional compatibility choice: some wallets (Sparrow) treat `-1` as a send failure. Documented in `docs/FEATURES.md`; revisit if wallets handle `-1` correctly. |
+| AUD-041 | P3 | Version negotiation | The spec says to close when client and server ranges do not intersect. e-lite instead downgrades to the newest implemented version at or below the client maximum, so a client requesting `1.5`/`1.6`/`1.7` still connects on `1.4.2`. | Deliberate leniency for wallet compatibility; the negotiated version is returned so a compliant client adapts. Only a client maximum below 1.4 is refused. Tests cover the matrix; documented in `AGENTS.md`/`FEATURES.md`. |
 
 ## Reviewed and considered correct
 

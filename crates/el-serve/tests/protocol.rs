@@ -312,6 +312,27 @@ fn incompatible_protocol_is_rejected() {
 }
 
 #[test]
+fn future_protocol_versions_fall_back_to_the_previous_available() {
+    let (fx, _, _) = fixture();
+    for (id, requested) in ["1.4.3", "1.5", "1.6", "1.7"].into_iter().enumerate() {
+        let r = call(
+            &fx.shared,
+            id as u64,
+            "server.version",
+            json!(["test", requested]),
+        );
+        assert_eq!(r["result"][1], "1.4.2", "{requested}: {r}");
+    }
+    let r = call(
+        &fx.shared,
+        10,
+        "server.version",
+        json!(["test", ["1.5", "1.7"]]),
+    );
+    assert_eq!(r["result"][1], "1.4.2", "{r}");
+}
+
+#[test]
 fn silent_payments_are_gated_with_an_explicit_error() {
     let (fx, _, _) = fixture();
     for method in [

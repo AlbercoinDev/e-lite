@@ -68,10 +68,12 @@ Never treat a version number in this file as authoritative over the code/tag.
   listener authenticates clients; the onion address is the access secret. Do not
   expose them publicly without a tunnel/firewall/access plan.
 - Electrum protocol versions are negotiated per connection. This build serves
-  1.4–1.4.2 (`server.version` returns the negotiated version). Never raise
-  `protocol_max` until every method of that version (and the previous ones) is
-  implemented and tested: a server advertising a version MUST support all of
-  its methods.
+  1.4–1.4.2 (`server.version` returns the negotiated version). A request for a
+  future or skipped version falls back to the newest implemented version at or
+  below the client maximum; only a client that cannot speak 1.4 is refused.
+  Never raise `protocol_max` until every method of that version (and the
+  previous ones) is implemented and tested: a server advertising a version MUST
+  support all of its methods.
 - The memory budget reserves `max(1024 MiB, RAM/8)` for the OS/Core/page cache,
   caps e-lite at 75 % of total RAM, fixes memtables at `RAM/8`, and grows/shrinks
   the block cache in 256 MiB steps under `MemAvailable` + page-cache pressure.

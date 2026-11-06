@@ -1,5 +1,28 @@
 # Changelog
 
+## 0.1.0-alpha.25.4 — 2026-11-06
+
+### Patch: negotiate down instead of disconnecting
+
+A client that requested an unimplemented or skipped version (for example `1.5`
+or `1.6`) was disconnected even though the server could serve it with `1.4.2`.
+The server now picks the newest implemented version at or below the client's
+maximum and reports it in the `server.version` result. Only clients that cannot
+speak 1.4 at all are refused.
+
+- `ProtocolVersion::highest_available` replaces the strict range intersection;
+  the implemented versions are listed in `SERVER_VERSIONS`.
+- `1.4.3` (Namecoin-only), `1.5` (skipped) and future `1.6`/`1.7` now negotiate
+  to `1.4.2` instead of erroring.
+- Inverted ranges (`max < min`) are still `-32602`; a client maximum below
+  `1.4` still closes the connection.
+- Tests cover the selection matrix, the socket close path and the protocol
+  fallback for future versions.
+
+This is a deliberate leniency over the strict “no intersection, close” rule so
+wallets asking for a newer protocol keep working; the response tells them the
+actual version.
+
 ## 0.1.0-alpha.25.3 — 2026-11-06
 
 ### Patch: Electrum 1.4 protocol conformance

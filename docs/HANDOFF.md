@@ -1,9 +1,9 @@
 # Session handoff
 
 **Updated:** 2026-11-06
-**Latest published release:** `0.1.0-alpha.25.3`
-**Release:** https://github.com/AlbercoinDev/e-lite/releases/tag/v0.1.0-alpha.25.3
-**Main commit at handoff:** tag `v0.1.0-alpha.25.3`
+**Latest published release:** `0.1.0-alpha.25.4`
+**Release:** https://github.com/AlbercoinDev/e-lite/releases/tag/v0.1.0-alpha.25.4
+**Main commit at handoff:** tag `v0.1.0-alpha.25.4`
 
 This file is the short “where we are” for a new session. The invariants live in
 [`AGENTS.md`](../AGENTS.md) and [`PROJECT_MEMORY.md`](PROJECT_MEMORY.md); the
@@ -49,8 +49,9 @@ no repitas contexto ni rehagas decisiones ya documentadas.
 - Electrum 1.4–1.4.2 is implemented and negotiated per connection: numeric
   `server.version`, verbose `transaction.get` with block context, notification
   suppression, real `scripthash.unsubscribe` and canonical mempool status
-  order. The next compatibility step is 1.6, then 1.7 (which needs an outpoint
-  spend index).
+  order. A request for an unimplemented/skipped version falls back to the newest
+  implemented version at or below it. The next compatibility step is 1.6, then
+  1.7 (which needs an outpoint spend index).
 - Core RPC is HTTP; LAN/WAN requires SSH/VPN.
 - Rawtx resolution is local Core -> validated cache -> P2P/Esplora (whole blocks,
   Tor-first via the managed Tor, decoys, verified).
@@ -68,6 +69,17 @@ no repitas contexto ni rehagas decisiones ya documentadas.
   the onion setup, reset and security.
 - `docs/ROADMAP.md` contains future features/improvements. Do not present them as
   available.
+
+## Last change (alpha.25.4)
+
+- **Lenient version negotiation** (AUD-041): the server now selects the newest
+  implemented version at or below the client's maximum instead of disconnecting
+  when the ranges do not intersect. `1.4.3`, `1.5`, `1.6` and `1.7` requests all
+  negotiate `1.4.2` today; only a maximum below 1.4 is refused.
+- `SERVER_VERSIONS` is the single source of truth; add a version there only
+  after all of its methods are implemented and tested.
+- Tests: selection matrix (including gaps and future versions), protocol
+  fallback and the existing socket-close path for `< 1.4`.
 
 ## Last change (alpha.25.3)
 

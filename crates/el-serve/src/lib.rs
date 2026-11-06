@@ -25,7 +25,7 @@ use std::sync::{Arc, Mutex, RwLock, RwLockReadGuard};
 use std::time::{Duration, Instant, SystemTime};
 
 mod version;
-pub use version::{ProtocolVersion, SERVER_MAX, SERVER_MIN};
+pub use version::{ProtocolVersion, SERVER_MAX, SERVER_MIN, SERVER_VERSIONS};
 
 /// Electrum clients ask for a script's full history. A script with millions of
 /// entries would hold the index lock for too long; keep a generous cap that
@@ -1053,9 +1053,18 @@ fn negotiate_protocol(requested: Option<&Value>) -> RpcResult<ProtocolVersion> {
             ))
         }
     };
-    ProtocolVersion::negotiate(client_min, client_max, SERVER_MIN, SERVER_MAX).ok_or_else(|| {
+    if client_max < client_min {
+        return Err(RpcError::invalid("protocol range is inverted"));
+    }
+    // Deliberately lenient: a client asking for a future or skipped version
+    // (1.5, 1.6 before it is implemented, 1.7) is served the newest version we
+    // actually implement below it.  We only refuse clients that cannot speak
+    // 1.4 at all.  The negotiated version is returned, so a compliant client
+    // knows which shape to expect.
+    ProtocolVersion::highest_available(client_max, SERVER_VERSIONS).ok_or_else(|| {
         RpcError::server(format!(
-            "unsupported protocol; server supports {PROTOCOL_MIN}-{PROTOCOL_MAX}"
+            "no supported protocol at or below {client_max}; server supports \
+             {PROTOCOL_MIN}-{PROTOCOL_MAX}"
         ))
         .closing()
     })
@@ -2650,8 +2659,26 @@ mod tests {
         );
         assert!(server_version(&json!(["client", ["1.4", "1.4"]]), None).is_ok());
         assert!(server_version(&json!(["client", "1.2"]), None).is_err());
-        assert!(server_version(&json!(["client", "1.4.3"]), None).is_err());
         assert!(server_version(&json!(["client", ["1.0", "1.2"]]), None).is_err());
+        // Future, skipped or not-yet-implemented versions fall back to 1.4.2.
+        for requested in ["1.4.3", "1.5", "1.6", "1.7"] {
+            assert_eq!(
+                server_version(&json!(["client", requested]), None).unwrap()[1],
+                json!("1.4.2"),
+                "{requested} must fall back to the previous available version"
+            );
+        }
+        assert_eq!(
+            server_version(&json!(["client", ["1.5", "1.7"]]), None).unwrap()[1],
+            json!("1.4.2")
+        );
+        // An inverted range is a parameter error, not a version mismatch.
+        assert_eq!(
+            server_version(&json!(["client", ["1.6", "1.4"]]), None)
+                .unwrap_err()
+                .code,
+            -32602
+        );
         // Extraneous arguments are tolerated for future protocol extensions.
         assert!(server_version(&json!(["client", "1.4", "junk", 9]), None).is_ok());
     }

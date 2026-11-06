@@ -1,8 +1,11 @@
 //! Electrum protocol version parsing and negotiation.
 //!
 //! Electrum versions are dotted numeric strings (`1.4`, `1.4.2`, `1.7`).  The
-//! server speaks every version between `SERVER_MIN` and `SERVER_MAX`; the
-//! negotiated version is the highest version both sides support.
+//! server keeps an explicit list of implemented versions and negotiates down to
+//! the newest one at or below what the client asked for.  A client asking for a
+//! future or skipped version (1.5, 1.6 before it is implemented) is not
+//! disconnected; it is served the previous implemented version, and the
+//! response tells it which version is in effect.
 
 use std::fmt;
 
@@ -50,22 +53,18 @@ impl ProtocolVersion {
         Ok(Self::new(major, minor, patch))
     }
 
-    /// The highest version both the client range and the server range support.
-    pub fn negotiate(
-        client_min: Self,
-        client_max: Self,
-        server_min: Self,
-        server_max: Self,
-    ) -> Option<Self> {
-        if client_max < client_min {
-            return None;
-        }
-        let negotiated = client_max.min(server_max);
-        if negotiated < client_min.max(server_min) {
-            None
-        } else {
-            Some(negotiated)
-        }
+    /// The newest implemented version that does not exceed `client_max`.
+    ///
+    /// This is deliberately lenient: a client asking for an unimplemented
+    /// future version (or a gap such as 1.5) falls back to the previous
+    /// available version instead of losing the connection.  The caller should
+    /// only reject when no version at or below `client_max` exists.
+    pub fn highest_available(client_max: Self, available: &[Self]) -> Option<Self> {
+        available
+            .iter()
+            .copied()
+            .filter(|version| *version <= client_max)
+            .max()
     }
 }
 
@@ -81,10 +80,16 @@ impl fmt::Display for ProtocolVersion {
 
 /// Lowest and highest protocol versions this build can serve.
 ///
+/// 1.4.1 only changes AuxPoW header truncation (irrelevant on Bitcoin) and
 /// 1.4.2 adds `blockchain.scripthash.unsubscribe` (implemented).  1.4.3 only
-/// adds a Namecoin method, so it is deliberately not advertised.
+/// adds a Namecoin method, so it is deliberately not listed.
 pub const SERVER_MIN: ProtocolVersion = ProtocolVersion::new(1, 4, 0);
 pub const SERVER_MAX: ProtocolVersion = ProtocolVersion::new(1, 4, 2);
+
+/// Implemented protocol versions, sorted ascending.  Add a version here only
+/// after every method it documents is implemented and tested.
+pub const SERVER_VERSIONS: &[ProtocolVersion] =
+    &[SERVER_MIN, ProtocolVersion::new(1, 4, 1), SERVER_MAX];
 
 #[cfg(test)]
 mod tests {
@@ -123,39 +128,72 @@ mod tests {
     }
 
     #[test]
-    fn negotiation_picks_the_highest_common_version() {
-        let min = ProtocolVersion::new(1, 4, 0);
-        let max = ProtocolVersion::new(1, 7, 0);
+    fn selects_newest_version_at_or_below_client_max() {
+        let version = ProtocolVersion::new;
         assert_eq!(
-            ProtocolVersion::negotiate(min, max, SERVER_MIN, SERVER_MAX),
-            Some(SERVER_MAX)
+            ProtocolVersion::highest_available(version(1, 4, 0), SERVER_VERSIONS),
+            Some(version(1, 4, 0))
         );
         assert_eq!(
-            ProtocolVersion::negotiate(
-                ProtocolVersion::new(1, 4, 1),
-                ProtocolVersion::new(1, 4, 1),
-                SERVER_MIN,
-                SERVER_MAX
-            ),
-            Some(ProtocolVersion::new(1, 4, 1))
+            ProtocolVersion::highest_available(version(1, 4, 1), SERVER_VERSIONS),
+            Some(version(1, 4, 1))
         );
         assert_eq!(
-            ProtocolVersion::negotiate(
-                ProtocolVersion::new(1, 5, 0),
-                ProtocolVersion::new(1, 7, 0),
-                SERVER_MIN,
-                SERVER_MAX
-            ),
+            ProtocolVersion::highest_available(version(1, 4, 2), SERVER_VERSIONS),
+            Some(version(1, 4, 2))
+        );
+        // 1.4.3 is Namecoin-only, so it is not in our list.
+        assert_eq!(
+            ProtocolVersion::highest_available(version(1, 4, 3), SERVER_VERSIONS),
+            Some(version(1, 4, 2))
+        );
+        // 1.5 was skipped and 1.6 is not implemented yet: previous available.
+        assert_eq!(
+            ProtocolVersion::highest_available(version(1, 5, 0), SERVER_VERSIONS),
+            Some(version(1, 4, 2))
+        );
+        assert_eq!(
+            ProtocolVersion::highest_available(version(1, 6, 0), SERVER_VERSIONS),
+            Some(version(1, 4, 2))
+        );
+        assert_eq!(
+            ProtocolVersion::highest_available(version(1, 7, 0), SERVER_VERSIONS),
+            Some(version(1, 4, 2))
+        );
+        assert_eq!(
+            ProtocolVersion::highest_available(version(1, 3, 9), SERVER_VERSIONS),
             None
         );
+    }
+
+    #[test]
+    fn future_versions_fall_back_to_the_previous_available_one() {
+        let version = ProtocolVersion::new;
+        let mut available = SERVER_VERSIONS.to_vec();
+        available.push(version(1, 6, 0));
         assert_eq!(
-            ProtocolVersion::negotiate(
-                ProtocolVersion::new(1, 4, 3),
-                ProtocolVersion::new(1, 4, 3),
-                SERVER_MIN,
-                SERVER_MAX
-            ),
-            None
+            ProtocolVersion::highest_available(version(1, 4, 3), &available),
+            Some(version(1, 4, 2)),
+            "a version between available ones must not pick the newer protocol"
         );
+        assert_eq!(
+            ProtocolVersion::highest_available(version(1, 5, 0), &available),
+            Some(version(1, 4, 2))
+        );
+        assert_eq!(
+            ProtocolVersion::highest_available(version(1, 6, 0), &available),
+            Some(version(1, 6, 0))
+        );
+        assert_eq!(
+            ProtocolVersion::highest_available(version(1, 7, 0), &available),
+            Some(version(1, 6, 0))
+        );
+    }
+
+    #[test]
+    fn available_versions_are_sorted() {
+        assert!(SERVER_VERSIONS.windows(2).all(|pair| pair[0] < pair[1]));
+        assert_eq!(SERVER_VERSIONS.first(), Some(&SERVER_MIN));
+        assert_eq!(SERVER_VERSIONS.last(), Some(&SERVER_MAX));
     }
 }
