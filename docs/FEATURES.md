@@ -25,7 +25,7 @@ available**.
 | Reorg recovery within undo window | experimental | deeper reorg fails clearly |
 | Snapshots export/import | experimental | optional; not required from zero |
 
-## Index and Electrum 1.4
+## Index and Electrum 1.4–1.6
 
 | Feature | Status | Notes |
 |---|---|---|

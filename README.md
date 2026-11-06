@@ -1,6 +1,6 @@
 # e-lite
 
-**Electrum 1.4 server for Bitcoin Core.** Query history, balances and UTXOs of
+**Electrum 1.4–1.6 server for Bitcoin Core.** Query history, balances and UTXOs of
 any `scriptPubKey` in the active chain without registering wallets. Core remains
 the authority for consensus and the active chain; e-lite never invents data.
 
