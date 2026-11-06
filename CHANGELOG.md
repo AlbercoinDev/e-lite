@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.1.0-alpha.25.1 — 2026-11-06
+
+### Patch: load the bundled Tor libraries
+
+On Debian 13.7 (and any host without `libevent-2.1.so.7`), the managed Tor
+exited with status 127 because the expert bundle's `tor` has no RPATH and the
+loader could not find the `libevent`/`libssl`/`libcrypto` files shipped next to
+it.
+
+- **`LD_LIBRARY_PATH` for Tor**: e-lite prepends the Tor binary directory to
+  the child environment, so the bundled libraries are always found without
+  installing system packages. Existing `LD_LIBRARY_PATH` values are preserved.
+- **Actionable failure output**: if Tor exits unexpectedly, the last lines of
+  `tor.log` (including the loader error) are printed instead of only the exit
+  code.
+- **`doctor` runs `tor --version`** with the same environment and shows the
+  exact error if a library is still missing.
+- Tests: unit coverage for the library-path construction; the real-Tor
+  integration test and a minimal Debian 12 container check (bundle without
+  system libevent) pass with the new environment.
+
 ## 0.1.0-alpha.25 — 2026-11-05
 
 ### Onion works with wildcard Electrum listeners

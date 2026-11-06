@@ -156,6 +156,13 @@ The address is case-insensitive and must be copied exactly (56 characters plus
 
 - `tor binary: not found`: install the bundle (`install.sh --with-tor`) or
   install the `tor` package.
+- `managed Tor ... exited (exit status: 127)` + `libevent-2.1.so.7: cannot open
+  shared object file`: the bundle's `tor` needs its own libraries. alpha.25.1+
+  launches it with `LD_LIBRARY_PATH` pointing at them. If you are on an older
+  build, export
+  `LD_LIBRARY_PATH="$HOME/.local/lib/e-lite/tor${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"`
+  or install `libevent-2.1-7t64`. `e-lite doctor` runs `tor --version` with the
+  correct environment and prints the exact missing library.
 - `managed Tor ... exited`: read `<data-dir>/tor/tor.log`; the last lines have
   Tor's configuration error.
 - No onion address: check that `[tor] mode = "managed"`, `plain` or `tls` is

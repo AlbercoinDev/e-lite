@@ -7,6 +7,7 @@
 use crate::config::Config;
 use el_model::Chain;
 use el_serve::Shared;
+use std::ffi::{OsStr, OsString};
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::net::{IpAddr, TcpListener};
@@ -158,6 +159,64 @@ fn find_in_path(name: &str) -> Option<PathBuf> {
         }
     }
     None
+}
+
+/// The expert bundle ships its own libraries next to `tor` but the binary has
+/// no RPATH, so the dynamic loader needs `LD_LIBRARY_PATH` pointing at that
+/// directory. Prepend it to any inherited value.
+fn library_path(dir: &Path, existing: Option<&OsStr>) -> OsString {
+    let mut paths: Vec<PathBuf> = vec![dir.to_path_buf()];
+    if let Some(existing) = existing {
+        paths.extend(std::env::split_paths(existing));
+    }
+    match std::env::join_paths(paths) {
+        Ok(joined) => joined,
+        Err(_) => dir.as_os_str().to_os_string(),
+    }
+}
+
+fn apply_tor_env(cmd: &mut Command, binary: &Path) {
+    if let Some(dir) = binary.parent() {
+        let existing = std::env::var_os("LD_LIBRARY_PATH");
+        cmd.env("LD_LIBRARY_PATH", library_path(dir, existing.as_deref()));
+    }
+}
+
+/// `tor --version` with the same environment e-lite uses to launch it. Used by
+/// `doctor` to surface missing bundled/system libraries.
+pub fn version(cfg: &Config) -> Result<String, String> {
+    let binary = resolve_binary(cfg)
+        .ok_or_else(|| "Tor binary not found (install it or rerun the installer)".to_string())?;
+    let mut cmd = Command::new(&binary);
+    apply_tor_env(&mut cmd, &binary);
+    let out = cmd
+        .arg("--version")
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|e| format!("cannot run {}: {e}", binary.display()))?;
+    if !out.status.success() {
+        let err = String::from_utf8_lossy(&out.stderr);
+        let err = err.trim();
+        return Err(if err.is_empty() {
+            format!("{} exited with {}", binary.display(), out.status)
+        } else {
+            format!("{}: {err}", binary.display())
+        });
+    }
+    Ok(String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_string())
+}
+
+fn tail_log(path: &Path, lines: usize) -> String {
+    let Ok(text) = fs::read_to_string(path) else {
+        return String::new();
+    };
+    let all: Vec<&str> = text.lines().collect();
+    all[all.len().saturating_sub(lines)..].join("\n")
 }
 
 /// `[tor] binary`, then the installer-provided expert bundle next to the
@@ -470,7 +529,9 @@ fn supervise(
                 return;
             }
         };
-        let spawned = Command::new(&binary)
+        let mut command = Command::new(&binary);
+        apply_tor_env(&mut command, &binary);
+        let spawned = command
             .arg("-f")
             .arg(&torrc)
             .stdin(Stdio::null())
@@ -535,7 +596,17 @@ fn supervise(
             }
             match child.try_wait() {
                 Ok(Some(status)) => {
-                    eprintln!("[e-lite] WARNING: Tor: managed process exited ({status}); retrying");
+                    let detail = tail_log(&log_path, 5);
+                    if detail.is_empty() {
+                        eprintln!(
+                            "[e-lite] WARNING: Tor: managed process exited ({status}); retrying"
+                        );
+                    } else {
+                        eprintln!(
+                            "[e-lite] WARNING: Tor: managed process exited ({status}); retrying. \
+                             Last tor.log lines:\n{detail}"
+                        );
+                    }
                     break;
                 }
                 Ok(None) => {}
@@ -792,6 +863,17 @@ mod tests {
         let text = render_torrc(&cfg, &dir, 19_050).unwrap();
         assert!(text.contains("HiddenServicePort 50001 127.0.0.1:49001"));
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn tor_library_path_prepends_the_bundle_directory() {
+        use std::ffi::{OsStr, OsString};
+        let dir = Path::new("/opt/e-lite/tor");
+        assert_eq!(library_path(dir, None), OsString::from("/opt/e-lite/tor"));
+        assert_eq!(
+            library_path(dir, Some(OsStr::new("/usr/lib:/lib"))),
+            OsString::from("/opt/e-lite/tor:/usr/lib:/lib")
+        );
     }
 
     #[test]

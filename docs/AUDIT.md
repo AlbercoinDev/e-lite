@@ -1,7 +1,7 @@
 # Code audit
 
-**Base:** `0.1.0-alpha.24` → published `0.1.0-alpha.25` · **Scope:** `bin/e-lite`, `crates/*` (25 Rust files,
-~18k lines) · **Status:** findings fixed in `0.1.0-alpha.25` where noted.
+**Base:** `0.1.0-alpha.25` → published `0.1.0-alpha.25.1` · **Scope:** `bin/e-lite`, `crates/*` (25 Rust files,
+~18k lines) · **Status:** findings fixed in `0.1.0-alpha.25.1` where noted.
 
 This audit is not a claim of formal verification. It records static checks,
 manual review areas, concrete findings and residual risks.
@@ -57,6 +57,7 @@ Additional checks performed:
 | AUD-034 | P1 | Inbound onion | `bin/e-lite/src/tor.rs`, `bin/e-lite/src/main.rs` | The new managed Tor publishes Electrum on an onion; like the plain listener it has no client authentication or rate limiting. A leaked address gives full query access. | Loopback-only targets, v3 onion keys 0700, explicit warning in logs/docs, `mode=off`/`--no-tor`, address treated as a secret. Residual risk documented in `AUD-010`. |
 | AUD-035 | P2 | Installer supply chain | `install.sh`, `bin/e-lite/src/tor.rs` | The installer downloads a Tor expert bundle and e-lite later executes it; a compromised download would run as the user. | Pinned bundle version and SHA-256 in the installer; download from the Tor Project over TLS; fallback to `tor` in `PATH`; `doctor` shows the resolved binary. |
 | AUD-036 | P1 | Onion with wildcard listener | `bin/e-lite/src/tor.rs` | Binding Electrum to `0.0.0.0` (a common LAN setup) made the onion refuse to publish (`non-loopback target`), so users saw no onion address. | Wildcard listeners are mapped to loopback targets (`0.0.0.0`→`127.0.0.1`, `[::]`→`[::1]`); explicit `target_plain`/`target_tls` overrides; effective ports/targets persisted in `tor/state` for accurate `onion show`. |
+| AUD-037 | P1 | Managed Tor startup | `bin/e-lite/src/tor.rs` | The expert bundle's `tor` has no RPATH; on Debian 13.7 without `libevent-2.1.so.7` it exited 127 and e-lite retried forever, so no onion was created. | Launch Tor with `LD_LIBRARY_PATH` prepended with its own directory (inherited value preserved); print the last `tor.log` lines on unexpected exit; `doctor` runs `tor --version` with the same environment. Reproduced in a Debian 12 container (127 before, 0.4.9.15 after). |
 
 ## Residual risks and intentional limits
 

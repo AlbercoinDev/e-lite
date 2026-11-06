@@ -1,9 +1,9 @@
 # Session handoff
 
-**Updated:** 2026-11-05
-**Latest published release:** `0.1.0-alpha.25`
-**Release:** https://github.com/AlbercoinDev/e-lite/releases/tag/v0.1.0-alpha.25
-**Main commit at handoff:** `8280671` (`alpha.25: onion with wildcard Electrum listeners`)
+**Updated:** 2026-11-06
+**Latest published release:** `0.1.0-alpha.25.1`
+**Release:** https://github.com/AlbercoinDev/e-lite/releases/tag/v0.1.0-alpha.25.1
+**Main commit at handoff:** `60abce0` (`alpha.25.1: load the bundled Tor libraries`)
 
 This file is the short “where we are” for a new session. The invariants live in
 [`AGENTS.md`](../AGENTS.md) and [`PROJECT_MEMORY.md`](PROJECT_MEMORY.md); the
@@ -42,8 +42,10 @@ no repitas contexto ni rehagas decisiones ya documentadas.
   reloaded when they change. `[tor] mode = "managed"` (default) runs e-lite's own
   Tor and publishes plain 50001 + TLS 50002 as a v3 onion; TLS uses an
   auto-generated self-signed certificate when none is configured. Wildcard
-  listeners (`0.0.0.0`/`[::]`) are mapped to loopback onion targets. There is no
-  client authentication or rate limiting; treat the onion address as a secret.
+  listeners (`0.0.0.0`/`[::]`) are mapped to loopback onion targets. The
+  installer-provisioned Tor bundle is launched with `LD_LIBRARY_PATH` pointing
+  at its own libraries. There is no client authentication or rate limiting;
+  treat the onion address as a secret.
 - Core RPC is HTTP; LAN/WAN requires SSH/VPN.
 - Rawtx resolution is local Core -> validated cache -> P2P/Esplora (whole blocks,
   Tor-first via the managed Tor, decoys, verified).
@@ -61,6 +63,17 @@ no repitas contexto ni rehagas decisiones ya documentadas.
   the onion setup, reset and security.
 - `docs/ROADMAP.md` contains future features/improvements. Do not present them as
   available.
+
+## Last audit/fixes (alpha.25.1)
+
+- **Bundled Tor libraries**: the expert bundle's `tor` has no RPATH; on Debian
+  13.7 without `libevent-2.1.so.7` it exited 127. e-lite now prepends the Tor
+  binary directory to `LD_LIBRARY_PATH`, preserving any inherited value.
+- **Diagnostics**: unexpected Tor exits print the last `tor.log` lines;
+  `doctor` runs `tor --version` with the same environment.
+- Evidence: unit test for the library path, the real-Tor integration test, and a
+  Debian 12 minimal container reproducing the missing-libevent case (before:
+  exit 127; after: `Tor version 0.4.9.15`).
 
 ## Last audit/fixes (alpha.25)
 

@@ -1509,6 +1509,12 @@ fn cmd_doctor(cfg: &Config, chain: Chain) -> R<()> {
             println!("tor binary: not found");
         }
     }
+    if tor_status.binary.is_some() {
+        match tor::version(cfg) {
+            Ok(v) => println!("tor version: {v}"),
+            Err(e) => println!("tor version: unavailable ({e})"),
+        }
+    }
     match &tor_status.onion {
         Some(addr) => {
             println!(
@@ -1609,6 +1615,12 @@ fn cmd_onion(cfg: &Config, chain: Chain, action: Option<&str>, purge: bool, yes:
             match &s.binary {
                 Some(p) => println!("tor binary: {}", p.display()),
                 None => println!("tor binary: not found"),
+            }
+            if s.binary.is_some() {
+                match tor::version(cfg) {
+                    Ok(v) => println!("tor version: {v}"),
+                    Err(e) => println!("tor version: unavailable ({e})"),
+                }
             }
             println!("tor socks:  {}", s.socks);
             println!(
