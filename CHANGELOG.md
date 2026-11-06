@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.1.0-alpha.27.1 — 2026-11-06
+
+### Patch: 1.7 scriptpubkey notifications
+
+`blockchain.scriptpubkey.subscribe` notifications must use the
+`blockchain.scriptpubkey.subscribe` method (the params still carry the
+scripthash). The notifier previously sent every notification as
+`blockchain.scripthash.subscribe`.
+
+- Scriptpubkey subscribers now receive the correct method name; scripthash
+  subscribers keep `blockchain.scripthash.subscribe`.
+- The 1.7 e2e now mines after subscribing and asserts both the outpoint and the
+  scriptpubkey notification method. It also filters the spend UTXO by the mining
+  address so the `spk_hint` check is exercised correctly.
+
 ## 0.1.0-alpha.27 — 2026-11-06
 
 ### Electrum 1.7 compatibility

@@ -79,7 +79,7 @@ for key in ("mempoolminfee", "minrelaytxfee", "incrementalrelayfee"):
 
 # Build a spend from the wallet so testmempoolaccept/outpoint use a real tx.
 utxos = json.loads(cli("listunspent", "1", "9999999"))
-u = next(x for x in utxos if x["amount"] >= 0.01)
+u = next(x for x in utxos if x["address"] == mine_addr and x["amount"] >= 0.01)
 dest = cli("getnewaddress")
 amount = round(u["amount"] - 0.0001, 8)
 raw = cli(
@@ -118,7 +118,8 @@ assert mempool_status["spender_height"] in (0, -1), mempool_status
 recent = call(12, "mempool.recent", [])
 assert any(x["txid"] == txid for x in recent), recent
 
-# Mine: outpoint notification and confirmed spender.
+# Mine: outpoint and scriptpubkey notifications, plus the confirmed spender.
+call(24, "blockchain.scriptpubkey.subscribe", [script_hex])
 call(13, "blockchain.headers.subscribe", [])
 cli("generatetoaddress", "1", mine_addr)
 
@@ -139,6 +140,14 @@ wait_for(
     ),
     what="outpoint notification",
 )
+wait_for(
+    lambda: any(
+        n.get("method") == "blockchain.scriptpubkey.subscribe"
+        and n["params"][0] == sh
+        for n in notifications
+    ),
+    what="scriptpubkey notification",
+)
 
 # scriptpubkey.* returns the 1.7 dict shapes.
 history = call(15, "blockchain.scriptpubkey.get_history", [script_hex])
@@ -149,7 +158,6 @@ unspent = call(17, "blockchain.scriptpubkey.listunspent", [script_hex])
 assert isinstance(unspent["utxos"], list), unspent
 mempool_history = call(18, "blockchain.scriptpubkey.get_mempool", [script_hex])
 assert isinstance(mempool_history["history"], list), mempool_history
-assert call(19, "blockchain.scriptpubkey.subscribe", [script_hex]) is not None
 assert call(20, "blockchain.scriptpubkey.unsubscribe", [script_hex]) is True
 
 # Unknown outpoint and malformed/oversized protocol inputs.

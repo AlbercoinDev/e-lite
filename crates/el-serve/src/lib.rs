@@ -2643,16 +2643,21 @@ pub fn start_notifications(shared: Arc<Shared>) -> std::thread::JoinHandle<()> {
                             Err(_) => continue,
                         }
                     };
-                    let force_reorg = reorg
-                        && client
-                            .spk_subs
-                            .lock()
-                            .map(|spk| spk.contains(&script))
-                            .unwrap_or(false);
+                    let is_spk = client
+                        .spk_subs
+                        .lock()
+                        .map(|spk| spk.contains(&script))
+                        .unwrap_or(false);
+                    let force_reorg = reorg && is_spk;
                     if new != old || force_reorg {
+                        let method = if is_spk {
+                            "blockchain.scriptpubkey.subscribe"
+                        } else {
+                            "blockchain.scripthash.subscribe"
+                        };
                         let notification = json!({
                             "jsonrpc": "2.0",
-                            "method": "blockchain.scripthash.subscribe",
+                            "method": method,
                             "params": [script.to_electrum_hex(), new],
                         });
                         if client.send(&notification) {

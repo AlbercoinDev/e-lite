@@ -1,9 +1,9 @@
 # Session handoff
 
 **Updated:** 2026-11-06
-**Latest published release:** `0.1.0-alpha.27`
-**Release:** https://github.com/AlbercoinDev/e-lite/releases/tag/v0.1.0-alpha.27
-**Main commit at handoff:** tag `v0.1.0-alpha.27`
+**Latest published release:** `0.1.0-alpha.27.1`
+**Release:** https://github.com/AlbercoinDev/e-lite/releases/tag/v0.1.0-alpha.27.1
+**Main commit at handoff:** tag `v0.1.0-alpha.27.1`
 
 This file is the short “where we are” for a new session. The invariants live in
 [`AGENTS.md`](../AGENTS.md) and [`PROJECT_MEMORY.md`](PROJECT_MEMORY.md); the
@@ -73,6 +73,14 @@ no repitas contexto ni rehagas decisiones ya documentadas.
   the onion setup, reset and security.
 - `docs/ROADMAP.md` contains future features/improvements. Do not present them as
   available.
+
+## Last change (alpha.27.1)
+
+- Scriptpubkey notifications now use `blockchain.scriptpubkey.subscribe` (the
+  params still carry the scripthash); scripthash subscribers are unchanged.
+- The 1.7 e2e subscribes before mining and asserts both notification methods,
+  and selects a UTXO belonging to the mining address so the `spk_hint` path is
+  real.
 
 ## Last change (alpha.27)
 
