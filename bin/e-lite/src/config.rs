@@ -54,6 +54,15 @@ pub struct PublicServersCfg {
     /// run. Existing files are never overwritten.
     #[serde(default = "d_true")]
     pub generate: bool,
+    /// Refuse to start `run` when no public provider answers for the network.
+    #[serde(default = "d_true")]
+    pub require_ready: bool,
+    /// Timeout for each provider probe.
+    #[serde(default = "d_probe_timeout")]
+    pub probe_timeout_seconds: u64,
+    /// How long to wait for a provider before failing `run`.
+    #[serde(default = "d_ready_timeout")]
+    pub ready_timeout_seconds: u64,
 }
 
 impl Default for PublicServersCfg {
@@ -61,6 +70,9 @@ impl Default for PublicServersCfg {
         Self {
             file: None,
             generate: true,
+            require_ready: true,
+            probe_timeout_seconds: d_probe_timeout(),
+            ready_timeout_seconds: d_ready_timeout(),
         }
     }
 }
@@ -496,6 +508,9 @@ pub struct RawtxCfg {
     pub tor_socks: Option<String>,
     #[serde(default)]
     pub allow_clearnet: bool,
+    /// Use clearnet when Tor is unavailable or a Tor request fails.
+    #[serde(default = "d_true")]
+    pub tor_fallback_clearnet: bool,
     #[serde(default = "d_true")]
     pub use_p2p: bool,
     #[serde(default = "d_true")]
@@ -517,6 +532,7 @@ impl Default for RawtxCfg {
             decoys: d_decoys(),
             tor_socks: d_tor_socks(),
             allow_clearnet: false,
+            tor_fallback_clearnet: true,
             use_p2p: true,
             use_esplora: true,
             p2p_v2: true,
@@ -571,6 +587,12 @@ fn d_window() -> u32 {
 }
 fn d_true() -> bool {
     true
+}
+fn d_probe_timeout() -> u64 {
+    5
+}
+fn d_ready_timeout() -> u64 {
+    60
 }
 fn d_listen() -> String {
     "127.0.0.1:50001".to_string()

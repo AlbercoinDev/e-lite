@@ -104,6 +104,7 @@ cache_mib = 2048                    # validated LRU cache; 0 disables
 decoys = 3                          # extra blocks fetched per real fetch
 tor_socks = "127.0.0.1:9050"        # empty requires allow_clearnet = true
 allow_clearnet = false              # fail closed without Tor; also gates repair
+tor_fallback_clearnet = true        # if Tor fails, use clearnet (IP exposed)
 use_p2p = true                      # minimal P2P client; used for prune-gap repair
 use_esplora = true                  # Esplora block endpoints; used for repair too
 p2p_v2 = true                       # BIP324 encrypted transport, fallback to v1
@@ -118,6 +119,9 @@ p2p_peers = []                      # empty: discover from local Core
 # data only (fail closed).
 # file = ""                         # empty = <config dir>/public-servers.toml
 generate = true                     # create it from the template when missing
+require_ready = true                # run: refuse wallets if no provider answers
+probe_timeout_seconds = 5           # per-provider probe timeout
+ready_timeout_seconds = 60          # wait for a provider before failing run
 
 [silent_payments]
 enabled = false                     # opt-in gate; BIP352 indexer not included yet

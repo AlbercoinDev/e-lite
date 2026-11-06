@@ -1229,6 +1229,25 @@ fn cmd_doctor(cfg: &Config, chain: Chain) -> R<()> {
         for url in &public.endpoints {
             println!("  esplora: {url}");
         }
+        let probe = public_servers::probe(cfg, &public.endpoints, false);
+        for status in &probe.statuses {
+            println!(
+                "  probe: {} healthy={} via={} {}ms{}",
+                status.url,
+                status.healthy,
+                status.via,
+                status.latency_ms,
+                status
+                    .error
+                    .as_deref()
+                    .map(|e| format!(" error={e}"))
+                    .unwrap_or_default()
+            );
+        }
+        println!(
+            "  provider ready: {} (tor_ready={}, clearnet_fallback={})",
+            probe.ready, probe.tor_ready, probe.clearnet_fallback
+        );
     }
 
     let core = match core_client(cfg, chain) {
@@ -3760,7 +3779,8 @@ fn build_resolver(
     chain: Chain,
     store: &Arc<Store>,
     core: &CoreClient,
-) -> R<(Arc<Resolver>, Vec<String>)> {
+    esplora_urls: Vec<String>,
+) -> R<Arc<Resolver>> {
     let mut peers = cfg.rawtx.p2p_peers.clone();
     if cfg.rawtx.enabled && cfg.rawtx.use_p2p && peers.is_empty() {
         match core.node_addresses(64) {
@@ -3787,18 +3807,13 @@ fn build_resolver(
         }
     }
     let tor = cfg.rawtx.tor_socks.clone().filter(|s| !s.trim().is_empty());
-    let esplora_urls = if !cfg.rawtx.esplora_urls.is_empty() {
-        cfg.rawtx.esplora_urls.clone()
-    } else {
-        let resolved = public_servers::load(cfg, chain, crate::config_path().as_deref());
-        resolved.endpoints
-    };
     let rc = RawtxConfig {
         enabled: cfg.rawtx.enabled,
         cache_mib: cfg.rawtx.cache_mib,
         decoys: cfg.rawtx.decoys,
         tor_socks: tor,
         allow_clearnet: cfg.rawtx.allow_clearnet,
+        fallback_clearnet: cfg.rawtx.tor_fallback_clearnet,
         use_p2p: cfg.rawtx.use_p2p,
         use_esplora: cfg.rawtx.use_esplora,
         p2p_v2: cfg.rawtx.p2p_v2,
@@ -3808,10 +3823,16 @@ fn build_resolver(
         chain,
     };
     let resolver = Resolver::new(Arc::clone(store), &rc)?;
-    Ok((
-        Arc::new(resolver.with_local(Arc::new(CoreBlockSource::new(core.clone())))),
-        esplora_urls,
+    Ok(Arc::new(
+        resolver.with_local(Arc::new(CoreBlockSource::new(core.clone()))),
     ))
+}
+
+fn requires_ready_provider(cfg: &Config, chain: Chain) -> bool {
+    cfg.rawtx.enabled
+        && cfg.rawtx.use_esplora
+        && cfg.public_servers.require_ready
+        && chain != Chain::Regtest
 }
 
 fn effective_rate_limit(cfg: &Config) -> (u64, u64) {
@@ -3831,7 +3852,12 @@ fn build_shared(
     identity: NetworkIdentity,
 ) -> R<Arc<Shared>> {
     let core = core_client(cfg, chain)?;
-    let (resolver, public_servers) = build_resolver(cfg, chain, &store, &core)?;
+    let public_servers = if !cfg.rawtx.esplora_urls.is_empty() {
+        cfg.rawtx.esplora_urls.clone()
+    } else {
+        public_servers::load(cfg, chain, crate::config_path().as_deref()).endpoints
+    };
+    let resolver = build_resolver(cfg, chain, &store, &core, public_servers.clone())?;
     let log_file = cfg.app_log_file(chain);
     let banner_file = cfg.app_banner_file(chain);
     if let Some(path) = &banner_file {
@@ -3869,6 +3895,10 @@ fn build_shared(
         core,
         resolver,
         public_servers,
+        provider_status: Mutex::new(Vec::new()),
+        provider_ready: AtomicBool::new(false),
+        tor_ready: AtomicBool::new(false),
+        clearnet_fallback: AtomicBool::new(false),
         mempool: Arc::new(RwLock::new(Mempool::new())),
         relayfee: Mutex::new(0.0),
         fee_estimates: Mutex::new(std::collections::HashMap::new()),
@@ -3908,6 +3938,30 @@ fn build_shared(
     }
     publish_memory(&shared);
     Ok(shared)
+}
+
+fn refresh_providers(shared: &Shared, cfg: &Config, wait: bool) {
+    if !cfg.rawtx.enabled || !cfg.rawtx.use_esplora || shared.public_servers.is_empty() {
+        return;
+    }
+    let probe = public_servers::probe(cfg, &shared.public_servers, wait);
+    if probe.clearnet_fallback {
+        eprintln!(
+            "[e-lite] WARNING: Tor is unavailable; using clearnet public providers (operator IP exposed)"
+        );
+    }
+    if let Ok(mut statuses) = shared.provider_status.lock() {
+        *statuses = probe
+            .statuses
+            .iter()
+            .map(public_servers::ProviderStatus::to_json)
+            .collect();
+    }
+    shared.provider_ready.store(probe.ready, Ordering::Relaxed);
+    shared.tor_ready.store(probe.tor_ready, Ordering::Relaxed);
+    shared
+        .clearnet_fallback
+        .store(probe.clearnet_fallback, Ordering::Relaxed);
 }
 
 fn publish_memory(shared: &Shared) {
@@ -4059,7 +4113,6 @@ fn cmd_serve(cfg: &Config, chain: Chain) -> R<()> {
         return Ok(());
     };
     let shared = build_shared(cfg, chain, Arc::clone(&store), identity)?;
-    let transports = start_transports(&shared, cfg)?;
     let mut tor_runtime = match tor::spawn(cfg, chain, Some(Arc::clone(&shared)), auto_cert) {
         Ok(v) => v,
         Err(e) => {
@@ -4067,6 +4120,24 @@ fn cmd_serve(cfg: &Config, chain: Chain) -> R<()> {
             None
         }
     };
+    if cfg.tor.managed() && tor_runtime.is_some() {
+        let deadline =
+            Instant::now() + Duration::from_secs(cfg.tor.start_timeout_seconds.clamp(5, 30));
+        while !shared.stats.tor_bootstrapped.load(Ordering::Relaxed) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(500));
+        }
+    }
+    refresh_providers(&shared, cfg, false);
+    if !shared.provider_ready.load(Ordering::Relaxed)
+        && cfg.rawtx.enabled
+        && chain != Chain::Regtest
+    {
+        eprintln!(
+            "[e-lite] WARNING: serve mode without a ready public provider; \
+             local queries work, some raw transactions/history entries may be unavailable"
+        );
+    }
+    let transports = start_transports(&shared, cfg)?;
     let tip = shared
         .store
         .committed_tip()?
@@ -4216,7 +4287,6 @@ fn cmd_run(cfg: &Config, chain: Chain) -> R<()> {
         return Ok(());
     };
     let shared = build_shared(cfg, chain, Arc::clone(&store), live)?;
-    let transports = start_transports(&shared, cfg)?;
     let mut tor_runtime = match tor::spawn(cfg, chain, Some(Arc::clone(&shared)), auto_cert) {
         Ok(v) => v,
         Err(e) => {
@@ -4224,6 +4294,33 @@ fn cmd_run(cfg: &Config, chain: Chain) -> R<()> {
             None
         }
     };
+    if cfg.tor.managed() && tor_runtime.is_some() {
+        // Let the managed Tor bootstrap before deciding to fall back to clearnet.
+        let deadline =
+            Instant::now() + Duration::from_secs(cfg.tor.start_timeout_seconds.clamp(5, 30));
+        while !shared.stats.tor_bootstrapped.load(Ordering::Relaxed) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(500));
+        }
+    }
+    refresh_providers(&shared, cfg, true);
+    if requires_ready_provider(cfg, chain) && !shared.provider_ready.load(Ordering::Relaxed) {
+        return fail(format!(
+            "no public provider answered for {}: wallets would receive incomplete histories. \
+             Check public-servers.toml, Tor/clearnet access and the provider URLs, or set \
+             [public_servers] require_ready = false to start in local-only mode.",
+            chain.name()
+        ));
+    }
+    if !shared.provider_ready.load(Ordering::Relaxed)
+        && cfg.rawtx.enabled
+        && chain != Chain::Regtest
+    {
+        eprintln!(
+            "[e-lite] WARNING: no public provider is ready; serving local data only \
+             (some wallet histories may be incomplete)"
+        );
+    }
+    let transports = start_transports(&shared, cfg)?;
     println!(
         "e-lite {}: started at {} — indexing and serving on {} (network {}, core {}, manage {:?})",
         VERSION,
@@ -4640,6 +4737,21 @@ mod tests {
         let mut cfg = Config::default();
         cfg.server.tls_listen = "0.0.0.0:50002".to_string();
         assert_eq!(effective_rate_limit(&cfg), (50, 300), "exposed TLS on");
+    }
+
+    #[test]
+    fn provider_readiness_is_required_only_for_networked_wallets() {
+        let mut cfg = Config::default();
+        assert!(!requires_ready_provider(&cfg, Chain::Regtest));
+        assert!(requires_ready_provider(&cfg, Chain::Signet));
+        cfg.public_servers.require_ready = false;
+        assert!(!requires_ready_provider(&cfg, Chain::Signet));
+        cfg.public_servers.require_ready = true;
+        cfg.rawtx.enabled = false;
+        assert!(!requires_ready_provider(&cfg, Chain::Signet));
+        cfg.rawtx.enabled = true;
+        cfg.rawtx.use_esplora = false;
+        assert!(!requires_ready_provider(&cfg, Chain::Signet));
     }
 
     #[test]

@@ -31,3 +31,4 @@ libc.workspace = true
 tar.workspace = true
 flate2.workspace = true
 rcgen.workspace = true
+reqwest.workspace = true

@@ -77,6 +77,11 @@ Never treat a version number in this file as authoritative over the code/tag.
   template; a missing file means local data only (fail closed), never a hidden
   fallback list. Only whole blocks are requested by hash, and clearnet entries
   must be HTTPS (`.onion` over Tor is the only plain-HTTP exception).
+- `run` probes the network's providers (`/block-height/0`) and does not open
+  Electrum until at least one answers; `require_ready`/`ready_timeout_seconds`
+  control the gate. `tor_fallback_clearnet = true` uses clearnet when Tor is
+  unavailable or a request fails (log + `/status`), while `.onion` still needs
+  Tor; set it to `false` for fail-closed.
 - Electrum protocol versions are negotiated per connection. This build serves
   1.4–1.7 (`server.version` returns the negotiated version). A request for a
   future or skipped version falls back to the newest implemented version at or

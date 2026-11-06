@@ -71,12 +71,13 @@ available**.
 |---|---|---|
 | Local-first rawtx | experimental | Core/cache before external |
 | Whole-block external fetch | experimental | by hash, never txid |
-| Tor SOCKS5h, fail closed | experimental | managed Tor by default; `tor_socks`, `allow_clearnet` |
+| Tor SOCKS5h with clearnet fallback | experimental | Tor first; `tor_fallback_clearnet` (default true) uses clearnet if Tor fails; `allow_clearnet` forces it |
 | Managed Tor + onion service | experimental | plain 50001 + TLS 50002; `e-lite onion show/reset` |
 | Auto self-signed onion TLS cert | experimental | SAN includes the onion; reloaded on change |
 | Decoys and random source order | experimental | `decoys=3` default |
 | Block hash/header/Merkle/witness validation | experimental | before serving/caching |
-| Configurable Esplora endpoints | experimental | editable `public-servers.toml`; shipped defaults; fail-closed |
+| Configurable Esplora endpoints | experimental | editable `public-servers.toml`; shipped defaults; fail-closed if no provider and `require_ready` |
+| Provider readiness gate | experimental | probes `/block-height/0` before opening Electrum; `require_ready`, latency/state in `/status` |
 | P2P peers auto/config | experimental | BIP324 v2 + v1 fallback |
 | Prune-gap repair from verified sources | experimental | bounded by `repair_max_gap_blocks` |
 | Silent payments privacy | **not available** | gate only |

@@ -644,6 +644,11 @@ pub struct Shared {
     /// Effective public Esplora bases for this network (from public-servers.toml
     /// or the [rawtx] override). Empty means local data only.
     pub public_servers: Vec<String>,
+    /// Startup probe results, one JSON object per provider.
+    pub provider_status: Mutex<Vec<Value>>,
+    pub provider_ready: AtomicBool,
+    pub tor_ready: AtomicBool,
+    pub clearnet_fallback: AtomicBool,
     pub mempool: Arc<RwLock<Mempool>>,
     pub relayfee: Mutex<f64>,
     pub fee_estimates: Mutex<FeeEstimateCache>,
@@ -891,6 +896,19 @@ impl Shared {
                 "histogram_buckets": mem_buckets,
             },
             "public_servers": &self.public_servers,
+            "provider_status": self
+                .provider_status
+                .lock()
+                .map(|s| s.clone())
+                .unwrap_or_default(),
+            "provider_ready": self.provider_ready.load(Ordering::Relaxed),
+            "providers_healthy": self
+                .provider_status
+                .lock()
+                .map(|s| s.iter().filter(|p| p.get("healthy").and_then(Value::as_bool).unwrap_or(false)).count() as u64)
+                .unwrap_or(0),
+            "tor_ready": self.tor_ready.load(Ordering::Relaxed),
+            "clearnet_fallback": self.clearnet_fallback.load(Ordering::Relaxed),
             "rawtx": {
                 "cache_hits": rawtx.cache_hits.load(Ordering::Relaxed),
                 "cache_puts": rawtx.cache_puts.load(Ordering::Relaxed),
@@ -3337,6 +3355,12 @@ fn metrics_text(shared: &Shared) -> String {
         "Requests rejected by the per-client rate limit",
         "counter",
         g("rate_limited"),
+    );
+    line(
+        "e_lite_providers_healthy",
+        "Public providers that answered the startup probe",
+        "gauge",
+        g("providers_healthy"),
     );
     line(
         "e_lite_last_block_ms",

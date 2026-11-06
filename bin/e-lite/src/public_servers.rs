@@ -10,12 +10,190 @@ use crate::config::Config;
 use el_model::Chain;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct NetworkServers {
     #[serde(default)]
     esplora: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ProviderStatus {
+    pub url: String,
+    pub healthy: bool,
+    pub latency_ms: u64,
+    /// `tor`, `clearnet` or `none`.
+    pub via: String,
+    pub error: Option<String>,
+}
+
+impl ProviderStatus {
+    pub fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "url": self.url,
+            "healthy": self.healthy,
+            "latency_ms": self.latency_ms,
+            "via": self.via,
+            "error": self.error,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ProbeOutcome {
+    pub statuses: Vec<ProviderStatus>,
+    pub ready: bool,
+    pub tor_ready: bool,
+    pub clearnet_fallback: bool,
+}
+
+/// Probe the providers and wait (up to `cfg.public_servers.ready_timeout_seconds`)
+/// until at least one answers. Uses `/block-height/0`: a constant, public query
+/// that never contains wallet data.
+pub fn probe(cfg: &Config, urls: &[String], wait_for_ready: bool) -> ProbeOutcome {
+    if urls.is_empty() {
+        return ProbeOutcome::default();
+    }
+    let timeout = Duration::from_secs(cfg.public_servers.probe_timeout_seconds.max(1));
+    let tor = cfg
+        .rawtx
+        .tor_socks
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .and_then(|proxy| {
+            reqwest::blocking::Client::builder()
+                .timeout(timeout)
+                .user_agent(concat!("e-lite/", env!("CARGO_PKG_VERSION")))
+                .proxy(reqwest::Proxy::all(format!("socks5h://{proxy}")).ok()?)
+                .build()
+                .ok()
+        });
+    let direct = reqwest::blocking::Client::builder()
+        .timeout(timeout)
+        .user_agent(concat!("e-lite/", env!("CARGO_PKG_VERSION")))
+        .build()
+        .ok();
+    let fallback = cfg.rawtx.tor_fallback_clearnet;
+    let allow_clearnet = cfg.rawtx.allow_clearnet;
+
+    let deadline =
+        Instant::now() + Duration::from_secs(cfg.public_servers.ready_timeout_seconds.max(1));
+    loop {
+        let outcome = probe_once(
+            urls,
+            tor.as_ref(),
+            direct.as_ref(),
+            allow_clearnet,
+            fallback,
+        );
+        if outcome.ready || !wait_for_ready || Instant::now() >= deadline {
+            if !outcome.ready && wait_for_ready {
+                eprintln!(
+                    "[e-lite] WARNING: no public provider answered for {} after {}s",
+                    cfg.network.name, cfg.public_servers.ready_timeout_seconds
+                );
+            }
+            return outcome;
+        }
+        eprintln!(
+            "[e-lite] waiting for a public provider ({} configured, retrying)",
+            urls.len()
+        );
+        std::thread::sleep(Duration::from_secs(2));
+    }
+}
+
+fn probe_once(
+    urls: &[String],
+    tor: Option<&reqwest::blocking::Client>,
+    direct: Option<&reqwest::blocking::Client>,
+    allow_clearnet: bool,
+    fallback: bool,
+) -> ProbeOutcome {
+    let mut outcome = ProbeOutcome::default();
+    for url in urls {
+        let base = url.trim_end_matches('/');
+        let is_onion = base.to_ascii_lowercase().contains(".onion");
+        let target = format!("{base}/block-height/0");
+        let started = Instant::now();
+        let mut status = ProviderStatus {
+            url: base.to_string(),
+            ..Default::default()
+        };
+
+        let attempt =
+            |client: Option<&reqwest::blocking::Client>, via: &str| -> Result<(), String> {
+                let Some(client) = client else {
+                    return Err(format!("no {via} client"));
+                };
+                let response = client.get(&target).send().map_err(|e| e.to_string())?;
+                let status_code = response.status();
+                if !status_code.is_success() {
+                    return Err(format!("HTTP {status_code}"));
+                }
+                let body = response.text().map_err(|e| e.to_string())?;
+                let hash = body.trim();
+                if hash.len() != 64 || !hash.bytes().all(|b| b.is_ascii_hexdigit()) {
+                    return Err("unexpected block-height response".to_string());
+                }
+                Ok(())
+            };
+
+        if is_onion {
+            match attempt(tor, "tor") {
+                Ok(()) => {
+                    status.healthy = true;
+                    status.via = "tor".to_string();
+                    outcome.tor_ready = true;
+                }
+                Err(e) => status.error = Some(e),
+            }
+        } else {
+            let mut tor_error = None;
+            if tor.is_some() {
+                match attempt(tor, "tor") {
+                    Ok(()) => {
+                        status.healthy = true;
+                        status.via = "tor".to_string();
+                        outcome.tor_ready = true;
+                    }
+                    Err(e) => tor_error = Some(e),
+                }
+            }
+            if !status.healthy && (fallback || allow_clearnet) {
+                match attempt(direct, "clearnet") {
+                    Ok(()) => {
+                        status.healthy = true;
+                        status.via = "clearnet".to_string();
+                        if (tor_error.is_some() || tor.is_none()) && !allow_clearnet {
+                            outcome.clearnet_fallback = true;
+                        }
+                    }
+                    Err(e) => {
+                        status.error = Some(match tor_error {
+                            Some(t) => format!("tor: {t}; clearnet: {e}"),
+                            None => e,
+                        });
+                    }
+                }
+            } else if !status.healthy {
+                status.error = Some(match tor_error {
+                    Some(t) => format!("tor: {t}; clearnet fallback disabled"),
+                    None => "no Tor and clearnet disabled".to_string(),
+                });
+            }
+        }
+
+        status.latency_ms = started.elapsed().as_millis() as u64;
+        if status.healthy {
+            outcome.ready = true;
+        }
+        outcome.statuses.push(status);
+    }
+    outcome
 }
 
 #[derive(Debug, Clone, Default)]
@@ -225,6 +403,41 @@ mod tests {
         let mut cfg = Config::default();
         cfg.public_servers.file = Some(path.display().to_string());
         cfg
+    }
+
+    #[test]
+    fn probe_reports_a_healthy_provider() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = std::thread::spawn(move || {
+            let (mut sock, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 4096];
+            let _ = sock.read(&mut buf);
+            let body = "00".repeat(32);
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            sock.write_all(response.as_bytes()).unwrap();
+        });
+
+        let mut cfg = Config::default();
+        cfg.rawtx.tor_socks = None;
+        cfg.rawtx.allow_clearnet = false;
+        cfg.rawtx.tor_fallback_clearnet = true;
+        cfg.public_servers.probe_timeout_seconds = 3;
+        let outcome = probe(&cfg, &[format!("http://{addr}")], false);
+        assert!(outcome.ready, "{outcome:?}");
+        assert!(outcome.statuses[0].healthy);
+        assert!(
+            outcome.clearnet_fallback,
+            "no Tor must surface the fallback"
+        );
+        handle.join().unwrap();
     }
 
     #[test]

@@ -140,6 +140,7 @@ fn config(decoys: u32, cache_mib: u64) -> RawtxConfig {
         decoys,
         tor_socks: None,
         allow_clearnet: true,
+        fallback_clearnet: false,
         use_p2p: false,
         use_esplora: false,
         p2p_v2: false,
@@ -295,9 +296,14 @@ fn live_esplora_signet_block() {
             .to_string()
     };
     let hash = Hash32::from_hex(&hash_at(1000)).unwrap();
-    let src =
-        el_rawtx::EsploraSource::new(vec![base.to_string()], None, true, Duration::from_secs(30))
-            .unwrap();
+    let src = el_rawtx::EsploraSource::new(
+        vec![base.to_string()],
+        None,
+        true,
+        false,
+        Duration::from_secs(30),
+    )
+    .unwrap();
     let bytes = src.fetch_block(&hash).unwrap();
     let block: Block = bitcoin::consensus::deserialize(&bytes).unwrap();
     let got = Hash32::from_hex(&block.block_hash().to_string()).unwrap();
@@ -384,8 +390,14 @@ fn live_esplora_resolver_tip() {
         .unwrap();
 
     let src = Arc::new(
-        el_rawtx::EsploraSource::new(vec![base.to_string()], None, true, Duration::from_secs(60))
-            .unwrap(),
+        el_rawtx::EsploraSource::new(
+            vec![base.to_string()],
+            None,
+            true,
+            false,
+            Duration::from_secs(60),
+        )
+        .unwrap(),
     );
     let resolver = Resolver::new(Arc::clone(&store), &config(0, 1))
         .unwrap()

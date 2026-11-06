@@ -90,6 +90,9 @@ pub struct RawtxConfig {
     pub decoys: u32,
     pub tor_socks: Option<String>,
     pub allow_clearnet: bool,
+    /// If Tor is configured but a request fails, retry the clearnet endpoint
+    /// directly. This exposes the operator's IP to the provider.
+    pub fallback_clearnet: bool,
     pub use_p2p: bool,
     pub use_esplora: bool,
     pub p2p_v2: bool,
@@ -135,6 +138,7 @@ impl Resolver {
                     cfg.esplora_urls.clone(),
                     tor.clone(),
                     cfg.allow_clearnet,
+                    cfg.fallback_clearnet,
                     Duration::from_secs(60),
                 ) {
                     Ok(s) => external.push(Arc::new(s)),

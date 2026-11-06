@@ -97,6 +97,8 @@ assert isinstance(st["public_servers"], list), st
 assert st["rate_limit_rps"] == 0, st  # loopback-only e2e: auto-disabled
 assert st["rate_burst"] == 300, st
 assert st["core_rpc_loopback"] is True, st
+assert st["provider_ready"] is False, st  # regtest has no public providers
+assert st["clearnet_fallback"] is False, st
 assert st["ready"] is True and st["fully_synced"] is True, st
 print("memory accounting OK:", mem["total_mib"], mem["available_mib"], "MiB")
 PY

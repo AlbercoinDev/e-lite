@@ -1,5 +1,30 @@
 # Changelog
 
+## 0.1.0-alpha.29.1 — 2026-11-06
+
+### Patch: provider readiness and clearnet fallback
+
+- **Readiness before wallets**: `run` probes the network's `public-servers.toml`
+  entries (`GET /block-height/0`) and only opens the Electrum listeners after at
+  least one provider answers. If none does within `ready_timeout_seconds`
+  (default 60 s), it exits with instructions instead of letting a wallet receive
+  an incomplete history.
+- **Tor fallback to clearnet**: `[rawtx] tor_fallback_clearnet = true` (default)
+  tries Tor first, then the clearnet endpoint if the Tor proxy is unavailable or
+  the Tor request fails. `.onion` endpoints still require Tor. Clearnet fallback
+  logs a warning and is visible in `/status`; use `false` for fail-closed.
+- **Health surface**: `/status` now includes per-provider `{url, healthy,
+  latency_ms, via, error}`, `provider_ready`, `providers_healthy`, `tor_ready`
+  and `clearnet_fallback`; `/metrics` adds `e_lite_providers_healthy`.
+  `doctor` probes and prints the same table.
+- **`serve`** probes once but does not block (offline mode); it warns when no
+  provider is ready. `index`/`doctor` never block.
+- **Config**: `[public_servers] require_ready`, `probe_timeout_seconds`,
+  `ready_timeout_seconds`; `[rawtx] tor_fallback_clearnet`.
+- Tests: provider probe (healthy fallback), readiness gate decision, Tor
+  fallback state, config parsing; existing 1.4/1.6/1.7 e2e regtest stays green.
+- No schema or protocol changes.
+
 ## 0.1.0-alpha.29 — 2026-11-06
 
 ### Core RPC exposure guard

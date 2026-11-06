@@ -36,7 +36,7 @@ acceptance signal that would move it to `FEATURES.md`.
 
 | Priority | Item | Why / acceptance |
 |---|---|---|
-| P1 | Provider pooling/health and per-source policy | avoid single-provider dependency; still whole-block only. |
+| P2 | Periodic provider health/cooldown | startup readiness, latency and Tor→clearnet fallback are implemented (alpha.29.1). Add periodic re-probing, cooldown and per-source policy; still whole-block only. |
 | P2 | Tor stream isolation verification | per-request circuits, no DNS leaks; integration test where possible. |
 | P2 | Decoy scheduling improvements | avoid temporal correlation while keeping bandwidth bounded. |
 | P2 | Log/metric redaction audit | ensure scripts/txids/labels never appear; add tests/lint. |

@@ -1,9 +1,9 @@
 # Session handoff
 
 **Updated:** 2026-11-06
-**Latest published release:** `0.1.0-alpha.29`
-**Release:** https://github.com/AlbercoinDev/e-lite/releases/tag/v0.1.0-alpha.29
-**Main commit at handoff:** tag `v0.1.0-alpha.29`
+**Latest published release:** `0.1.0-alpha.29.1`
+**Release:** https://github.com/AlbercoinDev/e-lite/releases/tag/v0.1.0-alpha.29.1
+**Main commit at handoff:** tag `v0.1.0-alpha.29.1`
 
 This file is the short “where we are” for a new session. The invariants live in
 [`AGENTS.md`](../AGENTS.md) and [`PROJECT_MEMORY.md`](PROJECT_MEMORY.md); the
@@ -47,7 +47,9 @@ no repitas contexto ni rehagas decisiones ya documentadas.
   at its own libraries. There is no client authentication or rate limiting;
   treat the onion address as a secret. Per-client rate limiting is active by
   default on non-loopback listeners (50 req/s, burst 300; `[server] rate_limit`
-  and `rate_burst`; `0` disables). It is not authentication.
+  and `rate_burst`; `0` disables). It is not authentication. `run` probes the
+  network providers and gates the wallet listeners until one answers; Tor
+  failure falls back to clearnet (`tor_fallback_clearnet`).
 - Electrum 1.4–1.7 is implemented and negotiated per connection: numeric
   `server.version`, verbose `transaction.get` with block context, notification
   suppression, real `scripthash.unsubscribe`, canonical mempool status order,
@@ -75,6 +77,19 @@ no repitas contexto ni rehagas decisiones ya documentadas.
   the onion setup, reset and security.
 - `docs/ROADMAP.md` contains future features/improvements. Do not present them as
   available.
+
+## Last change (alpha.29.1)
+
+- **Provider readiness gate**: `run` probes `public-servers.toml` for the active
+  network and does not open Electrum until one answers `/block-height/0`
+  (`require_ready`, 60 s budget). `serve` probes and warns but stays offline.
+  This prevents Sparrow's `UNFETCHABLE_BLOCK_TRANSACTION` NPE caused by a
+  history entry whose raw tx cannot be served.
+- **Tor → clearnet fallback**: `tor_fallback_clearnet = true` by default; logs
+  the IP exposure and shows it in `/status`. `.onion` still requires Tor;
+  `false` restores fail-closed.
+- `/status`, `/metrics` and `doctor` expose provider health/latency/via.
+- Provider endpoints with two clients in `el-rawtx`; no schema/protocol changes.
 
 ## Last change (alpha.29)
 

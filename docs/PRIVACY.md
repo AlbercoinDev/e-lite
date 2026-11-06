@@ -77,23 +77,27 @@ cache_mib = 2048
 decoys = 3
 tor_socks = "127.0.0.1:9050"
 allow_clearnet = false
+tor_fallback_clearnet = true
 use_p2p = true
 use_esplora = true
 p2p_v2 = true
 esplora_urls = []          # empty = use public-servers.toml
 p2p_peers = []             # empty = discover from local Core
-# allow_clearnet = true is required for clearnet Esplora/P2P without Tor
+# allow_clearnet = true forces clearnet; tor_fallback_clearnet uses it only if Tor fails
 
 [public_servers]
 # file = ""               # empty = <config dir>/public-servers.toml
 generate = true           # create it from the shipped template when missing
+require_ready = true      # run: refuse wallets until a provider answers
 ```
 
 ## Tor and clearnet
 
-- Default is **Tor-first, fail closed**: with `allow_clearnet = false`,
-  clearnet endpoints are skipped when Tor is not configured, and the resolver
-  reports that no source is available.
+- Default is **Tor-first with clearnet fallback**: `tor_fallback_clearnet = true`
+  tries Tor first, then the clearnet provider if the Tor proxy is unavailable or
+  a Tor request fails. The fallback exposes the operator IP to that provider; set
+  `tor_fallback_clearnet = false` to stay fail-closed. `allow_clearnet = true`
+  makes clearnet a normal source instead of a fallback.
 - e-lite runs its own Tor by default (`[tor] mode = "managed"`) and uses that
   SOCKS proxy for external rawtx/repair requests. There is no dependency on a
   system Tor daemon.
@@ -104,6 +108,9 @@ generate = true           # create it from the shipped template when missing
   the address can query it: e-lite does not authenticate clients or rate limit
   requests. Treat the address as a secret; use `[tor] mode = "off"` to disable
   the onion.
+- `run` waits for at least one provider to answer `/block-height/0` before
+  opening the Electrum listeners (`require_ready = true` by default). This
+  prevents a wallet from receiving a history it cannot fully resolve.
 - `allow_clearnet = true` permits direct clearnet access if you explicitly
   accept the privacy trade-off. It is not the default.
 - `decoys = 3` fetches extra random blocks after a real external fetch, so the

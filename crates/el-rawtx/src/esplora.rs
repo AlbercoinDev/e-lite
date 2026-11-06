@@ -12,7 +12,11 @@ use std::time::Duration;
 
 pub struct EsploraSource {
     bases: Vec<String>,
-    client: reqwest::blocking::Client,
+    tor_client: Option<reqwest::blocking::Client>,
+    direct_client: Option<reqwest::blocking::Client>,
+    fallback_clearnet: bool,
+    allow_clearnet: bool,
+    fallback_warned: std::sync::atomic::AtomicBool,
 }
 
 const MAX_BLOCK_BYTES: u64 = 8 * 1024 * 1024;
@@ -22,8 +26,27 @@ impl EsploraSource {
         bases: Vec<String>,
         tor_socks: Option<String>,
         allow_clearnet: bool,
+        fallback_clearnet: bool,
         timeout: Duration,
     ) -> Result<Self> {
+        let tor_client = tor_socks.and_then(|socks| {
+            reqwest::blocking::Client::builder()
+                .timeout(timeout)
+                .user_agent(concat!("e-lite/", env!("CARGO_PKG_VERSION")))
+                .proxy(reqwest::Proxy::all(format!("socks5h://{socks}")).ok()?)
+                .build()
+                .ok()
+        });
+        let direct_client = if allow_clearnet || fallback_clearnet {
+            reqwest::blocking::Client::builder()
+                .timeout(timeout)
+                .user_agent(concat!("e-lite/", env!("CARGO_PKG_VERSION")))
+                .build()
+                .ok()
+        } else {
+            None
+        };
+
         let mut clean = Vec::new();
         for base in bases {
             let b = base.trim_end_matches('/').to_string();
@@ -35,37 +58,56 @@ impl EsploraSource {
                 continue;
             }
             let is_onion = lower.contains(".onion");
-            // Skip endpoints we cannot use instead of disabling the whole
-            // source (e.g. a mainnet onion URL with allow_clearnet but no Tor).
-            if is_onion && tor_socks.is_none() {
+            // Onion endpoints only work through Tor; clearnet works through Tor
+            // or, when allowed/fallback is configured, directly.
+            if is_onion && tor_client.is_none() {
                 continue;
             }
-            if !is_onion && tor_socks.is_none() && !allow_clearnet {
+            if !is_onion && tor_client.is_none() && direct_client.is_none() {
                 continue;
             }
             clean.push(b);
         }
         if clean.is_empty() {
             return Err(RawtxError::Config(
-                "no usable esplora endpoints (need Tor or allow_clearnet=true)".into(),
+                "no usable esplora endpoints (need Tor or clearnet access)".into(),
             ));
         }
 
-        let mut builder = reqwest::blocking::Client::builder()
-            .timeout(timeout)
-            .user_agent(concat!("e-lite/", env!("CARGO_PKG_VERSION")));
-        if let Some(socks) = tor_socks {
-            let proxy = reqwest::Proxy::all(format!("socks5h://{socks}"))
-                .map_err(|e| RawtxError::Config(format!("bad tor proxy: {e}")))?;
-            builder = builder.proxy(proxy);
-        }
-        let client = builder
-            .build()
-            .map_err(|e| RawtxError::Config(format!("http client: {e}")))?;
         Ok(EsploraSource {
             bases: clean,
-            client,
+            tor_client,
+            direct_client,
+            fallback_clearnet,
+            allow_clearnet,
+            fallback_warned: std::sync::atomic::AtomicBool::new(false),
         })
+    }
+
+    fn fetch_with(
+        client: &reqwest::blocking::Client,
+        base: &str,
+        hash: &Hash32,
+    ) -> Result<Vec<u8>> {
+        let url = format!("{}/block/{}/raw", base, hash.to_hex());
+        let resp = client
+            .get(&url)
+            .send()
+            .map_err(|e| RawtxError::Unavailable(format!("{base}: {e}")))?;
+        let status = resp.status();
+        if !status.is_success() {
+            return Err(RawtxError::Unavailable(format!("{base}: HTTP {status}")));
+        }
+        if resp.content_length().unwrap_or(0) > MAX_BLOCK_BYTES {
+            return Err(RawtxError::Unavailable(format!("{base}: block too large")));
+        }
+        let bytes = resp
+            .bytes()
+            .map_err(|e| RawtxError::Unavailable(format!("{base}: {e}")))?;
+        if bytes.len() as u64 > MAX_BLOCK_BYTES {
+            return Err(RawtxError::Unavailable(format!("{base}: block too large")));
+        }
+        Ok(bytes.to_vec())
     }
 }
 
@@ -80,27 +122,32 @@ impl BlockSource for EsploraSource {
         let mut errors = Vec::new();
         for idx in order {
             let base = &self.bases[idx];
-            let url = format!("{}/block/{}/raw", base, hash.to_hex());
-            match self.client.get(&url).send() {
-                Ok(resp) => {
-                    let status = resp.status();
-                    if !status.is_success() {
-                        errors.push(format!("{base}: HTTP {status}"));
-                        continue;
-                    }
-                    if resp.content_length().unwrap_or(0) > MAX_BLOCK_BYTES {
-                        errors.push(format!("{base}: block too large"));
-                        continue;
-                    }
-                    match resp.bytes() {
-                        Ok(bytes) if bytes.len() as u64 <= MAX_BLOCK_BYTES => {
-                            return Ok(bytes.to_vec())
+            let is_onion = base.to_ascii_lowercase().contains(".onion");
+            if let Some(client) = &self.tor_client {
+                match Self::fetch_with(client, base, hash) {
+                    Ok(bytes) => return Ok(bytes),
+                    Err(e) => errors.push(e.to_string()),
+                }
+            }
+            if !is_onion {
+                if let Some(client) = &self.direct_client {
+                    let via_fallback = self.fallback_clearnet && !self.allow_clearnet;
+                    match Self::fetch_with(client, base, hash) {
+                        Ok(bytes) => {
+                            if via_fallback
+                                && !self
+                                    .fallback_warned
+                                    .swap(true, std::sync::atomic::Ordering::Relaxed)
+                            {
+                                eprintln!(
+                                    "[e-lite] WARNING: Tor request failed; using clearnet for {base} (operator IP exposed)"
+                                );
+                            }
+                            return Ok(bytes);
                         }
-                        Ok(_) => errors.push(format!("{base}: block too large")),
-                        Err(e) => errors.push(format!("{base}: {e}")),
+                        Err(e) => errors.push(e.to_string()),
                     }
                 }
-                Err(e) => errors.push(format!("{base}: {e}")),
             }
         }
         Err(RawtxError::Unavailable(errors.join("; ")))
@@ -137,6 +184,7 @@ mod tests {
             vec![base],
             None,
             true, // local test server
+            false,
             Duration::from_secs(5),
         )
         .unwrap();
@@ -151,6 +199,7 @@ mod tests {
             vec!["https://blockstream.info/api".into()],
             None,
             false,
+            false,
             Duration::from_secs(5),
         );
         assert!(err.is_err());
@@ -162,6 +211,7 @@ mod tests {
             vec!["file:///tmp".into()],
             None,
             true,
+            false,
             Duration::from_secs(5),
         );
         assert!(err.is_err());
@@ -173,6 +223,7 @@ mod tests {
             vec!["http://example.onion/api".into()],
             None,
             true,
+            false,
             Duration::from_secs(5),
         );
         assert!(err.is_err());
