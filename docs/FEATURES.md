@@ -25,7 +25,7 @@ available**.
 | Reorg recovery within undo window | experimental | deeper reorg fails clearly |
 | Snapshots export/import | experimental | optional; not required from zero |
 
-## Index and Electrum 1.4–1.6
+## Index and Electrum 1.4–1.7
 
 | Feature | Status | Notes |
 |---|---|---|
@@ -37,8 +37,10 @@ available**.
 | Block stats | experimental | local |
 | Broadcast | experimental | via Core |
 | Raw transaction get | experimental | local Core -> cache -> P2P/Esplora |
-| Electrum 1.4–1.6 negotiation | experimental | negotiates 1.4–1.6 numerically; 1.6 clients get `headers` arrays and `mempool.get_info`; future/skipped versions fall back to the newest implemented version below; 1.7 not implemented |
+| Electrum 1.4–1.7 negotiation | experimental | negotiates 1.4–1.7 numerically; 1.6 clients get `headers` arrays; 1.7 adds scriptpubkey/outpoint/ping shapes; future/skipped versions fall back to the newest implemented version below |
 | Broadcast package | experimental | Core `submitpackage`, stable success/errors result; protocol 1.6 |
+| Outpoint status/subscriptions | experimental | protocol 1.7; on-demand history scan, no extra index writes |
+| Scriptpubkey methods | experimental | protocol 1.7; scripthash logic with dict results and `10001` |
 | TLS Electrum | experimental | opt-in `tls_listen`; PEM cert/key; reload on change; no client auth |
 | Silent payments BIP352 | **gate** | explicit error; no indexer |
 
@@ -51,11 +53,14 @@ available**.
 `blockchain.scripthash.get_balance`, `blockchain.scripthash.listunspent`,
 `blockchain.scripthash.subscribe`, `blockchain.scripthash.unsubscribe`,
 `blockchain.scripthash.get_mempool`, `mempool.get_fee_histogram`,
-`mempool.get_info`, `blockchain.relayfee`, `blockchain.estimatefee`,
+`mempool.get_info`, `mempool.recent`, `blockchain.relayfee`, `blockchain.estimatefee`,
 `blockchain.block.stats`, `blockchain.transaction.get`,
 `blockchain.transaction.get_merkle`, `blockchain.transaction.id_from_pos`,
 `blockchain.transaction.broadcast`,
 `blockchain.transaction.broadcast_package` (protocol 1.6),
+`blockchain.transaction.testmempoolaccept`,
+`blockchain.scriptpubkey.*` (protocol 1.7),
+`blockchain.outpoint.*` (protocol 1.7),
 `blockchain.silentpayments.subscribe`/`unsubscribe` (explicit gate error).
 
 ## Privacy and external data
@@ -99,7 +104,7 @@ available**.
 |---|---|
 | Debian 12+/LMDE 6+, x86_64 | supported |
 | Bitcoin Core 28+ | supported; tested with 32.x |
-| Electrum protocol 1.4–1.6 | supported |
+| Electrum protocol 1.4–1.7 | supported |
 | Electrum/Sparrow wallets | tested on regtest; broader matrix pending |
 | ARM64 | not published |
 | Windows/macOS | not supported |

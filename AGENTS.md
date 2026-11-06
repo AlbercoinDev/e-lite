@@ -73,13 +73,16 @@ Never treat a version number in this file as authoritative over the code/tag.
   fallback list. Only whole blocks are requested by hash, and clearnet entries
   must be HTTPS (`.onion` over Tor is the only plain-HTTP exception).
 - Electrum protocol versions are negotiated per connection. This build serves
-  1.4–1.6 (`server.version` returns the negotiated version). A request for a
+  1.4–1.7 (`server.version` returns the negotiated version). A request for a
   future or skipped version falls back to the newest implemented version at or
   below the client maximum; only a client that cannot speak 1.4 is refused.
-  Protocol 1.6 requires `server.version` to be the first message; otherwise the
+  Protocol 1.6+ requires `server.version` to be the first message; otherwise the
   connection is capped at 1.4.2. Never raise `protocol_max` until every method
   of that version (and the previous ones) is implemented and tested: a server
   advertising a version MUST support all of its methods.
+- Electrum 1.7 `outpoint.*` is resolved on demand from the existing history/UTXO
+  data; do not add a persistent spend index to `apply_block` without a benchmark
+  and a schema/migration plan. `scriptpubkey.*` reuses the scripthash logic.
 - The memory budget reserves `max(1024 MiB, RAM/8)` for the OS/Core/page cache,
   caps e-lite at 75 % of total RAM, fixes memtables at `RAM/8`, and grows/shrinks
   the block cache in 256 MiB steps under `MemAvailable` + page-cache pressure.

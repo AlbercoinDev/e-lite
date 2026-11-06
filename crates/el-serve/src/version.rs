@@ -88,12 +88,18 @@ impl fmt::Display for ProtocolVersion {
 pub const SERVER_MIN: ProtocolVersion = ProtocolVersion::new(1, 4, 0);
 pub const V1_4_2: ProtocolVersion = ProtocolVersion::new(1, 4, 2);
 pub const V1_6: ProtocolVersion = ProtocolVersion::new(1, 6, 0);
-pub const SERVER_MAX: ProtocolVersion = V1_6;
+pub const V1_7: ProtocolVersion = ProtocolVersion::new(1, 7, 0);
+pub const SERVER_MAX: ProtocolVersion = V1_7;
 
 /// Implemented protocol versions, sorted ascending. Add a version here only
 /// after every method it documents is implemented and tested.
-pub const SERVER_VERSIONS: &[ProtocolVersion] =
-    &[SERVER_MIN, ProtocolVersion::new(1, 4, 1), V1_4_2, V1_6];
+pub const SERVER_VERSIONS: &[ProtocolVersion] = &[
+    SERVER_MIN,
+    ProtocolVersion::new(1, 4, 1),
+    V1_4_2,
+    V1_6,
+    V1_7,
+];
 
 /// Versions that do not require `server.version` to be the first message.
 pub const PRE_1_6_VERSIONS: &[ProtocolVersion] =
@@ -166,7 +172,11 @@ mod tests {
         );
         assert_eq!(
             ProtocolVersion::highest_available(version(1, 7, 0), SERVER_VERSIONS),
-            Some(version(1, 6, 0))
+            Some(version(1, 7, 0))
+        );
+        assert_eq!(
+            ProtocolVersion::highest_available(version(1, 8, 0), SERVER_VERSIONS),
+            Some(version(1, 7, 0))
         );
         assert_eq!(
             ProtocolVersion::highest_available(version(1, 3, 9), SERVER_VERSIONS),
@@ -177,23 +187,25 @@ mod tests {
     #[test]
     fn future_versions_fall_back_to_the_previous_available_one() {
         let version = ProtocolVersion::new;
-        let mut available = SERVER_VERSIONS.to_vec();
-        available.push(version(1, 7, 0));
         assert_eq!(
-            ProtocolVersion::highest_available(version(1, 4, 3), &available),
+            ProtocolVersion::highest_available(version(1, 4, 3), SERVER_VERSIONS),
             Some(version(1, 4, 2)),
             "a version between available ones must not pick the newer protocol"
         );
         assert_eq!(
-            ProtocolVersion::highest_available(version(1, 5, 0), &available),
+            ProtocolVersion::highest_available(version(1, 5, 0), SERVER_VERSIONS),
             Some(version(1, 4, 2))
         );
         assert_eq!(
-            ProtocolVersion::highest_available(version(1, 6, 0), &available),
+            ProtocolVersion::highest_available(version(1, 6, 0), SERVER_VERSIONS),
             Some(version(1, 6, 0))
         );
         assert_eq!(
-            ProtocolVersion::highest_available(version(1, 7, 0), &available),
+            ProtocolVersion::highest_available(version(1, 7, 0), SERVER_VERSIONS),
+            Some(version(1, 7, 0))
+        );
+        assert_eq!(
+            ProtocolVersion::highest_available(version(1, 8, 0), SERVER_VERSIONS),
             Some(version(1, 7, 0))
         );
     }

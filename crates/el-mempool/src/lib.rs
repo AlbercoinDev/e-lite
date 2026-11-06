@@ -44,6 +44,8 @@ pub struct MempoolTx {
     pub txid: Hash32,
     pub fee_sat: u64,
     pub vsize: u64,
+    /// Core's `getrawmempool true` entry time (epoch seconds); 0 if unknown.
+    pub time: u64,
     /// Per-script (received_sat, spent_sat) for this transaction.
     pub effects: HashMap<ScriptHash, (u64, u64)>,
     pub outputs: Vec<(Outpoint, ScriptHash, u64)>,
@@ -59,6 +61,8 @@ pub struct Mempool {
     raw: HashMap<Hash32, bitcoin::Transaction>,
     by_script: HashMap<ScriptHash, Vec<Hash32>>,
     spending: HashSet<Outpoint>,
+    /// Reverse map for `blockchain.outpoint.*`: outpoint -> spending txid.
+    spent_by: HashMap<Outpoint, Hash32>,
     histogram: Vec<(f64, u64)>,
     version: u64,
     unresolved_inputs: u64,
@@ -103,8 +107,33 @@ impl Mempool {
         self.spending.contains(op)
     }
 
-    /// Unconfirmed transactions touching `script`: (txid, fee, electrum height).
-    ///
+    /// The transaction spending `op`, if it is still unconfirmed.
+    pub fn spender(&self, op: &Outpoint) -> Option<(Hash32, i32)> {
+        self.spent_by
+            .get(op)
+            .and_then(|txid| self.txs.get(txid).map(|tx| (*txid, tx.height)))
+    }
+
+    /// Look up a mempool transaction by txid.
+    pub fn tx(&self, txid: &Hash32) -> Option<&MempoolTx> {
+        self.txs.get(txid)
+    }
+
+    /// The last `limit` transactions to enter the mempool, newest first.
+    pub fn recent(&self, limit: usize) -> Vec<(Hash32, u64, u64)> {
+        let mut out: Vec<(Hash32, u64, u64, u64)> = self
+            .txs
+            .values()
+            .map(|tx| (tx.txid, tx.fee_sat, tx.vsize, tx.time))
+            .collect();
+        out.sort_by(|a, b| b.3.cmp(&a.3).then_with(|| a.0.cmp(&b.0)));
+        out.truncate(limit);
+        out.into_iter()
+            .map(|(txid, fee, vsize, _)| (txid, fee, vsize))
+            .collect()
+    }
+
+    /// Unconfirmed transactions touching `script`: (txid, fee, electrum height).    ///
     /// The order is the canonical Electrum status order: `(-height, txid)`, so
     /// height 0 (all inputs confirmed) comes before height -1 (unconfirmed
     /// parent), then by txid.  The status hash and `get_mempool` must agree.
@@ -155,6 +184,7 @@ impl Mempool {
     pub fn refresh(&mut self, core: &CoreClient, store: &Store) -> Result<bool> {
         let entries = core.raw_mempool_verbose()?;
         let mut wanted: HashMap<Hash32, (u64, u64)> = HashMap::new();
+        let mut times: HashMap<Hash32, u64> = HashMap::new();
         for (txid_hex, entry) in &entries {
             let Ok(txid) = Hash32::from_hex(txid_hex) else {
                 continue;
@@ -165,6 +195,7 @@ impl Mempool {
                 .map(|f| (f.base * 100_000_000.0).round() as u64)
                 .unwrap_or(0);
             wanted.insert(txid, (entry.vsize, fee_sat));
+            times.insert(txid, entry.time);
         }
 
         let wanted_set: HashSet<Hash32> = wanted.keys().copied().collect();
@@ -216,6 +247,7 @@ impl Mempool {
 
         let mut txs: HashMap<Hash32, MempoolTx> = HashMap::new();
         let mut spending = HashSet::new();
+        let mut spent_by: HashMap<Outpoint, Hash32> = HashMap::new();
         let mut unresolved = 0u64;
         for (txid, tx) in &self.raw {
             let (vsize, fee_sat) = wanted.get(txid).copied().unwrap_or((0, 0));
@@ -230,6 +262,7 @@ impl Mempool {
                         .unwrap_or(Hash32::ZERO),
                     vout: input.previous_output.vout,
                 };
+                spent_by.insert(op, *txid);
                 let from_mempool = outputs.get(&op).copied();
                 let prev = from_mempool.or_else(|| {
                     store
@@ -271,6 +304,7 @@ impl Mempool {
                     txid: *txid,
                     fee_sat,
                     vsize,
+                    time: times.get(txid).copied().unwrap_or(0),
                     effects,
                     outputs: tx_outputs,
                     height: if all_inputs_confirmed { 0 } else { -1 },
@@ -294,6 +328,7 @@ impl Mempool {
         self.txs = txs;
         self.by_script = by_script;
         self.spending = spending;
+        self.spent_by = spent_by;
         self.unresolved_inputs = unresolved;
         self.histogram = build_histogram(&self.txs);
         self.version += 1;
@@ -407,6 +442,7 @@ mod tests {
             txid,
             fee_sat: 1,
             vsize: 1,
+            time: 0,
             effects,
             outputs: Vec::new(),
             height,
@@ -567,6 +603,7 @@ mod tests {
                     txid: *txid,
                     fee_sat,
                     vsize,
+                    time: 0,
                     effects,
                     outputs: outs,
                     height: if confirmed_parents { 0 } else { -1 },

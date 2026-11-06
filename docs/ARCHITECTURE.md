@@ -1,6 +1,6 @@
 # Architecture and execution modes
 
-e-lite is a local index for Bitcoin Core plus an Electrum 1.4–1.6 server. Core
+e-lite is a local index for Bitcoin Core plus an Electrum 1.4–1.7 server. Core
 validates the chain; e-lite reads the active chain, stores history/UTXO/txids,
 and answers wallets from that index. It never invents chain data.
 

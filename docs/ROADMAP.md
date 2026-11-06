@@ -10,7 +10,7 @@ acceptance signal that would move it to `FEATURES.md`.
 | P1 | Authentication and rate limiting for non-loopback Electrum | Electrum has no standard client authentication; a token/basic policy or mTLS is not wallet-compatible. At minimum add per-client request budgets and document firewall/IP allowlist/VPN/Tor. TLS on a separate listener is already implemented. |
 | P1 | Core RPC over TLS or a documented authenticated tunnel | avoids cleartext credentials on LAN/WAN. Could be native TLS or a mandatory SSH/VPN recipe with tests. |
 | P2 | Onion service packaging | publish Electrum over Tor without exposing a clearnet port. |
-| P2 | Electrum 1.7 | 1.6 is implemented. 1.7 needs `scriptpubkey.*`, outpoint subscriptions (new `spends` index), `testmempoolaccept`, `mempool.recent`, the new `server.ping` and removal of `hash_function` from `server.features`. Only advertise 1.7 after all its methods pass the wallet matrix. |
+| P2 | Derived `spends` index (outpoint performance) | 1.7 resolves spent outpoints on demand from script history with no extra index writes. If profiling shows it is hot, add a derived `spends` CF (outpoint → spender) with a schema/undo plan and snapshot handling; never on the hot apply path without a benchmark. |
 | P2 | BIP352 silent payments | schema v2 for prevout pubkeys, in-memory scan keys, labels/notifications; never log/persist keys. |
 | P3 | ARM64 builds and more distros | release artifacts + CI. |
 

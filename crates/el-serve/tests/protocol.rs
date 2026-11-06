@@ -194,7 +194,7 @@ fn electrum_14_fixtures() {
     );
     assert_eq!(r["result"]["hash_function"], "sha256");
     assert_eq!(r["result"]["protocol_min"], "1.4");
-    assert_eq!(r["result"]["protocol_max"], "1.6");
+    assert_eq!(r["result"]["protocol_max"], "1.7");
 
     let r = call(s, 3, "server.ping", json!([]));
     assert!(r["result"].is_null());
@@ -319,7 +319,8 @@ fn future_protocol_versions_fall_back_to_the_previous_available() {
         ("1.4.3", "1.4.2"),
         ("1.5", "1.4.2"),
         ("1.6", "1.6"),
-        ("1.7", "1.6"),
+        ("1.7", "1.7"),
+        ("1.8", "1.7"),
     ]
     .into_iter()
     .enumerate()
@@ -336,9 +337,9 @@ fn future_protocol_versions_fall_back_to_the_previous_available() {
         &fx.shared,
         10,
         "server.version",
-        json!(["test", ["1.5", "1.7"]]),
+        json!(["test", ["1.5", "1.8"]]),
     );
-    assert_eq!(r["result"][1], "1.6", "{r}");
+    assert_eq!(r["result"][1], "1.7", "{r}");
 }
 
 #[test]
@@ -636,6 +637,168 @@ fn block_headers_shape_depends_on_the_negotiated_version() {
     assert_eq!(r["count"], 1);
     assert!(r["hex"].is_string(), "{r}");
     assert!(r.get("headers").is_none(), "{r}");
+}
+
+#[test]
+fn electrum_17_features_ping_and_shapes() {
+    let (fx, _script, txid) = fixture();
+    let v17 = el_serve::ProtocolVersion::new(1, 7, 0);
+
+    let features =
+        el_serve::dispatch_for(&fx.shared, None, v17, "server.features", &json!([])).unwrap();
+    assert_eq!(features["protocol_max"], "1.7");
+    assert!(features.get("hash_function").is_none(), "{features}");
+
+    let features16 = el_serve::dispatch_for(
+        &fx.shared,
+        None,
+        el_serve::ProtocolVersion::new(1, 6, 0),
+        "server.features",
+        &json!([]),
+    )
+    .unwrap();
+    assert_eq!(features16["hash_function"], "sha256");
+
+    let pong = el_serve::dispatch_for(&fx.shared, None, v17, "server.ping", &json!([5])).unwrap();
+    assert_eq!(pong["data"].as_str().unwrap().len(), 5);
+    let old = el_serve::dispatch_for(
+        &fx.shared,
+        None,
+        el_serve::ProtocolVersion::new(1, 6, 0),
+        "server.ping",
+        &json!([]),
+    )
+    .unwrap();
+    assert_eq!(old, Value::Null);
+    assert!(
+        el_serve::dispatch_for(&fx.shared, None, v17, "server.ping", &json!([2_000_000])).is_err()
+    );
+
+    let recent =
+        el_serve::dispatch_for(&fx.shared, None, v17, "mempool.recent", &json!([])).unwrap();
+    assert_eq!(recent, json!([]));
+
+    let script_hex = "51";
+    let history = el_serve::dispatch_for(
+        &fx.shared,
+        None,
+        v17,
+        "blockchain.scriptpubkey.get_history",
+        &json!([script_hex]),
+    )
+    .unwrap();
+    assert_eq!(history["history"].as_array().unwrap().len(), 1, "{history}");
+    let balance = el_serve::dispatch_for(
+        &fx.shared,
+        None,
+        v17,
+        "blockchain.scriptpubkey.get_balance",
+        &json!([script_hex]),
+    )
+    .unwrap();
+    assert_eq!(balance["confirmed"], 1000);
+    let unspent = el_serve::dispatch_for(
+        &fx.shared,
+        None,
+        v17,
+        "blockchain.scriptpubkey.listunspent",
+        &json!([script_hex]),
+    )
+    .unwrap();
+    assert_eq!(unspent["utxos"].as_array().unwrap().len(), 1, "{unspent}");
+    let mempool = el_serve::dispatch_for(
+        &fx.shared,
+        None,
+        v17,
+        "blockchain.scriptpubkey.get_mempool",
+        &json!([script_hex]),
+    )
+    .unwrap();
+    assert_eq!(mempool["history"], json!([]));
+
+    let status = el_serve::dispatch_for(
+        &fx.shared,
+        None,
+        v17,
+        "blockchain.outpoint.get_status",
+        &json!([txid.to_hex(), 0, script_hex]),
+    )
+    .unwrap();
+    assert_eq!(status["funder_height"], 0, "{status}");
+    assert!(status.get("spender_txhash").is_none(), "{status}");
+
+    // Wrong spk_hint must not invent an answer.
+    let mismatched = el_serve::dispatch_for(
+        &fx.shared,
+        None,
+        v17,
+        "blockchain.outpoint.get_status",
+        &json!([txid.to_hex(), 0, "52"]),
+    )
+    .unwrap();
+    assert_eq!(mismatched, json!({}));
+
+    let unknown = el_serve::dispatch_for(
+        &fx.shared,
+        None,
+        v17,
+        "blockchain.outpoint.get_status",
+        &json!(["00".repeat(32), 0, script_hex]),
+    )
+    .unwrap();
+    assert_eq!(unknown, json!({}));
+}
+
+#[test]
+fn testmempoolaccept_is_reachable() {
+    let (fx, _, _) = fixture();
+    let v17 = el_serve::ProtocolVersion::new(1, 7, 0);
+    let r = el_serve::dispatch_for(
+        &fx.shared,
+        None,
+        v17,
+        "blockchain.transaction.testmempoolaccept",
+        &json!([["00"]]),
+    );
+    let error = r.unwrap_err();
+    assert_ne!(error.code, -32601, "method must exist");
+}
+
+#[test]
+fn scriptpubkey_subscription_returns_a_status() {
+    use std::io::{BufRead, BufReader, Write};
+    use std::net::{TcpListener, TcpStream};
+
+    let (fx, _script, _txid) = fixture();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    el_serve::start_listener_on(listener, Arc::clone(&fx.shared), None);
+    let sock = TcpStream::connect(addr).unwrap();
+    sock.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    let mut writer = sock.try_clone().unwrap();
+    let mut reader = BufReader::new(sock);
+    let mut call = |id: u64, method: &str, params: Value| {
+        writer
+            .write_all(
+                (json!({"jsonrpc":"2.0","id":id,"method":method,"params":params}).to_string()
+                    + "\n")
+                    .as_bytes(),
+            )
+            .unwrap();
+        writer.flush().unwrap();
+        let mut line = String::new();
+        reader.read_line(&mut line).unwrap();
+        serde_json::from_str::<Value>(&line).unwrap()
+    };
+
+    let r = call(1, "server.version", json!(["test", "1.7"]));
+    assert_eq!(r["result"][1], "1.7", "{r}");
+    let r = call(2, "blockchain.scriptpubkey.subscribe", json!(["51"]));
+    assert!(r["result"].is_string(), "{r}");
+    let r = call(3, "blockchain.scriptpubkey.unsubscribe", json!(["51"]));
+    assert_eq!(r["result"], json!(true), "{r}");
+    let r = call(4, "blockchain.scriptpubkey.unsubscribe", json!(["51"]));
+    assert_eq!(r["result"], json!(false), "{r}");
 }
 
 #[test]

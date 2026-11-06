@@ -1,7 +1,7 @@
 # Code audit
 
-**Base:** `0.1.0-alpha.25.4` → published `0.1.0-alpha.26` · **Scope:** `bin/e-lite`, `crates/*` (26 Rust files,
-~18k lines) · **Status:** findings fixed in `0.1.0-alpha.26` where noted.
+**Base:** `0.1.0-alpha.26.1` → published `0.1.0-alpha.27` · **Scope:** `bin/e-lite`, `crates/*` (26 Rust files,
+~19k lines) · **Status:** findings fixed in `0.1.0-alpha.27` where noted.
 
 This audit is not a claim of formal verification. It records static checks,
 manual review areas, concrete findings and residual risks.
@@ -61,6 +61,7 @@ Additional checks performed:
 | AUD-038 | P1 | Onion ports | `bin/e-lite/src/tor.rs`, `bin/e-lite/src/config.rs` | `onion_port`/`onion_tls_port` defaulted to 50001/50002, so a user with `--listen 51001 --tls-listen 51002` saw the onion on 50001/50002 and connected to the wrong port. | 0 now means "same as the Electrum listener"; effective ports are used in torrc, the startup log, `tor/state`, `/status` and `onion show`; explicit overrides still work. |
 | AUD-039 | P2 | Electrum 1.4 conformance | `crates/el-serve/src/lib.rs`, `crates/el-serve/src/version.rs` | `server.version` compared versions as strings, returned the server maximum instead of the negotiated version, accepted repeated calls, never closed on incompatible ranges, and answered JSON-RPC notifications. `transaction.get(verbose)` lacked `blockhash`/`confirmations`/`time`, and `scripthash.unsubscribe` always returned `true`. | Numeric `ProtocolVersion` negotiation (1.4–1.4.2, first call only, close on no overlap), notification suppression, verbose tx decoration from the index, real unsubscribe result, `server.add_peer`, canonical mempool order. Tests in `version.rs`, `protocol.rs` and `e2e_sparrow.py`. |
 | AUD-042 | P2 | Electrum 1.6 | `crates/el-serve/src/lib.rs`, `crates/el-rpc/src/lib.rs` | 1.6 clients expect `blockchain.block.headers` to return a `headers` array, plus `mempool.get_info`, `estimatefee(mode)` and `broadcast_package`. Serving the 1.4 shape or advertising 1.6 without those methods would break clients. | Version-aware headers shape; `server.version`-first cap for 1.6 (late negotiation stays 1.4.2); Core `getmempoolinfo` mapping; fee mode with per-mode cache; `submitpackage` wrapper with stable `{success, errors}` result. Tests: 1.6 negotiation/headers, protocol unit tests, real parent+child package in `tests/e2e_electrum16.py`. |
+| AUD-043 | P2 | Electrum 1.7 | `crates/el-serve/src/lib.rs`, `crates/el-mempool/src/lib.rs` | 1.7 removes `hash_function`, changes `server.ping`, and adds `scriptpubkey.*`, `outpoint.*`, `mempool.recent` and `testmempoolaccept`. Outpoint status needs a spender lookup that must not slow the index apply path. | Additive methods exposed without version gating; features/ping version-aware. Outpoints resolved on demand: UTXO fast path, mempool reverse map, history scan limited to `spent_sat > 0`, `spk_hint` verified, raw tx only for candidates. Scriptpubkey reuses scripthash logic with `10001` and reorg notifications. No schema/CF/undo/digest changes; `listunspent` sorted. Tests in `protocol.rs` and `tests/e2e_electrum17.py`; e2e asserts `rawtx.fetches == 0`. |
 
 ## Residual risks and intentional limits
 

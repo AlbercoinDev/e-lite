@@ -7,7 +7,7 @@
 
 use el_chain::ReaderTracker;
 use el_mempool::Mempool;
-use el_model::{merkle_branch, BlockRecord, Hash32, NetworkIdentity, ScriptHash};
+use el_model::{merkle_branch, BlockRecord, Hash32, NetworkIdentity, Outpoint, ScriptHash};
 use el_rawtx::Resolver;
 use el_rpc::CoreClient;
 use el_store::Store;
@@ -26,7 +26,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 mod version;
 pub use version::{
-    ProtocolVersion, PRE_1_6_VERSIONS, SERVER_MAX, SERVER_MIN, SERVER_VERSIONS, V1_6,
+    ProtocolVersion, PRE_1_6_VERSIONS, SERVER_MAX, SERVER_MIN, SERVER_VERSIONS, V1_6, V1_7,
 };
 
 /// Electrum clients ask for a script's full history. A script with millions of
@@ -35,7 +35,7 @@ pub use version::{
 pub const MAX_HISTORY_ENTRIES: usize = 100_000;
 
 pub const PROTOCOL_MIN: &str = "1.4";
-pub const PROTOCOL_MAX: &str = "1.6";
+pub const PROTOCOL_MAX: &str = "1.7";
 /// Fee-estimate cache key: (confirmation target, Core estimate mode).
 type FeeEstimateKey = (u32, Option<String>);
 type FeeEstimateCache = HashMap<FeeEstimateKey, (f64, Instant)>;
@@ -466,10 +466,21 @@ fn file_mtime(path: &Path) -> Option<SystemTime> {
     std::fs::metadata(path).and_then(|m| m.modified()).ok()
 }
 
+#[derive(Clone)]
+pub struct OutpointSub {
+    pub script: ScriptHash,
+    pub status: Value,
+}
+
 pub struct ClientState {
     pub id: u64,
     pub writer: Mutex<Wire>,
     pub subs: Mutex<HashMap<ScriptHash, Option<String>>>,
+    /// Scripts subscribed through `blockchain.scriptpubkey.subscribe`; these
+    /// receive a notification on reorg even when the status did not change.
+    pub spk_subs: Mutex<HashSet<ScriptHash>>,
+    /// Outpoint subscriptions from `blockchain.outpoint.subscribe`.
+    pub outpoints: Mutex<HashMap<(Hash32, u32), OutpointSub>>,
     pub headers: AtomicBool,
     pub last_height: AtomicU64,
     pub alive: AtomicBool,
@@ -526,6 +537,8 @@ impl ClientRegistry {
             id,
             writer: Mutex::new(wire),
             subs: Mutex::new(HashMap::new()),
+            spk_subs: Mutex::new(HashSet::new()),
+            outpoints: Mutex::new(HashMap::new()),
             headers: AtomicBool::new(false),
             last_height: AtomicU64::new(0),
             alive: AtomicBool::new(true),
@@ -895,13 +908,14 @@ pub fn dispatch_for(
 ) -> RpcResult<Value> {
     match method {
         "server.version" => server_version(params, client),
-        "server.ping" => Ok(Value::Null),
+        "server.ping" => server_ping(params, version),
         "server.banner" => Ok(json!(banner_text(shared))),
         "server.donation_address" => Ok(json!("")),
         "server.peers.subscribe" => Ok(json!([])),
         "server.add_peer" => Ok(json!(false)),
-        "server.features" => server_features(shared),
+        "server.features" => server_features(shared, version),
         "mempool.get_info" => mempool_info(shared),
+        "mempool.recent" => mempool_recent(shared),
         _ => {
             // Everything else reads the index: enforce a consistent tip and a
             // non-misleading state. The read lock is taken per method and is
@@ -949,6 +963,27 @@ pub fn dispatch_for(
                     Ok(json!(removed))
                 }
                 "blockchain.scripthash.get_mempool" => scripthash_mempool(shared, params),
+                "blockchain.scriptpubkey.get_history" => {
+                    let _g = read_guard(shared)?;
+                    scriptpubkey_history(shared, params)
+                }
+                "blockchain.scriptpubkey.get_balance" => {
+                    let _g = read_guard(shared)?;
+                    scriptpubkey_balance(shared, params)
+                }
+                "blockchain.scriptpubkey.listunspent" => {
+                    let _g = read_guard(shared)?;
+                    scriptpubkey_listunspent(shared, params)
+                }
+                "blockchain.scriptpubkey.get_mempool" => scriptpubkey_mempool(shared, params),
+                "blockchain.scriptpubkey.subscribe" => {
+                    let _g = read_guard(shared)?;
+                    scriptpubkey_subscribe(shared, client, params)
+                }
+                "blockchain.scriptpubkey.unsubscribe" => scriptpubkey_unsubscribe(client, params),
+                "blockchain.outpoint.get_status" => outpoint_get_status(shared, params),
+                "blockchain.outpoint.subscribe" => outpoint_subscribe(shared, client, params),
+                "blockchain.outpoint.unsubscribe" => outpoint_unsubscribe(client, params),
                 "mempool.get_fee_histogram" => fee_histogram(shared),
                 "blockchain.relayfee" => relay_fee(shared),
                 "blockchain.estimatefee" => estimate_fee(shared, params),
@@ -957,6 +992,7 @@ pub fn dispatch_for(
                 "blockchain.transaction.broadcast_package" => {
                     broadcast_package(shared, params, version)
                 }
+                "blockchain.transaction.testmempoolaccept" => test_mempool_accept(shared, params),
                 "blockchain.silentpayments.subscribe" | "blockchain.silentpayments.unsubscribe" => {
                     silent_payments(shared, method)
                 }
@@ -1303,7 +1339,27 @@ fn uptime_text(d: std::time::Duration) -> String {
     )
 }
 
-fn server_features(shared: &Shared) -> RpcResult<Value> {
+fn server_ping(params: &Value, version: ProtocolVersion) -> RpcResult<Value> {
+    if version < V1_7 {
+        return Ok(Value::Null);
+    }
+    // The 1.7 signature is (pong_len, data). `data` is ignored by the caller
+    // and we return the requested number of hex characters.
+    let pong_len = params
+        .as_array()
+        .and_then(|a| a.first())
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    const MAX_PONG_HEX: u64 = 1024 * 1024;
+    if pong_len > MAX_PONG_HEX {
+        return Err(RpcError::invalid(format!(
+            "pong_len must be <= {MAX_PONG_HEX} hex characters"
+        )));
+    }
+    Ok(json!({ "data": "0".repeat(pong_len as usize) }))
+}
+
+fn server_features(shared: &Shared, version: ProtocolVersion) -> RpcResult<Value> {
     if matches!(
         shared.get_state(),
         state::WAITING_FOR_CORE | state::INITIALIZING
@@ -1313,7 +1369,7 @@ fn server_features(shared: &Shared) -> RpcResult<Value> {
         ));
     }
     let id = shared.identity();
-    Ok(json!({
+    let mut features = json!({
         "genesis_hash": id.genesis.to_hex(),
         "hash_function": "sha256",
         "server_version": format!("e-lite {VERSION}"),
@@ -1321,7 +1377,13 @@ fn server_features(shared: &Shared) -> RpcResult<Value> {
         "protocol_max": PROTOCOL_MAX,
         "pruning": Value::Null,
         "hosts": {},
-    }))
+    });
+    if version >= V1_7 {
+        if let Some(obj) = features.as_object_mut() {
+            obj.remove("hash_function");
+        }
+    }
+    Ok(features)
 }
 
 fn tip_block(shared: &Shared) -> RpcResult<el_model::BlockRecord> {
@@ -1461,17 +1523,24 @@ fn param_scripthash(params: &Value) -> RpcResult<ScriptHash> {
 
 type HistoryRow = (u32, u32, String, u64, u64);
 
-fn history_entries(shared: &Shared, script: ScriptHash) -> RpcResult<Vec<HistoryRow>> {
+fn history_entries_with_code(
+    shared: &Shared,
+    script: ScriptHash,
+    too_large_code: i64,
+) -> RpcResult<Vec<HistoryRow>> {
     let entries = shared
         .store
         .history_for_script(script)
         .map_err(|e| RpcError::server(e.to_string()))?;
     if entries.len() > MAX_HISTORY_ENTRIES {
-        return Err(RpcError::server(format!(
-            "history for this script has {} entries (limit {}); use a script with fewer transactions",
-            entries.len(),
-            MAX_HISTORY_ENTRIES
-        )));
+        return Err(RpcError::new(
+            too_large_code,
+            format!(
+                "history for this script has {} entries (limit {}); use a script with fewer transactions",
+                entries.len(),
+                MAX_HISTORY_ENTRIES
+            ),
+        ));
     }
     let mut blocks: HashMap<u32, el_model::BlockRecord> = HashMap::new();
     let mut out = Vec::with_capacity(entries.len());
@@ -1504,9 +1573,8 @@ fn history_entries(shared: &Shared, script: ScriptHash) -> RpcResult<Vec<History
     Ok(out)
 }
 
-fn scripthash_history(shared: &Shared, params: &Value) -> RpcResult<Value> {
-    let script = param_scripthash(params)?;
-    let entries = history_entries(shared, script)?;
+fn history_value(shared: &Shared, script: ScriptHash, too_large_code: i64) -> RpcResult<Value> {
+    let entries = history_entries_with_code(shared, script, too_large_code)?;
     let mem = shared
         .mempool
         .read()
@@ -1527,8 +1595,7 @@ fn scripthash_history(shared: &Shared, params: &Value) -> RpcResult<Value> {
     Ok(Value::Array(arr))
 }
 
-fn scripthash_balance(shared: &Shared, params: &Value) -> RpcResult<Value> {
-    let script = param_scripthash(params)?;
+fn balance_value(shared: &Shared, script: ScriptHash) -> RpcResult<Value> {
     let utxos = shared
         .store
         .utxos_for_script(script)
@@ -1546,8 +1613,7 @@ fn scripthash_balance(shared: &Shared, params: &Value) -> RpcResult<Value> {
     }))
 }
 
-fn scripthash_listunspent(shared: &Shared, params: &Value) -> RpcResult<Value> {
-    let script = param_scripthash(params)?;
+fn listunspent_value(shared: &Shared, script: ScriptHash) -> RpcResult<Value> {
     let utxos = shared
         .store
         .utxos_for_script(script)
@@ -1556,18 +1622,27 @@ fn scripthash_listunspent(shared: &Shared, params: &Value) -> RpcResult<Value> {
         .mempool
         .read()
         .map_err(|_| RpcError::server("mempool lock poisoned"))?;
-    let mut arr = Vec::new();
+    // Electrum expects confirmed UTXOs in blockchain order, even though the
+    // store index is keyed by (script, outpoint).
+    let mut rows: Vec<(u32, String, u32, u64)> = Vec::with_capacity(utxos.len());
     for (op, value, height, _coinbase) in utxos {
         if mem.is_spent(&op) {
             continue;
         }
-        arr.push(json!({
-            "tx_hash": op.txid.to_hex(),
-            "tx_pos": op.vout,
-            "height": height,
-            "value": value,
-        }));
+        rows.push((height, op.txid.to_hex(), op.vout, value));
     }
+    rows.sort_by(|a, b| (a.0, &a.1, a.2).cmp(&(b.0, &b.1, b.2)));
+    let mut arr: Vec<Value> = rows
+        .into_iter()
+        .map(|(height, tx_hash, tx_pos, value)| {
+            json!({
+                "tx_hash": tx_hash,
+                "tx_pos": tx_pos,
+                "height": height,
+                "value": value,
+            })
+        })
+        .collect();
     for (op, value) in mem.utxos(script) {
         arr.push(json!({
             "tx_hash": op.txid.to_hex(),
@@ -1579,8 +1654,12 @@ fn scripthash_listunspent(shared: &Shared, params: &Value) -> RpcResult<Value> {
     Ok(Value::Array(arr))
 }
 
-fn script_status(shared: &Shared, script: ScriptHash) -> RpcResult<Option<String>> {
-    let entries = history_entries(shared, script)?;
+fn status_value(
+    shared: &Shared,
+    script: ScriptHash,
+    too_large_code: i64,
+) -> RpcResult<Option<String>> {
+    let entries = history_entries_with_code(shared, script, too_large_code)?;
     let mem = shared
         .mempool
         .read()
@@ -1599,6 +1678,44 @@ fn script_status(shared: &Shared, script: ScriptHash) -> RpcResult<Option<String
     Ok(Some(hex::encode(hasher.finalize())))
 }
 
+fn script_status(shared: &Shared, script: ScriptHash) -> RpcResult<Option<String>> {
+    status_value(shared, script, -32000)
+}
+
+fn mempool_value(shared: &Shared, script: ScriptHash) -> RpcResult<Value> {
+    let mem = shared
+        .mempool
+        .read()
+        .map_err(|_| RpcError::server("mempool lock poisoned"))?;
+    let arr: Vec<Value> = mem
+        .history(script)
+        .into_iter()
+        .map(|(txid, fee, height)| {
+            json!({
+                "tx_hash": txid.to_hex(),
+                "height": height,
+                "fee": fee,
+            })
+        })
+        .collect();
+    Ok(Value::Array(arr))
+}
+
+fn scripthash_history(shared: &Shared, params: &Value) -> RpcResult<Value> {
+    let script = param_scripthash(params)?;
+    history_value(shared, script, -32000)
+}
+
+fn scripthash_balance(shared: &Shared, params: &Value) -> RpcResult<Value> {
+    let script = param_scripthash(params)?;
+    balance_value(shared, script)
+}
+
+fn scripthash_listunspent(shared: &Shared, params: &Value) -> RpcResult<Value> {
+    let script = param_scripthash(params)?;
+    listunspent_value(shared, script)
+}
+
 fn scripthash_subscribe(
     shared: &Shared,
     client: Option<&Arc<ClientState>>,
@@ -1615,6 +1732,304 @@ fn scripthash_subscribe(
         Some(status) => Ok(json!(status)),
         None => Ok(Value::Null),
     }
+}
+
+fn param_scriptpubkey(params: &Value) -> RpcResult<ScriptHash> {
+    let s = params
+        .as_array()
+        .and_then(|a| a.first())
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| RpcError::invalid("expected scriptPubKey hex"))?;
+    let bytes =
+        hex::decode(s).map_err(|e| RpcError::invalid(format!("invalid scriptPubKey: {e}")))?;
+    Ok(ScriptHash::from_script(&bytes))
+}
+
+fn scriptpubkey_history(shared: &Shared, params: &Value) -> RpcResult<Value> {
+    let script = param_scriptpubkey(params)?;
+    Ok(json!({ "history": history_value(shared, script, 10001)? }))
+}
+
+fn scriptpubkey_balance(shared: &Shared, params: &Value) -> RpcResult<Value> {
+    let script = param_scriptpubkey(params)?;
+    balance_value(shared, script)
+}
+
+fn scriptpubkey_listunspent(shared: &Shared, params: &Value) -> RpcResult<Value> {
+    let script = param_scriptpubkey(params)?;
+    Ok(json!({ "utxos": listunspent_value(shared, script)? }))
+}
+
+fn scriptpubkey_mempool(shared: &Shared, params: &Value) -> RpcResult<Value> {
+    let script = param_scriptpubkey(params)?;
+    Ok(json!({ "history": mempool_value(shared, script)? }))
+}
+
+fn scriptpubkey_subscribe(
+    shared: &Shared,
+    client: Option<&Arc<ClientState>>,
+    params: &Value,
+) -> RpcResult<Value> {
+    let script = param_scriptpubkey(params)?;
+    let status = status_value(shared, script, 10001)?;
+    if let Some(c) = client {
+        if let Ok(mut subs) = c.subs.lock() {
+            subs.insert(script, status.clone());
+        }
+        if let Ok(mut spk) = c.spk_subs.lock() {
+            spk.insert(script);
+        }
+    }
+    match status {
+        Some(status) => Ok(json!(status)),
+        None => Ok(Value::Null),
+    }
+}
+
+fn scriptpubkey_unsubscribe(client: Option<&Arc<ClientState>>, params: &Value) -> RpcResult<Value> {
+    let script = param_scriptpubkey(params)?;
+    let removed = client
+        .map(|c| {
+            let in_subs = c
+                .subs
+                .lock()
+                .ok()
+                .map(|mut subs| subs.remove(&script).is_some())
+                .unwrap_or(false);
+            if let Ok(mut spk) = c.spk_subs.lock() {
+                spk.remove(&script);
+            }
+            in_subs
+        })
+        .unwrap_or(false);
+    Ok(json!(removed))
+}
+fn param_outpoint(params: &Value) -> RpcResult<(Hash32, u32, ScriptHash)> {
+    let arr = params
+        .as_array()
+        .ok_or_else(|| RpcError::invalid("expected [tx_hash, txout_idx, spk_hint]"))?;
+    let txid = arr
+        .first()
+        .and_then(Value::as_str)
+        .ok_or_else(|| RpcError::invalid("expected tx_hash hex"))?;
+    let txid = Hash32::from_hex(txid).map_err(RpcError::invalid)?;
+    let vout = arr
+        .get(1)
+        .and_then(Value::as_u64)
+        .ok_or_else(|| RpcError::invalid("expected txout_idx"))? as u32;
+    let script = param_scriptpubkey(&json!([arr.get(2).cloned().unwrap_or(Value::Null)]))?;
+    Ok((txid, vout, script))
+}
+
+fn decode_raw_tx(raw: &str) -> RpcResult<bitcoin::Transaction> {
+    let bytes = hex::decode(raw).map_err(|e| RpcError::server(format!("rawtx hex: {e}")))?;
+    bitcoin::consensus::encode::deserialize::<bitcoin::Transaction>(&bytes)
+        .map_err(|e| RpcError::server(format!("rawtx decode: {e}")))
+}
+
+fn resolve_raw(shared: &Shared, txid: Hash32, height: u32) -> RpcResult<String> {
+    let _guard = shared.readers.enter(height);
+    shared
+        .resolver
+        .raw_tx(txid, height)
+        .map_err(|e| RpcError::server(e.to_string()))
+}
+
+/// Resolve the Electrum 1.7 outpoint status without a persistent spend index.
+/// The fast path is a live UTXO (no raw-tx fetch); spent outputs are resolved
+/// from the script history, and only the candidate raw transactions are read.
+fn outpoint_status(
+    shared: &Shared,
+    txid: Hash32,
+    vout: u32,
+    script: ScriptHash,
+) -> RpcResult<Value> {
+    let op = Outpoint { txid, vout };
+
+    // Funder in the mempool: outputs are already in memory and verify the hint.
+    {
+        let mem = shared
+            .mempool
+            .read()
+            .map_err(|_| RpcError::server("mempool lock poisoned"))?;
+        if let Some(tx) = mem.tx(&txid) {
+            let Some((_, out_script, _)) = tx.outputs.iter().find(|(op, _, _)| op.vout == vout)
+            else {
+                return Ok(json!({}));
+            };
+            if *out_script != script {
+                return Ok(json!({}));
+            }
+            let mut status = json!({ "funder_height": tx.height });
+            if let Some((spender, height)) = mem.spender(&op) {
+                status["spender_txhash"] = json!(spender.to_hex());
+                status["spender_height"] = json!(height);
+            }
+            return Ok(status);
+        }
+    }
+
+    // Confirmed funder height.
+    let funder_height = {
+        let _g = read_guard(shared)?;
+        let occurrences = shared
+            .store
+            .occurrences(txid)
+            .map_err(|e| RpcError::server(e.to_string()))?;
+        let Some((height, _)) = occurrences.first().copied() else {
+            return Ok(json!({}));
+        };
+        height
+    };
+
+    // Mempool spender of a confirmed output.
+    if let Some((spender, height)) = shared
+        .mempool
+        .read()
+        .map_err(|_| RpcError::server("mempool lock poisoned"))?
+        .spender(&op)
+    {
+        return Ok(json!({
+            "funder_height": funder_height,
+            "spender_txhash": spender.to_hex(),
+            "spender_height": height,
+        }));
+    }
+
+    // Unspent fast path: the UTXO also carries the authoritative script.
+    let utxo = {
+        let _g = read_guard(shared)?;
+        shared
+            .store
+            .get_utxo(&op)
+            .map_err(|e| RpcError::server(e.to_string()))?
+    };
+    if let Some(utxo) = utxo {
+        if utxo.script_hash != script {
+            return Ok(json!({}));
+        }
+        return Ok(json!({ "funder_height": funder_height }));
+    }
+
+    // Spent: verify the funding output against the client's hint, then scan the
+    // spending candidates. The funding block is normally already cached.
+    let funding_raw = resolve_raw(shared, txid, funder_height)?;
+    let funding = decode_raw_tx(&funding_raw)?;
+    let Some(output) = funding.output.get(vout as usize) else {
+        return Ok(json!({}));
+    };
+    if ScriptHash::from_script(output.script_pubkey.as_bytes()) != script {
+        return Ok(json!({}));
+    }
+
+    let candidates = {
+        let _g = read_guard(shared)?;
+        let entries = shared
+            .store
+            .history_for_script(script)
+            .map_err(|e| RpcError::server(e.to_string()))?;
+        if entries.len() > MAX_HISTORY_ENTRIES {
+            return Err(RpcError::server(format!(
+                "history for this script has {} entries (limit {}); cannot resolve the spender",
+                entries.len(),
+                MAX_HISTORY_ENTRIES
+            )));
+        }
+        let mut candidates = Vec::new();
+        for (height, tx_pos, effect) in entries {
+            if height < funder_height || effect.spent_sat == 0 {
+                continue;
+            }
+            let rec = shared
+                .store
+                .get_block(height)
+                .map_err(|e| RpcError::server(e.to_string()))?
+                .ok_or_else(|| RpcError::server(format!("block {height} missing")))?;
+            let candidate = shared
+                .store
+                .txid_at(rec.txnum_base + tx_pos as u64)
+                .map_err(|e| RpcError::server(e.to_string()))?;
+            candidates.push((candidate, height));
+        }
+        candidates
+    };
+
+    for (spender, height) in candidates {
+        if spender == txid {
+            continue;
+        }
+        let raw = resolve_raw(shared, spender, height)?;
+        let tx = decode_raw_tx(&raw)?;
+        if tx.input.iter().any(|input| {
+            input.previous_output.txid.to_string() == txid.to_hex()
+                && input.previous_output.vout == vout
+        }) {
+            return Ok(json!({
+                "funder_height": funder_height,
+                "spender_txhash": spender.to_hex(),
+                "spender_height": height,
+            }));
+        }
+    }
+
+    Ok(json!({ "funder_height": funder_height }))
+}
+
+fn outpoint_get_status(shared: &Shared, params: &Value) -> RpcResult<Value> {
+    let (txid, vout, script) = param_outpoint(params)?;
+    outpoint_status(shared, txid, vout, script)
+}
+
+fn outpoint_subscribe(
+    shared: &Shared,
+    client: Option<&Arc<ClientState>>,
+    params: &Value,
+) -> RpcResult<Value> {
+    let (txid, vout, script) = param_outpoint(params)?;
+    let status = outpoint_status(shared, txid, vout, script)?;
+    if let Some(c) = client {
+        let mut subs = c
+            .outpoints
+            .lock()
+            .map_err(|_| RpcError::server("outpoint lock poisoned"))?;
+        if subs.len() >= 1000 && !subs.contains_key(&(txid, vout)) {
+            return Err(RpcError::server(
+                "too many outpoint subscriptions on this connection (limit 1000)",
+            ));
+        }
+        subs.insert(
+            (txid, vout),
+            OutpointSub {
+                script,
+                status: status.clone(),
+            },
+        );
+    }
+    Ok(status)
+}
+
+fn outpoint_unsubscribe(client: Option<&Arc<ClientState>>, params: &Value) -> RpcResult<Value> {
+    let arr = params
+        .as_array()
+        .ok_or_else(|| RpcError::invalid("expected [tx_hash, txout_idx]"))?;
+    let txid = arr
+        .first()
+        .and_then(Value::as_str)
+        .ok_or_else(|| RpcError::invalid("expected tx_hash hex"))?;
+    let txid = Hash32::from_hex(txid).map_err(RpcError::invalid)?;
+    let vout = arr
+        .get(1)
+        .and_then(Value::as_u64)
+        .ok_or_else(|| RpcError::invalid("expected txout_idx"))? as u32;
+    let removed = client
+        .and_then(|c| {
+            c.outpoints
+                .lock()
+                .ok()
+                .map(|mut subs| subs.remove(&(txid, vout)).is_some())
+        })
+        .unwrap_or(false);
+    Ok(json!(removed))
 }
 
 /// Turn Core's `decoderawtransaction` result into the verbose object wallets
@@ -1752,6 +2167,25 @@ fn mempool_info(shared: &Shared) -> RpcResult<Value> {
         "minrelaytxfee": info.minrelaytxfee,
         "incrementalrelayfee": info.incrementalrelayfee,
     }))
+}
+
+fn mempool_recent(shared: &Shared) -> RpcResult<Value> {
+    let mem = shared
+        .mempool
+        .read()
+        .map_err(|_| RpcError::server("mempool lock poisoned"))?;
+    Ok(Value::Array(
+        mem.recent(10)
+            .into_iter()
+            .map(|(txid, fee, vsize)| {
+                json!({
+                    "txid": txid.to_hex(),
+                    "fee": fee,
+                    "vsize": vsize,
+                })
+            })
+            .collect(),
+    ))
 }
 
 fn fee_histogram(shared: &Shared) -> RpcResult<Value> {
@@ -1928,6 +2362,31 @@ fn submit_package_summary(core: &Value) -> Value {
     }
 }
 
+fn test_mempool_accept(shared: &Shared, params: &Value) -> RpcResult<Value> {
+    let raw = params
+        .as_array()
+        .and_then(|a| a.first())
+        .and_then(Value::as_array)
+        .ok_or_else(|| RpcError::invalid("expected an array of raw transactions"))?;
+    let mut raw_txs = Vec::with_capacity(raw.len());
+    for tx in raw {
+        raw_txs.push(
+            tx.as_str()
+                .ok_or_else(|| RpcError::invalid("raw transactions must be hex strings"))?
+                .to_string(),
+        );
+    }
+    if raw_txs.is_empty() {
+        return Err(RpcError::invalid(
+            "testmempoolaccept expects a non-empty array of raw transactions",
+        ));
+    }
+    shared
+        .core
+        .test_mempool_accept(&raw_txs)
+        .map_err(|e| RpcError::server(format!("testmempoolaccept: {e}")))
+}
+
 fn silent_payments(shared: &Shared, method: &str) -> RpcResult<Value> {
     if !shared.silent_payments_enabled {
         return Err(RpcError::server(
@@ -1943,22 +2402,7 @@ fn silent_payments(shared: &Shared, method: &str) -> RpcResult<Value> {
 
 fn scripthash_mempool(shared: &Shared, params: &Value) -> RpcResult<Value> {
     let script = param_scripthash(params)?;
-    let mem = shared
-        .mempool
-        .read()
-        .map_err(|_| RpcError::server("mempool lock poisoned"))?;
-    let arr: Vec<Value> = mem
-        .history(script)
-        .into_iter()
-        .map(|(txid, fee, height)| {
-            json!({
-                "tx_hash": txid.to_hex(),
-                "height": height,
-                "fee": fee,
-            })
-        })
-        .collect();
-    Ok(Value::Array(arr))
+    mempool_value(shared, script)
 }
 
 fn transaction_merkle(shared: &Shared, params: &Value) -> RpcResult<Value> {
@@ -2199,7 +2643,13 @@ pub fn start_notifications(shared: Arc<Shared>) -> std::thread::JoinHandle<()> {
                             Err(_) => continue,
                         }
                     };
-                    if new != old {
+                    let force_reorg = reorg
+                        && client
+                            .spk_subs
+                            .lock()
+                            .map(|spk| spk.contains(&script))
+                            .unwrap_or(false);
+                    if new != old || force_reorg {
                         let notification = json!({
                             "jsonrpc": "2.0",
                             "method": "blockchain.scripthash.subscribe",
@@ -2212,6 +2662,41 @@ pub fn start_notifications(shared: Arc<Shared>) -> std::thread::JoinHandle<()> {
                                 .fetch_add(1, Ordering::Relaxed);
                             if let Ok(mut subs) = client.subs.lock() {
                                 subs.insert(script, new);
+                            }
+                        } else {
+                            shared.stats.notifier_errors.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                }
+
+                let outpoints: Vec<((Hash32, u32), OutpointSub)> = client
+                    .outpoints
+                    .lock()
+                    .map(|s| s.iter().map(|(k, v)| (*k, v.clone())).collect())
+                    .unwrap_or_default();
+                for ((txid, vout), sub) in outpoints {
+                    if !(force_all || reorg || dirty.contains(&sub.script)) {
+                        continue;
+                    }
+                    let new = match outpoint_status(&shared, txid, vout, sub.script) {
+                        Ok(value) => value,
+                        Err(_) => continue,
+                    };
+                    if new != sub.status {
+                        let notification = json!({
+                            "jsonrpc": "2.0",
+                            "method": "blockchain.outpoint.subscribe",
+                            "params": [txid.to_hex(), vout, new],
+                        });
+                        if client.send(&notification) {
+                            shared
+                                .stats
+                                .notifications_sent
+                                .fetch_add(1, Ordering::Relaxed);
+                            if let Ok(mut subs) = client.outpoints.lock() {
+                                if let Some(entry) = subs.get_mut(&(txid, vout)) {
+                                    entry.status = new;
+                                }
                             }
                         } else {
                             shared.stats.notifier_errors.fetch_add(1, Ordering::Relaxed);
@@ -2798,16 +3283,21 @@ mod tests {
                 "{requested} must fall back to 1.4.2"
             );
         }
-        for requested in ["1.6", "1.7"] {
+        assert_eq!(
+            server_version(&json!(["client", "1.6"]), None).unwrap()[1],
+            json!("1.6"),
+            "1.6 must negotiate 1.6"
+        );
+        for requested in ["1.7", "1.8"] {
             assert_eq!(
                 server_version(&json!(["client", requested]), None).unwrap()[1],
-                json!("1.6"),
+                json!("1.7"),
                 "{requested} must negotiate the newest available version below it"
             );
         }
         assert_eq!(
-            server_version(&json!(["client", ["1.5", "1.7"]]), None).unwrap()[1],
-            json!("1.6")
+            server_version(&json!(["client", ["1.5", "1.8"]]), None).unwrap()[1],
+            json!("1.7")
         );
         // An inverted range is a parameter error, not a version mismatch.
         assert_eq!(

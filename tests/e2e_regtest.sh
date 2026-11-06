@@ -164,6 +164,9 @@ python3 "$(dirname "$0")/e2e_sparrow.py" "$ELECTRUM_PORT" "$CORE" "$RPC_PORT" "$
 echo "== Electrum 1.6: headers array, mempool info, fee mode, package ==="
 python3 "$(dirname "$0")/e2e_electrum16.py" "$ELECTRUM_PORT" "$CORE" "$RPC_PORT" "$ADDR"
 
+echo "== Electrum 1.7: scriptpubkey, outpoint, testmempoolaccept =="
+python3 "$(dirname "$0")/e2e_electrum17.py" "$ELECTRUM_PORT" "$CORE" "$RPC_PORT" "$ADDR"
+
 STATUS=$(curl -s "http://127.0.0.1:$METRICS_PORT/status")
 python3 - "$STATUS" <<'PY'
 import json, sys
@@ -171,6 +174,7 @@ raw = json.loads(sys.argv[1])["rawtx"]
 assert raw["cache_puts"] >= 1, raw
 assert raw["cache_hits"] >= 1, raw
 assert raw["unavailable"] == 0, raw
+assert raw["fetches"] == 0, "regtest must use only local Core, no public server: {raw}"
 print("rawtx cache:", raw)
 PY
 

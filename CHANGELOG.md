@@ -1,5 +1,40 @@
 # Changelog
 
+## 0.1.0-alpha.27 — 2026-11-06
+
+### Electrum 1.7 compatibility
+
+The server now negotiates 1.4–1.7. Additive methods are available to every
+client; only `server.ping` and `server.features` change shape with the
+negotiated version. No schema, index or snapshot changes: 1.7 is resolved from
+existing data plus the whole-block resolver.
+
+- **`server.features`**: `protocol_max = "1.7"`; `hash_function` is omitted for
+  1.7 clients and kept for 1.4/1.6.
+- **`server.ping`**: 1.7 signature `(pong_len=0, data="")` returns
+  `{"data": "<pong_len hex chars>"}`; notifications get no response. The length
+  is capped at 1 MiB to avoid memory abuse.
+- **`blockchain.scriptpubkey.*`**: `get_balance`, `get_history`, `get_mempool`,
+  `listunspent`, `subscribe`, `unsubscribe`; history/mempool return dicts, the
+  notification still uses the scripthash, and an oversized history returns
+  `10001`. Scriptpubkey subscribers are notified on reorg even if the status is
+  unchanged.
+- **`blockchain.outpoint.*`**: `get_status`, `subscribe`, `unsubscribe`. Live
+  UTXOs use the O(1) fast path; spent outputs are resolved from the script
+  history and only the candidate raw transactions are fetched. `spk_hint` is
+  verified against the live UTXO / mempool output / funding transaction; a
+  mismatch returns `{}` instead of inventing a spender. Subscriptions are capped
+  at 1,000 per connection.
+- **`mempool.recent`**: last 10 mempool entries with `txid`, `fee`, `vsize`.
+- **`blockchain.transaction.testmempoolaccept`**: local Core only.
+- **`listunspent`** (scripthash and scriptpubkey) now uses blockchain order
+  `(height, tx_pos)` for confirmed UTXOs.
+- **Privacy/efficiency**: outpoint and scriptpubkey methods add no index writes;
+  the e2e asserts `rawtx.fetches == 0` on regtest, i.e. only local data was used.
+- Tests: 1.7 features/ping/shapes, scriptpubkey subscribe/unsubscribe, outpoint
+  unknown/unspent/mempool/confirmed, outpoint notifications, real
+  `testmempoolaccept`, and a 1.6/1.4 regression on the same instance.
+
 ## 0.1.0-alpha.26.1 — 2026-11-06
 
 ### Patch: public providers live in an editable file

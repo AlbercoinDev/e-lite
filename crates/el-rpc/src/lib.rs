@@ -353,6 +353,11 @@ impl CoreClient {
         self.call("submitpackage", serde_json::json!([raw_txs]))
     }
 
+    /// Test mempool acceptance without broadcasting.
+    pub fn test_mempool_accept(&self, raw_txs: &[String]) -> Result<serde_json::Value> {
+        self.call("testmempoolaccept", serde_json::json!([raw_txs]))
+    }
+
     pub fn raw_mempool_verbose(&self) -> Result<std::collections::HashMap<String, MempoolEntry>> {
         self.call("getrawmempool", serde_json::json!([true]))
     }
@@ -408,6 +413,9 @@ pub struct MempoolFees {
 pub struct MempoolEntry {
     #[serde(default)]
     pub vsize: u64,
+    /// Entry time from Core (epoch seconds); 0 when unavailable.
+    #[serde(default)]
+    pub time: u64,
     #[serde(default)]
     pub fees: Option<MempoolFees>,
     #[serde(default)]

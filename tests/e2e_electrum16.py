@@ -47,7 +47,7 @@ def connect(protocol):
 s, f, call, negotiated = connect("1.6")
 assert negotiated == "1.6", negotiated
 features = call(1, "server.features", [])["result"]
-assert features["protocol_max"] == "1.6", features
+assert features["protocol_max"] == "1.7", features
 assert features["hash_function"] == "sha256", features
 
 chunk = call(2, "blockchain.block.headers", [0, 2])["result"]
