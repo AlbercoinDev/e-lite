@@ -94,8 +94,9 @@ assert mem["available_mib"] > 0, mem
 assert st["tuning"]["cache_mib"] >= 128, st["tuning"]
 assert "public_servers" in st, st
 assert isinstance(st["public_servers"], list), st
-assert st["rate_limit_rps"] == 0, st  # loopback-only e2e: auto-disabled
-assert st["rate_burst"] == 300, st
+assert st["rate_limit_rps"] == 200, st  # uniform soft throttle
+assert st["rate_burst"] == 5000, st
+assert "disk" in st and st["disk"]["total_bytes"] > 0, st
 assert st["core_rpc_loopback"] is True, st
 assert st["provider_ready"] is False, st  # regtest has no public providers
 assert st["clearnet_fallback"] is False, st

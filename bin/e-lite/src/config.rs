@@ -520,6 +520,10 @@ pub struct RawtxCfg {
     /// Max concurrent external block downloads (wallet + prefetch).
     #[serde(default = "d_max_parallel_fetches")]
     pub max_parallel_fetches: usize,
+    /// Rawtx cache directory. Empty = `<data-dir>/rawtx-cache`. Point it at
+    /// tmpfs (for example `/dev/shm/e-lite-rawtx`) to keep blocks off disk.
+    #[serde(default)]
+    pub cache_dir: String,
     /// Timeout for one P2P connect/handshake/block attempt.
     #[serde(default = "d_p2p_timeout")]
     pub p2p_timeout_seconds: u64,
@@ -548,6 +552,7 @@ impl Default for RawtxCfg {
             request_timeout_seconds: d_rawtx_timeout(),
             provider_cooldown_seconds: d_provider_cooldown(),
             max_parallel_fetches: d_max_parallel_fetches(),
+            cache_dir: String::new(),
             p2p_timeout_seconds: d_p2p_timeout(),
             use_p2p: true,
             use_esplora: true,
@@ -593,7 +598,7 @@ fn d_milestone_seconds() -> u64 {
     21_600
 }
 fn d_log_max_mib() -> u64 {
-    64
+    16
 }
 fn d_block_source() -> String {
     "auto".to_string()
@@ -662,7 +667,7 @@ fn d_poll() -> u64 {
     10
 }
 fn d_cache_mib() -> u64 {
-    2048
+    256
 }
 fn d_decoys() -> u32 {
     1
@@ -1001,7 +1006,7 @@ mod tests {
         assert_eq!(cfg.core.prune_mib, 1);
         assert_eq!(cfg.index.reorg_window, 288);
         assert_eq!(cfg.pruning.max_core_lag_blocks, 192);
-        assert_eq!(cfg.rawtx.cache_mib, 2048);
+        assert_eq!(cfg.rawtx.cache_mib, 256);
         assert!(cfg.rawtx.esplora_urls.is_empty());
     }
 

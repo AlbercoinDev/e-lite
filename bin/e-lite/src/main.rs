@@ -3836,6 +3836,11 @@ fn build_resolver(
         request_timeout_seconds: cfg.rawtx.request_timeout_seconds,
         provider_cooldown_seconds: cfg.rawtx.provider_cooldown_seconds,
         max_parallel_fetches: cfg.rawtx.max_parallel_fetches,
+        cache_dir: if cfg.rawtx.cache_dir.trim().is_empty() {
+            None
+        } else {
+            Some(std::path::PathBuf::from(cfg.rawtx.cache_dir.trim()))
+        },
         use_p2p: cfg.rawtx.use_p2p,
         use_esplora: cfg.rawtx.use_esplora,
         p2p_v2: cfg.rawtx.p2p_v2,
@@ -3858,13 +3863,13 @@ fn requires_ready_provider(cfg: &Config, chain: Chain) -> bool {
 }
 
 fn effective_rate_limit(cfg: &Config) -> (u64, u64) {
-    let exposed = !is_loopback_listen(&cfg.server.listen)
-        || (cfg.server.tls_enabled() && !is_loopback_listen(&cfg.server.tls_listen));
-    let rate = cfg
-        .server
-        .rate_limit
-        .unwrap_or(if exposed { 50 } else { 0 });
-    (rate, cfg.server.rate_burst.unwrap_or(300))
+    // Same generous budget for every client. The limiter delays instead of
+    // rejecting, so an initial wallet scan never aborts; a sustained abuser is
+    // still capped. `rate_limit = 0` disables it entirely.
+    (
+        cfg.server.rate_limit.unwrap_or(200),
+        cfg.server.rate_burst.unwrap_or(5000),
+    )
 }
 
 fn build_shared(
@@ -4756,15 +4761,15 @@ mod tests {
     }
 
     #[test]
-    fn rate_limit_defaults_follow_listener_exposure() {
+    fn rate_limit_defaults_are_uniform_and_generous() {
         let mut cfg = Config::default();
-        assert_eq!(effective_rate_limit(&cfg), (0, 300), "loopback is off");
+        assert_eq!(effective_rate_limit(&cfg), (200, 5000), "loopback");
 
         cfg.server.listen = "0.0.0.0:50001".to_string();
-        assert_eq!(effective_rate_limit(&cfg), (50, 300), "exposed is on");
+        assert_eq!(effective_rate_limit(&cfg), (200, 5000), "exposed");
 
         cfg.server.rate_limit = Some(0);
-        assert_eq!(effective_rate_limit(&cfg), (0, 300), "explicit 0 disables");
+        assert_eq!(effective_rate_limit(&cfg), (0, 5000), "explicit 0 disables");
 
         cfg.server.rate_limit = Some(10);
         cfg.server.rate_burst = Some(5);
@@ -4772,7 +4777,7 @@ mod tests {
 
         let mut cfg = Config::default();
         cfg.server.tls_listen = "0.0.0.0:50002".to_string();
-        assert_eq!(effective_rate_limit(&cfg), (50, 300), "exposed TLS on");
+        assert_eq!(effective_rate_limit(&cfg), (200, 5000), "exposed TLS");
     }
 
     #[test]

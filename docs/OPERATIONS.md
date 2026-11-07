@@ -279,13 +279,13 @@ require restart. Full details in [`TUNING.md`](TUNING.md).
 ## Logs
 
 `run`, `index` and `serve` write the same lines shown on screen to
-`<data-dir>/e-lite.log` (per network). Rotation keeps `e-lite.log.1` at 64 MiB by
+`<data-dir>/e-lite.log` (per network). Rotation keeps `e-lite.log.1` at 16 MiB by
 default. Override with `--log-file`, `--log-max-mib` or `--no-log-file`, or:
 
 ```toml
 [logging]
 file = "/var/log/e-lite/e-lite.log"
-max_mib = 64
+max_mib = 16
 ```
 
 Core's own log is separate: `<data-dir>/bitcoind.log` (or `[core] log_file`), and

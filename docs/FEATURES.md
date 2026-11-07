@@ -75,6 +75,8 @@ available**.
 | Managed Tor + onion service | experimental | plain 50001 + TLS 50002; `e-lite onion show/reset` |
 | Auto self-signed onion TLS cert | experimental | SAN includes the onion; reloaded on change |
 | Decoys and random source order | experimental | `decoys=1` default; max 2 in flight; prefetch spawns none |
+| Rawtx cache | experimental | 256 MiB default; `cache_dir` can point at tmpfs to avoid disk |
+| Electrum rate limit | experimental | 200 req/s, burst 5000 for every client; over-budget requests wait, never error; `0` disables |
 | Block hash/header/Merkle/witness validation | experimental | before serving/caching |
 | Configurable Esplora endpoints | experimental | editable `public-servers.toml`; shipped defaults; fail-closed if no provider and `require_ready` |
 | Provider readiness gate | experimental | probes `/block-height/0` + genesis raw block before opening Electrum; `require_ready`, latency/state in `/status` |
@@ -90,7 +92,8 @@ available**.
 | Feature | Status | Notes |
 |---|---|---|
 | `/status`, `/metrics`, `/healthz` | experimental | loopback by default; memory and TLS counters |
-| Application log `e-lite.log` | experimental | tee of console; rotation; `--log-file`/`--no-log-file` |
+| Application log `e-lite.log` | experimental | tee of console; 16 MiB rotation; `--log-file`/`--no-log-file` |
+| Disk breakdown | experimental | `/status.disk`: index, txids, rawtx cache, log and snapshot bytes |
 | Wallet banner | experimental | built-in INDEXING/READY + template file |
 | Adaptive memory budget | experimental | hot cache grow/shrink; 75 % ceiling; reserve |
 | READY / FULLY SYNCED status | experimental | log, `/status`, `/metrics`, `e-lite status` |

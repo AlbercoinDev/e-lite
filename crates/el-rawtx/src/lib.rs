@@ -105,6 +105,8 @@ pub struct RawtxConfig {
     pub provider_cooldown_seconds: u64,
     /// Maximum concurrent external block downloads.
     pub max_parallel_fetches: usize,
+    /// Cache directory override. `None` uses `<data-dir>/rawtx-cache`.
+    pub cache_dir: Option<std::path::PathBuf>,
     pub use_p2p: bool,
     pub use_esplora: bool,
     pub p2p_v2: bool,
@@ -187,6 +189,7 @@ pub struct Resolver {
     /// External sources, tried in random order.
     external: Vec<Arc<dyn BlockSource>>,
     cache: Option<BlockCache>,
+    cache_dir: std::path::PathBuf,
     decoys: u32,
     stats: Arc<RawtxStats>,
     chain: Chain,
@@ -235,9 +238,13 @@ impl Resolver {
             }
         }
 
+        let cache_dir = cfg
+            .cache_dir
+            .clone()
+            .unwrap_or_else(|| store.path().join("rawtx-cache"));
         let cache = if cfg.cache_mib > 0 {
             Some(BlockCache::open(
-                &store.path().join("rawtx-cache"),
+                &cache_dir,
                 cfg.cache_mib.saturating_mul(1024 * 1024),
             )?)
         } else {
@@ -249,6 +256,7 @@ impl Resolver {
             local: None,
             external,
             cache,
+            cache_dir,
             decoys: cfg.decoys,
             stats,
             chain: cfg.chain,
@@ -275,6 +283,16 @@ impl Resolver {
 
     pub fn external_sources(&self) -> usize {
         self.external.len()
+    }
+
+    /// Directory used by the validated rawtx cache.
+    pub fn cache_dir(&self) -> &std::path::Path {
+        &self.cache_dir
+    }
+
+    /// Logical bytes stored in the rawtx cache.
+    pub fn cache_size_bytes(&self) -> u64 {
+        self.cache.as_ref().map(|c| c.size()).unwrap_or(0)
     }
 
     /// Whether a pruned-index repair has any chance: a validated block cache

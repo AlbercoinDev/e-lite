@@ -1,9 +1,9 @@
 # Session handoff
 
 **Updated:** 2026-11-07
-**Latest published release:** `0.1.0-alpha.29.3.2`
-**Release:** https://github.com/AlbercoinDev/e-lite/releases/tag/v0.1.0-alpha.29.3.2
-**Main commit at handoff:** tag `v0.1.0-alpha.29.3.2`
+**Latest published release:** `0.1.0-alpha.29.3.3`
+**Release:** https://github.com/AlbercoinDev/e-lite/releases/tag/v0.1.0-alpha.29.3.3
+**Main commit at handoff:** tag `v0.1.0-alpha.29.3.3`
 
 This file is the short “where we are” for a new session. The invariants live in
 [`AGENTS.md`](../AGENTS.md) and [`PROJECT_MEMORY.md`](PROJECT_MEMORY.md); the
@@ -44,10 +44,11 @@ no repitas contexto ni rehagas decisiones ya documentadas.
   auto-generated self-signed certificate when none is configured. Wildcard
   listeners (`0.0.0.0`/`[::]`) are mapped to loopback onion targets. The
   installer-provisioned Tor bundle is launched with `LD_LIBRARY_PATH` pointing
-  at its own libraries. There is no client authentication or rate limiting;
-  treat the onion address as a secret. Per-client rate limiting is active by
-  default on non-loopback listeners (50 req/s, burst 300; `[server] rate_limit`
-  and `rate_burst`; `0` disables). It is not authentication. `run` probes the
+  at its own libraries. There is no client authentication; treat the onion
+  address as a secret. Per-client rate limiting is a throttle, not auth: 200
+  req/s with burst 5000 for every client (LAN and public), over-budget requests
+  wait for the next token instead of being rejected, and `[server] rate_limit =
+  0` disables it. `run` probes the
   network providers and gates the wallet listeners until one answers a real
   genesis block request (`/block-height/0` plus `/block/<genesis>/raw` with a
   header-hash check); Tor failure falls back to clearnet
@@ -79,6 +80,19 @@ no repitas contexto ni rehagas decisiones ya documentadas.
   the onion setup, reset and security.
 - `docs/ROADMAP.md` contains future features/improvements. Do not present them as
   available.
+
+## Last change (alpha.29.3.3)
+
+- **Rate limit uniform and non-blocking**: 200 req/s / burst 5000 for every
+  client (no loopback/LAN/public distinction). Over-budget requests wait for
+  the next token instead of returning `-32000`; a Sparrow gap scan no longer
+  aborts at ~55 addresses. `rate_limit = 0` still disables.
+- **Disk-minimal defaults for a max-pruned Core**: rawtx cache 256 MiB (was
+  2048), optional `rawtx.cache_dir` for tmpfs (`/dev/shm/e-lite-rawtx`), log
+  rotation 16 MiB (was 64). Snapshots remain manual/off by default.
+- **Disk breakdown** in `/status.disk`: index, txids, cache, log and snapshot
+  bytes, plus the effective cache directory and total.
+- No schema or protocol change.
 
 ## Last change (alpha.29.3.2)
 
@@ -431,8 +445,9 @@ startup/shutdown + log assertions).
 
 P1 (before any public exposure or mainnet production claim):
 
-1. Authentication/rate limiting for non-loopback Electrum. TLS encrypts the
-   transport but does not restrict clients; document firewall/allowlist/VPN/Tor.
+1. Authentication for non-loopback Electrum. TLS encrypts the transport and
+   rate limiting is only a throttle, not access control; document
+   firewall/allowlist/VPN/Tor.
 2. Core RPC TLS or a hard SSH/VPN requirement with tests.
 3. Verify/close the audit residual risks in `docs/AUDIT.md` (snapshot archive
    limits, per-client threads, provider trust).
@@ -475,8 +490,8 @@ kill -USR1 "$(pgrep -f 'e-lite run')"
 - Expose metrics publicly.
 - Expose Electrum without TLS or without a firewall/VPN/Tor access policy; TLS
   alone does not authenticate clients.
-- Claim client authentication/rate limiting, Electrum 1.7 or silent payments are
-  implemented.
+- Claim client authentication, that rate limiting is access control, Electrum
+  1.7 or silent payments are implemented.
 - Delete an existing index/datadir to “fix” an error before checking
   `NEEDS_RECOVERY`/snapshot options.
 
@@ -488,6 +503,6 @@ startup/shutdown/memory assertions, `e-lite.log` presence, 1.6 and 1.7
 negotiation on the same instance, scriptpubkey/outpoint checks, outpoint
 notification, real testmempoolaccept, the rate-limit burst test, the strict
 Core RPC check and the Sparrow sequence with confirmed verbose transaction)
-passed on the alpha.29.3.2 code. Full signet/testnet4 acceptance
+passed on the alpha.29.3.3 code. Full signet/testnet4 acceptance
 is still operator-run; results belong in `docs/GETTING-STARTED.md`/release notes
 when available.

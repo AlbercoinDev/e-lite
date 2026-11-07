@@ -487,21 +487,30 @@ impl RateLimit {
         }
     }
 
-    /// `true` when the request may proceed. A zero refill rate disables the
-    /// limiter (loopback-only listeners by default).
+    /// Consume one token. When the bucket is empty, wait for the next token
+    /// instead of rejecting the request: an initial wallet scan must never be
+    /// aborted by a burst. Returns `true` when the request had to wait.
+    ///
+    /// A zero refill rate disables the limiter.
     fn acquire(&mut self, now: Instant) -> bool {
         if self.refill_per_sec <= 0.0 {
-            return true;
+            return false;
         }
         let elapsed = now.saturating_duration_since(self.last).as_secs_f64();
         self.tokens = (self.tokens + elapsed * self.refill_per_sec).min(self.capacity);
         self.last = now;
         if self.tokens >= 1.0 {
             self.tokens -= 1.0;
-            true
-        } else {
-            false
+            return false;
         }
+        let wait = (1.0 - self.tokens) / self.refill_per_sec;
+        if wait > 0.0 {
+            std::thread::sleep(Duration::from_secs_f64(wait));
+        }
+        // The sleep produced exactly the token consumed here.
+        self.tokens = 0.0;
+        self.last = Instant::now();
+        true
     }
 }
 
@@ -869,6 +878,26 @@ impl Shared {
         }
     }
 
+    fn disk_breakdown(&self) -> (u64, u64, u64, u64, u64) {
+        let total = self.db_bytes_cached();
+        let txids = std::fs::metadata(self.store.txids_path())
+            .map(|m| m.len())
+            .unwrap_or(0);
+        let cache = self.resolver.cache_size_bytes();
+        let log = if self.log_file.starts_with(&self.data_dir) {
+            std::fs::metadata(&self.log_file)
+                .map(|m| m.len())
+                .unwrap_or(0)
+        } else {
+            0
+        };
+        let snapshots = top_level_snapshot_bytes(&self.data_dir);
+        let cache_on_data = self.resolver.cache_dir().starts_with(&self.data_dir);
+        let index =
+            total.saturating_sub(txids + log + snapshots + if cache_on_data { cache } else { 0 });
+        (index, txids, cache, log, snapshots)
+    }
+
     pub fn status_json(&self) -> Value {
         let (height, txnum, hash) = match self.store.committed_tip() {
             Ok(Some(t)) => (t.height as u64, t.txnum, t.block_hash.to_hex()),
@@ -877,6 +906,9 @@ impl Shared {
         let core_height = self.stats.core_height.load(Ordering::Relaxed);
         let pruneheight = self.stats.core_pruneheight.load(Ordering::Relaxed);
         let sync = self.sync_status();
+        let db_bytes = self.db_bytes_cached();
+        let (index_bytes, txids_bytes, cache_bytes, log_bytes, snapshot_bytes) =
+            self.disk_breakdown();
         let rawtx = self.resolver.stats();
         let id = self.identity();
         let mem = self.mempool.read();
@@ -905,7 +937,16 @@ impl Shared {
             "retention_blocks": core_height.saturating_sub(pruneheight),
             "txnum": txnum,
             "tip_hash": hash,
-            "db_bytes": self.db_bytes_cached(),
+            "db_bytes": db_bytes,
+            "disk": {
+                "index_bytes": index_bytes,
+                "txids_bytes": txids_bytes,
+                "cache_bytes": cache_bytes,
+                "cache_dir": self.resolver.cache_dir().display().to_string(),
+                "log_bytes": log_bytes,
+                "snapshot_bytes": snapshot_bytes,
+                "total_bytes": db_bytes,
+            },
             "disk_free_bytes": el_chain::disk_free_bytes(&self.data_dir).unwrap_or(0),
             "core_disk_free_bytes": el_chain::disk_free_bytes(&self.core_datadir).unwrap_or(0),
             "disk_low": self.stats.disk_low.load(Ordering::Relaxed),
@@ -1021,6 +1062,24 @@ impl Shared {
             },
         })
     }
+}
+
+/// On-demand snapshots are user files; count the common top-level layout only.
+fn top_level_snapshot_bytes(dir: &std::path::Path) -> u64 {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    entries
+        .flatten()
+        .filter_map(|entry| {
+            let path = entry.path();
+            let name = path.file_name()?.to_string_lossy();
+            if !path.is_file() || !name.ends_with(".tar.gz") {
+                return None;
+            }
+            entry.metadata().ok().map(|m| m.len())
+        })
+        .sum()
 }
 
 /// Free bytes on the filesystem containing `path` (0 when it cannot be read).
@@ -3176,32 +3235,19 @@ pub fn process_line_for(
         }
     };
     let params = request.get("params").cloned().unwrap_or(json!([]));
-    let allowed = client
+    let throttled = client
         .map(|c| {
             c.budget
                 .lock()
                 .map(|mut budget| budget.acquire(Instant::now()))
-                .unwrap_or(true)
+                .unwrap_or(false)
         })
-        .unwrap_or(true);
-    if !allowed {
+        .unwrap_or(false);
+    if throttled {
+        // Soft throttle: the request already waited for its token. Keep the
+        // counter for observability, but never turn a wallet burst into an
+        // error.
         shared.stats.rate_limited.fetch_add(1, Ordering::Relaxed);
-        shared.stats.errors_total.fetch_add(1, Ordering::Relaxed);
-        return LineOutcome {
-            response: if is_notification {
-                None
-            } else {
-                Some(json!({
-                    "jsonrpc": "2.0",
-                    "id": id,
-                    "error": {
-                        "code": -32000,
-                        "message": "rate limit exceeded; slow down"
-                    },
-                }))
-            },
-            close: false,
-        };
     }
     if method != "server.version" {
         if let Some(c) = client {
@@ -3510,7 +3556,7 @@ fn metrics_text(shared: &Shared) -> String {
     );
     line(
         "e_lite_rate_limited_total",
-        "Requests rejected by the per-client rate limit",
+        "Requests delayed by the per-client rate limiter",
         "counter",
         g("rate_limited"),
     );
@@ -3638,18 +3684,20 @@ mod tests {
     }
 
     #[test]
-    fn rate_limit_burst_and_refill() {
+    fn rate_limit_waits_instead_of_rejecting() {
         let start = Instant::now();
-        let mut limit = RateLimit::new(2, 1);
-        assert!(limit.acquire(start));
-        assert!(limit.acquire(start));
-        assert!(!limit.acquire(start));
-        assert!(limit.acquire(start + Duration::from_secs(1)));
-        assert!(!limit.acquire(start + Duration::from_secs(1)));
+        let mut limit = RateLimit::new(1, 10);
+        assert!(!limit.acquire(start), "first request is immediate");
+        let before = Instant::now();
+        assert!(limit.acquire(start), "second request waits for a token");
+        assert!(
+            before.elapsed() >= Duration::from_millis(80),
+            "the limiter must delay, not reject"
+        );
 
         let mut disabled = RateLimit::new(1, 0);
         for _ in 0..10 {
-            assert!(disabled.acquire(start));
+            assert!(!disabled.acquire(start), "rate 0 never throttles");
         }
     }
 

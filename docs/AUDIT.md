@@ -1,7 +1,7 @@
 # Code audit
 
-**Base:** `0.1.0-alpha.29.3.1` → published `0.1.0-alpha.29.3.2` · **Scope:** `bin/e-lite`, `crates/*` (26 Rust files,
-~19k lines) · **Status:** findings fixed in `0.1.0-alpha.29.3.2` where noted.
+**Base:** `0.1.0-alpha.29.3.2` → published `0.1.0-alpha.29.3.3` · **Scope:** `bin/e-lite`, `crates/*` (26 Rust files,
+~19k lines) · **Status:** findings fixed in `0.1.0-alpha.29.3.3` where noted.
 
 This audit is not a claim of formal verification. It records static checks,
 manual review areas, concrete findings and residual risks.
@@ -70,6 +70,8 @@ Additional checks performed:
 | AUD-050 | P1 | Rawtx concurrency | `crates/el-rawtx/src/lib.rs`, `crates/el-rawtx/src/p2p.rs` | Concurrent wallet/prefetch requests for the same block each downloaded it, and P2P tried up to 4 peers × v2/v1 × the 30 s Core timeout with no memory of failures. One block could take minutes (`dac454` failed after 134 s). | In-flight block dedup, `max_parallel_fetches=4`, P2P `p2p_timeout_seconds=8` with a 2× total cap, connected-peers-first discovery, last-good-first ordering, failed-peer cooldown, `connect_timeout`, and a Tor circuit breaker. Silent-peer, cooldown and shared-download tests added. |
 | AUD-051 | P1 | Rawtx availability | `crates/el-rawtx/src/esplora.rs`, `crates/el-rawtx/src/lib.rs` | A single provider failure put it in a 300 s cooldown; if the only working provider failed, every request returned "cooling down" without touching the network, aborting Sparrow's wallet loading. | If no provider is attemptable, e-lite forces one attempt (last good first); a provider that already answered is cooled for at most 30 s. Inflight leader panics are converted to errors. Tests cover forced attempt and skip-with-healthy-alternative. |
 | AUD-052 | P1 | P2P Tor timeout | `crates/el-rawtx/src/p2p.rs` | The `socks` crate's `Socks5Stream::connect_with_password` has no connect/read/write timeout; a stalled Tor SOCKS proxy could block a P2P fetch indefinitely, ignoring `p2p_timeout_seconds`. | Replaced with a minimal SOCKS5 CONNECT that applies the P2P timeout to proxy connect, greeting, authentication, request and reply. Tests cover a silent proxy timing out and a password-auth handshake. |
+| AUD-053 | P1 | Electrum rate limit | `crates/el-serve/src/lib.rs`, `bin/e-lite/src/main.rs` | A hard 50/s + burst-300 bucket on exposed listeners returned `-32000` during a wallet gap scan; Sparrow aborted at ~55 addresses and required a reconnect. | Uniform 200/s + burst 5000 for every client; over-budget requests wait for the next token instead of erroring. `0` disables. Updated unit/integration tests assert delay and success, not rejection. |
+| AUD-054 | P2 | Disk footprint | `bin/e-lite/src/config.rs`, `crates/el-rawtx/src/lib.rs`, `crates/el-serve/src/lib.rs` | The rawtx cache defaulted to 2 GiB on disk and logs to 64 MiB; with Core pruned to the maximum this was the largest avoidable footprint. | Cache default 256 MiB, optional `rawtx.cache_dir` (tmpfs keeps blocks off disk), log rotation 16 MiB, and `/status.disk` breaks down index/txids/cache/log/snapshots. Snapshots remain manual. No schema change. |
 
 ## Residual risks and intentional limits
 

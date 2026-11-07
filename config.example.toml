@@ -62,10 +62,10 @@ poll_seconds = 10
 [server]
 listen = "127.0.0.1:50001"
 max_clients = 32
-# Per-client Electrum request budget. Absent = auto: enabled only when a
-# listener is non-loopback. 0 disables it. Burst defaults to 300.
-# rate_limit = 50                  # requests/second per client
-# rate_burst = 300                 # initial burst tokens per client
+# Per-client Electrum request budget. Same policy for every client; requests
+# over the rate wait for the next token (they are not rejected). 0 disables it.
+# rate_limit = 200                 # requests/second per client
+# rate_burst = 5000                # initial burst tokens per client
 # Optional TLS listener. Empty disables TLS; the plain listener keeps working.
 # The certificate is validated against the hostname the client connects to, so
 # a public-domain certificate only works when the wallet uses that name (use
@@ -100,7 +100,8 @@ listen = "127.0.0.1:9184"
 
 [rawtx]
 enabled = true
-cache_mib = 2048                    # validated LRU cache; 0 disables
+cache_mib = 256                     # validated LRU cache; 0 disables
+# cache_dir = "/dev/shm/e-lite-rawtx" # tmpfs keeps blocks off disk (counts as RAM)
 decoys = 1                          # extra blocks fetched per real fetch (max 2 in flight)
 tor_socks = "127.0.0.1:9050"        # empty requires allow_clearnet = true
 allow_clearnet = false              # fail closed without Tor; also gates repair
@@ -132,7 +133,7 @@ enabled = false                     # opt-in gate; BIP352 indexer not included y
 
 [logging]
 # file = "/var/log/e-lite/e-lite.log"  # default <data-dir>/e-lite.log
-max_mib = 64                        # rotate to e-lite.log.1 above this; 0 = never
+max_mib = 16                        # rotate to e-lite.log.1 above this; 0 = never
 
 [safety]
 allow_mainnet = false               # mainnet requires explicit opt-in

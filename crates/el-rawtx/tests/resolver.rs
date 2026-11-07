@@ -169,6 +169,7 @@ fn config(decoys: u32, cache_mib: u64) -> RawtxConfig {
         request_timeout_seconds: 15,
         provider_cooldown_seconds: 120,
         max_parallel_fetches: 4,
+        cache_dir: None,
         use_p2p: false,
         use_esplora: false,
         p2p_v2: false,

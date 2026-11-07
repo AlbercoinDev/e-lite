@@ -73,7 +73,8 @@ is non-empty, it replaces the file for that run:
 ```toml
 [rawtx]
 enabled = true
-cache_mib = 2048
+cache_mib = 256
+# cache_dir = "/dev/shm/e-lite-rawtx"  # tmpfs: no disk, counts as RAM
 decoys = 1
 tor_socks = "127.0.0.1:9050"
 allow_clearnet = false
@@ -109,9 +110,9 @@ require_ready = true      # run: refuse wallets until a provider answers
   clearnet and `.onion` requests go through the proxy.
 - **Inbound onion:** the same managed Tor publishes Electrum as a v3 onion
   service. This hides the server IP and encrypts the transport, but anyone with
-  the address can query it: e-lite does not authenticate clients or rate limit
-  requests. Treat the address as a secret; use `[tor] mode = "off"` to disable
-  the onion.
+  the address can query it: e-lite does not authenticate clients; rate limiting
+  is only a throttle, not access control. Treat the address as a secret; use
+  `[tor] mode = "off"` to disable the onion.
 - `run` waits for at least one provider to answer `/block-height/0` and serve
   the genesis raw block with a matching header hash before opening the Electrum
   listeners (`require_ready = true` by default). This prevents a wallet from
@@ -126,9 +127,10 @@ require_ready = true      # run: refuse wallets until a provider answers
   the provider's view is not a single “interesting” block. At most two decoy
   downloads run at once and the background prefetch never spawns decoys. Set
   `decoys = 0` to reduce bandwidth at the cost of privacy.
-- The validated block cache reduces repeated external fetches. Set
-  `cache_mib = 0` to disable it; repair still works from P2P/Esplora when a
-  source is available.
+- The validated block cache reduces repeated external fetches. It defaults to
+  256 MiB. Set `cache_mib = 0` to disable it, or point `cache_dir` at tmpfs
+  (`/dev/shm/e-lite-rawtx`) to keep blocks off persistent disk; repair still
+  works from P2P/Esplora when a source is available.
 
 ## P2P details
 

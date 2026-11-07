@@ -68,10 +68,11 @@ Never treat a version number in this file as authoritative over the code/tag.
   listener authenticates clients; the onion address is the access secret. Do not
   expose them publicly without a tunnel/firewall/access plan.
 - Electrum rate limiting is a per-connection token bucket, not authentication:
-  `rate_limit` defaults to auto (enabled only when a listener is non-loopback),
-  `0` disables it, and `rate_burst` defaults to 300. Never add token/mTLS auth
-  to the Electrum listener: wallets do not support it. Access control remains
-  firewall/allowlist/VPN/Tor.
+  `rate_limit` defaults to 200 req/s for every client (LAN and public alike),
+  `rate_burst` to 5000, and `0` disables it. Over-budget requests **wait for the
+  next token**; they must not be rejected, because a wallet's initial scan
+  aborts on an error. Never add token/mTLS auth to the Electrum listener:
+  wallets do not support it. Access control remains firewall/allowlist/VPN/Tor.
 - Public servers are not compiled into the binary: they live in the editable
   `public-servers.toml` next to `config.toml`. A first run copies the shipped
   template; a missing file means local data only (fail closed), never a hidden
@@ -93,6 +94,10 @@ Never treat a version number in this file as authoritative over the code/tag.
 - Decoys default to 1, at most 2 are in flight, and the prefetch never spawns
   decoys. The prefetcher enqueues up to 16 confirmed history heights per
   history response with one worker; it is an optimisation, never correctness.
+- The rawtx cache defaults to 256 MiB under `<data-dir>/rawtx-cache`; `cache_dir`
+  may point at tmpfs to keep blocks off disk, and the log rotates at 16 MiB.
+  Assume Core is pruned to the maximum: do not duplicate block data on disk
+  without a disk-pressure cap. Snapshots are manual only.
 - `run` probes the network's providers (`/block-height/0` plus the genesis raw
   block with a header-hash check) and does not open Electrum until at least one
   answers; `require_ready`/`ready_timeout_seconds` control the gate.
@@ -148,9 +153,9 @@ Never treat a version number in this file as authoritative over the code/tag.
   `127.0.0.1:50002` when `tls_listen` is empty and the port is free.
 - `CertWatcher` reloads changed PEMs by mtime without restart and keeps the old
   cert if the new pair is invalid (Let's Encrypt renewals need no restart).
-- TLS only encrypts; there is no client auth or rate limiting (AUD-010). A
-  public domain also needs a reachable bind (`0.0.0.0`/IP, not the default
-  loopback) plus a firewall/VPN/allowlist plan.
+- TLS only encrypts; there is no client auth and rate limiting is only a
+  throttle (AUD-010). A public domain also needs a reachable bind
+  (`0.0.0.0`/IP, not the default loopback) plus a firewall/VPN/allowlist plan.
 
 ## Quality gates
 

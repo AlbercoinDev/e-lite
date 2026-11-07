@@ -158,14 +158,15 @@ e-lite run --network mainnet --allow-mainnet \
 | Flag | TOML field | Default |
 |---|---|---|
 | `--max-clients <n>` | `server.max_clients` | `32` |
-| `--set server.rate_limit=<n>` | `server.rate_limit` | auto: `50` when non-loopback, off on loopback |
-| `--set server.rate_burst=<n>` | `server.rate_burst` | `300` |
+| `--set server.rate_limit=<n>` | `server.rate_limit` | `200` for every client; `0` disables |
+| `--set server.rate_burst=<n>` | `server.rate_burst` | `5000` |
 | `--banner-file <path>` | `server.banner_file` | built-in templates |
 | `--p2p-peers <a,b>` | `rawtx.p2p_peers` | discovered from Core |
 | `--no-p2p` | `rawtx.use_p2p=false` | enabled |
 | `--no-esplora` | `rawtx.use_esplora=false` | enabled |
 | `--decoys <n>` | `rawtx.decoys` | `1` (max 2 in flight) |
-| `--rawtx-cache-mib <n>` | `rawtx.cache_mib` | `2048` |
+| `--rawtx-cache-mib <n>` | `rawtx.cache_mib` | `256` |
+| `--set rawtx.cache_dir=<path>` | `rawtx.cache_dir` | `<data-dir>/rawtx-cache`; tmpfs keeps it off disk |
 | `--tor-socks <addr>` | `rawtx.tor_socks` | `127.0.0.1:9050` |
 | `--allow-clearnet` | `rawtx.allow_clearnet` | `false` |
 | `--set rawtx.tor_fallback_clearnet=true` | use clearnet when Tor fails | `true` |
@@ -177,6 +178,9 @@ e-lite run --network mainnet --allow-mainnet \
 | `--no-rawtx` | `rawtx.enabled=false` | enabled |
 | `--tls-listen <addr>` | `server.tls_listen` | disabled |
 | `--tls-cert`, `--tls-key` | `server.tls_cert`, `server.tls_key` | none |
+
+Requests above `server.rate_limit` **wait for the next token** instead of
+returning an error, so a wallet's initial gap scan is not aborted.
 
 ## Tor and onion
 
@@ -234,7 +238,7 @@ line (`READY`/`FULLY SYNCED`), `/status` and `e-lite status`.
 | Flag | TOML field | Default |
 |---|---|---|
 | `--log-file <path>` | `logging.file` | `<data-dir>/e-lite.log` |
-| `--log-max-mib <n>` | `logging.max_mib` | `64` (0 disables rotation) |
+| `--log-max-mib <n>` | `logging.max_mib` | `16` (0 disables rotation) |
 | `--no-log-file` | — | logging enabled |
 
 The file receives exactly the same lines as the console (stdout + stderr),

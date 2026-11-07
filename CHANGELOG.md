@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.1.0-alpha.29.3.3 — 2026-11-07
+
+### Patch: wallet-friendly rate limit and disk-minimal defaults
+
+- **Rate limit is now a throttle, not an error**: the same 200 req/s with burst
+  5000 applies to every client (loopback, LAN and public). When the bucket is
+  empty the request waits for the next token (a few milliseconds at 200 req/s)
+  instead of returning `-32000 "rate limit exceeded"`. A Sparrow gap scan no
+  longer aborts around address 55; `server.rate_limit = 0` still disables the
+  limiter.
+- **Disk-minimal defaults for a max-pruned Core**:
+  - rawtx cache default lowered from 2048 MiB to 256 MiB;
+  - new `rawtx.cache_dir` lets the cache live on tmpfs (for example
+    `/dev/shm/e-lite-rawtx`), keeping block data off persistent disk;
+  - application log rotation lowered from 64 MiB to 16 MiB;
+  - snapshots remain manual/off by default.
+- **Disk breakdown** in `/status.disk`: `index_bytes`, `txids_bytes`,
+  `cache_bytes`, `cache_dir`, `log_bytes`, `snapshot_bytes` and `total_bytes`.
+- Tests: rate-limit unit and protocol tests now assert waiting/success instead
+  of rejection. No schema, Electrum protocol or provider behaviour change.
+
 ## 0.1.0-alpha.29.3.2 — 2026-11-07
 
 ### Patch: never fail a wallet request without trying a provider

@@ -123,6 +123,7 @@ fn fixture() -> (Fixture, ScriptHash, Hash32) {
                 request_timeout_seconds: 15,
                 provider_cooldown_seconds: 120,
                 max_parallel_fetches: 4,
+                cache_dir: None,
                 use_p2p: false,
                 use_esplora: false,
                 p2p_v2: false,
@@ -457,6 +458,7 @@ fn slow_transaction_get_does_not_hold_the_index_lock() {
                 request_timeout_seconds: 15,
                 provider_cooldown_seconds: 120,
                 max_parallel_fetches: 4,
+                cache_dir: None,
                 use_p2p: false,
                 use_esplora: false,
                 p2p_v2: false,
@@ -842,12 +844,12 @@ fn notifications_are_not_answered() {
 }
 
 #[test]
-fn rate_limit_rejects_bursts_but_keeps_the_connection() {
+fn rate_limit_throttles_without_errors() {
     use std::io::{BufRead, BufReader, Write};
     use std::net::{TcpListener, TcpStream};
 
     let (fx, _script, _txid) = fixture();
-    fx.shared.clients.set_rate_limit(1, 2);
+    fx.shared.clients.set_rate_limit(2, 1);
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
     el_serve::start_listener_on(listener, Arc::clone(&fx.shared), None);
@@ -870,23 +872,20 @@ fn rate_limit_rejects_bursts_but_keeps_the_connection() {
     write(json!({"jsonrpc":"2.0","id":1,"method":"server.version","params":["test","1.4"]}));
     assert!(read()["result"].is_array());
 
-    let mut limited = false;
+    let started = std::time::Instant::now();
     for id in 2..=6 {
         write(json!({"jsonrpc":"2.0","id":id,"method":"server.ping","params":[]}));
         let response = read();
-        if response["error"]["message"]
-            .as_str()
-            .unwrap_or("")
-            .contains("rate limit")
-        {
-            limited = true;
-        }
+        assert_eq!(
+            response["result"],
+            Value::Null,
+            "throttled request must still succeed: {response}"
+        );
     }
-    assert!(limited, "burst must hit the per-client rate limit");
-    std::thread::sleep(Duration::from_millis(1100));
-    write(json!({"jsonrpc":"2.0","id":10,"method":"server.ping","params":[]}));
-    let response = read();
-    assert_eq!(response["result"], Value::Null, "{response}");
+    assert!(
+        started.elapsed() >= Duration::from_millis(1500),
+        "burst should be delayed, not rejected"
+    );
 }
 
 #[test]
