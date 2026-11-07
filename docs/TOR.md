@@ -98,28 +98,43 @@ the Electrum listener". With `--listen 0.0.0.0:51001 --tls-listen 0.0.0.0:51002`
 the onion is published as `<addr>.onion:51001` and `<addr>.onion:51002`. Set an
 explicit value to publish a different virtual port.
 
-### TLS certificate
+### TLS certificate and wallet trust
 
 TLS does not depend on Tor. On the first `run`/`serve` with TLS enabled and no
-operator certificate, e-lite generates and reuses:
+operator certificate, e-lite generates a **per-instance local CA** and a server
+certificate signed by it:
 
 ```
-<data-dir>/tls/self-signed.crt
-<data-dir>/tls/self-signed.key   (0600)
-<data-dir>/tls/self-signed.san
+<data-dir>/tls/ca.crt           # local CA: import THIS in the wallet
+<data-dir>/tls/ca.key           # CA private key (0600)
+<data-dir>/tls/self-signed.crt  # server leaf + CA (the TLS chain)
+<data-dir>/tls/self-signed.key  # leaf private key (0600)
+<data-dir>/tls/self-signed.san  # regeneration marker
+<data-dir>/tls/cert-model       # CA fingerprint marker
 ```
 
-The SAN covers `localhost`, `127.0.0.1`, `::1`, the machine hostname, the
+Java-based wallets (Sparrow) reject a self-signed **server** certificate used as
+a trust anchor with `TrustAnchor ... is not a CA certificate`. That is why the
+identity is split: trust `ca.crt` in the wallet; the served chain contains the
+leaf and the CA, so the wallet can build and validate the path.
+
+The leaf SAN covers `localhost`, `127.0.0.1`, `::1`, the machine hostname, the
 non-loopback IPs of the local interfaces and the onion address once it exists.
-The certificate is regenerated when the SAN set changes (including a new LAN
-address); the key is reused and `CertWatcher` reloads the PEM without
-restarting. Files are written `0600` atomically. A corrupt generated pair is
-rebuilt. Operator-provided certificates are never overwritten; if
-`tls_auto_cert = false`, an existing valid generated pair is still served.
+When the SAN set changes (new LAN address or onion), the leaf is re-signed with
+the **same** CA, so the wallet keeps trusting it. A corrupt pair or an old
+single-cert installation is migrated on the next start. Files are written
+`0600` atomically. Operator-provided certificates are never overwritten; if
+`tls_auto_cert = false`, an existing valid pair is still served.
 
-The startup log prints the certificate path and the SHA-256 of the DER leaf
-certificate, the same value `openssl x509 -in <cert> -fingerprint -sha256
--noout` prints (without colons).
+Verify the chain yourself:
+
+```bash
+openssl verify -CAfile <data-dir>/tls/ca.crt <data-dir>/tls/self-signed.crt
+```
+
+The startup log prints the leaf and CA fingerprints (SHA-256 of the DER
+certificate, the value `openssl x509 -fingerprint -sha256` prints, without
+colons).
 
 If Tor is unavailable, the clearnet plain and TLS listeners keep working; only
 the onion is missing. The same is true in reverse: `[tor] mode = "off"` serves

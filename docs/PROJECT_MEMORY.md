@@ -41,8 +41,9 @@ the per-client rate limiter are implemented; client authentication is not.
 - Snapshots are optional, never required by the from-zero flow.
 - Electrum binds per-network ports (55011/55022/55084 mainnet, 55111/55122/
   55184 testnet4, 55211/55222/55284 signet, 55311/55322/55384 regtest) on
-  `0.0.0.0`. TLS is enabled by default with a generated self-signed certificate
-  and does not authenticate clients. A managed Tor publishes an onion (plain +
+  `0.0.0.0`. TLS is enabled by default with a generated local CA and a server
+  certificate signed by it; wallets must trust `ca.crt`, not the leaf. TLS does
+  not authenticate clients. A managed Tor publishes an onion (plain +
   TLS) by default; the address is the access secret. The per-connection rate
   limiter delays requests instead of rejecting them, so it is a throttle, not
   access control.

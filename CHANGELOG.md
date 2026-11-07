@@ -1,5 +1,29 @@
 # Changelog
 
+## 0.1.0-alpha.29.4.3 — 2026-11-07
+
+### Fix: Java/Sparrow TLS trust (local CA + server certificate)
+
+- **Why**: Java wallets reject a self-signed server certificate used as a
+  `TrustAnchor` with `TrustAnchor ... is not a CA certificate`. e-lite generated
+  a single leaf with no CA, so Sparrow could not validate it even after
+  importing it.
+- **New model**: e-lite now generates a per-instance local CA (`ca.crt`,
+  `ca.key`, `CA:TRUE`) and signs the server certificate with it. The TLS chain
+  file (`self-signed.crt`) contains leaf + CA, so a wallet that trusts
+  `ca.crt` can build the path and validate the hostname/IP.
+- The leaf is re-signed with the same CA when the SAN set changes (LAN IP,
+  hostname, onion), so wallets keep trusting the CA across restarts and onion
+  rotation.
+- Existing single-cert installs migrate automatically on the next start: the
+  leaf key is reused, the CA is created and the chain is rewritten. Import the
+  new `ca.crt` in the wallet and remove the old trusted server certificate.
+- The startup log prints the leaf fingerprint and the CA path/fingerprint.
+- Tests: CA+leaf chain structure, migration from the old single-cert model,
+  `openssl verify -CAfile ca.crt`, `CA:TRUE`, and wallet-style validation of
+  `localhost` and the LAN IP (with a wrong host rejected).
+- Docs updated with the trust instructions.
+
 ## 0.1.0-alpha.29.4.2 — 2026-11-07
 
 ### Patch: undo at commit boundaries, per-network SOCKS and multi-instance tests

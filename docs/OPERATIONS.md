@@ -162,11 +162,22 @@ ambiguous; e-lite then refuses to guess and asks for an explicit
 ## Electrum TLS
 
 TLS is **on by default** on a separate listener. Without operator PEMs, e-lite
-generates a self-signed certificate in `<data-dir>/tls/` on first start and
-prints its path and the SHA-256 of the DER certificate (the value
-`openssl x509 -fingerprint -sha256` shows). The SANs include `localhost`, the
+generates a **local CA** and a server certificate signed by it in
+`<data-dir>/tls/`, and prints both fingerprints. Trust **`ca.crt`** in the
+wallet, not `self-signed.crt`: the latter is the server chain (leaf + CA).
+This is required by Java-based wallets such as Sparrow, which reject a
+non-CA certificate used as a `TrustAnchor`. The SANs include `localhost`, the
 loopback addresses, the hostname, the local LAN IPs and the onion address.
-Disable it with `tls = false` or `--no-tls`.
+Disable TLS with `tls = false` or `--no-tls`.
+
+Existing installations migrate automatically on the next start: e-lite creates
+the CA, re-signs the leaf and rewrites `self-signed.crt`. Remove the old
+trusted server certificate from the wallet and import the new `ca.crt`. Verify
+with:
+
+```bash
+openssl verify -CAfile <data-dir>/tls/ca.crt <data-dir>/tls/self-signed.crt
+```
 
 ```toml
 [server]

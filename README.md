@@ -4,7 +4,7 @@
 any `scriptPubKey` in the active chain without registering wallets. Core remains
 the authority for consensus and the active chain; e-lite never invents data.
 
-> **Status: `v0.1.0-alpha.29.4.2` — experimental, no funds.**
+> **Status: `v0.1.0-alpha.29.4.3` — experimental, no funds.**
 > Test on regtest/signet/testnet4 before mainnet.
 > Electrum is plain TCP on loopback by default. Optional TLS is available on a
 > separate listener; e-lite also runs its own Tor and publishes an onion service
@@ -42,9 +42,11 @@ e-lite run    --network signet --manage managed \
 
 Electrum/Sparrow: `0.0.0.0:55011` plain and `0.0.0.0:55022` TLS for mainnet
 (`55111`/`55122` testnet4, `55211`/`55222` signet, `55311`/`55322` regtest).
-TLS is on by default: on first start e-lite generates a self-signed certificate
-in `<data-dir>/tls/` and prints its path and SHA-256. Use a wallet that trusts
-it, or configure `[server] tls_cert`/`tls_key` with a public-CA certificate.
+TLS is on by default: on first start e-lite generates a local CA and a server
+certificate signed by it in `<data-dir>/tls/`, and prints both fingerprints.
+Import **`ca.crt`** into the wallet trust store (Java/Sparrow rejects a
+self-signed server certificate as a trust anchor). Alternatively configure
+`[server] tls_cert`/`tls_key` with a public-CA certificate.
 `tls = false` (or `--no-tls`) disables TLS. `e-lite run`/`serve` also start a
 managed Tor and show an onion address:
 

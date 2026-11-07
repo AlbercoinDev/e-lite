@@ -1,7 +1,7 @@
 # Code audit
 
-**Base:** `0.1.0-alpha.29.4.1` → published `0.1.0-alpha.29.4.2` · **Scope:** `bin/e-lite`, `crates/*` (26 Rust files,
-~19k lines) · **Status:** findings fixed in `0.1.0-alpha.29.4.2` where noted.
+**Base:** `0.1.0-alpha.29.4.2` → published `0.1.0-alpha.29.4.3` · **Scope:** `bin/e-lite`, `crates/*` (26 Rust files,
+~19k lines) · **Status:** findings fixed in `0.1.0-alpha.29.4.3` where noted.
 
 This audit is not a claim of formal verification. It records static checks,
 manual review areas, concrete findings and residual risks.
@@ -95,6 +95,7 @@ Additional checks performed:
 | AUD-075 | P2 | Config validation | `bin/e-lite/src/config.rs` | Default TLS paths were filled independently, hiding a half-configured cert/key pair; legacy datadir detection accepted a bare `bitcoin.conf` with no chain data. | Fill both paths only when neither is set, so validation catches a half pair; legacy detection requires the chain's block directory. Unit tests cover both. |
 | AUD-076 | P2 | Multi-instance | `crates/el-model/src/types.rs`, `bin/e-lite/src/tor.rs` | Managed Tor used 9050 for every network, so two instances starting together could race for the same SOCKS port. | Per-network defaults (9050 mainnet, 55150/55250/55350 others) with the old fallback; explicit `tor.socks_port` still wins. `tests/e2e_multi_instance.sh` runs two instances and checks listeners, certificates, RSS and independent stop/restart. |
 | AUD-077 | P2 | TLS trust test | `tests/e2e_defaults.sh` | TLS tests used `CERT_NONE`, so they proved encryption but not trust or hostname/IP validation. | The generated certificate is loaded as a CA with `check_hostname` for `localhost` and the LAN IP, and a hostname outside the SAN must fail. |
+| AUD-078 | P1 | Wallet TLS trust | `bin/e-lite/src/tls.rs` | The generated identity was a single self-signed server certificate. Java/Sparrow treats the trusted certificate as a `TrustAnchor` and rejects it because it is not a CA (`TrustAnchor ... is not a CA certificate`), so wallets could not connect with TLS even after importing the cert. | Generate a per-instance local CA (`ca.crt`, `CA:TRUE`, key 0600) and sign the server leaf with it; `self-signed.crt` is now the leaf+CA chain. Trust `ca.crt` in the wallet. The leaf is re-signed with the same CA on SAN changes; old single-cert installs migrate on next start. Tests check the chain structure, migration, `openssl verify`, `CA:TRUE` and wallet-style hostname/LAN-IP validation. |
 
 ## Residual risks and intentional limits
 

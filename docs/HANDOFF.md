@@ -1,9 +1,9 @@
 # Session handoff
 
 **Updated:** 2026-11-07
-**Latest published release:** `0.1.0-alpha.29.4.2`
-**Release:** https://github.com/AlbercoinDev/e-lite/releases/tag/v0.1.0-alpha.29.4.2
-**Main commit at handoff:** tag `v0.1.0-alpha.29.4.2`
+**Latest published release:** `0.1.0-alpha.29.4.3`
+**Release:** https://github.com/AlbercoinDev/e-lite/releases/tag/v0.1.0-alpha.29.4.3
+**Main commit at handoff:** tag `v0.1.0-alpha.29.4.3`
 
 This file is the short “where we are” for a new session. The invariants live in
 [`AGENTS.md`](../AGENTS.md) and [`PROJECT_MEMORY.md`](PROJECT_MEMORY.md); the
@@ -83,6 +83,18 @@ no repitas contexto ni rehagas decisiones ya documentadas.
   the onion setup, reset and security.
 - `docs/ROADMAP.md` contains future features/improvements. Do not present them as
   available.
+
+## Last change (alpha.29.4.3)
+
+- **TLS trust fixed for Java/Sparrow**: the generated TLS identity is now a
+  local CA (`ca.crt`, `CA:TRUE`) plus a server leaf signed by it. The chain file
+  contains leaf + CA. Trust `ca.crt` in the wallet; the old single self-signed
+  cert was rejected as a Java `TrustAnchor`.
+- Existing installs migrate on the next start (leaf key reused, new CA, chain
+  rewritten). Remove the old trusted certificate from the wallet and import the
+  new `ca.crt`.
+- Tests: CA/leaf structure, migration, `openssl verify`, `CA:TRUE`, and
+  wallet-style hostname/LAN-IP validation.
 
 ## Last change (alpha.29.4.2)
 
@@ -605,6 +617,6 @@ startup/shutdown/memory assertions, `e-lite.log` presence, 1.6 and 1.7
 negotiation on the same instance, scriptpubkey/outpoint checks, outpoint
 notification, real testmempoolaccept, the rate-limit burst test, the strict
 Core RPC check and the Sparrow sequence with confirmed verbose transaction)
-passed on the alpha.29.4.2 code. Full signet/testnet4 acceptance
+passed on the alpha.29.4.3 code. Full signet/testnet4 acceptance
 is still operator-run; results belong in `docs/GETTING-STARTED.md`/release notes
 when available.

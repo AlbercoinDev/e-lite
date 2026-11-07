@@ -53,15 +53,15 @@ export PATH="$HOME/.local/bin:$PATH"
 ## Pinned version
 
 ```bash
-curl -fsSL https://github.com/AlbercoinDev/e-lite/releases/download/v0.1.0-alpha.29.4.2/install.sh \
-  | sh -s -- --version 0.1.0-alpha.29.4.2 --yes
+curl -fsSL https://github.com/AlbercoinDev/e-lite/releases/download/v0.1.0-alpha.29.4.3/install.sh \
+  | sh -s -- --version 0.1.0-alpha.29.4.3 --yes
 ```
 
 With Core:
 
 ```bash
-curl -fsSL https://github.com/AlbercoinDev/e-lite/releases/download/v0.1.0-alpha.29.4.2/install.sh \
-  | sh -s -- --version 0.1.0-alpha.29.4.2 --with-core --yes
+curl -fsSL https://github.com/AlbercoinDev/e-lite/releases/download/v0.1.0-alpha.29.4.3/install.sh \
+  | sh -s -- --version 0.1.0-alpha.29.4.3 --with-core --yes
 ```
 
 ## System-wide .deb
@@ -107,9 +107,10 @@ sha256sum -c SHA256SUMS   # inside the release artifact directory
 
 Wallets connect to `0.0.0.0:55011` (plain) or `0.0.0.0:55022` (TLS) for
 mainnet; testnet4 uses `55111`/`55122`, signet `55211`/`55222` and regtest
-`55311`/`55322`. TLS is enabled by default and a self-signed certificate is
-generated on first start in `<data-dir>/tls/`; the startup log prints its path
-and SHA-256. Use `[server] tls = false` or `--no-tls` to disable it, or point
+`55311`/`55322`. TLS is enabled by default and a local CA plus a server
+certificate signed by it are generated on first start in `<data-dir>/tls/`; the
+startup log prints both fingerprints. Import `ca.crt` into the wallet trust
+store (Sparrow/Java rejects a non-CA certificate as a trust anchor). Use `[server] tls = false` or `--no-tls` to disable it, or point
 `tls_cert`/`tls_key` at an operator certificate:
 
 ```toml

@@ -969,11 +969,17 @@ mod tests {
         let (cert, _key) =
             crate::tls::ensure_self_signed(&cfg, Chain::Regtest, Some(&addr)).unwrap();
         assert!(Path::new(&cert).is_file());
+        let (ca_cert, ca_key) = crate::tls::auto_ca_paths(&cfg, Chain::Regtest);
+        assert!(ca_cert.is_file() && ca_key.is_file());
+        let ca_before = fs::read(&ca_cert).unwrap();
         let old = reset(&cfg, Chain::Regtest, false).unwrap();
         assert_eq!(old, addr);
         assert!(!onion_dir.exists());
         assert!(dir.join("tor/onion.prev").exists());
         assert!(!Path::new(&cert).exists());
+        // The CA survives an onion reset: the new leaf is signed with the same
+        // CA, so wallets do not need to import a new trust anchor.
+        assert_eq!(ca_before, fs::read(&ca_cert).unwrap());
         let _ = fs::remove_dir_all(&dir);
     }
 }

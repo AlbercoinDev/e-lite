@@ -175,16 +175,27 @@ Never treat a version number in this file as authoritative over the code/tag.
   (`crates/el-serve/src/lib.rs`, `build_tls_config`). A wallet validates the cert
   against the name it connects to: a cert for `example.com` fails for `.onion`
   and the auto self-signed cert fails for any public hostname.
-- The self-signed cert (`<data-dir>/tls/self-signed.*`) is generated when TLS is
-  enabled and `[server] tls_cert`/`tls_key` point at the auto paths (defaults).
-  It does not require Tor. SANs: `localhost`, `127.0.0.1`, `::1`, the hostname,
-  the non-loopback IPs of the local interfaces and the onion address once
-  known. The key is reused when only the SAN set changes; a corrupt pair is
-  regenerated. Files are written `0600` through a temporary file and an atomic
-  rename. `tls_auto_cert = false` may still serve an existing valid pair.
-  Operator certificates are never overwritten or regenerated
-  (`bin/e-lite/src/tls.rs`, `ensure_self_signed`). The logged fingerprint is the
-  SHA-256 of the DER leaf certificate (what `openssl x509 -fingerprint -sha256`
+- The generated TLS identity is a **local CA plus a server leaf**, not a single
+  self-signed leaf (`bin/e-lite/src/tls.rs`). Files under `<data-dir>/tls/`:
+  `ca.crt`/`ca.key` (CA, `CA:TRUE`, key 0600), `self-signed.crt` (leaf followed
+  by the CA, the TLS chain), `self-signed.key` (leaf key), `self-signed.san` and
+  `cert-model`. It does not require Tor. SANs on the leaf: `localhost`,
+  `127.0.0.1`, `::1`, the hostname, the non-loopback IPs of the local
+  interfaces and the onion address once known.
+- **Java/Sparrow compatibility**: Java rejects a non-CA certificate used as a
+  `TrustAnchor` (`TrustAnchor ... is not a CA certificate`). The wallet must
+  trust `ca.crt`, not the leaf. Do not "fix" the error by disabling TLS
+  verification or by marking the leaf as a CA.
+- The leaf is re-signed with the same CA when the SAN set changes (LAN IP,
+  hostname, onion), so wallets keep trusting the CA across restarts and onion
+  rotation. The leaf key is reused; a corrupt pair or a pre-CA installation is
+  migrated on the next start (new CA, chain rewritten). A CA change requires a
+  new trust import.
+- `tls_auto_cert = false` may still serve an existing valid pair; it warns if
+  `ca.crt` is missing. Operator certificates are never overwritten. Files are
+  written `0600` through a temporary file and an atomic rename. The startup log
+  prints the leaf fingerprint and the CA path/fingerprint; fingerprints are the
+  SHA-256 of the DER certificate (what `openssl x509 -fingerprint -sha256`
   prints), not of the PEM text.
 - Consequence: a public domain certificate in `[server] tls_cert`/`tls_key`
   disables the auto onion certificate, and `.onion` wallets then get a hostname

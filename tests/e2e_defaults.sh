@@ -74,7 +74,9 @@ done
 [ -f "$DATA/tls/self-signed.crt" ] || { echo "certificate not generated" >&2; tail -40 "$RUN/serve.log"; exit 1; }
 
 LAN_IP=$(hostname -I 2>/dev/null | awk '{print $1}')
-python3 - "$PLAIN" "$TLS" "$DATA/tls/self-signed.crt" "$METRICS" "$LAN_IP" <<'PY'
+LEAF="$DATA/tls/self-signed.crt"
+CA="$DATA/tls/ca.crt"
+python3 - "$PLAIN" "$TLS" "$CA" "$METRICS" "$LAN_IP" <<'PY'
 import json, socket, ssl, sys, urllib.request
 plain, tls, cert, metrics = int(sys.argv[1]), int(sys.argv[2]), sys.argv[3], int(sys.argv[4])
 lan_ip = sys.argv[5]
@@ -135,7 +137,19 @@ print("verified TLS: localhost +", lan_ip or "no LAN IP", "+ wrong host rejected
 print("plain", st["listen"], "tls", st["tls_listen"], "state", st["state"])
 PY
 
-TEXT=$(openssl x509 -in "$DATA/tls/self-signed.crt" -noout -text)
+# The chain must validate against the local CA and the CA must be a real CA
+# (Java/Sparrow rejects a non-CA certificate used as a TrustAnchor).
+CA_TEXT=$(openssl x509 -in "$CA" -noout -text)
+echo "$CA_TEXT" | grep -q "CA:TRUE" || {
+  echo "local CA lacks BasicConstraints CA:TRUE" >&2
+  exit 1
+}
+openssl verify -CAfile "$CA" "$LEAF" >/dev/null || {
+  echo "server chain does not verify against the local CA" >&2
+  openssl verify -CAfile "$CA" "$LEAF" >&2
+  exit 1
+}
+TEXT=$(openssl x509 -in "$LEAF" -noout -text)
 echo "$TEXT" | grep -q "DNS:localhost" || {
   echo "self-signed certificate lacks the localhost SAN" >&2
   exit 1
@@ -149,7 +163,7 @@ if [ -n "$LAN_IP" ]; then
   }
 fi
 # The logged fingerprint must be the DER fingerprint openssl prints.
-FP=$(openssl x509 -in "$DATA/tls/self-signed.crt" -noout -fingerprint -sha256 \
+FP=$(openssl x509 -in "$LEAF" -noout -fingerprint -sha256 \
   | sed 's/.*=//; s/://g' | tr 'A-F' 'a-f')
 grep -qi "sha256 $FP" "$RUN/serve.log" || {
   echo "logged fingerprint does not match openssl ($FP)" >&2

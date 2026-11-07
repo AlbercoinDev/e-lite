@@ -1,14 +1,28 @@
 //! TLS certificate preparation.
 //!
-//! TLS is independent of Tor: e-lite generates and reuses a self-signed
-//! certificate on first start when the operator did not configure one. The
-//! certificate is regenerated when the SAN set changes (for example, when the
-//! onion address becomes known) and never when the operator supplied their own
-//! PEM files.
+//! TLS is independent of Tor. When no operator certificate is configured,
+//! e-lite generates a per-instance **local CA** and a server certificate signed
+//! by it. Serving a leaf that is not itself a CA and asking the wallet to trust
+//! the CA is what Java-based wallets (Sparrow) require: Java rejects a
+//! non-CA certificate used as a `TrustAnchor`.
+//!
+//! Files under `<data-dir>/tls/`:
+//! - `ca.crt` / `ca.key`: the local CA (import `ca.crt` into the wallet trust
+//!   store; the key stays private, mode 0600);
+//! - `self-signed.crt`: the server leaf followed by the CA (TLS chain);
+//! - `self-signed.key`: the leaf private key;
+//! - `self-signed.san` and `cert-model`: regeneration markers.
+//!
+//! The leaf is re-signed with the same CA when the SAN set changes (for
+//! example when the onion address appears), so wallets keep trusting the CA.
+//! Operator PEMs are never overwritten.
 
 use crate::config::Config;
 use el_model::Chain;
-use rcgen::{CertificateParams, DnType, KeyPair, SanType};
+use rcgen::{
+    BasicConstraints, CertificateParams, DistinguishedName, DnType, ExtendedKeyUsagePurpose, IsCa,
+    KeyPair, KeyUsagePurpose,
+};
 use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::CertificateDer;
 use std::fs;
@@ -17,9 +31,16 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
+const CERT_MODEL: &str = "ca-v1";
+
 pub fn auto_cert_paths(cfg: &Config, chain: Chain) -> (PathBuf, PathBuf) {
     let dir = cfg.data_dir(chain).join("tls");
     (dir.join("self-signed.crt"), dir.join("self-signed.key"))
+}
+
+pub fn auto_ca_paths(cfg: &Config, chain: Chain) -> (PathBuf, PathBuf) {
+    let dir = cfg.data_dir(chain).join("tls");
+    (dir.join("ca.crt"), dir.join("ca.key"))
 }
 
 /// Write a file with 0600 permissions and publish it atomically, so a crash or
@@ -108,8 +129,8 @@ fn hostname() -> Option<String> {
     (!v.is_empty()).then_some(v)
 }
 
-/// Names covered by the generated certificate, in a stable order so the
-/// fingerprint only changes when the identity actually changes.
+/// Names covered by the generated server certificate, in a stable order so the
+/// leaf only changes when the identity actually changes.
 fn san_names(onion: Option<&str>) -> Vec<String> {
     let mut names = vec![
         "localhost".to_string(),
@@ -140,15 +161,51 @@ fn pair_is_valid(cert: &Path, key: &Path) -> bool {
     cert.is_file() && key.is_file() && el_serve::build_tls_config(cert, key).is_ok()
 }
 
-/// Write a self-signed certificate covering the active identities. Reuses the
-/// existing pair when it is valid and the SAN set did not change; a corrupt
-/// pair is replaced.
+/// Parameters of the e-lite-managed local CA. They are deterministic so an
+/// existing `ca.crt` can be used as the issuer without parsing ASN.1: the
+/// subject and key identifier are derived from this DN and the CA key.
+fn ca_params(chain: Chain) -> CertificateParams {
+    let mut params = CertificateParams::default();
+    params.distinguished_name = DistinguishedName::new();
+    params.distinguished_name.push(
+        DnType::CommonName,
+        format!("e-lite {} local CA", chain.name()),
+    );
+    params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
+    params
+}
+
+/// Load the local CA or create a new one. Returns the CA certificate PEM and
+/// its private key PEM.
+fn ensure_ca(chain: Chain, cert_path: &Path, key_path: &Path) -> Result<(String, String), String> {
+    if pair_is_valid(cert_path, key_path) {
+        let cert =
+            fs::read_to_string(cert_path).map_err(|e| format!("{}: {e}", cert_path.display()))?;
+        let key =
+            fs::read_to_string(key_path).map_err(|e| format!("{}: {e}", key_path.display()))?;
+        return Ok((cert, key));
+    }
+    let key = KeyPair::generate().map_err(|e| format!("cannot generate the CA key: {e}"))?;
+    let cert = ca_params(chain)
+        .self_signed(&key)
+        .map_err(|e| format!("cannot generate the local CA: {e}"))?;
+    let key_pem = key.serialize_pem();
+    // Store the key first: a crash leaves no orphan CA cert without its key.
+    write_private(key_path, key_pem.as_bytes())?;
+    write_private(cert_path, cert.pem().as_bytes())?;
+    Ok((cert.pem(), key_pem))
+}
+
+/// Create or refresh the server certificate. Reuses the CA and the leaf key
+/// when possible; a corrupt pair or an old single-cert model is replaced.
 pub fn ensure_self_signed(
     cfg: &Config,
     chain: Chain,
     onion: Option<&str>,
 ) -> Result<(String, String), String> {
     let (cert_path, key_path) = auto_cert_paths(cfg, chain);
+    let (ca_cert_path, ca_key_path) = auto_ca_paths(cfg, chain);
     let dir = cert_path
         .parent()
         .ok_or_else(|| "invalid TLS certificate path".to_string())?;
@@ -159,19 +216,31 @@ pub fn ensure_self_signed(
     perms.set_mode(0o700);
     let _ = fs::set_permissions(dir, perms);
 
+    let (ca_pem, ca_key_pem) = ensure_ca(chain, &ca_cert_path, &ca_key_path)?;
+    let ca_key =
+        KeyPair::from_pem(&ca_key_pem).map_err(|e| format!("cannot read the local CA key: {e}"))?;
+    let ca_cert = ca_params(chain)
+        .self_signed(&ca_key)
+        .map_err(|e| format!("cannot use the local CA: {e}"))?;
+    let ca_fp = cert_fingerprint(&ca_cert_path)?;
+    let model = format!("{CERT_MODEL} {ca_fp}\n");
+    let model_path = dir.join("cert-model");
+
     let names = san_names(onion);
     let san = format!("{}\n", names.join("\n"));
     let san_path = dir.join("self-signed.san");
     let pair_valid = pair_is_valid(&cert_path, &key_path);
-    if pair_valid && fs::read_to_string(&san_path).ok().as_deref() == Some(san.as_str()) {
+    let model_ok = fs::read_to_string(&model_path).ok().as_deref() == Some(model.as_str());
+    if pair_valid && model_ok && fs::read_to_string(&san_path).ok().as_deref() == Some(san.as_str())
+    {
         return Ok((
             cert_path.display().to_string(),
             key_path.display().to_string(),
         ));
     }
 
-    // Keep the key when the current pair is valid and only the SAN set
-    // changed; never derive a new cert from an unreadable/mismatched key.
+    // Keep the key when the current leaf is valid and only the SAN set or the
+    // CA changed; never derive a new cert from an unreadable key.
     let reused_key = if pair_valid {
         fs::read_to_string(&key_path)
             .ok()
@@ -179,35 +248,30 @@ pub fn ensure_self_signed(
     } else {
         None
     };
-    let mut params = CertificateParams::new(Vec::<String>::new())
+    let mut params = CertificateParams::new(names.clone())
         .map_err(|e| format!("cannot prepare the TLS certificate: {e}"))?;
-    params
-        .distinguished_name
-        .push(DnType::CommonName, "e-lite self-signed");
-    for name in &names {
-        match name.parse::<IpAddr>() {
-            Ok(ip) => params.subject_alt_names.push(SanType::IpAddress(ip)),
-            Err(_) => {
-                let dns = name
-                    .clone()
-                    .try_into()
-                    .map_err(|e| format!("invalid certificate name {name:?}: {e}"))?;
-                params.subject_alt_names.push(SanType::DnsName(dns));
-            }
-        }
-    }
+    params.distinguished_name = DistinguishedName::new();
+    params.distinguished_name.push(
+        DnType::CommonName,
+        format!("e-lite {} server", chain.name()),
+    );
+    params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
+    params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
+    params.use_authority_key_identifier_extension = true;
     let key = match reused_key {
         Some(k) => k,
         None => KeyPair::generate().map_err(|e| format!("cannot generate the TLS key: {e}"))?,
     };
-    let cert = params
-        .self_signed(&key)
-        .map_err(|e| format!("cannot generate the TLS certificate: {e}"))?;
-    // Key first, then certificate, then the SAN marker: a crash at any point
-    // leaves a pair that is regenerated on the next start.
+    let leaf = params
+        .signed_by(&key, &ca_cert, &ca_key)
+        .map_err(|e| format!("cannot sign the TLS certificate: {e}"))?;
+    // Chain = leaf + CA. rustls sends the intermediate so the wallet can build
+    // the path to the trusted local CA.
+    let chain = format!("{}{}", leaf.pem(), ca_pem);
     write_private(&key_path, key.serialize_pem().as_bytes())?;
-    write_private(&cert_path, cert.pem().as_bytes())?;
+    write_private(&cert_path, chain.as_bytes())?;
     write_private(&san_path, san.as_bytes())?;
+    write_private(&model_path, model.as_bytes())?;
     if !pair_is_valid(&cert_path, &key_path) {
         return Err("the generated TLS certificate/key pair is not usable".to_string());
     }
@@ -217,7 +281,7 @@ pub fn ensure_self_signed(
     ))
 }
 
-/// SHA-256 of the DER-encoded leaf certificate, the value `openssl x509
+/// SHA-256 of the first DER certificate in a PEM file, the value `openssl x509
 /// -fingerprint -sha256` prints (without the colons).
 fn cert_fingerprint(cert: &Path) -> Result<String, String> {
     let der: CertificateDer<'static> = CertificateDer::pem_file_iter(cert)
@@ -250,6 +314,14 @@ pub fn prepare(cfg: &mut Config, chain: Chain) -> Result<bool, String> {
         // An explicit opt-out may still use a pair generated earlier; it must
         // not silently serve a missing or corrupt certificate.
         if auto_exists {
+            let (ca_cert, _) = auto_ca_paths(cfg, chain);
+            if !ca_cert.is_file() {
+                eprintln!(
+                    "[e-lite] WARNING: tls_auto_cert is off and {} is missing; wallets \
+                     cannot validate the server certificate",
+                    ca_cert.display()
+                );
+            }
             return Ok(false);
         }
         return Err(
@@ -264,10 +336,15 @@ pub fn prepare(cfg: &mut Config, chain: Chain) -> Result<bool, String> {
     cfg.server.tls_key = key;
     el_serve::build_tls_config(Path::new(&cert), Path::new(&cfg.server.tls_key))
         .map_err(|e| format!("TLS certificate/key is not usable: {e}"))?;
-    let digest = cert_fingerprint(Path::new(&cert))?;
+    let (ca_cert, _) = auto_ca_paths(cfg, chain);
+    let leaf_fp = cert_fingerprint(Path::new(&cert))?;
+    let ca_fp = cert_fingerprint(&ca_cert)?;
     eprintln!(
-        "[e-lite] TLS certificate: {cert} (self-signed; sha256 {digest}). \
-         Add it to the wallet trust store or use a public CA certificate for a real domain."
+        "[e-lite] TLS certificate: {cert} (leaf sha256 {leaf_fp}). \
+         Local CA: {} (sha256 {ca_fp}); trust the CA certificate in the wallet, \
+         or use a public CA certificate for a real domain.",
+        ca_cert.display(),
+        ca_fp = ca_fp
     );
     Ok(true)
 }
@@ -296,25 +373,36 @@ mod tests {
         (cfg, dir)
     }
 
+    fn chain_len(path: &Path) -> usize {
+        CertificateDer::pem_file_iter(path).unwrap().count()
+    }
+
     #[test]
-    fn self_signed_certificate_is_written_with_onion_san() {
-        let (mut cfg, dir) = temp_cfg("cert");
+    fn generated_chain_has_a_ca_and_a_server_leaf() {
+        let (mut cfg, dir) = temp_cfg("chain");
         cfg.server.tls_cert.clear();
         cfg.server.tls_key.clear();
         let onion = format!("{}.onion", "b".repeat(56));
         let (cert, key) = ensure_self_signed(&cfg, Chain::Regtest, Some(&onion)).unwrap();
-        assert!(Path::new(&cert).is_file());
-        assert!(Path::new(&key).is_file());
-        let mode = fs::metadata(&key).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode, 0o600);
+        let (ca_cert, ca_key) = auto_ca_paths(&cfg, Chain::Regtest);
+        assert_eq!(chain_len(Path::new(&cert)), 2, "leaf + CA");
+        assert_eq!(chain_len(&ca_cert), 1);
+        assert!(ca_cert.is_file() && ca_key.is_file());
+        let ca_mode = fs::metadata(&ca_key).unwrap().permissions().mode() & 0o777;
+        assert_eq!(ca_mode, 0o600);
+        let key_mode = fs::metadata(&key).unwrap().permissions().mode() & 0o777;
+        assert_eq!(key_mode, 0o600);
         let san = fs::read_to_string(dir.join("tls/self-signed.san")).unwrap();
         assert!(san.contains(&onion));
         assert!(san.contains("localhost"));
-        // The same SAN reuses the files instead of regenerating them.
+        // The same SAN reuses the files (including the CA) instead of
+        // regenerating them.
+        let ca_before = fs::read(&ca_cert).unwrap();
         let before = fs::metadata(&cert).unwrap().modified().unwrap();
         std::thread::sleep(Duration::from_millis(20));
         let _ = ensure_self_signed(&cfg, Chain::Regtest, Some(&onion)).unwrap();
         assert_eq!(before, fs::metadata(&cert).unwrap().modified().unwrap());
+        assert_eq!(ca_before, fs::read(&ca_cert).unwrap());
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -329,6 +417,31 @@ mod tests {
         fs::write(&key, "not a key").unwrap();
         ensure_self_signed(&cfg, Chain::Regtest, None).unwrap();
         assert!(pair_is_valid(&cert, &key), "pair must be rebuilt");
+        assert_eq!(chain_len(&cert), 2);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn old_single_cert_model_is_migrated_to_ca_plus_leaf() {
+        let (mut cfg, dir) = temp_cfg("migrate");
+        cfg.server.tls_cert.clear();
+        cfg.server.tls_key.clear();
+        // Simulate a 29.4.x install: a single self-signed leaf and no CA.
+        let key = KeyPair::generate().unwrap();
+        let mut params = CertificateParams::new(vec!["localhost".to_string()]).unwrap();
+        params.distinguished_name = DistinguishedName::new();
+        params
+            .distinguished_name
+            .push(DnType::CommonName, "e-lite self-signed");
+        let old = params.self_signed(&key).unwrap();
+        let (cert, key_path) = auto_cert_paths(&cfg, Chain::Regtest);
+        fs::create_dir_all(cert.parent().unwrap()).unwrap();
+        fs::write(&cert, old.pem()).unwrap();
+        fs::write(&key_path, key.serialize_pem()).unwrap();
+        ensure_self_signed(&cfg, Chain::Regtest, None).unwrap();
+        assert_eq!(chain_len(&cert), 2);
+        let (ca_cert, _) = auto_ca_paths(&cfg, Chain::Regtest);
+        assert!(ca_cert.is_file());
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -365,6 +478,8 @@ mod tests {
         let fp = cert_fingerprint(Path::new(&cfg.server.tls_cert)).unwrap();
         assert_eq!(fp.len(), 64);
         assert!(fp.chars().all(|c| c.is_ascii_hexdigit()));
+        let (ca_cert, _) = auto_ca_paths(&cfg, Chain::Regtest);
+        assert_ne!(fp, cert_fingerprint(&ca_cert).unwrap());
         let _ = fs::remove_dir_all(&dir);
     }
 

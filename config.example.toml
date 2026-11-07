@@ -67,15 +67,16 @@ poll_seconds = 10
 # Empty = 0.0.0.0:<network plain port>:
 # mainnet 55011, testnet4 55111, signet 55211, regtest 55311.
 listen = ""
-# TLS is on by default. A self-signed certificate is generated on first start
-# in <data-dir>/tls (SANs: localhost, 127.0.0.1, ::1, hostname and the onion
-# address once known). Set tls = false to disable it.
+# TLS is on by default. A local CA (ca.crt) plus a server certificate signed by
+# it are generated on first start in <data-dir>/tls (SANs: localhost, 127.0.0.1,
+# ::1, hostname, LAN IPs and the onion address once known). Trust ca.crt in the
+# wallet. Set tls = false to disable it.
 tls = true
 # Empty = host of `listen` + the network TLS port:
 # mainnet 55022, testnet4 55122, signet 55222, regtest 55322.
 tls_listen = ""
-# Empty = generated self-signed certificate/key. Operator PEMs are never
-# overwritten and keep working with a public-domain certificate.
+# Empty = generated CA + server chain. Operator PEMs are never overwritten and
+# keep working with a public-domain certificate.
 # tls_cert = "/etc/e-lite/tls/fullchain.pem"
 # tls_key = "/etc/e-lite/tls/privkey.pem"
 # tls_auto_cert = true
