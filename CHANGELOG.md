@@ -1,5 +1,42 @@
 # Changelog
 
+## 0.1.0-alpha.29.3.1 — 2026-11-07
+
+### Patch: stop dead providers and peers from stalling rawtx
+
+- **Direct provider cooldown**: a failed Tor *or direct* request now cools that
+  provider for `provider_cooldown_seconds` (default 300 s), and the last
+  provider that answered is tried first. Previously a dead clearnet provider
+  (for example `mempool.space/signet/api` timing out) cost 15 s on every block;
+  the 17–34 s gaps in Sparrow matched that timeout.
+- **Shorter rawtx timeout**: `request_timeout_seconds` default is now 8 s
+  (was 15). Healthy Esplora providers answer in well under a second.
+- **In-flight block dedup**: concurrent `transaction.get` calls and the history
+  prefetcher for the same block share one download instead of racing.
+- **Concurrency limit**: `max_parallel_fetches` (default 4) bounds external
+  block downloads, including decoys.
+- **P2P fail-fast**:
+  - `p2p_timeout_seconds` (default 8) is separate from Core RPC's timeout and
+    budgets v2 + v1 per peer; one block has a total 2× timeout cap.
+  - Peers come from Core's current connections first (`getpeerinfo`), then
+    addrman; up to three are tried per block.
+  - The last peer that answered goes first; failed peers are skipped for the
+    provider cooldown instead of being retried for every block.
+  - A failed Tor SOCKS connect trips a circuit breaker: non-onion peers go
+    direct for the cooldown window (with one warning) instead of retrying Tor
+    per peer and per block.
+  - Direct connects now use `connect_timeout`; previously the OS timeout could
+    add minutes.
+- **Cheaper decoys and prefetch**: `decoys` defaults to 1 (was 3), at most two
+  decoys run at once, and the prefetch never spawns decoys. The prefetcher uses
+  one worker and at most 16 heights per history response.
+- `/status` and `/metrics` expose provider/P2P failures, cooling skips,
+  decoys in flight and prefetch queued/done.
+- Tests: silent P2P peer fails within the short timeout and is not reconnected
+  while cooled; concurrent resolvers share one block download; a failed direct
+  provider is not retried. Workspace tests and regtest e2e are green.
+- No schema or Electrum protocol changes.
+
 ## 0.1.0-alpha.29.3 — 2026-11-07
 
 ### Patch: P2P witness, faster rawtx and history prefetch

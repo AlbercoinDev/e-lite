@@ -15,10 +15,11 @@ use el_model::{Chain, Hash32};
 use el_store::Store;
 use rand::seq::SliceRandom;
 use rand::thread_rng;
+use std::collections::HashMap;
 use std::fmt;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::{Duration, Instant};
 
 pub use cache::BlockCache;
 pub use core_source::CoreBlockSource;
@@ -80,6 +81,10 @@ pub struct RawtxStats {
     pub verify_failures: AtomicU64,
     pub decoys: AtomicU64,
     pub unavailable: AtomicU64,
+    pub p2p_attempts: AtomicU64,
+    pub p2p_failures: AtomicU64,
+    pub p2p_skipped: AtomicU64,
+    pub p2p_tor_failures: AtomicU64,
 }
 
 #[derive(Clone, Debug)]
@@ -95,8 +100,10 @@ pub struct RawtxConfig {
     pub fallback_clearnet: bool,
     /// Timeout for a single Esplora block request.
     pub request_timeout_seconds: u64,
-    /// Skip Tor for a provider after a failed Tor attempt.
+    /// Skip a provider (Tor or direct) after a failed attempt.
     pub provider_cooldown_seconds: u64,
+    /// Maximum concurrent external block downloads.
+    pub max_parallel_fetches: usize,
     pub use_p2p: bool,
     pub use_esplora: bool,
     pub p2p_v2: bool,
@@ -104,6 +111,72 @@ pub struct RawtxConfig {
     pub p2p_peers: Vec<String>,
     pub p2p_timeout: Duration,
     pub chain: Chain,
+}
+
+/// A block download shared by concurrent callers asking for the same height.
+struct InflightBlock {
+    done: Mutex<bool>,
+    result: Mutex<Option<Result<Vec<u8>>>>,
+    cv: Condvar,
+}
+
+impl InflightBlock {
+    fn new() -> Self {
+        Self {
+            done: Mutex::new(false),
+            result: Mutex::new(None),
+            cv: Condvar::new(),
+        }
+    }
+}
+
+/// Small counting semaphore: bounds total external downloads without pulling
+/// in an async runtime.
+struct Semaphore {
+    permits: Mutex<usize>,
+    cv: Condvar,
+}
+
+impl Semaphore {
+    fn new(permits: usize) -> Arc<Self> {
+        Arc::new(Self {
+            permits: Mutex::new(permits.max(1)),
+            cv: Condvar::new(),
+        })
+    }
+
+    fn acquire(self: &Arc<Self>) -> Permit {
+        let mut permits = self
+            .permits
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        while *permits == 0 {
+            permits = self
+                .cv
+                .wait(permits)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+        }
+        *permits -= 1;
+        Permit {
+            sem: Arc::clone(self),
+        }
+    }
+}
+
+struct Permit {
+    sem: Arc<Semaphore>,
+}
+
+impl Drop for Permit {
+    fn drop(&mut self) {
+        let mut permits = self
+            .sem
+            .permits
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *permits += 1;
+        self.sem.cv.notify_one();
+    }
 }
 
 pub struct Resolver {
@@ -116,26 +189,34 @@ pub struct Resolver {
     decoys: u32,
     stats: Arc<RawtxStats>,
     chain: Chain,
+    inflight: Mutex<HashMap<Hash32, Arc<InflightBlock>>>,
+    external_slots: Arc<Semaphore>,
+    decoys_inflight: Arc<AtomicUsize>,
 }
 
 impl Resolver {
     pub fn new(store: Arc<Store>, cfg: &RawtxConfig) -> Result<Self> {
         let mut external: Vec<Arc<dyn BlockSource>> = Vec::new();
         let tor = cfg.tor_socks.clone();
+        let stats = Arc::new(RawtxStats::default());
 
         if cfg.enabled {
             if cfg.use_p2p && !cfg.p2p_peers.is_empty() {
                 if tor.is_none() && !cfg.allow_clearnet && !cfg.fallback_clearnet {
                     // fail closed: no external P2P without Tor and no fallback
                 } else {
-                    external.push(Arc::new(P2pSource::new(
-                        cfg.p2p_peers.clone(),
-                        tor.clone(),
-                        cfg.p2p_timeout,
-                        cfg.chain,
-                        cfg.p2p_v2,
-                        cfg.fallback_clearnet,
-                    )));
+                    external.push(Arc::new(
+                        P2pSource::new(
+                            cfg.p2p_peers.clone(),
+                            tor.clone(),
+                            cfg.p2p_timeout,
+                            cfg.chain,
+                            cfg.p2p_v2,
+                            cfg.fallback_clearnet,
+                            Duration::from_secs(cfg.provider_cooldown_seconds.max(1)),
+                        )
+                        .with_stats(Arc::clone(&stats)),
+                    ));
                 }
             }
             if cfg.use_esplora && !cfg.esplora_urls.is_empty() {
@@ -168,8 +249,11 @@ impl Resolver {
             external,
             cache,
             decoys: cfg.decoys,
-            stats: Arc::new(RawtxStats::default()),
+            stats,
             chain: cfg.chain,
+            inflight: Mutex::new(HashMap::new()),
+            external_slots: Semaphore::new(cfg.max_parallel_fetches),
+            decoys_inflight: Arc::new(AtomicUsize::new(0)),
         })
     }
 
@@ -278,6 +362,15 @@ impl Resolver {
 
     /// Resolve a confirmed transaction's raw hex at `height`.
     pub fn raw_tx(&self, txid: Hash32, height: u32) -> Result<String> {
+        self.raw_tx_inner(txid, height, true)
+    }
+
+    /// Background prefetch path: same lookup, but no privacy decoys.
+    pub fn raw_tx_prefetch(&self, txid: Hash32, height: u32) -> Result<String> {
+        self.raw_tx_inner(txid, height, false)
+    }
+
+    fn raw_tx_inner(&self, txid: Hash32, height: u32, allow_decoys: bool) -> Result<String> {
         let rec = self
             .store
             .get_block(height)?
@@ -316,33 +409,123 @@ impl Resolver {
             }
         }
 
-        // 3) External sources, random order.
+        // 3) External sources, shared across concurrent callers.
         if self.external.is_empty() {
             self.stats.unavailable.fetch_add(1, Ordering::Relaxed);
             return Err(RawtxError::Unavailable(
                 "no external source configured (or Tor is required and unavailable)".to_string(),
             ));
         }
+        let bytes = self.fetch_external_block(&rec.hash)?;
+        match self.verified_tx(&bytes, &rec, txid) {
+            Ok(hex) => {
+                if allow_decoys {
+                    self.spawn_decoys(rec.hash);
+                }
+                Ok(hex)
+            }
+            Err(e) => {
+                self.stats.verify_failures.fetch_add(1, Ordering::Relaxed);
+                eprintln!("[e-lite] external block {} rejected: {e}", rec.hash);
+                Err(e)
+            }
+        }
+    }
+
+    /// Fetch one block from the external sources, deduplicating concurrent
+    /// requests for the same hash. The first caller downloads; the rest wait
+    /// for its result instead of hammering the same provider.
+    fn fetch_external_block(&self, hash: &Hash32) -> Result<Vec<u8>> {
+        if let Some(cache) = &self.cache {
+            if let Some(bytes) = cache.get(hash) {
+                return Ok(bytes);
+            }
+        }
+        let (entry, leader) = {
+            let mut map = self
+                .inflight
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            match map.get(hash) {
+                Some(existing) => (Arc::clone(existing), false),
+                None => {
+                    let entry = Arc::new(InflightBlock::new());
+                    map.insert(*hash, Arc::clone(&entry));
+                    (entry, true)
+                }
+            }
+        };
+
+        if leader {
+            let result = self.fetch_from_external_sources(hash);
+            *entry
+                .result
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(result.clone());
+            *entry
+                .done
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = true;
+            entry.cv.notify_all();
+            self.inflight
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .remove(hash);
+            return result;
+        }
+
+        let deadline = Instant::now() + Duration::from_secs(120);
+        let mut done = entry
+            .done
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        while !*done {
+            let now = Instant::now();
+            if now >= deadline {
+                return Err(RawtxError::Unavailable(
+                    "inflight block download timed out".into(),
+                ));
+            }
+            let (guard, _) = entry
+                .cv
+                .wait_timeout(done, deadline.saturating_duration_since(now))
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            done = guard;
+        }
+        drop(done);
+        let result = entry
+            .result
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        result.unwrap_or_else(|| Err(RawtxError::Unavailable("inflight result lost".into())))
+    }
+
+    fn fetch_from_external_sources(&self, hash: &Hash32) -> Result<Vec<u8>> {
+        let _permit = self.external_slots.acquire();
         let mut order: Vec<usize> = (0..self.external.len()).collect();
         order.shuffle(&mut thread_rng());
         let mut errors = Vec::new();
         for idx in order {
             let source = &self.external[idx];
-            match source.fetch_block(&rec.hash) {
+            match source.fetch_block(hash) {
                 Ok(bytes) => {
                     self.stats.fetches.fetch_add(1, Ordering::Relaxed);
                     self.stats
                         .bytes
                         .fetch_add(bytes.len() as u64, Ordering::Relaxed);
-                    match self.verified_tx(&bytes, &rec, txid) {
-                        Ok(hex) => {
-                            self.cache_store(&rec.hash, &bytes);
-                            self.spawn_decoys(rec.hash);
-                            return Ok(hex);
+                    match verify_block_by_hash(&bytes, hash).and_then(|block| {
+                        verify_witness_commitment(&block)?;
+                        Ok(block)
+                    }) {
+                        Ok(_) => {
+                            self.cache_store(hash, &bytes);
+                            return Ok(bytes);
                         }
                         Err(e) => {
                             self.stats.verify_failures.fetch_add(1, Ordering::Relaxed);
                             eprintln!("[e-lite] {} returned an invalid block: {e}", source.name());
+                            errors.push(format!("{}: {e}", source.name()));
                         }
                     }
                 }
@@ -351,6 +534,11 @@ impl Resolver {
         }
         self.stats.unavailable.fetch_add(1, Ordering::Relaxed);
         Err(RawtxError::Unavailable(errors.join("; ")))
+    }
+
+    /// Number of decoy downloads currently in flight.
+    pub fn decoys_inflight(&self) -> usize {
+        self.decoys_inflight.load(Ordering::Relaxed)
     }
 
     fn cache_store(&self, hash: &Hash32, bytes: &[u8]) {
@@ -378,6 +566,7 @@ impl Resolver {
 
     /// Fetch decoys in the background so the caller is not delayed.
     fn spawn_decoys(&self, exclude: Hash32) {
+        const MAX_DECOYS_INFLIGHT: usize = 2;
         if self.decoys == 0 || self.external.is_empty() {
             return;
         }
@@ -389,6 +578,10 @@ impl Resolver {
             return;
         }
         for _ in 0..self.decoys {
+            if self.decoys_inflight.fetch_add(1, Ordering::Relaxed) >= MAX_DECOYS_INFLIGHT {
+                self.decoys_inflight.fetch_sub(1, Ordering::Relaxed);
+                break;
+            }
             // Retry the random pick so decoys are always distinct from the real
             // block and always exist in the index.
             let mut chosen = None;
@@ -401,18 +594,25 @@ impl Resolver {
                     }
                 }
             }
-            let Some(hash) = chosen else { continue };
+            let Some(hash) = chosen else {
+                self.decoys_inflight.fetch_sub(1, Ordering::Relaxed);
+                continue;
+            };
             let sources = self.external.clone();
             let stats = Arc::clone(&self.stats);
+            let inflight = Arc::clone(&self.decoys_inflight);
+            let slots = Arc::clone(&self.external_slots);
             std::thread::spawn(move || {
+                let _permit = slots.acquire();
                 let mut order: Vec<usize> = (0..sources.len()).collect();
                 order.shuffle(&mut thread_rng());
                 for idx in order {
                     if sources[idx].fetch_block(&hash).is_ok() {
                         stats.decoys.fetch_add(1, Ordering::Relaxed);
-                        return;
+                        break;
                     }
                 }
+                inflight.fetch_sub(1, Ordering::Relaxed);
             });
         }
     }

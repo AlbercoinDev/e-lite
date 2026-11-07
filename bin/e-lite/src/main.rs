@@ -3784,27 +3784,45 @@ fn build_resolver(
 ) -> R<Arc<Resolver>> {
     let mut peers = cfg.rawtx.p2p_peers.clone();
     if cfg.rawtx.enabled && cfg.rawtx.use_p2p && peers.is_empty() {
-        match core.node_addresses(64) {
-            Ok(addrs) => {
-                peers = addrs
-                    .into_iter()
-                    .filter(|a| a.services & 1 != 0)
-                    .map(|a| {
-                        let host = if a.address.contains(':') && !a.address.starts_with('[') {
-                            format!("[{}]", a.address)
-                        } else {
-                            a.address.clone()
-                        };
-                        format!("{host}:{}", a.port)
-                    })
-                    .collect();
-                println!("p2p peers discovered from Core: {}", peers.len());
+        let mut connected = 0usize;
+        // Prefer peers Core is connected to right now: addrman contains many
+        // stale addresses, and each dead peer costs a timeout.
+        if let Ok(list) = core.connected_peers() {
+            for peer in list {
+                if peer.services & 1 == 0 {
+                    continue;
+                }
+                peers.push(peer.addr);
             }
-            Err(_) => {
-                // Core may be offline (serve mode) or still starting. P2P
-                // discovery is optional; do not print a startup error. The
-                // operator can configure [rawtx] p2p_peers explicitly.
+            connected = peers.len();
+        }
+        if peers.len() < 8 {
+            if let Ok(addrs) = core.node_addresses(64) {
+                for a in addrs {
+                    if a.services & 1 == 0 {
+                        continue;
+                    }
+                    let host = if a.address.contains(':') && !a.address.starts_with('[') {
+                        format!("[{}]", a.address)
+                    } else {
+                        a.address.clone()
+                    };
+                    peers.push(format!("{host}:{}", a.port));
+                    if peers.len() >= 8 {
+                        break;
+                    }
+                }
             }
+        }
+        let mut seen = std::collections::HashSet::new();
+        peers.retain(|peer| seen.insert(peer.clone()));
+        peers.truncate(8);
+        if !peers.is_empty() {
+            println!(
+                "p2p peers discovered from Core: {} ({} connected)",
+                peers.len(),
+                connected.min(peers.len())
+            );
         }
     }
     let tor = cfg.rawtx.tor_socks.clone().filter(|s| !s.trim().is_empty());
@@ -3817,12 +3835,13 @@ fn build_resolver(
         fallback_clearnet: cfg.rawtx.tor_fallback_clearnet,
         request_timeout_seconds: cfg.rawtx.request_timeout_seconds,
         provider_cooldown_seconds: cfg.rawtx.provider_cooldown_seconds,
+        max_parallel_fetches: cfg.rawtx.max_parallel_fetches,
         use_p2p: cfg.rawtx.use_p2p,
         use_esplora: cfg.rawtx.use_esplora,
         p2p_v2: cfg.rawtx.p2p_v2,
         esplora_urls: esplora_urls.clone(),
         p2p_peers: peers,
-        p2p_timeout: Duration::from_secs(cfg.core.timeout_seconds.max(1)),
+        p2p_timeout: Duration::from_secs(cfg.rawtx.p2p_timeout_seconds.max(1)),
         chain,
     };
     let resolver = Resolver::new(Arc::clone(store), &rc)?;
@@ -3863,7 +3882,7 @@ fn build_shared(
     let resolver = build_resolver(cfg, chain, &store, &core, public_servers.clone())?;
     let readers = el_chain::ReaderTracker::new();
     let prefetch = if resolver.external_sources() > 0 && cfg.rawtx.enabled {
-        el_serve::Prefetcher::new(Arc::clone(&resolver), Arc::clone(&readers), 2, 512)
+        el_serve::Prefetcher::new(Arc::clone(&resolver), Arc::clone(&readers), 1, 64)
     } else {
         el_serve::Prefetcher::disabled()
     };

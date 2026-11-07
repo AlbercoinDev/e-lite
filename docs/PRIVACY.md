@@ -74,12 +74,14 @@ is non-empty, it replaces the file for that run:
 [rawtx]
 enabled = true
 cache_mib = 2048
-decoys = 3
+decoys = 1
 tor_socks = "127.0.0.1:9050"
 allow_clearnet = false
 tor_fallback_clearnet = true
-request_timeout_seconds = 15
-provider_cooldown_seconds = 120
+request_timeout_seconds = 8
+provider_cooldown_seconds = 300
+max_parallel_fetches = 4
+p2p_timeout_seconds = 8
 use_p2p = true
 use_esplora = true
 p2p_v2 = true
@@ -110,14 +112,16 @@ require_ready = true      # run: refuse wallets until a provider answers
   the address can query it: e-lite does not authenticate clients or rate limit
   requests. Treat the address as a secret; use `[tor] mode = "off"` to disable
   the onion.
-- `run` waits for at least one provider to answer `/block-height/0` before
-  opening the Electrum listeners (`require_ready = true` by default). This
-  prevents a wallet from receiving a history it cannot fully resolve.
+- `run` waits for at least one provider to answer `/block-height/0` and serve
+  the genesis raw block with a matching header hash before opening the Electrum
+  listeners (`require_ready = true` by default). This prevents a wallet from
+  receiving a history it cannot fully resolve.
 - `allow_clearnet = true` permits direct clearnet access if you explicitly
   accept the privacy trade-off. It is not the default.
-- `decoys = 3` fetches extra random blocks after a real external fetch, so the
-  provider's view is not a single “interesting” block. Set `decoys = 0` to
-  reduce bandwidth at the cost of privacy.
+- `decoys = 1` fetches one extra random block after a real external fetch, so
+  the provider's view is not a single “interesting” block. At most two decoy
+  downloads run at once and the background prefetch never spawns decoys. Set
+  `decoys = 0` to reduce bandwidth at the cost of privacy.
 - The validated block cache reduces repeated external fetches. Set
   `cache_mib = 0` to disable it; repair still works from P2P/Esplora when a
   source is available.
@@ -126,8 +130,16 @@ require_ready = true      # run: refuse wallets until a provider answers
 
 - Minimal Bitcoin P2P client: `version`/`verack`, `ping`/`pong`, `getdata` for
   `MSG_BLOCK` only.
-- BIP324 v2 is attempted first; v1 is the fallback.
-- Requests are distributed/randomised; up to four peers are tried per fetch.
+- BIP324 v2 is attempted first; v1 is the fallback within the same per-peer
+  timeout budget.
+- Peers are discovered from Core's current connections first, then from
+  addrman. Up to three peers are tried per fetch, with a total 2× timeout cap.
+- The last peer that answered is tried first. A failed peer is skipped for
+  `provider_cooldown_seconds` (300 s by default), so every block does not pay
+  the same dead peer's timeout.
+- If a Tor SOCKS connect fails, P2P uses clearnet for non-onion peers for the
+  cooldown window (when `tor_fallback_clearnet = true`); `.onion` peers still
+  require Tor.
 - Tor is used for P2P when configured; otherwise clearnet requires
   `allow_clearnet = true`.
 

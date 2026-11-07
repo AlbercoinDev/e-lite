@@ -50,6 +50,31 @@ impl BlockSource for MockSource {
     }
 }
 
+struct SlowSource {
+    blocks: Vec<u8>,
+    calls: AtomicU64,
+}
+
+impl SlowSource {
+    fn new(blocks: Vec<u8>) -> Arc<Self> {
+        Arc::new(SlowSource {
+            blocks,
+            calls: AtomicU64::new(0),
+        })
+    }
+}
+
+impl BlockSource for SlowSource {
+    fn name(&self) -> &str {
+        "slow"
+    }
+    fn fetch_block(&self, _hash: &Hash32) -> Result<Vec<u8>> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        std::thread::sleep(Duration::from_millis(100));
+        Ok(self.blocks.clone())
+    }
+}
+
 fn test_block() -> Block {
     let coinbase = Transaction {
         version: Version::TWO,
@@ -143,6 +168,7 @@ fn config(decoys: u32, cache_mib: u64) -> RawtxConfig {
         fallback_clearnet: false,
         request_timeout_seconds: 15,
         provider_cooldown_seconds: 120,
+        max_parallel_fetches: 4,
         use_p2p: false,
         use_esplora: false,
         p2p_v2: false,
@@ -172,6 +198,39 @@ fn serves_from_external_source_and_then_cache() {
         "second call must hit cache"
     );
     assert_eq!(resolver.stats().cache_hits.load(Ordering::SeqCst), 1);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn concurrent_requests_share_one_block_download() {
+    use std::sync::Barrier;
+
+    let dir = tmp("inflight");
+    let (store, _hash, txid, bytes) = setup(&dir, 0);
+    let src = SlowSource::new(bytes);
+    let resolver = Arc::new(
+        Resolver::new(Arc::clone(&store), &config(0, 0))
+            .unwrap()
+            .with_external(src.clone()),
+    );
+    let barrier = Arc::new(Barrier::new(8));
+    let mut handles = Vec::new();
+    for _ in 0..8 {
+        let resolver = Arc::clone(&resolver);
+        let barrier = Arc::clone(&barrier);
+        handles.push(std::thread::spawn(move || {
+            barrier.wait();
+            resolver.raw_tx(txid, 0)
+        }));
+    }
+    for handle in handles {
+        assert!(handle.join().unwrap().is_ok());
+    }
+    assert_eq!(
+        src.calls.load(Ordering::SeqCst),
+        1,
+        "concurrent requests must share one download"
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -314,6 +373,54 @@ fn live_esplora_signet_block() {
     eprintln!("live esplora signet block 1000: {} bytes", bytes.len());
 }
 
+/// Live provider health: a dead provider may cost one timeout, but the last
+/// good provider and the direct cooldown must keep the following blocks fast.
+#[test]
+#[ignore]
+fn live_esplora_health_cooldown() {
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(15))
+        .build()
+        .unwrap();
+    let good = "https://blockstream.info/signet/api";
+    let hashes: Vec<String> = (1000..1004)
+        .map(|h| {
+            client
+                .get(format!("{good}/block-height/{h}"))
+                .send()
+                .unwrap()
+                .text()
+                .unwrap()
+                .trim()
+                .to_string()
+        })
+        .collect();
+    let src = el_rawtx::EsploraSource::new(
+        vec![
+            "https://mempool.space/signet/api".to_string(),
+            good.to_string(),
+        ],
+        None,
+        true,
+        false,
+        Duration::from_secs(8),
+        Duration::from_secs(300),
+    )
+    .unwrap();
+    for hash in hashes {
+        let hash = Hash32::from_hex(&hash).unwrap();
+        let started = Instant::now();
+        let result = src.fetch_block(&hash);
+        eprintln!(
+            "live provider fetch {:?} -> {}",
+            started.elapsed(),
+            result
+                .map(|b| format!("{} bytes", b.len()))
+                .unwrap_or_else(|e| e.to_string())
+        );
+    }
+}
+
 /// Live end-to-end external resolution: fetch a real signet tip block through
 /// Esplora, verify it against a locally stored header, then hit the cache.
 #[test]
@@ -440,6 +547,7 @@ fn live_p2p_regtest() {
         el_model::Chain::Regtest,
         v2,
         false,
+        Duration::from_secs(5),
     );
     let bytes = src.fetch_block(&hash).unwrap();
     let block: Block = bitcoin::consensus::deserialize(&bytes).unwrap();

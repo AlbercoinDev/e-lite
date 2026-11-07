@@ -5,16 +5,19 @@
 //! blocks. BIP324 v2 is tried first and falls back to v1. Use Tor for network
 //! privacy.
 
-use crate::{BlockSource, RawtxError, Result};
+use crate::{BlockSource, RawtxError, RawtxStats, Result};
 use bip324::io::{Payload, Protocol};
 use bip324::{PacketType, Role};
 use el_model::{Chain, Hash32};
 use rand::seq::SliceRandom;
 use rand::thread_rng;
 use sha2::{Digest, Sha256};
+use std::collections::{HashMap, HashSet};
 use std::io::{self, BufReader, Read, Write};
-use std::net::TcpStream;
-use std::time::Duration;
+use std::net::{TcpStream, ToSocketAddrs};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 const PROTOCOL_VERSION: i32 = 70016;
 const MAX_MESSAGE: u32 = 4 * 1024 * 1024 + 1024;
@@ -29,7 +32,13 @@ pub struct P2pSource {
     magic: [u8; 4],
     v2: bool,
     fallback_clearnet: bool,
-    fallback_warned: std::sync::atomic::AtomicBool,
+    fallback_warned: AtomicBool,
+    cooldown: Duration,
+    total_timeout: Duration,
+    peer_failures: Mutex<HashMap<String, Instant>>,
+    last_good: Mutex<Option<String>>,
+    tor_cooldown_until: Mutex<Option<Instant>>,
+    stats: Option<Arc<RawtxStats>>,
 }
 
 fn sha256d(data: &[u8]) -> [u8; 32] {
@@ -247,6 +256,7 @@ impl P2pSource {
         chain: Chain,
         v2: bool,
         fallback_clearnet: bool,
+        cooldown: Duration,
     ) -> Self {
         P2pSource {
             peers,
@@ -255,55 +265,131 @@ impl P2pSource {
             magic: chain.magic(),
             v2,
             fallback_clearnet,
-            fallback_warned: std::sync::atomic::AtomicBool::new(false),
+            fallback_warned: AtomicBool::new(false),
+            cooldown,
+            total_timeout: timeout.saturating_mul(2),
+            peer_failures: Mutex::new(HashMap::new()),
+            last_good: Mutex::new(None),
+            tor_cooldown_until: Mutex::new(None),
+            stats: None,
         }
     }
 
-    fn connect_raw(&self, peer: &str) -> Result<TcpStream> {
+    /// Attach the resolver's counters (optional; tests omit it).
+    pub fn with_stats(mut self, stats: Arc<RawtxStats>) -> Self {
+        self.stats = Some(stats);
+        self
+    }
+
+    fn bump(&self, f: impl FnOnce(&RawtxStats)) {
+        if let Some(stats) = &self.stats {
+            f(stats);
+        }
+    }
+
+    fn direct_connect(&self, peer: &str, timeout: Duration) -> Result<TcpStream> {
+        let addrs: Vec<_> = peer
+            .to_socket_addrs()
+            .map_err(|e| RawtxError::Unavailable(format!("resolve {peer}: {e}")))?
+            .collect();
+        let mut last = None;
+        for addr in addrs {
+            match TcpStream::connect_timeout(&addr, timeout) {
+                Ok(stream) => return Ok(stream),
+                Err(e) => last = Some(e),
+            }
+        }
+        Err(RawtxError::Unavailable(format!(
+            "connect {peer}: {}",
+            last.map(|e| e.to_string())
+                .unwrap_or_else(|| "no addresses".to_string())
+        )))
+    }
+
+    fn connect_raw(&self, peer: &str, timeout: Duration) -> Result<TcpStream> {
+        let tor_cooled = self
+            .tor_cooldown_until
+            .lock()
+            .map(|until| until.is_some_and(|t| t > Instant::now()))
+            .unwrap_or(false);
         let stream = if let Some(proxy) = &self.tor_socks {
-            let user = format!("e-lite-{}", rand::random::<u64>());
-            match socks::Socks5Stream::connect_with_password(proxy.as_str(), peer, &user, "e-lite")
-            {
-                Ok(s) => s.into_inner(),
-                Err(e) if self.fallback_clearnet => {
-                    if !self
-                        .fallback_warned
-                        .swap(true, std::sync::atomic::Ordering::Relaxed)
-                    {
-                        eprintln!(
-                            "[e-lite] WARNING: Tor connect failed for P2P peer {peer} ({e}); using clearnet (operator IP exposed)"
-                        );
-                    }
-                    TcpStream::connect(peer)
-                        .map_err(|e| RawtxError::Unavailable(format!("connect {peer}: {e}")))?
+            if tor_cooled {
+                if self.fallback_clearnet {
+                    self.direct_connect(peer, timeout)?
+                } else {
+                    return Err(RawtxError::Unavailable(format!(
+                        "tor cooling down for {peer}; clearnet fallback disabled"
+                    )));
                 }
-                Err(e) => return Err(RawtxError::Unavailable(format!("tor connect {peer}: {e}"))),
+            } else {
+                let user = format!("e-lite-{}", rand::random::<u64>());
+                match socks::Socks5Stream::connect_with_password(
+                    proxy.as_str(),
+                    peer,
+                    &user,
+                    "e-lite",
+                ) {
+                    Ok(s) => {
+                        if let Ok(mut until) = self.tor_cooldown_until.lock() {
+                            *until = None;
+                        }
+                        s.into_inner()
+                    }
+                    Err(e) => {
+                        self.bump(|stats| {
+                            stats.p2p_tor_failures.fetch_add(1, Ordering::Relaxed);
+                        });
+                        if let Ok(mut until) = self.tor_cooldown_until.lock() {
+                            *until = Some(Instant::now() + self.cooldown);
+                        }
+                        if self.fallback_clearnet {
+                            if !self.fallback_warned.swap(true, Ordering::Relaxed) {
+                                eprintln!(
+                                    "[e-lite] WARNING: Tor connect failed for P2P peer {peer} ({e}); using clearnet (operator IP exposed)"
+                                );
+                            }
+                            self.direct_connect(peer, timeout)?
+                        } else {
+                            return Err(RawtxError::Unavailable(format!(
+                                "tor connect {peer}: {e}"
+                            )));
+                        }
+                    }
+                }
             }
         } else {
-            TcpStream::connect(peer)
-                .map_err(|e| RawtxError::Unavailable(format!("connect {peer}: {e}")))?
+            self.direct_connect(peer, timeout)?
         };
         stream
             .set_nodelay(true)
             .map_err(|e| RawtxError::Io(e.to_string()))?;
         stream
-            .set_read_timeout(Some(self.timeout))
+            .set_read_timeout(Some(timeout))
             .map_err(|e| RawtxError::Io(e.to_string()))?;
         stream
-            .set_write_timeout(Some(self.timeout))
+            .set_write_timeout(Some(timeout))
             .map_err(|e| RawtxError::Io(e.to_string()))?;
         Ok(stream)
     }
 
-    fn fetch_from(&self, peer: &str, hash: &Hash32) -> Result<Vec<u8>> {
+    fn fetch_from(&self, peer: &str, hash: &Hash32, budget: Duration) -> Result<Vec<u8>> {
+        let deadline = Instant::now() + budget;
         let mut v2_error = None;
         if self.v2 {
-            match self.fetch_from_v2(peer, hash) {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(RawtxError::Unavailable(format!("{peer} p2p timeout")));
+            }
+            match self.fetch_from_v2(peer, hash, remaining) {
                 Ok(bytes) => return Ok(bytes),
                 Err(e) => v2_error = Some(e),
             }
         }
-        match self.fetch_from_v1(peer, hash) {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(RawtxError::Unavailable(format!("{peer} p2p timeout")));
+        }
+        match self.fetch_from_v1(peer, hash, remaining) {
             Ok(bytes) => Ok(bytes),
             Err(e) => match v2_error {
                 Some(v2) => Err(RawtxError::Unavailable(format!("{v2}; v1: {e}"))),
@@ -312,8 +398,8 @@ impl P2pSource {
         }
     }
 
-    fn fetch_from_v1(&self, peer: &str, hash: &Hash32) -> Result<Vec<u8>> {
-        let mut stream = self.connect_raw(peer)?;
+    fn fetch_from_v1(&self, peer: &str, hash: &Hash32, timeout: Duration) -> Result<Vec<u8>> {
+        let mut stream = self.connect_raw(peer, timeout)?;
         send_message(
             &mut stream,
             self.magic,
@@ -367,8 +453,8 @@ impl P2pSource {
         }
     }
 
-    fn fetch_from_v2(&self, peer: &str, hash: &Hash32) -> Result<Vec<u8>> {
-        let stream = self.connect_raw(peer)?;
+    fn fetch_from_v2(&self, peer: &str, hash: &Hash32, timeout: Duration) -> Result<Vec<u8>> {
+        let stream = self.connect_raw(peer, timeout)?;
         let reader = BufReader::new(
             stream
                 .try_clone()
@@ -472,11 +558,68 @@ impl BlockSource for P2pSource {
         }
         let mut peers = self.peers.clone();
         peers.shuffle(&mut thread_rng());
+        if let Some(good) = self.last_good.lock().ok().and_then(|g| g.clone()) {
+            if let Some(pos) = peers.iter().position(|p| *p == good) {
+                let good = peers.remove(pos);
+                peers.insert(0, good);
+            }
+        }
+
+        let now = Instant::now();
+        let cooling: HashSet<String> = self
+            .peer_failures
+            .lock()
+            .map(|m| {
+                m.iter()
+                    .filter(|(_, until)| **until > now)
+                    .map(|(peer, _)| peer.clone())
+                    .collect()
+            })
+            .unwrap_or_default();
+        let candidates: Vec<String> = peers
+            .into_iter()
+            .filter(|peer| !cooling.contains(peer))
+            .collect();
+        if candidates.is_empty() {
+            self.bump(|stats| {
+                stats.p2p_skipped.fetch_add(1, Ordering::Relaxed);
+            });
+            return Err(RawtxError::Unavailable(
+                "all p2p peers are cooling down".into(),
+            ));
+        }
+
+        let started = Instant::now();
         let mut errors = Vec::new();
-        for peer in peers.iter().take(4) {
-            match self.fetch_from(peer, hash) {
-                Ok(bytes) => return Ok(bytes),
-                Err(e) => errors.push(format!("{peer}: {e}")),
+        for peer in candidates.into_iter().take(3) {
+            let remaining = self.total_timeout.saturating_sub(started.elapsed());
+            if remaining.is_zero() {
+                errors.push("p2p total timeout".to_string());
+                break;
+            }
+            let budget = remaining.min(self.timeout);
+            self.bump(|stats| {
+                stats.p2p_attempts.fetch_add(1, Ordering::Relaxed);
+            });
+            match self.fetch_from(&peer, hash, budget) {
+                Ok(bytes) => {
+                    if let Ok(mut good) = self.last_good.lock() {
+                        *good = Some(peer.clone());
+                    }
+                    if let Ok(mut failures) = self.peer_failures.lock() {
+                        failures.remove(&peer);
+                    }
+                    return Ok(bytes);
+                }
+                Err(e) => {
+                    self.bump(|stats| {
+                        stats.p2p_failures.fetch_add(1, Ordering::Relaxed);
+                    });
+                    if let Ok(mut failures) = self.peer_failures.lock() {
+                        failures.insert(peer.clone(), Instant::now() + self.cooldown);
+                    }
+                    errors.push(format!("{peer}: {e}"));
+                }
             }
         }
         Err(RawtxError::Unavailable(errors.join("; ")))
@@ -495,6 +638,55 @@ mod tests {
         TxMerkleNode, TxOut, Witness,
     };
     use std::net::TcpListener;
+
+    #[test]
+    fn failed_peer_is_cooled_down() {
+        use std::sync::atomic::AtomicUsize;
+        use std::sync::Arc;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let accepts = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&accepts);
+        std::thread::spawn(move || {
+            while let Ok((mut sock, _)) = listener.accept() {
+                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let mut buf = [0u8; 4096];
+                let _ = sock.read(&mut buf);
+                std::thread::sleep(Duration::from_secs(2));
+            }
+        });
+
+        let stats = Arc::new(RawtxStats::default());
+        let src = P2pSource::new(
+            vec![addr],
+            None,
+            Duration::from_millis(200),
+            Chain::Regtest,
+            false,
+            false,
+            Duration::from_secs(60),
+        )
+        .with_stats(Arc::clone(&stats));
+        let hash = Hash32([0x11; 32]);
+        assert!(src.fetch_block(&hash).is_err());
+        assert_eq!(accepts.load(std::sync::atomic::Ordering::SeqCst), 1);
+        // A second block must not reconnect while the peer is cooled down.
+        assert!(src.fetch_block(&hash).is_err());
+        assert_eq!(accepts.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(
+            stats.p2p_attempts.load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+        assert_eq!(
+            stats.p2p_failures.load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+        assert_eq!(
+            stats.p2p_skipped.load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+    }
 
     #[test]
     fn version_advertises_witness() {
@@ -638,6 +830,7 @@ mod tests {
             Chain::Regtest,
             false,
             false,
+            Duration::from_secs(5),
         );
         assert_eq!(src.fetch_block(&hash).unwrap(), bytes);
     }
@@ -655,6 +848,7 @@ mod tests {
             Chain::Regtest,
             true,
             false,
+            Duration::from_secs(5),
         );
         assert_eq!(src.fetch_block(&hash).unwrap(), bytes);
     }
@@ -672,6 +866,7 @@ mod tests {
             Chain::Regtest,
             true,
             false,
+            Duration::from_secs(5),
         );
         assert_eq!(src.fetch_block(&hash).unwrap(), bytes);
     }
@@ -689,6 +884,7 @@ mod tests {
             Chain::Regtest,
             false,
             false,
+            Duration::from_secs(5),
         );
         assert!(src.fetch_block(&hash).is_err());
     }

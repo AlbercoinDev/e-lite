@@ -74,12 +74,14 @@ available**.
 | Tor SOCKS5h with clearnet fallback | experimental | Tor first; `tor_fallback_clearnet` (default true) uses clearnet if Tor fails; `allow_clearnet` forces it |
 | Managed Tor + onion service | experimental | plain 50001 + TLS 50002; `e-lite onion show/reset` |
 | Auto self-signed onion TLS cert | experimental | SAN includes the onion; reloaded on change |
-| Decoys and random source order | experimental | `decoys=3` default |
+| Decoys and random source order | experimental | `decoys=1` default; max 2 in flight; prefetch spawns none |
 | Block hash/header/Merkle/witness validation | experimental | before serving/caching |
 | Configurable Esplora endpoints | experimental | editable `public-servers.toml`; shipped defaults; fail-closed if no provider and `require_ready` |
 | Provider readiness gate | experimental | probes `/block-height/0` + genesis raw block before opening Electrum; `require_ready`, latency/state in `/status` |
-| History block prefetch | experimental | background fetch of confirmed history blocks before `transaction.get`; 2 workers, bounded queue, dedup |
-| P2P peers auto/config | experimental | BIP324 v2 + v1 fallback |
+| Provider health cooldown | experimental | failed Tor or direct provider is skipped for `provider_cooldown_seconds` (300 s); last good provider goes first |
+| In-flight block dedup | experimental | concurrent tx/prefetch of the same block share one download; `max_parallel_fetches=4` |
+| History block prefetch | experimental | background fetch of confirmed history blocks before `transaction.get`; 1 worker, 16 heights per history, bounded queue, no decoys |
+| P2P peers auto/config | experimental | connected peers first, last-good peer first, failed-peer cooldown, total timeout; BIP324 v2 + v1 |
 | Prune-gap repair from verified sources | experimental | bounded by `repair_max_gap_blocks` |
 | Silent payments privacy | **not available** | gate only |
 

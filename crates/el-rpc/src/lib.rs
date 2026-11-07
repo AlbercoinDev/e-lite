@@ -398,6 +398,12 @@ impl CoreClient {
         self.call("getnodeaddresses", serde_json::json!([count]))
     }
 
+    /// Peers Core is connected to right now. These are more reliable for P2P
+    /// block fetches than random addrman entries.
+    pub fn connected_peers(&self) -> Result<Vec<PeerInfo>> {
+        self.call("getpeerinfo", serde_json::json!([]))
+    }
+
     pub fn mempool_txids(&self) -> Result<Vec<String>> {
         self.call("getrawmempool", serde_json::json!([false]))
     }
@@ -455,6 +461,33 @@ pub struct NodeAddress {
     pub port: u16,
     #[serde(default)]
     pub services: u64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct PeerInfo {
+    pub addr: String,
+    #[serde(default)]
+    pub inbound: bool,
+    /// Core returns this as a number in `getpeerinfo` and may format it as a
+    /// hex string in other versions; accept both.
+    #[serde(default, deserialize_with = "de_services")]
+    pub services: u64,
+}
+
+fn de_services<'de, D>(deserializer: D) -> std::result::Result<u64, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = serde_json::Value::deserialize(deserializer)?;
+    match value {
+        serde_json::Value::Number(n) => Ok(n.as_u64().unwrap_or(0)),
+        serde_json::Value::String(s) => {
+            let s = s.trim();
+            u64::from_str_radix(s.strip_prefix("0x").unwrap_or(s), 16)
+                .map_err(serde::de::Error::custom)
+        }
+        _ => Ok(0),
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -702,6 +735,19 @@ mod tests {
     use super::*;
     use std::net::TcpListener;
     use std::thread;
+
+    #[test]
+    fn parses_peerinfo_services_as_number_or_hex_string() {
+        let numeric: PeerInfo =
+            serde_json::from_str(r#"{"addr":"1.2.3.4:8333","inbound":false,"services":1033}"#)
+                .unwrap();
+        assert_eq!(numeric.services & 1, 1, "NODE_NETWORK bit");
+        let hex: PeerInfo =
+            serde_json::from_str(r#"{"addr":"5.6.7.8:38333","services":"0000000000000409"}"#)
+                .unwrap();
+        assert_eq!(hex.services & 1, 1, "NODE_NETWORK bit");
+        assert_eq!(hex.services & (1 << 3), 1 << 3, "NODE_WITNESS bit");
+    }
 
     #[test]
     fn base64_matches_known_vectors() {

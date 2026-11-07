@@ -1,9 +1,9 @@
 # Session handoff
 
 **Updated:** 2026-11-07
-**Latest published release:** `0.1.0-alpha.29.3`
-**Release:** https://github.com/AlbercoinDev/e-lite/releases/tag/v0.1.0-alpha.29.3
-**Main commit at handoff:** tag `v0.1.0-alpha.29.3`
+**Latest published release:** `0.1.0-alpha.29.3.1`
+**Release:** https://github.com/AlbercoinDev/e-lite/releases/tag/v0.1.0-alpha.29.3.1
+**Main commit at handoff:** tag `v0.1.0-alpha.29.3.1`
 
 This file is the short “where we are” for a new session. The invariants live in
 [`AGENTS.md`](../AGENTS.md) and [`PROJECT_MEMORY.md`](PROJECT_MEMORY.md); the
@@ -79,6 +79,23 @@ no repitas contexto ni rehagas decisiones ya documentadas.
   the onion setup, reset and security.
 - `docs/ROADMAP.md` contains future features/improvements. Do not present them as
   available.
+
+## Last change (alpha.29.3.1)
+
+- **Dead providers no longer stall every block**: direct Esplora failures are
+  cooled down like Tor failures (`provider_cooldown_seconds`, 300 s), the last
+  good provider is tried first, and `request_timeout_seconds` defaults to 8 s.
+  This fixes the 17–34 s gaps caused by `mempool.space/signet/api` timing out
+  on every block.
+- **In-flight dedup and concurrency**: concurrent wallet/prefetch requests for
+  one block share a download; `max_parallel_fetches` (4) caps external work.
+- **P2P fail-fast**: `p2p_timeout_seconds` (8), current Core connections first,
+  last-good peer first, failed-peer cooldown, total 2× timeout per block,
+  `connect_timeout`, and a Tor circuit breaker before clearnet fallback.
+- **Decoys/prefetch**: `decoys = 1` (max 2 in flight), prefetch has one worker,
+  enqueues at most 16 heights and never spawns decoys.
+- `/status`/`/metrics` expose P2P failures/skips, decoys in flight and prefetch
+  queued/done. No schema or protocol change.
 
 ## Last change (alpha.29.3)
 
@@ -455,6 +472,6 @@ startup/shutdown/memory assertions, `e-lite.log` presence, 1.6 and 1.7
 negotiation on the same instance, scriptpubkey/outpoint checks, outpoint
 notification, real testmempoolaccept, the rate-limit burst test, the strict
 Core RPC check and the Sparrow sequence with confirmed verbose transaction)
-passed on the alpha.29.3 code. Full signet/testnet4 acceptance
+passed on the alpha.29.3.1 code. Full signet/testnet4 acceptance
 is still operator-run; results belong in `docs/GETTING-STARTED.md`/release notes
 when available.

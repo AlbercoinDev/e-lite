@@ -514,9 +514,15 @@ pub struct RawtxCfg {
     /// Timeout for each Esplora raw-block request.
     #[serde(default = "d_rawtx_timeout")]
     pub request_timeout_seconds: u64,
-    /// Skip Tor for a provider after a failed Tor request.
+    /// Skip a provider (Tor and/or direct) after a failed request.
     #[serde(default = "d_provider_cooldown")]
     pub provider_cooldown_seconds: u64,
+    /// Max concurrent external block downloads (wallet + prefetch).
+    #[serde(default = "d_max_parallel_fetches")]
+    pub max_parallel_fetches: usize,
+    /// Timeout for one P2P connect/handshake/block attempt.
+    #[serde(default = "d_p2p_timeout")]
+    pub p2p_timeout_seconds: u64,
     #[serde(default = "d_true")]
     pub use_p2p: bool,
     #[serde(default = "d_true")]
@@ -541,6 +547,8 @@ impl Default for RawtxCfg {
             tor_fallback_clearnet: true,
             request_timeout_seconds: d_rawtx_timeout(),
             provider_cooldown_seconds: d_provider_cooldown(),
+            max_parallel_fetches: d_max_parallel_fetches(),
+            p2p_timeout_seconds: d_p2p_timeout(),
             use_p2p: true,
             use_esplora: true,
             p2p_v2: true,
@@ -603,10 +611,16 @@ fn d_ready_timeout() -> u64 {
     60
 }
 fn d_rawtx_timeout() -> u64 {
-    15
+    8
 }
 fn d_provider_cooldown() -> u64 {
-    120
+    300
+}
+fn d_max_parallel_fetches() -> usize {
+    4
+}
+fn d_p2p_timeout() -> u64 {
+    8
 }
 fn d_listen() -> String {
     "127.0.0.1:50001".to_string()
@@ -651,7 +665,7 @@ fn d_cache_mib() -> u64 {
     2048
 }
 fn d_decoys() -> u32 {
-    3
+    1
 }
 fn d_tor_socks() -> Option<String> {
     Some("127.0.0.1:9050".to_string())

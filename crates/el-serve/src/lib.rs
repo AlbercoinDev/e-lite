@@ -647,6 +647,8 @@ impl ClientRegistry {
 pub struct Prefetcher {
     tx: Option<mpsc::SyncSender<(Hash32, u32)>>,
     seen: Mutex<HashSet<u32>>,
+    queued: Arc<AtomicU64>,
+    done: Arc<AtomicU64>,
 }
 
 impl Prefetcher {
@@ -654,6 +656,8 @@ impl Prefetcher {
         Self {
             tx: None,
             seen: Mutex::new(HashSet::new()),
+            queued: Arc::new(AtomicU64::new(0)),
+            done: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -665,10 +669,12 @@ impl Prefetcher {
     ) -> Self {
         let (tx, rx) = mpsc::sync_channel::<(Hash32, u32)>(queue.max(1));
         let rx = Arc::new(Mutex::new(rx));
+        let done = Arc::new(AtomicU64::new(0));
         for _ in 0..workers.max(1) {
             let resolver = Arc::clone(&resolver);
             let readers = Arc::clone(&readers);
             let rx = Arc::clone(&rx);
+            let done = Arc::clone(&done);
             std::thread::spawn(move || loop {
                 let item = {
                     let guard = match rx.lock() {
@@ -681,30 +687,43 @@ impl Prefetcher {
                     return;
                 };
                 let _guard = readers.enter(height);
-                let _ = resolver.raw_tx(txid, height);
+                let _ = resolver.raw_tx_prefetch(txid, height);
+                done.fetch_add(1, Ordering::Relaxed);
             });
         }
         Self {
             tx: Some(tx),
             seen: Mutex::new(HashSet::new()),
+            queued: Arc::new(AtomicU64::new(0)),
+            done,
         }
+    }
+
+    /// (queued, completed) background prefetches.
+    pub fn stats(&self) -> (u64, u64) {
+        (
+            self.queued.load(Ordering::Relaxed),
+            self.done.load(Ordering::Relaxed),
+        )
     }
 
     /// Enqueue one txid per block height. Duplicates and a full queue are
     /// dropped silently: prefetch is an optimisation, never a correctness path.
-    pub fn enqueue(&self, txid: Hash32, height: u32) {
+    pub fn enqueue(&self, txid: Hash32, height: u32) -> bool {
         let Some(tx) = &self.tx else {
-            return;
+            return false;
         };
         let Ok(mut seen) = self.seen.lock() else {
-            return;
+            return false;
         };
         if seen.len() >= 20_000 {
             seen.clear();
         }
-        if seen.insert(height) {
-            let _ = tx.try_send((txid, height));
+        if seen.insert(height) && tx.try_send((txid, height)).is_ok() {
+            self.queued.fetch_add(1, Ordering::Relaxed);
+            return true;
         }
+        false
     }
 }
 
@@ -988,8 +1007,17 @@ impl Shared {
                 "bytes": rawtx.bytes.load(Ordering::Relaxed),
                 "verify_failures": rawtx.verify_failures.load(Ordering::Relaxed),
                 "decoys": rawtx.decoys.load(Ordering::Relaxed),
+                "decoys_inflight": self.resolver.decoys_inflight(),
                 "unavailable": rawtx.unavailable.load(Ordering::Relaxed),
                 "external_sources": self.resolver.external_sources(),
+                "p2p_attempts": rawtx.p2p_attempts.load(Ordering::Relaxed),
+                "p2p_failures": rawtx.p2p_failures.load(Ordering::Relaxed),
+                "p2p_skipped": rawtx.p2p_skipped.load(Ordering::Relaxed),
+                "p2p_tor_failures": rawtx.p2p_tor_failures.load(Ordering::Relaxed),
+            },
+            "prefetch": {
+                "queued": self.prefetch.stats().0,
+                "done": self.prefetch.stats().1,
             },
         })
     }
@@ -1699,6 +1727,7 @@ fn history_entries_with_code(
     }
     let mut blocks: HashMap<u32, el_model::BlockRecord> = HashMap::new();
     let mut out = Vec::with_capacity(entries.len());
+    let mut prefetched = 0usize;
     for (height, tx_pos, effect) in entries {
         let rec = match blocks.get(&height) {
             Some(r) => *r,
@@ -1717,7 +1746,9 @@ fn history_entries_with_code(
             .store
             .txid_at(txnum)
             .map_err(|e| RpcError::server(e.to_string()))?;
-        shared.prefetch.enqueue(txid, height);
+        if prefetched < 16 && shared.prefetch.enqueue(txid, height) {
+            prefetched += 1;
+        }
         out.push((
             height,
             tx_pos,
@@ -3314,6 +3345,54 @@ fn metrics_text(shared: &Shared) -> String {
         "Effective RocksDB block cache",
         "gauge",
         st["tuning"]["cache_mib"].as_u64().unwrap_or(0),
+    );
+    line(
+        "e_lite_rawtx_cache_hits",
+        "Raw transactions served from the validated block cache",
+        "counter",
+        st["rawtx"]["cache_hits"].as_u64().unwrap_or(0),
+    );
+    line(
+        "e_lite_rawtx_fetches",
+        "Whole blocks fetched from external sources",
+        "counter",
+        st["rawtx"]["fetches"].as_u64().unwrap_or(0),
+    );
+    line(
+        "e_lite_rawtx_unavailable",
+        "Raw transactions that could not be resolved",
+        "counter",
+        st["rawtx"]["unavailable"].as_u64().unwrap_or(0),
+    );
+    line(
+        "e_lite_rawtx_decoys_inflight",
+        "Decoy block downloads currently in flight",
+        "gauge",
+        st["rawtx"]["decoys_inflight"].as_u64().unwrap_or(0),
+    );
+    line(
+        "e_lite_rawtx_p2p_failures",
+        "P2P peer fetch failures",
+        "counter",
+        st["rawtx"]["p2p_failures"].as_u64().unwrap_or(0),
+    );
+    line(
+        "e_lite_rawtx_p2p_skipped",
+        "P2P fetches skipped because every peer was cooling down",
+        "counter",
+        st["rawtx"]["p2p_skipped"].as_u64().unwrap_or(0),
+    );
+    line(
+        "e_lite_prefetch_queued",
+        "History blocks queued for background prefetch",
+        "counter",
+        st["prefetch"]["queued"].as_u64().unwrap_or(0),
+    );
+    line(
+        "e_lite_prefetch_done",
+        "History blocks processed by the prefetcher",
+        "counter",
+        st["prefetch"]["done"].as_u64().unwrap_or(0),
     );
     line(
         "e_lite_memory_available_mib",

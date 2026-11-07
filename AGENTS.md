@@ -79,13 +79,23 @@ Never treat a version number in this file as authoritative over the code/tag.
   must be HTTPS (`.onion` over Tor is the only plain-HTTP exception).
 - P2P rawtx must advertise `NODE_WITNESS` (bit 3) in `version`; without it peers
   strip witnesses from blocks, which looks like a valid block hash but fails the
-  BIP141 check. The background prefetcher enqueues confirmed history heights and
-  must stay bounded/deduplicated; it is an optimisation, never correctness.
-- `run` probes the network's providers (`/block-height/0`) and does not open
-  Electrum until at least one answers; `require_ready`/`ready_timeout_seconds`
-  control the gate. `tor_fallback_clearnet = true` uses clearnet when Tor is
-  unavailable or a request fails (log + `/status`), while `.onion` still needs
-  Tor; set it to `false` for fail-closed.
+  BIP141 check. P2P is fail-fast: connected peers first, last-good peer first,
+  per-peer timeout/failed-peer cooldown, total 2× timeout, and a Tor circuit
+  breaker before clearnet fallback. Never let one block spend minutes trying
+  dead peers.
+- Provider health is sticky: a failed Tor **or direct** request cools that
+  provider for `provider_cooldown_seconds` (300 s), and the last successful
+  provider is tried first. `max_parallel_fetches` (4) bounds total external
+  downloads; concurrent requests for the same block share one download.
+- Decoys default to 1, at most 2 are in flight, and the prefetch never spawns
+  decoys. The prefetcher enqueues up to 16 confirmed history heights per
+  history response with one worker; it is an optimisation, never correctness.
+- `run` probes the network's providers (`/block-height/0` plus the genesis raw
+  block with a header-hash check) and does not open Electrum until at least one
+  answers; `require_ready`/`ready_timeout_seconds` control the gate.
+  `tor_fallback_clearnet = true` uses clearnet when Tor is unavailable or a
+  request fails (log + `/status`), while `.onion` still needs Tor; set it to
+  `false` for fail-closed.
 - Electrum protocol versions are negotiated per connection. This build serves
   1.4–1.7 (`server.version` returns the negotiated version). A request for a
   future or skipped version falls back to the newest implemented version at or

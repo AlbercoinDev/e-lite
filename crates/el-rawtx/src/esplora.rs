@@ -8,7 +8,10 @@ use crate::{BlockSource, RawtxError, Result};
 use el_model::Hash32;
 use rand::seq::SliceRandom;
 use rand::thread_rng;
-use std::time::Duration;
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 pub struct EsploraSource {
     bases: Vec<String>,
@@ -16,9 +19,11 @@ pub struct EsploraSource {
     direct_client: Option<reqwest::blocking::Client>,
     fallback_clearnet: bool,
     allow_clearnet: bool,
-    fallback_warned: std::sync::atomic::AtomicBool,
+    fallback_warned: AtomicBool,
     cooldown: Duration,
-    tor_failures: std::sync::Mutex<std::collections::HashMap<String, std::time::Instant>>,
+    tor_failures: Mutex<HashMap<String, Instant>>,
+    direct_failures: Mutex<HashMap<String, Instant>>,
+    last_good: Mutex<Option<String>>,
 }
 
 const MAX_BLOCK_BYTES: u64 = 8 * 1024 * 1024;
@@ -83,9 +88,11 @@ impl EsploraSource {
             direct_client,
             fallback_clearnet,
             allow_clearnet,
-            fallback_warned: std::sync::atomic::AtomicBool::new(false),
+            fallback_warned: AtomicBool::new(false),
             cooldown,
-            tor_failures: std::sync::Mutex::new(std::collections::HashMap::new()),
+            tor_failures: Mutex::new(HashMap::new()),
+            direct_failures: Mutex::new(HashMap::new()),
+            last_good: Mutex::new(None),
         })
     }
 
@@ -114,6 +121,33 @@ impl EsploraSource {
         }
         Ok(bytes.to_vec())
     }
+
+    fn cooled(failures: &Mutex<HashMap<String, Instant>>, base: &str) -> bool {
+        failures
+            .lock()
+            .map(|m| m.get(base).is_some_and(|until| *until > Instant::now()))
+            .unwrap_or(false)
+    }
+
+    fn mark_failed(failures: &Mutex<HashMap<String, Instant>>, base: &str, cooldown: Duration) {
+        if let Ok(mut m) = failures.lock() {
+            m.insert(base.to_string(), Instant::now() + cooldown);
+        }
+    }
+
+    fn mark_good(&self, base: &str, tor: bool) {
+        if let Ok(mut good) = self.last_good.lock() {
+            *good = Some(base.to_string());
+        }
+        let map = if tor {
+            &self.tor_failures
+        } else {
+            &self.direct_failures
+        };
+        if let Ok(mut m) = map.lock() {
+            m.remove(base);
+        }
+    }
 }
 
 impl BlockSource for EsploraSource {
@@ -124,53 +158,63 @@ impl BlockSource for EsploraSource {
     fn fetch_block(&self, hash: &Hash32) -> Result<Vec<u8>> {
         let mut order: Vec<usize> = (0..self.bases.len()).collect();
         order.shuffle(&mut thread_rng());
+        // Providers that answered recently go first. This avoids paying a
+        // dead provider's timeout on every block while keeping the rest
+        // shuffled for less predictable traffic.
+        let last_idx = self.last_good.lock().ok().and_then(|good| {
+            good.as_ref()
+                .and_then(|base| self.bases.iter().position(|b| b == base))
+        });
+        if let Some(idx) = last_idx {
+            if let Some(pos) = order.iter().position(|&i| i == idx) {
+                let idx = order.remove(pos);
+                order.insert(0, idx);
+            }
+        }
+
         let mut errors = Vec::new();
         for idx in order {
             let base = &self.bases[idx];
             let is_onion = base.to_ascii_lowercase().contains(".onion");
-            let tor_cooled = self
-                .tor_failures
-                .lock()
-                .map(|failures| {
-                    failures
-                        .get(base)
-                        .map(|until| *until > std::time::Instant::now())
-                        .unwrap_or(false)
-                })
-                .unwrap_or(false);
+
             if let Some(client) = &self.tor_client {
-                if !tor_cooled {
+                if Self::cooled(&self.tor_failures, base) {
+                    errors.push(format!("tor {base}: cooling down"));
+                } else {
                     match Self::fetch_with(client, base, hash) {
-                        Ok(bytes) => return Ok(bytes),
+                        Ok(bytes) => {
+                            self.mark_good(base, true);
+                            return Ok(bytes);
+                        }
                         Err(e) => {
-                            if let Ok(mut failures) = self.tor_failures.lock() {
-                                failures.insert(
-                                    base.clone(),
-                                    std::time::Instant::now() + self.cooldown,
-                                );
-                            }
-                            errors.push(e.to_string());
+                            Self::mark_failed(&self.tor_failures, base, self.cooldown);
+                            errors.push(format!("tor {e}"));
                         }
                     }
                 }
             }
+
             if !is_onion {
                 if let Some(client) = &self.direct_client {
+                    if Self::cooled(&self.direct_failures, base) {
+                        errors.push(format!("direct {base}: cooling down"));
+                        continue;
+                    }
                     let via_fallback = self.fallback_clearnet && !self.allow_clearnet;
                     match Self::fetch_with(client, base, hash) {
                         Ok(bytes) => {
-                            if via_fallback
-                                && !self
-                                    .fallback_warned
-                                    .swap(true, std::sync::atomic::Ordering::Relaxed)
-                            {
+                            self.mark_good(base, false);
+                            if via_fallback && !self.fallback_warned.swap(true, Ordering::Relaxed) {
                                 eprintln!(
                                     "[e-lite] WARNING: Tor request failed; using clearnet for {base} (operator IP exposed)"
                                 );
                             }
                             return Ok(bytes);
                         }
-                        Err(e) => errors.push(e.to_string()),
+                        Err(e) => {
+                            Self::mark_failed(&self.direct_failures, base, self.cooldown);
+                            errors.push(format!("direct {e}"));
+                        }
                     }
                 }
             }
@@ -217,6 +261,44 @@ mod tests {
         let got = src.fetch_block(&Hash32([0x11; 32])).unwrap();
         assert_eq!(got, vec![1, 2, 3, 4]);
         handle.join().unwrap();
+    }
+
+    #[test]
+    fn direct_failure_is_cooled_down() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let requests = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&requests);
+        std::thread::spawn(move || {
+            while let Ok((mut sock, _)) = listener.accept() {
+                counter.fetch_add(1, Ordering::SeqCst);
+                let mut buf = [0u8; 4096];
+                let _ = sock.read(&mut buf);
+                let _ = sock.write_all(
+                    b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                );
+            }
+        });
+
+        let src = EsploraSource::new(
+            vec![format!("http://{addr}")],
+            None,
+            true,
+            false,
+            Duration::from_secs(2),
+            Duration::from_secs(60),
+        )
+        .unwrap();
+        assert!(src.fetch_block(&Hash32([0x22; 32])).is_err());
+        assert!(src.fetch_block(&Hash32([0x22; 32])).is_err());
+        assert_eq!(
+            requests.load(Ordering::SeqCst),
+            1,
+            "a cooled provider must not be retried for every block"
+        );
     }
 
     #[test]

@@ -1,7 +1,7 @@
 # Code audit
 
-**Base:** `0.1.0-alpha.29.2` → published `0.1.0-alpha.29.3` · **Scope:** `bin/e-lite`, `crates/*` (26 Rust files,
-~19k lines) · **Status:** findings fixed in `0.1.0-alpha.29.3` where noted.
+**Base:** `0.1.0-alpha.29.3` → published `0.1.0-alpha.29.3.1` · **Scope:** `bin/e-lite`, `crates/*` (26 Rust files,
+~19k lines) · **Status:** findings fixed in `0.1.0-alpha.29.3.1` where noted.
 
 This audit is not a claim of formal verification. It records static checks,
 manual review areas, concrete findings and residual risks.
@@ -66,6 +66,8 @@ Additional checks performed:
 | AUD-046 | P1 | Provider network identity | `bin/e-lite/src/public_servers.rs`, `bin/e-lite/src/main.rs` | The readiness probe accepted any 64-hex `/block-height/0`, so a provider for another network could satisfy `require_ready`; wallets could open against the wrong chain. | The probe receives the indexed `NetworkIdentity` genesis (or the known chain genesis in `doctor`) and rejects a mismatch with `genesis mismatch ... (wrong network)`. Tests cover matching and mismatching genesis; 1.4/1.6/1.7 regtest e2e stays green. |
 | AUD-047 | P1 | P2P witness | `crates/el-rawtx/src/p2p.rs` | The P2P `version` payload advertised no services, so modern peers stripped witnesses from served blocks. The stripped block still had the requested hash (witness data is not committed by the old merkle root path used here), so validation failed with `missing witness reserved value` and wallets stayed on `Retrieving transaction`. | Advertise `NODE_WITNESS` (bit 3) in the v1 and v2 `version` payload. Added a unit test asserting the bit; P2P e2e/real-provider probes verify full blocks. Also falls back to clearnet when Tor connect fails (`tor_fallback_clearnet`) with a one-time warning. |
 | AUD-048 | P3 | Rawtx latency | `crates/el-serve/src/lib.rs`, `crates/el-rawtx/src/esplora.rs` | With a pruned Core, `transaction.get` fetched one whole block per request; a slow or unresponsive Tor provider could add ~60 s per transaction. | Esplora per-request timeout is 15 s (`rawtx.request_timeout_seconds`) and a failed provider's Tor path is skipped for 120 s (`rawtx.provider_cooldown_seconds`). Confirmed history heights are enqueued in a bounded (512), deduplicated, 2-worker prefetcher so later `transaction.get` hits the block cache. Optimisation only: cache misses still resolve synchronously; no schema change. |
+| AUD-049 | P1 | Provider health | `crates/el-rawtx/src/esplora.rs`, `bin/e-lite/src/config.rs` | Only Tor failures were cooled; a dead direct provider (mempool signet timing out) was retried on every block, adding ~15 s each time. Provider order was random, so the timeout recurred. | Direct failures now get the same cooldown (`provider_cooldown_seconds`, 300 s); the last successful provider is tried first; `request_timeout_seconds` defaults to 8 s. Tests cover a failing direct provider not being retried; e2e stays green. |
+| AUD-050 | P1 | Rawtx concurrency | `crates/el-rawtx/src/lib.rs`, `crates/el-rawtx/src/p2p.rs` | Concurrent wallet/prefetch requests for the same block each downloaded it, and P2P tried up to 4 peers × v2/v1 × the 30 s Core timeout with no memory of failures. One block could take minutes (`dac454` failed after 134 s). | In-flight block dedup, `max_parallel_fetches=4`, P2P `p2p_timeout_seconds=8` with a 2× total cap, connected-peers-first discovery, last-good-first ordering, failed-peer cooldown, `connect_timeout`, and a Tor circuit breaker. Silent-peer, cooldown and shared-download tests added. |
 
 ## Residual risks and intentional limits
 

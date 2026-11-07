@@ -164,13 +164,15 @@ e-lite run --network mainnet --allow-mainnet \
 | `--p2p-peers <a,b>` | `rawtx.p2p_peers` | discovered from Core |
 | `--no-p2p` | `rawtx.use_p2p=false` | enabled |
 | `--no-esplora` | `rawtx.use_esplora=false` | enabled |
-| `--decoys <n>` | `rawtx.decoys` | `3` |
+| `--decoys <n>` | `rawtx.decoys` | `1` (max 2 in flight) |
 | `--rawtx-cache-mib <n>` | `rawtx.cache_mib` | `2048` |
 | `--tor-socks <addr>` | `rawtx.tor_socks` | `127.0.0.1:9050` |
 | `--allow-clearnet` | `rawtx.allow_clearnet` | `false` |
 | `--set rawtx.tor_fallback_clearnet=true` | use clearnet when Tor fails | `true` |
-| `--set rawtx.request_timeout_seconds=<n>` | per-provider block timeout | `15` |
-| `--set rawtx.provider_cooldown_seconds=<n>` | skip Tor for a failed provider | `120` |
+| `--set rawtx.request_timeout_seconds=<n>` | per-provider block timeout | `8` |
+| `--set rawtx.provider_cooldown_seconds=<n>` | cool down a failed provider (Tor or direct) | `300` |
+| `--set rawtx.max_parallel_fetches=<n>` | concurrent external block downloads | `4` |
+| `--set rawtx.p2p_timeout_seconds=<n>` | P2P connect/handshake/block timeout | `8` |
 | `--set public_servers.require_ready=false` | start without a ready provider | `true` |
 | `--no-rawtx` | `rawtx.enabled=false` | enabled |
 | `--tls-listen <addr>` | `server.tls_listen` | disabled |
