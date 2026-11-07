@@ -228,10 +228,15 @@ isolates e-lite from download speed.
 | | `readers=8` | 0.280 s | 17,857 | 22 MiB | 3.7 MB |
 | | `batch=64` | 0.481 s | 10,395 | 21 MiB | 3.7 MB |
 | | `batch=1024` | 0.283 s | 17,668 | 23 MiB | 3.7 MB |
-| 400 blocks × 100 outputs (40k outputs) | default (256) | 0.490 s | 816 | 69 MiB | 20.9 MB |
-| | `readers=4` | 0.475 s | 842 | 67 MiB | 20.9 MB |
-| | `batch=64` | 0.710 s | 563 | 53 MiB | 20.9 MB |
-| | `batch=1024` | 0.500 s | 800 | 69 MiB | 20.9 MB |
+| 400 blocks × 100 outputs (511 indexed incl. premine) | default (256) | 0.485 s | 1,054 | 71 MiB | 21.8 MB |
+| | `batch=1024` | 0.484 s | 1,056 | 67 MiB | 20.9 MB |
+
+The first table was measured on 0.1.0-alpha.29.4.0 with the old block count
+(it excluded the 110 premine blocks). The second table is the same workload on
+0.1.0-alpha.29.4.2 with the corrected count and the commit-group undo coverage:
+wall time is unchanged (0.485 s vs 0.490 s) and the index is ~4 % larger because
+the last reorg window is always retained. That is the accepted cost of a
+committed tip that can always be rewound.
 
 Conclusions kept: `batch_blocks = 256` is the best default (`64` is ~30-50 %
 slower on output-heavy blocks; `1024` is not faster and holds more work).
