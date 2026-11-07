@@ -80,7 +80,9 @@ for spec in "${specs[@]}"; do
     "$RUN/$name.log" "$RUN/$name.meta" -- "$BIN" "${args[@]}"
   read -r secs rss <"$RUN/$name.meta"
   bytes=$(du -sb "$data" | cut -f1)
-  blocks=$((TIP - 110))
+  # The index starts at genesis, so it processes TIP + 1 blocks (the 110
+  # premine blocks are part of the chain, not excluded).
+  blocks=$((TIP + 1))
   txs=$(sed -n 's/.*txnum \([0-9]*\).*/\1/p' "$RUN/$name.log" | tail -1)
   txs=${txs:-0}
   bps=$(python3 -c "print(f'{$blocks/$secs:.1f}')")

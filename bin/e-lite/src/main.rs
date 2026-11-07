@@ -2723,14 +2723,21 @@ impl Indexer {
                 }
             };
             let t0 = Instant::now();
-            // Undo is only useful for the reorg window. Writing it for every
-            // historical block and deleting it a few commits later was pure
-            // write amplification. Anchor the window to the highest block this
-            // catch-up call may apply (`target`), not to Core's tip: when the
-            // index lags, the last blocks it commits are its own tip and must
-            // stay rewindable even if Core is far ahead. Keep a safety margin
-            // for an interrupted catch-up.
-            let keep_undo = should_store_undo(height, target, self.cfg.index.reorg_window);
+            // Undo is only useful for the reorg window. Anchor the window to
+            // the end of the current commit group, not to Core's tip: a commit
+            // always happens at a group boundary, so the blocks that can
+            // become the committed tip keep their undo even when the index is
+            // far behind Core. `group_end` is bounded by the highest block
+            // this catch-up call may apply so the last group is also covered.
+            let batch_blocks = self.tunables.batch_blocks().max(1) as u64;
+            let group_start = height.saturating_sub(count as u64);
+            let group_end = group_start
+                .saturating_add(batch_blocks.saturating_sub(1))
+                .min(target);
+            let keep_undo = should_store_undo(height, group_end, self.cfg.index.reorg_window);
+            // A time-based commit is only safe when the current tip already
+            // has its whole reorg window; otherwise wait for the group end.
+            let undo_ready = keep_undo;
             match apply_prepared_with_prefetch(
                 &self.store,
                 height as u32,
@@ -2795,7 +2802,7 @@ impl Indexer {
             let _ = permit_tx.send(());
             let commit_due = count >= self.tunables.batch_blocks().max(1)
                 || group_txids.len() >= self.tunables.max_group_txs()
-                || group_started.elapsed() >= self.tunables.commit_interval();
+                || (group_started.elapsed() >= self.tunables.commit_interval() && undo_ready);
             if commit_due {
                 let current = tip.expect("tip set");
                 let sync =
@@ -2853,7 +2860,12 @@ impl Indexer {
             }
         }
 
-        if result.is_ok() && count > 0 && !paused_by_disk && !self.disk_guard() {
+        // Commit a partial group only if it contains undo for its tip. A
+        // supervisor-deadline break can leave the group before its undo zone
+        // (large bulk batches); dropping those applied blocks is cheaper than
+        // committing a tip that cannot be rewound. A clean end-of-call always
+        // covers the tip, so no progress is lost there.
+        if result.is_ok() && count > 0 && group_undo && !paused_by_disk && !self.disk_guard() {
             let current = tip.expect("tip set");
             let sync = self.commit_sync(info.initialblockdownload, current.height as u64, core_tip);
             self.commit_group(
@@ -4960,6 +4972,17 @@ mod tests {
         // A short batch (near the tip) keeps undo throughout.
         assert!(should_store_undo(0, 100, 288));
         assert!(should_store_undo(0, 0, 288));
+        // With the default batch (256 <= window + 64) every block in the
+        // group is covered, so a commit at any point in the group is safe.
+        let start = 1_000u64;
+        let end = start + 255;
+        for h in start..=end {
+            assert!(should_store_undo(h, end, 288));
+        }
+        // A 512-block group only skips the part that cannot become a commit
+        // tip (the group commits at its end).
+        assert!(!should_store_undo(start, start + 511, 288));
+        assert!(should_store_undo(start + 160, start + 511, 288));
     }
 
     #[test]

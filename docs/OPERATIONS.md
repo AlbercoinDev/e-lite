@@ -141,6 +141,11 @@ e-lite run --network regtest
 `[core] core_datadir` and `[core] rpc_url` in each instance (different RPC
 ports). Never point two instances at the same Core datadir.
 
+A managed Tor uses a per-network SOCKS port so instances can start together:
+9050 on mainnet and 55150/55250/55350 on testnet4/signet/regtest. If the
+preferred port is busy, e-lite falls back to 9050 and then 19050-19100. Set
+`[tor] socks_port` to pin one explicitly.
+
 Moving an existing installation: stop e-lite, then move the index and the Core
 datadir into the new per-network folder (same filesystem, so it is a rename):
 

@@ -62,13 +62,19 @@ Never treat a version number in this file as authoritative over the code/tag.
   (`prune_defer_free_gib = 0`), only by the 1k-block gain and 30 s interval.
 - Never authorise a Core prune from a tip that is not durable: flush RocksDB/WAL
   first. A failed prune RPC must retry the same safe height after backoff.
-- Anchor the undo window to the highest block of the **catch-up batch**, not to
-  Core's tip (`should_store_undo`). A lagging index must keep the last
-  `reorg_window + 64` blocks rewindable at its own committed tip. A Core
+- Anchor the undo window to the end of the **current commit group**, not to
+  Core's tip (`should_store_undo`). A time-based commit must wait until the tip
+  has its whole `reorg_window + 64` window, and a partial group without undo is
+  not committed. With the default batch every group block is covered; a larger
+  bulk group skips only the prefix that cannot become a commit tip. A Core
   rollback deeper than the window is `NEEDS_RECOVERY`, never a silent reindex.
 - Crash recovery: SIGKILL during indexing, a write failure and a reorg at the
   indexed tip must all recover through RocksDB/WAL and undo. Covered by
   `tests/e2e_recovery.sh`; run it after touching commit, undo or rewind.
+- Multi-instance: one Core datadir per network, per-network Electrum/TLS/metrics
+  ports and per-network managed-Tor SOCKS ports (9050 mainnet; 55150/55250/
+  55350 for testnet4/signet/regtest). `tests/e2e_multi_instance.sh` covers two
+  simultaneous instances, distinct certificates and independent shutdown.
 - Drop locators for deleted `blk*.dat` files (sidecar compaction at open and
   in-memory filtering after prune) and only hold a ReaderTracker guard when the
   block is still at/above Core's prune height; external resolutions must not

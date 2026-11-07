@@ -1,5 +1,28 @@
 # Changelog
 
+## 0.1.0-alpha.29.4.2 — 2026-11-07
+
+### Patch: undo at commit boundaries, per-network SOCKS and multi-instance tests
+
+- **Undo anchored to the commit group**: the reorg window is now relative to
+  the end of the current commit group, and a time-based commit waits until the
+  tip has its whole undo window. With the default batch (256 <= window + 64)
+  every block of a group is covered; with larger bulk batches only the part
+  that cannot become a commit tip is skipped. A partial group without undo is
+  not committed, so no committed tip is left unrecoverable.
+- **Per-network SOCKS ports**: a managed Tor uses 9050 on mainnet and
+  55150/55250/55350 on testnet4/signet/regtest, so several managed instances
+  can start together without racing for the same socket. Explicit
+  `tor.socks_port` still wins.
+- **Multi-instance test** (`tests/e2e_multi_instance.sh`): two regtest Cores and
+  two e-lite instances with independent plain/TLS/metrics ports and data dirs;
+  verifies both heights, distinct certificates, combined RSS, and that stopping
+  or restarting one does not affect the other.
+- **TLS trust test**: `e2e_defaults.sh` now validates the generated certificate
+  as a CA with `check_hostname` for `localhost` and the LAN IP, and checks that
+  a hostname outside the SAN is rejected.
+- Benchmark block count now includes the genesis/premine blocks it indexes.
+
 ## 0.1.0-alpha.29.4.1 — 2026-11-07
 
 ### Patch: undo at the committed tip, TLS hardening and input validation

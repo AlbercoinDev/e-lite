@@ -236,6 +236,18 @@ impl Chain {
         }
     }
 
+    /// Default SOCKS port for a managed Tor. Mainnet keeps the conventional
+    /// 9050; the other networks use distinct ports so several managed
+    /// instances can start at once without racing for the same socket.
+    pub fn default_socks_port(self) -> u16 {
+        match self {
+            Chain::Mainnet => 9050,
+            Chain::Testnet4 => 55150,
+            Chain::Signet => 55250,
+            Chain::Regtest => 55350,
+        }
+    }
+
     /// Loopback metrics listener, one per network so instances do not clash.
     pub fn default_metrics_port(self) -> u16 {
         match self {
@@ -362,6 +374,28 @@ mod tests {
             assert_eq!(r.tx_pos(), p);
         }
         assert!(TxRef::try_new(1, 1 << 24).is_err());
+    }
+
+    #[test]
+    fn network_ports_and_socks_are_distinct() {
+        use std::collections::HashSet;
+        let chains = [
+            Chain::Mainnet,
+            Chain::Testnet4,
+            Chain::Signet,
+            Chain::Regtest,
+        ];
+        let mut plain = HashSet::new();
+        let mut tls = HashSet::new();
+        let mut metrics = HashSet::new();
+        let mut socks = HashSet::new();
+        for chain in chains {
+            assert!(plain.insert(chain.default_electrum_port()));
+            assert!(tls.insert(chain.default_electrum_tls_port()));
+            assert!(metrics.insert(chain.default_metrics_port()));
+            assert!(socks.insert(chain.default_socks_port()));
+        }
+        assert_eq!(Chain::Mainnet.default_socks_port(), 9050);
     }
 
     #[test]

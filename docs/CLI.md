@@ -220,7 +220,7 @@ returning an error, so a wallet's initial gap scan is not aborted.
 | `--tor-auto-cert` / `--no-tor-auto-cert` | `tor.tls_auto_cert` | `true` |
 | `--tor-onion-port <n>` | `tor.onion_port` | `0` (same as `server.listen`) |
 | `--tor-onion-tls-port <n>` | `tor.onion_tls_port` | `0` (same as `server.tls_listen`) |
-| `--tor-socks-port <n>` | `tor.socks_port` | `0` (9050 if free, else 19050+) |
+| `--tor-socks-port <n>` | `tor.socks_port` | `0` (per-network: 9050 mainnet, 55150/55250/55350; then 19050+) |
 | `--tor-binary <path>` | `tor.binary` | installer bundle, then PATH |
 | `--tor-target-plain <addr>` | `tor.target_plain` | `server.listen` (wildcard mapped to loopback) |
 | `--tor-target-tls <addr>` | `tor.target_tls` | `server.tls_listen` (wildcard mapped to loopback) |

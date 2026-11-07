@@ -73,9 +73,11 @@ for _ in $(seq 1 120); do
 done
 [ -f "$DATA/tls/self-signed.crt" ] || { echo "certificate not generated" >&2; tail -40 "$RUN/serve.log"; exit 1; }
 
-python3 - "$PLAIN" "$TLS" "$DATA/tls/self-signed.crt" "$METRICS" <<'PY'
+LAN_IP=$(hostname -I 2>/dev/null | awk '{print $1}')
+python3 - "$PLAIN" "$TLS" "$DATA/tls/self-signed.crt" "$METRICS" "$LAN_IP" <<'PY'
 import json, socket, ssl, sys, urllib.request
 plain, tls, cert, metrics = int(sys.argv[1]), int(sys.argv[2]), sys.argv[3], int(sys.argv[4])
+lan_ip = sys.argv[5]
 
 def call(port, use_tls):
     s = socket.create_connection(("127.0.0.1", port), timeout=5)
@@ -102,6 +104,34 @@ st = json.load(urllib.request.urlopen(f"http://127.0.0.1:{metrics}/status"))
 assert st["tls_listen"] == f"0.0.0.0:{tls}", st.get("tls_listen")
 assert st["listen"] == f"0.0.0.0:{plain}", st.get("listen")
 assert st["tls_handshakes"] >= 1, st.get("tls_handshakes")
+
+def verified(host, server_hostname):
+    """Full wallet-style validation: trust the generated cert as CA and check
+    the name the client asked for."""
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    ctx.load_verify_locations(cafile=cert)
+    ctx.check_hostname = True
+    ctx.verify_mode = ssl.CERT_REQUIRED
+    s = ctx.wrap_socket(socket.create_connection((host, tls), timeout=5),
+                        server_hostname=server_hostname)
+    f = s.makefile("rwb")
+    f.write(json.dumps({"id": 1, "method": "server.version",
+                        "params": ["verified", "1.4"]}).encode() + b"\n")
+    f.flush()
+    reply = json.loads(f.readline())
+    s.close()
+    return negotiated(reply)
+
+assert verified("127.0.0.1", "localhost") == "1.4"
+if lan_ip:
+    assert verified(lan_ip, lan_ip) == "1.4"
+try:
+    verified("127.0.0.1", "wrong.example")
+except ssl.SSLCertVerificationError:
+    pass
+else:
+    raise AssertionError("the certificate validated a hostname it does not cover")
+print("verified TLS: localhost +", lan_ip or "no LAN IP", "+ wrong host rejected")
 print("plain", st["listen"], "tls", st["tls_listen"], "state", st["state"])
 PY
 
@@ -112,7 +142,6 @@ echo "$TEXT" | grep -q "DNS:localhost" || {
 }
 # A LAN address, when the host has one, must be covered so a wallet connecting
 # by IP can validate the certificate.
-LAN_IP=$(hostname -I 2>/dev/null | awk '{print $1}')
 if [ -n "$LAN_IP" ]; then
   echo "$TEXT" | grep -q "IP Address:$LAN_IP" || {
     echo "self-signed certificate lacks the LAN IP SAN $LAN_IP" >&2

@@ -295,11 +295,17 @@ fn port_free(port: u16) -> bool {
     TcpListener::bind(("127.0.0.1", port)).is_ok()
 }
 
-fn choose_socks_port(cfg: &Config) -> Result<u16, String> {
+fn choose_socks_port(cfg: &Config, chain: Chain) -> Result<u16, String> {
     if cfg.tor.socks_port > 0 {
         return Ok(cfg.tor.socks_port);
     }
-    if port_free(9050) {
+    // Per-network defaults avoid a race when several managed instances start
+    // together. Mainnet keeps 9050 for compatibility with existing setups.
+    let preferred = chain.default_socks_port();
+    if port_free(preferred) {
+        return Ok(preferred);
+    }
+    if preferred != 9050 && port_free(9050) {
         return Ok(9050);
     }
     for port in 19_050..=19_100 {
@@ -307,10 +313,9 @@ fn choose_socks_port(cfg: &Config) -> Result<u16, String> {
             return Ok(port);
         }
     }
-    Err(
-        "cannot find a free SOCKS port for the managed Tor (9050 and 19050-19100 are busy)"
-            .to_string(),
-    )
+    Err(format!(
+        "cannot find a free SOCKS port for the managed Tor ({preferred}, 9050 and          19050-19100 are busy)"
+    ))
 }
 
 fn write_private(path: &Path, data: &[u8]) -> Result<(), String> {
@@ -341,7 +346,7 @@ pub fn prepare(cfg: &mut Config, chain: Chain) -> Result<(), String> {
         return Ok(());
     }
     if cfg.tor.socks_port == 0 {
-        cfg.tor.socks_port = choose_socks_port(cfg)?;
+        cfg.tor.socks_port = choose_socks_port(cfg, chain)?;
     }
     // Use the managed Tor for rawtx too, unless the operator configured an
     // explicit non-default proxy.
@@ -420,7 +425,7 @@ pub fn spawn(
         fs::set_permissions(dir, perms).map_err(|e| format!("{}: {e}", dir.display()))?;
     }
 
-    let socks = choose_socks_port(cfg)?;
+    let socks = choose_socks_port(cfg, chain)?;
     let torrc = render_torrc(cfg, &tor_dir, socks)?;
     let torrc_path = tor_dir.join("torrc");
     write_private(&torrc_path, torrc.as_bytes())?;

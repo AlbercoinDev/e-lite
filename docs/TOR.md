@@ -68,7 +68,8 @@ tls = true                   # publish the network TLS port
 tls_auto_cert = true         # deprecated: use [server] tls_auto_cert
 onion_port = 0               # 0 = same as server.listen
 onion_tls_port = 0           # 0 = same as server.tls_listen
-socks_port = 0               # 0 = 9050 if free, else 19050+
+socks_port = 0               # 0 = per-network (9050 mainnet, 55150/55250/55350),
+                             # then 9050, then 19050+
 binary = ""                  # "" = installer bundle, then `tor` in PATH
 start_timeout_seconds = 120
 # data_dir = ""              # default <data-dir>/tor

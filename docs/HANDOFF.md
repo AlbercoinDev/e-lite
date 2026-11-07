@@ -1,9 +1,9 @@
 # Session handoff
 
 **Updated:** 2026-11-07
-**Latest published release:** `0.1.0-alpha.29.4.1`
-**Release:** https://github.com/AlbercoinDev/e-lite/releases/tag/v0.1.0-alpha.29.4.1
-**Main commit at handoff:** tag `v0.1.0-alpha.29.4.1`
+**Latest published release:** `0.1.0-alpha.29.4.2`
+**Release:** https://github.com/AlbercoinDev/e-lite/releases/tag/v0.1.0-alpha.29.4.2
+**Main commit at handoff:** tag `v0.1.0-alpha.29.4.2`
 
 This file is the short “where we are” for a new session. The invariants live in
 [`AGENTS.md`](../AGENTS.md) and [`PROJECT_MEMORY.md`](PROJECT_MEMORY.md); the
@@ -83,6 +83,18 @@ no repitas contexto ni rehagas decisiones ya documentadas.
   the onion setup, reset and security.
 - `docs/ROADMAP.md` contains future features/improvements. Do not present them as
   available.
+
+## Last change (alpha.29.4.2)
+
+- **Undo at commit boundaries**: the window follows the end of the current
+  commit group and time-based commits wait for undo coverage; a partial group
+  without undo is not committed.
+- **Per-network SOCKS**: managed Tor defaults to 9050 (mainnet) and
+  55150/55250/55350 (testnet4/signet/regtest), avoiding startup races between
+  instances.
+- **New tests**: `tests/e2e_multi_instance.sh` (two instances, independent
+  listeners, distinct certs, combined RSS, stop/restart isolation) and full
+  TLS trust/hostname validation in `tests/e2e_defaults.sh`.
 
 ## Last change (alpha.29.4.1)
 
@@ -562,6 +574,9 @@ cargo test --workspace
 tests/e2e_launch_core.sh
 tests/e2e_pruned_ibd.sh
 tests/e2e_regtest.sh
+tests/e2e_defaults.sh
+tests/e2e_recovery.sh
+tests/e2e_multi_instance.sh
 ```
 
 Hot reload:
@@ -590,6 +605,6 @@ startup/shutdown/memory assertions, `e-lite.log` presence, 1.6 and 1.7
 negotiation on the same instance, scriptpubkey/outpoint checks, outpoint
 notification, real testmempoolaccept, the rate-limit burst test, the strict
 Core RPC check and the Sparrow sequence with confirmed verbose transaction)
-passed on the alpha.29.4.1 code. Full signet/testnet4 acceptance
+passed on the alpha.29.4.2 code. Full signet/testnet4 acceptance
 is still operator-run; results belong in `docs/GETTING-STARTED.md`/release notes
 when available.
