@@ -55,9 +55,12 @@ Expected:
 - Core starts or is adopted; state `WAITING_FOR_CORE` → `BUILDING_INDEX` → `READY`.
 - `prune_mib=1`: Core does not prune by itself; e-lite’s prune gate does.
 - `/status` shows `indexed_height`, `core_height`, `pruneheight`, `tuning`.
-- Electrum at `127.0.0.1:50001` (plain); metrics at `127.0.0.1:9184`.
-- Optional TLS listener: `--tls-listen`/`--tls-cert`/`--tls-key` (see
-  [`OPERATIONS.md`](OPERATIONS.md#electrum-tls-optional)).
+- Electrum at `0.0.0.0:55011` (plain) and `0.0.0.0:55022` (TLS) for mainnet;
+  signet uses `55211`/`55222`; metrics at `127.0.0.1:55084` (`55284` signet).
+- TLS is enabled by default on the network TLS port with a generated
+  self-signed certificate; `--no-tls` disables it. Operator PEMs:
+  `--tls-listen`/`--tls-cert`/`--tls-key` (see
+  [`OPERATIONS.md`](OPERATIONS.md#electrum-tls)).
 
 ## 4. Automated suite
 
@@ -90,7 +93,7 @@ The script refuses to start below 15/20 GiB free unless
 
 ```bash
 kill -USR1 "$(pgrep -f 'e-lite run')"
-curl -s http://127.0.0.1:9184/status | python3 -m json.tool | grep -A20 '"tuning"'
+curl -s http://127.0.0.1:55084/status | python3 -m json.tool | grep -A20 '"tuning"'
 ```
 
 Change `readers`, `cache_mib` (maximum), `commit_interval_ms`, `batch_blocks`,
@@ -104,7 +107,7 @@ data dir/network require restart.
 - [ ] `--with-core` installs/updates the latest official Core.
 - [ ] Installer downloads/verifies the Tor bundle; `--without-tor` skips it.
 - [ ] `e-lite --version` matches the release.
-- [ ] Managed Tor creates `<addr>.onion:50001` and `:50002`; the TLS certificate SAN includes the onion.
+- [ ] Managed Tor publishes the network plain/TLS ports (55011/55022 on mainnet); the TLS certificate SAN includes the onion.
 - [ ] `e-lite onion show` prints the address; `onion reset` (stopped) changes it on the next start.
 - [ ] The memory budget line appears, the cache grows in steps, and page cache stays above the reserve.
 - [ ] From-zero pruned sync reaches `READY` with `prune_mib=1`.

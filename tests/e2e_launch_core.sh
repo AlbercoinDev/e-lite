@@ -46,6 +46,7 @@ poll_seconds = 1
 
 [server]
 listen = "127.0.0.1:$ELECTRUM"
+tls = false
 
 [metrics]
 listen = "127.0.0.1:$METRICS"

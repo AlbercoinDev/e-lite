@@ -43,6 +43,7 @@ poll_seconds = 1
 
 [server]
 listen = "127.0.0.1:$ELECTRUM"
+tls = false
 
 [metrics]
 listen = "127.0.0.1:$METRICS"
@@ -62,9 +63,14 @@ except Exception: print("DOWN")' 2>/dev/null || echo DOWN
 }
 
 echo "== start e-lite with no Core =="
-for _ in $(seq 1 60); do [ "$(state)" = WAITING_FOR_CORE ] && break; sleep 0.5; done
-echo "state before Core: $(state)"
-[ "$(state)" = WAITING_FOR_CORE ] || { tail -30 "$RUN/serve.log"; exit 1; }
+# Before Core answers there is no network identity yet, so no HTTP transport:
+# the process logs the wait and retries with backoff.
+for _ in $(seq 1 60); do
+  grep -q "waiting for Bitcoin Core" "$RUN/serve.log" && break
+  sleep 0.5
+done
+grep -q "waiting for Bitcoin Core" "$RUN/serve.log" || { tail -30 "$RUN/serve.log"; exit 1; }
+echo "state before Core: $(state) (transports open only after Core answers)"
 
 echo "== start Core =="
 bitcoind -regtest -datadir="$CORE" -daemon -server -listen=0 \

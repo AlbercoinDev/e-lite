@@ -10,9 +10,18 @@ connect without opening a port, port-forwarding or using clearnet. Tor is
 On `e-lite run` or `e-lite serve` with the default configuration:
 
 - a v3 onion address, e.g. `abcdef...xyz.onion`;
-- plain Electrum on `<addr>.onion:50001`;
-- TLS Electrum on `<addr>.onion:50002` (self-signed certificate by default);
+- plain Electrum on the network plain port (`50011`-style defaults below);
+- TLS Electrum on the network TLS port (self-signed certificate by default);
 - the same Tor SOCKS proxy used for external rawtx/repair requests.
+
+The onion mirrors the active network's ports, so instances do not collide:
+
+| Network | Onion plain | Onion TLS |
+|---|---:|---:|
+| mainnet | 55011 | 55022 |
+| testnet4 | 55111 | 55122 |
+| signet | 55211 | 55222 |
+| regtest | 55311 | 55322 |
 
 The address is stable across restarts as long as `<data-dir>/tor/onion` is
 preserved. `e-lite onion reset` creates a new one.
@@ -54,9 +63,9 @@ Tor Project; e-lite does not redistribute the binary in its release assets.
 ```toml
 [tor]
 mode = "managed"             # managed | off
-plain = true                 # publish 50001
-tls = true                   # publish 50002
-tls_auto_cert = true         # self-signed cert if tls_cert/tls_key are empty
+plain = true                 # publish the network plain port
+tls = true                   # publish the network TLS port
+tls_auto_cert = true         # deprecated: use [server] tls_auto_cert
 onion_port = 0               # 0 = same as server.listen
 onion_tls_port = 0           # 0 = same as server.tls_listen
 socks_port = 0               # 0 = 9050 if free, else 19050+
@@ -72,14 +81,14 @@ CLI equivalents:
 ```bash
 e-lite run --network mainnet --allow-mainnet \
   --tor-mode managed --tor-plain --tor-tls \
-  --tor-onion-port 50001 --tor-onion-tls-port 50002
+  --tor-onion-port 55011 --tor-onion-tls-port 55022
 ```
 
 Use `--no-tor` to disable Tor for one run.
 
-If the Electrum listener binds a wildcard (`0.0.0.0:50001` or `[::]:50001`),
-the onion target is automatically the loopback address (`127.0.0.1:50001` or
-`[::1]:50001`): the wildcard socket accepts loopback connections, so this is
+If the Electrum listener binds a wildcard (`0.0.0.0:55011` or `[::]:55011`),
+the onion target is automatically the loopback address (`127.0.0.1:55011` or
+`[::1]:55011`): the wildcard socket accepts loopback connections, so this is
 safe. A specific non-loopback address is refused unless you set a reachable
 loopback `target_plain`/`target_tls`.
 
@@ -88,14 +97,10 @@ the Electrum listener". With `--listen 0.0.0.0:51001 --tls-listen 0.0.0.0:51002`
 the onion is published as `<addr>.onion:51001` and `<addr>.onion:51002`. Set an
 explicit value to publish a different virtual port.
 
-If `[server] tls_listen` is empty and `[tor] tls = true`, the effective TLS
-listener becomes `127.0.0.1:50002`. If that port is busy, e-lite logs a warning
-and publishes only the plain onion port.
-
 ### TLS certificate
 
-When `server.tls_cert`/`server.tls_key` are empty and `tls_auto_cert = true`,
-e-lite generates:
+TLS does not depend on Tor. On the first `run`/`serve` with TLS enabled and no
+operator certificate, e-lite generates and reuses:
 
 ```
 <data-dir>/tls/self-signed.crt
@@ -103,12 +108,18 @@ e-lite generates:
 <data-dir>/tls/self-signed.san
 ```
 
-The SAN covers `localhost`, `127.0.0.1` and the onion address once it exists.
-The certificate is regenerated when the address changes; `CertWatcher` reloads
-it without restarting. Operator-provided certificates are never overwritten.
+The SAN covers `localhost`, `127.0.0.1`, `::1`, the machine hostname and the
+onion address once it exists. The certificate is regenerated when the SAN set
+changes; `CertWatcher` reloads it without restarting. Operator-provided
+certificates are never overwritten. The startup log prints the certificate path
+and its SHA-256 so it can be imported into a wallet.
+
+If Tor is unavailable, the clearnet plain and TLS listeners keep working; only
+the onion is missing. The same is true in reverse: `[tor] mode = "off"` serves
+TLS with the generated certificate.
 
 Some wallets accept self-signed certificates for `.onion`; others do not. Plain
-50001 remains available.
+Electrum on the network port remains available.
 
 ## Commands
 
@@ -136,8 +147,9 @@ resolution before `[tor] binary` and the installer bundle.
 
 Use the onion address shown by `e-lite onion show` or `/status`:
 
-- plain: `tcp://<addr>.onion:50001`
-- TLS: `ssl://<addr>.onion:50002`
+- plain: `tcp://<addr>.onion:<network plain port>` (55011 mainnet, 55111 testnet4,
+  55211 signet, 55311 regtest)
+- TLS: `ssl://<addr>.onion:<network TLS port>` (55022, 55122, 55222, 55322)
 
 The address is case-insensitive and must be copied exactly (56 characters plus
 `.onion`).
@@ -175,5 +187,5 @@ The address is case-insensitive and must be copied exactly (56 characters plus
 - Address changed unexpectedly: the onion keys were removed, the data directory
   moved, or `e-lite onion reset` was used.
 - `onion reset` refuses: stop e-lite first (the managed Tor PID file is alive).
-- TLS port busy: free `127.0.0.1:50002` or set `[tor] tls = false` / a custom
-  `[server] tls_listen`.
+- TLS port busy: free the network TLS port, set `[server] tls_listen` to another
+  address, or disable TLS for that instance (`[server] tls = false`).

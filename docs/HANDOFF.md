@@ -1,9 +1,9 @@
 # Session handoff
 
 **Updated:** 2026-11-07
-**Latest published release:** `0.1.0-alpha.29.3.7`
-**Release:** https://github.com/AlbercoinDev/e-lite/releases/tag/v0.1.0-alpha.29.3.7
-**Main commit at handoff:** tag `v0.1.0-alpha.29.3.7`
+**Latest published release:** `0.1.0-alpha.29.4.0`
+**Release:** https://github.com/AlbercoinDev/e-lite/releases/tag/v0.1.0-alpha.29.4.0
+**Main commit at handoff:** tag `v0.1.0-alpha.29.4.0`
 
 This file is the short “where we are” for a new session. The invariants live in
 [`AGENTS.md`](../AGENTS.md) and [`PROJECT_MEMORY.md`](PROJECT_MEMORY.md); the
@@ -37,11 +37,14 @@ no repitas contexto ni rehagas decisiones ya documentadas.
   by itself; the prune gate keeps the cut below `index - 288`.
 - `prune_mib >= 550` requires `[pruning] allow_auto_prune = true`.
 - Snapshots are optional and are not needed for the from-zero flow.
-- Electrum is plain TCP on `127.0.0.1:50001` by default. Optional TLS is
-  available on `[server] tls_listen` with `tls_cert`/`tls_key`; the PEM files are
-  reloaded when they change. `[tor] mode = "managed"` (default) runs e-lite's own
-  Tor and publishes plain 50001 + TLS 50002 as a v3 onion; TLS uses an
-  auto-generated self-signed certificate when none is configured. Wildcard
+- Electrum binds per-network defaults: plain/TLS/metrics are
+  `55011/55022/55084` (mainnet), `55111/55122/55184` (testnet4),
+  `55211/55222/55284` (signet) and `55311/55322/55384` (regtest), on `0.0.0.0`
+  for Electrum. TLS is on by default with a generated self-signed certificate
+  (`<data-dir>/tls/`) and does not depend on Tor; `tls = false` / `--no-tls`
+  disables it. `[tor] mode = "managed"` (default) publishes the same plain/TLS
+  ports as a v3 onion. Data defaults to `~/e-lite/<network>` and Core to
+  `<data-dir>/bitcoin`, so one instance per chain can run at once. Wildcard
   listeners (`0.0.0.0`/`[::]`) are mapped to loopback onion targets. The
   installer-provisioned Tor bundle is launched with `LD_LIBRARY_PATH` pointing
   at its own libraries. There is no client authentication; treat the onion
@@ -80,6 +83,21 @@ no repitas contexto ni rehagas decisiones ya documentadas.
   the onion setup, reset and security.
 - `docs/ROADMAP.md` contains future features/improvements. Do not present them as
   available.
+
+## Last change (alpha.29.4.0)
+
+- **Per-network ports**: 55011/55022/55084 (mainnet), 55111/55122/55184
+  (testnet4), 55211/55222/55284 (signet), 55311/55322/55384 (regtest).
+- **TLS on by default** with an auto self-signed certificate that does not
+  require Tor; `--no-tls` disables it. Operator PEMs are preserved.
+- **Per-network data/Core layout**: `~/e-lite/<network>` and
+  `<data-dir>/bitcoin`; a single legacy Core datadir is detected with a
+  migration warning, two candidates are rejected as ambiguous.
+- **`run` serves offline**: an existing index opens Electrum in
+  `CORE_UNAVAILABLE` while the index loop retries Core; first runs still wait.
+- New `tests/e2e_defaults.sh`; regtest, pruned-IBD, resilience and wait-Core
+  e2e pass. `e2e_networks.sh` needs 15 GiB free and real signet/testnet4
+  downloads; it was not completed on the development VM (3.9 GiB free).
 
 ## Last change (alpha.29.3.7)
 
@@ -559,6 +577,6 @@ startup/shutdown/memory assertions, `e-lite.log` presence, 1.6 and 1.7
 negotiation on the same instance, scriptpubkey/outpoint checks, outpoint
 notification, real testmempoolaccept, the rate-limit burst test, the strict
 Core RPC check and the Sparrow sequence with confirmed verbose transaction)
-passed on the alpha.29.3.7 code. Full signet/testnet4 acceptance
+passed on the alpha.29.4.0 code. Full signet/testnet4 acceptance
 is still operator-run; results belong in `docs/GETTING-STARTED.md`/release notes
 when available.

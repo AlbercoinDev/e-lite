@@ -1,7 +1,7 @@
 # Code audit
 
-**Base:** `0.1.0-alpha.29.3.6` → published `0.1.0-alpha.29.3.7` · **Scope:** `bin/e-lite`, `crates/*` (26 Rust files,
-~19k lines) · **Status:** findings fixed in `0.1.0-alpha.29.3.7` where noted.
+**Base:** `0.1.0-alpha.29.3.7` → published `0.1.0-alpha.29.4.0` · **Scope:** `bin/e-lite`, `crates/*` (26 Rust files,
+~19k lines) · **Status:** findings fixed in `0.1.0-alpha.29.4.0` where noted.
 
 This audit is not a claim of formal verification. It records static checks,
 manual review areas, concrete findings and residual risks.
@@ -86,6 +86,10 @@ Additional checks performed:
 | AUD-066 | P2 | Pruned block locators | `crates/el-blocks/src/lib.rs`, `bin/e-lite/src/main.rs` | The sidecar kept locators for deleted `blk*.dat` files and the reader cache kept descriptors open, so pruned space could remain allocated and stale locators were tried. | Filter missing files at open and compact the sidecar before the scanner starts; after a prune filter the in-memory map and clear the reader cache. Tests cover locator filtering/compaction. |
 | AUD-067 | P2 | Reader guard vs pruning | `crates/el-serve/src/lib.rs` | `ReaderTracker` was entered for every rawtx height, including blocks below Core's prune height that must be resolved externally, blocking pruning for no reason. | Enter a guard only when `height >= core_pruneheight`; prefetch never holds a guard. |
 | AUD-068 | P3 | Prune gain | `bin/e-lite/src/config.rs` | 10k safe blocks retained a large tail (~15 GiB mainnet) despite the space-first goal. | Lower default to 1k (~1.5 GiB, rounded to Core block files); 30 s interval remains. |
+| AUD-069 | P2 | Listener defaults | `bin/e-lite/src/config.rs`, `crates/el-model/src/types.rs` | Every network defaulted to `127.0.0.1:50001`/`50002`/`9184`, so two instances collided and instances were loopback-only. | Per-network plain/TLS/metrics ports, wildcard plain bind paired with a same-host TLS listener, and `--no-tls`; explicit overrides still win. Unit tests assert no port reuse across chains. |
+| AUD-070 | P1 | TLS vs Tor | `bin/e-lite/src/tor.rs`, `bin/e-lite/src/tls.rs` | TLS was enabled and the certificate generated inside `tor::prepare`; a Tor error cleared `tls_listen`/cert/key, disabling clearnet TLS. | Moved certificate generation to `tls::prepare`, independent of Tor; a Tor failure only removes the onion. `--no-tls`/`tls=false` is the only way to disable TLS. `e2e_defaults.sh` serves plain+TLS with Tor off. |
+| AUD-071 | P2 | Data/Core layout | `bin/e-lite/src/config.rs`, `bin/e-lite/src/main.rs` | All networks shared `~/.bitcoin`; Core cannot serve two chains from one datadir, so multi-instance use was unsafe. | Default data dir `~/e-lite/<network>` and Core `<data-dir>/bitcoin`; a single legacy datadir is detected with a migration warning, two candidates are rejected. Documented in CLI/OPERATIONS. |
+| AUD-072 | P2 | `run` availability | `bin/e-lite/src/main.rs` | `run` passed `require_core=true` even when the index already had a pinned identity, so a Core restart left wallets disconnected instead of serving cached data. | `run` now starts transports in `CORE_UNAVAILABLE` with a stored identity and the index loop retries Core; a first run without an identity still waits. `tests/e2e_resilience.sh` and `tests/e2e_wait_core.sh` cover both paths. |
 
 ## Residual risks and intentional limits
 

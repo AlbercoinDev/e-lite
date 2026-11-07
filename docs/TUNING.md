@@ -214,6 +214,32 @@ it `core_resume_ahead_blocks` (5,000) before the tip, so peers reconnect while
 e-lite finishes. After that, `max_bulk_lag_blocks` (20,000) bounds additional
 growth relative to the lowest lag seen and resumes at half.
 
+### Measured on the test LXC (4 vCPU, 8 GiB, 2026-11-07)
+
+`tests/bench_index.sh` mines a disposable regtest chain and indexes it with
+several variants. Indexing is measured after Core already has the blocks, so it
+isolates e-lite from download speed.
+
+| Chain | Variant | Time | Blocks/s | Peak RSS | Index |
+|---|---|---:|---:|---:|---:|
+| 5,000 light blocks (5.7k txs) | default (256) | 0.306 s | 16,340 | 22 MiB | 3.7 MB |
+| | `readers=2` | 0.272 s | 18,382 | 22 MiB | 3.7 MB |
+| | `readers=4` | 0.297 s | 16,835 | 22 MiB | 3.7 MB |
+| | `readers=8` | 0.280 s | 17,857 | 22 MiB | 3.7 MB |
+| | `batch=64` | 0.481 s | 10,395 | 21 MiB | 3.7 MB |
+| | `batch=1024` | 0.283 s | 17,668 | 23 MiB | 3.7 MB |
+| 400 blocks × 100 outputs (40k outputs) | default (256) | 0.490 s | 816 | 69 MiB | 20.9 MB |
+| | `readers=4` | 0.475 s | 842 | 67 MiB | 20.9 MB |
+| | `batch=64` | 0.710 s | 563 | 53 MiB | 20.9 MB |
+| | `batch=1024` | 0.500 s | 800 | 69 MiB | 20.9 MB |
+
+Conclusions kept: `batch_blocks = 256` is the best default (`64` is ~30-50 %
+slower on output-heavy blocks; `1024` is not faster and holds more work).
+`readers` 2/4/8 are within noise on 4 vCPUs, so the adaptive default is kept.
+The bottleneck on this host was the wallet used to mine dense blocks (UTXO
+scan), not e-lite; the synthetic chain is much smaller than mainnet, so these
+numbers compare variants, not real chain throughput.
+
 Normal pruning runs every `min_gain_blocks` safe blocks (default **1,000**) and
 is not deferred by free space by default (`prune_defer_free_gib = 0`). At an
 average mainnet block size of ~1.5 MiB, 1,000 blocks is roughly 1.5 GiB of

@@ -52,7 +52,7 @@ impl CoreSupervisor {
             manage: cfg.core.manage,
             bitcoind: cfg.core.bitcoind.clone(),
             chain,
-            datadir: cfg.core_datadir(),
+            datadir: cfg.core_datadir(chain),
             rpc_port: rpc_port_from_url(&cfg.rpc_url(chain), chain.default_rpc_port()),
             prune_mib: cfg.core.prune_mib,
             extra_args: cfg.core.extra_args.clone(),

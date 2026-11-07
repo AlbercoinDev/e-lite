@@ -15,8 +15,9 @@ e-lite indexer  --->  RocksDB index (history, UTXO, txids, blocks, undo)
         |                     |
         |                     +--> canonical snapshots (optional)
         |
-        +--> Electrum TCP 127.0.0.1:50001 (optional TLS on tls_listen)
-        +--> /status and /metrics 127.0.0.1:9184
+        +--> Electrum plain 0.0.0.0:<network port> (55011 mainnet, ...)
+        +--> Electrum TLS 0.0.0.0:<network TLS port> (55022 mainnet, ...)
+        +--> /status and /metrics 127.0.0.1:<network metrics port> (55084, ...)
         +--> rawtx resolver: Core -> validated cache -> P2P/Esplora (Tor-first)
 ```
 

@@ -5,6 +5,8 @@
 //! live in `<data-dir>/tor/onion`; `e-lite onion reset` moves them aside.
 
 use crate::config::Config;
+
+pub use crate::tls::auto_cert_paths;
 use el_model::Chain;
 use el_serve::Shared;
 use std::ffi::{OsStr, OsString};
@@ -106,7 +108,7 @@ pub fn effective_onion_ports(cfg: &Config) -> (u16, Option<u16>) {
     (plain, tls)
 }
 
-fn valid_onion(addr: &str) -> bool {
+pub(crate) fn valid_onion(addr: &str) -> bool {
     let Some(name) = addr.strip_suffix(".onion") else {
         return false;
     };
@@ -328,71 +330,15 @@ fn write_private(path: &Path, data: &[u8]) -> Result<(), String> {
         .map_err(|e| format!("{}: {e}", path.display()))
 }
 
-pub fn auto_cert_paths(cfg: &Config, chain: Chain) -> (PathBuf, PathBuf) {
-    let dir = cfg.data_dir(chain).join("tls");
-    (dir.join("self-signed.crt"), dir.join("self-signed.key"))
-}
-
-/// Write a self-signed certificate whose SAN covers the onion address when it
-/// is known. Reuses the existing files when the SAN did not change.
-pub fn ensure_self_signed(
-    cfg: &Config,
-    chain: Chain,
-    onion: Option<&str>,
-) -> Result<(String, String), String> {
-    let (cert_path, key_path) = auto_cert_paths(cfg, chain);
-    let dir = cert_path
-        .parent()
-        .ok_or_else(|| "invalid TLS certificate path".to_string())?;
-    fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
-    let mut perms = fs::metadata(dir)
-        .map_err(|e| format!("{}: {e}", dir.display()))?
-        .permissions();
-    perms.set_mode(0o700);
-    let _ = fs::set_permissions(dir, perms);
-
-    let san_path = dir.join("self-signed.san");
-    let san = format!("{}\nlocalhost\n127.0.0.1\n", onion.unwrap_or("").trim());
-    if cert_path.is_file()
-        && key_path.is_file()
-        && fs::read_to_string(&san_path).ok().as_deref() == Some(san.as_str())
-    {
-        return Ok((
-            cert_path.display().to_string(),
-            key_path.display().to_string(),
-        ));
-    }
-
-    let mut names = vec!["localhost".to_string(), "127.0.0.1".to_string()];
-    if let Some(addr) = onion {
-        if valid_onion(addr) {
-            names.push(addr.to_string());
-        }
-    }
-    let generated = rcgen::generate_simple_self_signed(names)
-        .map_err(|e| format!("cannot generate self-signed TLS certificate: {e}"))?;
-    let key = generated.key_pair.serialize_pem();
-    let cert = generated.cert.pem();
-    write_private(&key_path, key.as_bytes())?;
-    write_private(&cert_path, cert.as_bytes())?;
-    write_private(&san_path, san.as_bytes())?;
-    Ok((
-        cert_path.display().to_string(),
-        key_path.display().to_string(),
-    ))
-}
-
-/// Resolve the effective TLS listener and certificate before transports start.
-/// Returns true when e-lite generated the certificate itself (so it may be
-/// regenerated with the onion SAN and removed by `onion reset`).
-pub fn prepare(cfg: &mut Config, chain: Chain) -> Result<bool, String> {
+/// Prepare the managed Tor for rawtx/onion use. TLS is handled separately by
+/// `tls::prepare` and does not depend on Tor being available.
+pub fn prepare(cfg: &mut Config, chain: Chain) -> Result<(), String> {
     if !cfg.tor.managed() {
-        return Ok(false);
+        return Ok(());
     }
     if resolve_binary(cfg).is_none() {
-        // Keep rawtx on its configured proxy and leave TLS alone: the onion
-        // cannot work without a Tor binary, and `spawn` logs the warning.
-        return Ok(false);
+        // Keep rawtx on its configured proxy; `spawn` logs the warning.
+        return Ok(());
     }
     if cfg.tor.socks_port == 0 {
         cfg.tor.socks_port = choose_socks_port(cfg)?;
@@ -411,32 +357,8 @@ pub fn prepare(cfg: &mut Config, chain: Chain) -> Result<bool, String> {
     if default_proxy {
         cfg.rawtx.tor_socks = Some(format!("127.0.0.1:{}", cfg.tor.socks_port));
     }
-    if cfg.tor.tls && cfg.server.tls_listen.trim().is_empty() {
-        if port_free(50002) {
-            cfg.server.tls_listen = DEFAULT_TLS_LISTEN.to_string();
-        } else {
-            return Err(format!(
-                "auto TLS port {DEFAULT_TLS_LISTEN} is busy; Tor TLS disabled"
-            ));
-        }
-    }
-    if !cfg.tor.tls || !cfg.server.tls_enabled() {
-        return Ok(false);
-    }
-    if !cfg.server.tls_cert.trim().is_empty() || !cfg.server.tls_key.trim().is_empty() {
-        return Ok(false);
-    }
-    if !cfg.tor.tls_auto_cert {
-        return Err(
-            "[tor] tls = true but no [server] tls_cert/tls_key and tls_auto_cert = false"
-                .to_string(),
-        );
-    }
-    let onion = read_hostname(&cfg.tor_dir(chain));
-    let (cert, key) = ensure_self_signed(cfg, chain, onion.as_deref())?;
-    cfg.server.tls_cert = cert;
-    cfg.server.tls_key = key;
-    Ok(true)
+    let _ = chain;
+    Ok(())
 }
 
 fn pid_alive(pid: u32) -> bool {
@@ -609,7 +531,7 @@ fn supervise(
                         }
                     }
                     if auto_cert {
-                        if let Err(e) = ensure_self_signed(&cfg, chain, Some(&addr)) {
+                        if let Err(e) = crate::tls::ensure_self_signed(&cfg, chain, Some(&addr)) {
                             eprintln!("[e-lite] WARNING: cannot refresh TLS certificate: {e}");
                         }
                     }
@@ -815,11 +737,13 @@ pub fn reset(cfg: &Config, chain: Chain, purge: bool) -> Result<String, String> 
             fs::rename(&onion_dir, &prev).map_err(|e| format!("{}: {e}", onion_dir.display()))?;
         }
     }
-    if cfg.server.tls_cert.trim().is_empty() {
-        let (cert, key) = auto_cert_paths(cfg, chain);
-        let _ = fs::remove_file(cert);
-        let _ = fs::remove_file(key);
-        if let Some(dir) = auto_cert_paths(cfg, chain).0.parent() {
+    // Drop the certificate only when e-lite manages it, so the next start
+    // regenerates it with the new onion SAN. Operator PEMs are never touched.
+    let (cert, key) = auto_cert_paths(cfg, chain);
+    if cfg.server.tls_cert.trim() == cert.display().to_string() {
+        let _ = fs::remove_file(&cert);
+        let _ = fs::remove_file(&key);
+        if let Some(dir) = cert.parent() {
             let _ = fs::remove_file(dir.join("self-signed.san"));
         }
     }
@@ -938,7 +862,8 @@ mod tests {
         cfg.server.tls_cert.clear();
         cfg.server.tls_key.clear();
         let onion = format!("{}.onion", "b".repeat(56));
-        let (cert, key) = ensure_self_signed(&cfg, Chain::Regtest, Some(&onion)).unwrap();
+        let (cert, key) =
+            crate::tls::ensure_self_signed(&cfg, Chain::Regtest, Some(&onion)).unwrap();
         assert!(Path::new(&cert).is_file());
         assert!(Path::new(&key).is_file());
         let mode = fs::metadata(&key).unwrap().permissions().mode() & 0o777;
@@ -948,7 +873,7 @@ mod tests {
         // The same SAN reuses the files instead of regenerating them.
         let before = fs::metadata(&cert).unwrap().modified().unwrap();
         std::thread::sleep(Duration::from_millis(20));
-        let _ = ensure_self_signed(&cfg, Chain::Regtest, Some(&onion)).unwrap();
+        let _ = crate::tls::ensure_self_signed(&cfg, Chain::Regtest, Some(&onion)).unwrap();
         assert_eq!(before, fs::metadata(&cert).unwrap().modified().unwrap());
         let _ = fs::remove_dir_all(&dir);
     }
@@ -979,7 +904,7 @@ mod tests {
         perms.set_mode(0o700);
         fs::set_permissions(&script, perms).unwrap();
         cfg.tor.binary = script.display().to_string();
-        let _ = prepare(&mut cfg, Chain::Regtest).unwrap();
+        prepare(&mut cfg, Chain::Regtest).unwrap();
         let mut rt = spawn(&cfg, Chain::Regtest, None, false)
             .unwrap()
             .expect("managed runtime");
@@ -1010,7 +935,7 @@ mod tests {
         cfg.server.tls_listen.clear();
         cfg.tor.socks_port = 0;
         cfg.tor.binary = binary;
-        let _ = prepare(&mut cfg, Chain::Regtest).unwrap();
+        prepare(&mut cfg, Chain::Regtest).unwrap();
         let mut rt = spawn(&cfg, Chain::Regtest, None, false)
             .unwrap()
             .expect("managed runtime");
@@ -1031,13 +956,13 @@ mod tests {
     #[test]
     fn reset_moves_onion_keys_and_auto_cert() {
         let (mut cfg, dir) = temp_cfg("reset");
-        cfg.server.tls_cert.clear();
-        cfg.server.tls_key.clear();
+        cfg.apply_network_defaults(Chain::Regtest);
         let onion_dir = dir.join("tor/onion");
         fs::create_dir_all(&onion_dir).unwrap();
         let addr = format!("{}.onion", "c".repeat(56));
         fs::write(onion_dir.join("hostname"), format!("{addr}\n")).unwrap();
-        let (cert, _key) = ensure_self_signed(&cfg, Chain::Regtest, Some(&addr)).unwrap();
+        let (cert, _key) =
+            crate::tls::ensure_self_signed(&cfg, Chain::Regtest, Some(&addr)).unwrap();
         assert!(Path::new(&cert).is_file());
         let old = reset(&cfg, Chain::Regtest, false).unwrap();
         assert_eq!(old, addr);

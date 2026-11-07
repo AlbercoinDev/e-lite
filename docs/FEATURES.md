@@ -18,6 +18,7 @@ available**.
 | Automatic pruning `>=550` + opt-in | experimental | hard lag cap + verified gap repair |
 | Parallel decode/txid/Merkle | experimental | readers prepare blocks; apply does UTXO/batch |
 | Commit sync policy | experimental | `auto` (txids in bulk, strict live), `always`, `txids` |
+| Per-network defaults | experimental | plain/TLS/metrics ports and `<data-dir>/bitcoin` per chain; multiple instances |
 | Prune cadence and deferral | experimental | every 1k safe blocks; no free-space deferral by default |
 | Core bulk pause + peer warm-up | experimental | pause during bulk; resume 5k blocks early |
 | Disk guard with download/index split | experimental | cgroup/LXC aware |
@@ -42,7 +43,7 @@ available**.
 | Broadcast package | experimental | Core `submitpackage`, stable success/errors result; protocol 1.6 |
 | Outpoint status/subscriptions | experimental | protocol 1.7; on-demand history scan, no extra index writes |
 | Scriptpubkey methods | experimental | protocol 1.7; scripthash logic with dict results and `10001` |
-| TLS Electrum | experimental | opt-in `tls_listen`; PEM cert/key; reload on change; no client auth |
+| TLS Electrum | experimental | on by default (`server.tls`); auto self-signed cert or operator PEM; reload on change; no client auth |
 | Rate limiting | experimental | per-client token bucket; auto for non-loopback; no client auth |
 | Silent payments BIP352 | **gate** | explicit error; no indexer |
 
@@ -72,8 +73,8 @@ available**.
 | Local-first rawtx | experimental | Core/cache before external |
 | Whole-block external fetch | experimental | by hash, never txid |
 | Tor SOCKS5h with clearnet fallback | experimental | Tor first; `tor_fallback_clearnet` (default true) uses clearnet if Tor fails; `allow_clearnet` forces it |
-| Managed Tor + onion service | experimental | plain 50001 + TLS 50002; `e-lite onion show/reset` |
-| Auto self-signed onion TLS cert | experimental | SAN includes the onion; reloaded on change |
+| Managed Tor + onion service | experimental | network plain/TLS ports; `e-lite onion show/reset` |
+| Auto self-signed TLS cert | experimental | generated without Tor; SAN includes localhost, hostname and onion; reloaded on change |
 | Decoys and random source order | experimental | `decoys=1` default; max 2 in flight; prefetch spawns none |
 | Rawtx cache | experimental | 256 MiB default; `cache_dir` can point at tmpfs to avoid disk |
 | Electrum rate limit | experimental | 200 req/s, burst 5000 for every client; over-budget requests wait, never error; `0` disables |

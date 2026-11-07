@@ -1,5 +1,37 @@
 # Changelog
 
+## 0.1.0-alpha.29.4.0 — 2026-11-07
+
+### Feature: per-network ports, automatic TLS and isolated instances
+
+- **Per-network listeners**: plain/TLS/metrics default to
+  `55011/55022/55084` (mainnet), `55111/55122/55184` (testnet4),
+  `55211/55222/55284` (signet) and `55311/55322/55384` (regtest). The plain
+  listener binds `0.0.0.0`; the TLS listener copies its host. Explicit
+  `--listen`, `--tls-listen` and `--metrics` still win.
+- **TLS on by default**: `[server] tls = true`. On first start e-lite generates
+  a self-signed certificate in `<data-dir>/tls/` (SANs: `localhost`, `127.0.0.1`,
+  `::1`, hostname, onion when known) and logs its path and SHA-256. `--no-tls` /
+  `tls = false` disables it. Operator PEMs are never overwritten.
+- **TLS independent of Tor**: certificate generation moved to
+  `bin/e-lite/src/tls.rs`; a Tor failure no longer disables clearnet TLS.
+- **One folder per network**: data defaults to `~/e-lite/<network>` and Core to
+  `<data-dir>/bitcoin`, so several instances can run side by side. A single
+  legacy Core datadir is detected with a migration warning; two candidates
+  (`~/.bitcoin` + `~/e-lite/bitcoin`) are rejected instead of guessed. The old
+  `~/.local/share/e-lite/<network>` index keeps being used until moved.
+- **Multi-instance**: distinct Electrum, TLS, metrics and onion ports per chain;
+  Core cannot share a datadir across chains, so each instance gets its own.
+- **`run` serves while Core is down**: with an existing index, `run` now opens
+  Electrum in `CORE_UNAVAILABLE` and keeps retrying Core instead of waiting
+  before serving. A first run with no identity still waits for Core.
+- Tests: per-network defaults, loopback pairing, TLS on/off validation, cert
+  generation without Tor, operator cert preservation, plus `tests/e2e_defaults.sh`
+  (plain + TLS + metrics with no TLS/Tor configuration) alongside regtest and
+  pruned-IBD.
+- Docs updated: README, CLI, OPERATIONS, TOR, INSTALL, GETTING-STARTED,
+  FEATURES, ARCHITECTURE, PRIVACY and AGENTS.
+
 ## 0.1.0-alpha.29.3.7 — 2026-11-07
 
 ### Patch: prune locator cleanup, external rawtx guards, disk-first gain

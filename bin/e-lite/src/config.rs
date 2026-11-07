@@ -248,18 +248,25 @@ impl Default for IndexCfg {
 #[derive(Debug, Clone, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ServerCfg {
-    #[serde(default = "d_listen")]
+    /// Plain Electrum listener. Empty = `0.0.0.0:<network default>`.
+    #[serde(default)]
     pub listen: String,
-    /// Optional TLS listener (for example `127.0.0.1:50002`). Empty disables
-    /// TLS; the plain listener keeps working.
+    /// Serve TLS as well. Enabled by default; `false` disables it.
+    #[serde(default = "d_true")]
+    pub tls: bool,
+    /// TLS listener. Empty = host of `listen` + `<network default>`.
     #[serde(default)]
     pub tls_listen: String,
-    /// PEM certificate chain (a public CA certificate can be reused).
+    /// PEM certificate chain (a public CA certificate can be reused). Empty =
+    /// e-lite generates and reuses a self-signed certificate in `<data-dir>/tls`.
     #[serde(default)]
     pub tls_cert: String,
-    /// PEM private key matching `tls_cert`.
+    /// PEM private key matching `tls_cert`. Empty = generated with the cert.
     #[serde(default)]
     pub tls_key: String,
+    /// Generate the self-signed certificate when no operator cert is configured.
+    #[serde(default = "d_true")]
+    pub tls_auto_cert: bool,
     /// Optional wallet banner template. Empty uses the built-in templates.
     /// If set and missing, e-lite creates it with the default template.
     #[serde(default)]
@@ -277,17 +284,19 @@ pub struct ServerCfg {
 
 impl ServerCfg {
     pub fn tls_enabled(&self) -> bool {
-        !self.tls_listen.trim().is_empty()
+        self.tls && !self.tls_listen.trim().is_empty()
     }
 }
 
 impl Default for ServerCfg {
     fn default() -> Self {
         ServerCfg {
-            listen: d_listen(),
+            listen: String::new(),
+            tls: true,
             tls_listen: String::new(),
             tls_cert: String::new(),
             tls_key: String::new(),
+            tls_auto_cert: true,
             banner_file: String::new(),
             max_clients: d_clients(),
             rate_limit: None,
@@ -380,7 +389,8 @@ fn d_tor_timeout() -> u64 {
 pub struct MetricsCfg {
     #[serde(default = "d_true")]
     pub enabled: bool,
-    #[serde(default = "d_metrics")]
+    /// Loopback metrics listener. Empty = `127.0.0.1:<network default>`.
+    #[serde(default)]
     pub listen: String,
 }
 
@@ -388,7 +398,7 @@ impl Default for MetricsCfg {
     fn default() -> Self {
         MetricsCfg {
             enabled: true,
-            listen: d_metrics(),
+            listen: String::new(),
         }
     }
 }
@@ -627,14 +637,8 @@ fn d_max_parallel_fetches() -> usize {
 fn d_p2p_timeout() -> u64 {
     8
 }
-fn d_listen() -> String {
-    "127.0.0.1:50001".to_string()
-}
 fn d_clients() -> usize {
     32
-}
-fn d_metrics() -> String {
-    "127.0.0.1:9184".to_string()
 }
 fn d_min_free() -> u64 {
     10
@@ -655,6 +659,16 @@ fn d_max_bulk_lag() -> u32 {
 }
 fn d_core_resume_ahead() -> u32 {
     5_000
+}
+
+/// Host part of a `host:port` listener, used to pair the TLS listener with the
+/// plain one (wildcard stays wildcard, loopback stays loopback).
+fn listener_host(addr: &str) -> String {
+    let addr = addr.trim();
+    match addr.rsplit_once(':') {
+        Some((host, _)) if !host.is_empty() => host.to_string(),
+        _ => "0.0.0.0".to_string(),
+    }
 }
 fn d_prune_defer_free() -> u64 {
     // Space-first default: do not defer normal pruning just because the disk
@@ -762,11 +776,22 @@ impl Config {
             .ok_or_else(|| format!("unknown network: {}", self.network.name))
     }
 
+    /// Per-network data directory. New installs use `~/e-lite/<chain>` so each
+    /// instance (and its Core datadir) lives in one self-contained folder.
+    /// Existing installs that still use `~/.local/share/e-lite/<chain>` keep
+    /// working until the operator moves them.
     pub fn data_dir(&self, chain: Chain) -> PathBuf {
-        match &self.network.data_dir {
-            Some(d) => PathBuf::from(d),
-            None => home().join(".local/share/e-lite").join(chain.name()),
+        if let Some(d) = &self.network.data_dir {
+            return PathBuf::from(d);
         }
+        let current = home().join("e-lite").join(chain.name());
+        if !current.exists() {
+            let legacy = home().join(".local/share/e-lite").join(chain.name());
+            if legacy.join("CURRENT").is_file() {
+                return legacy;
+            }
+        }
+        current
     }
 
     pub fn rpc_url(&self, chain: Chain) -> String {
@@ -776,11 +801,43 @@ impl Config {
             .unwrap_or_else(|| format!("http://127.0.0.1:{}", chain.default_rpc_port()))
     }
 
-    pub fn core_datadir(&self) -> PathBuf {
-        match &self.core.core_datadir {
-            Some(d) => PathBuf::from(d),
-            None => home().join(".bitcoin"),
+    /// Core datadir. Each network gets its own (`<data-dir>/bitcoin`) so several
+    /// instances never share a Core datadir. A single legacy datadir
+    /// (`~/.bitcoin` or the old `~/e-lite/bitcoin`) is still detected to avoid
+    /// silently starting a fresh download; two candidates are ambiguous and the
+    /// caller must choose with `[core] core_datadir`.
+    pub fn core_datadir(&self, chain: Chain) -> PathBuf {
+        if let Some(d) = &self.core.core_datadir {
+            return PathBuf::from(d);
         }
+        let current = self.data_dir(chain).join("bitcoin");
+        if current.exists() {
+            return current;
+        }
+        match self.legacy_core_datadirs(chain).as_slice() {
+            [only] => only.clone(),
+            _ => current,
+        }
+    }
+
+    /// Existing Core datadirs that already hold this chain's data and are not
+    /// the configured/default one.
+    pub fn legacy_core_datadirs(&self, chain: Chain) -> Vec<PathBuf> {
+        if self.core.core_datadir.is_some() {
+            return Vec::new();
+        }
+        let current = self.data_dir(chain).join("bitcoin");
+        let mut candidates = vec![
+            home().join(".bitcoin"),
+            home().join("e-lite").join("bitcoin"),
+        ];
+        candidates.retain(|dir| {
+            *dir != current
+                && (dir.join("bitcoin.conf").is_file()
+                    || el_blocks::default_blocks_dir(dir, chain).is_dir())
+        });
+        candidates.dedup();
+        candidates
     }
 
     pub fn cookie_file(&self) -> Option<PathBuf> {
@@ -791,7 +848,7 @@ impl Config {
     pub fn blocks_dir(&self, chain: Chain) -> PathBuf {
         match &self.core.blocks_dir {
             Some(d) => PathBuf::from(d),
-            None => el_blocks::default_blocks_dir(&self.core_datadir(), chain),
+            None => el_blocks::default_blocks_dir(&self.core_datadir(chain), chain),
         }
     }
 
@@ -843,6 +900,32 @@ impl Config {
         }
     }
 
+    /// Fill the per-network listener, metrics and TLS defaults. Called after
+    /// the chain is known and before validation/binding.
+    pub fn apply_network_defaults(&mut self, chain: Chain) {
+        if self.server.listen.trim().is_empty() {
+            self.server.listen = format!("0.0.0.0:{}", chain.default_electrum_port());
+        }
+        if self.server.tls {
+            if self.server.tls_listen.trim().is_empty() {
+                let host = listener_host(&self.server.listen);
+                self.server.tls_listen = format!("{host}:{}", chain.default_electrum_tls_port());
+            }
+            let tls_dir = self.data_dir(chain).join("tls");
+            if self.server.tls_cert.trim().is_empty() {
+                self.server.tls_cert = tls_dir.join("self-signed.crt").display().to_string();
+            }
+            if self.server.tls_key.trim().is_empty() {
+                self.server.tls_key = tls_dir.join("self-signed.key").display().to_string();
+            }
+        } else {
+            self.server.tls_listen.clear();
+        }
+        if self.metrics.enabled && self.metrics.listen.trim().is_empty() {
+            self.metrics.listen = format!("127.0.0.1:{}", chain.default_metrics_port());
+        }
+    }
+
     pub fn validate(&self) -> Result<(), String> {
         if self.index.batch_blocks == 0 {
             return Err("[index] batch_blocks must be >= 1".to_string());
@@ -879,21 +962,26 @@ impl Config {
         if self.server.max_clients == 0 {
             return Err("[server] max_clients must be >= 1".to_string());
         }
-        if self.server.tls_enabled() {
-            if self.server.tls_cert.trim().is_empty() || self.server.tls_key.trim().is_empty() {
+        if self.server.tls {
+            if self.server.tls_cert.trim().is_empty() != self.server.tls_key.trim().is_empty() {
                 return Err(
-                    "[server] tls_listen requires both tls_cert and tls_key (PEM files)"
+                    "[server] tls_cert and tls_key must be set together (or both empty for \
+                     an automatic self-signed certificate)"
                         .to_string(),
                 );
             }
-            if self.server.tls_listen.trim() == self.server.listen.trim() {
+            if !self.server.tls_listen.trim().is_empty()
+                && self.server.tls_listen.trim() == self.server.listen.trim()
+            {
                 return Err("[server] tls_listen must differ from listen".to_string());
             }
-        } else if !self.server.tls_cert.trim().is_empty() || !self.server.tls_key.trim().is_empty()
+        } else if !self.server.tls_listen.trim().is_empty()
+            || !self.server.tls_cert.trim().is_empty()
+            || !self.server.tls_key.trim().is_empty()
         {
             return Err(
-                "[server] tls_cert/tls_key are set but tls_listen is empty; \
-                 set tls_listen or remove them"
+                "[server] tls = false but tls_listen/tls_cert/tls_key are set; remove them \
+                 or set tls = true"
                     .to_string(),
             );
         }
@@ -951,13 +1039,15 @@ impl Config {
         }
         if let Some(dir) = &self.network.data_dir {
             let data = PathBuf::from(dir);
-            let core = self.core_datadir();
-            if data == core || data.starts_with(&core) {
-                return Err(format!(
-                    "[network] data_dir {} must not be inside the Core datadir {}",
-                    data.display(),
-                    core.display()
-                ));
+            if let Some(core) = &self.core.core_datadir {
+                let core = PathBuf::from(core);
+                if data == core || data.starts_with(&core) {
+                    return Err(format!(
+                        "[network] data_dir {} must not be inside the Core datadir {}",
+                        data.display(),
+                        core.display()
+                    ));
+                }
             }
         }
         Ok(())
@@ -1042,22 +1132,94 @@ mod tests {
     }
 
     #[test]
-    fn tls_listener_requires_cert_and_key() {
+    fn per_network_listener_defaults_do_not_collide() {
+        use el_model::Chain;
+        let cases = [
+            (
+                Chain::Mainnet,
+                "0.0.0.0:55011",
+                "0.0.0.0:55022",
+                "127.0.0.1:55084",
+            ),
+            (
+                Chain::Testnet4,
+                "0.0.0.0:55111",
+                "0.0.0.0:55122",
+                "127.0.0.1:55184",
+            ),
+            (
+                Chain::Signet,
+                "0.0.0.0:55211",
+                "0.0.0.0:55222",
+                "127.0.0.1:55284",
+            ),
+            (
+                Chain::Regtest,
+                "0.0.0.0:55311",
+                "0.0.0.0:55322",
+                "127.0.0.1:55384",
+            ),
+        ];
+        let mut seen = std::collections::HashSet::new();
+        for (chain, plain, tls, metrics) in cases {
+            let mut cfg = Config::default();
+            cfg.apply_network_defaults(chain);
+            assert_eq!(cfg.server.listen, plain);
+            assert_eq!(cfg.server.tls_listen, tls);
+            assert_eq!(cfg.metrics.listen, metrics);
+            assert!(cfg.server.tls_enabled());
+            assert!(cfg.server.tls_cert.contains(chain.name()));
+            for port in [plain, tls, metrics] {
+                assert!(seen.insert(port), "port {port} is reused");
+            }
+            cfg.validate().unwrap();
+        }
+    }
+
+    #[test]
+    fn loopback_plain_listener_keeps_tls_on_loopback() {
+        use el_model::Chain;
         let mut cfg = Config::default();
+        cfg.server.listen = "127.0.0.1:55011".to_string();
+        cfg.apply_network_defaults(Chain::Mainnet);
+        assert_eq!(cfg.server.tls_listen, "127.0.0.1:55022");
+    }
+
+    #[test]
+    fn tls_can_be_disabled_explicitly() {
+        use el_model::Chain;
+        let mut cfg = Config::default();
+        cfg.server.tls = false;
+        cfg.apply_network_defaults(Chain::Signet);
+        assert!(!cfg.server.tls_enabled());
+        assert!(cfg.server.tls_listen.is_empty());
+        assert!(cfg.server.tls_cert.is_empty());
+        cfg.validate().unwrap();
+    }
+
+    #[test]
+    fn tls_false_with_tls_fields_is_rejected() {
+        let mut cfg = Config::default();
+        cfg.server.tls = false;
         cfg.server.tls_listen = "127.0.0.1:50002".to_string();
-        assert!(cfg.validate().is_err());
-        cfg.server.tls_cert = "/etc/e-lite/tls/cert.pem".to_string();
-        cfg.server.tls_key = "/etc/e-lite/tls/key.pem".to_string();
-        assert!(cfg.validate().is_ok());
-        cfg.server.listen = "127.0.0.1:50002".to_string();
         assert!(cfg.validate().is_err());
     }
 
     #[test]
-    fn tls_files_without_listener_are_rejected() {
+    fn half_of_a_tls_pair_is_rejected() {
         let mut cfg = Config::default();
         cfg.server.tls_cert = "/etc/e-lite/tls/cert.pem".to_string();
+        cfg.server.tls_listen = "127.0.0.1:50002".to_string();
+        assert!(cfg.validate().is_err());
         cfg.server.tls_key = "/etc/e-lite/tls/key.pem".to_string();
+        cfg.validate().unwrap();
+    }
+
+    #[test]
+    fn tls_listener_must_differ_from_plain() {
+        let mut cfg = Config::default();
+        cfg.server.listen = "127.0.0.1:50001".to_string();
+        cfg.server.tls_listen = "127.0.0.1:50001".to_string();
         assert!(cfg.validate().is_err());
     }
 

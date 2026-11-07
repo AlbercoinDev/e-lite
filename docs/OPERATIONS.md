@@ -18,8 +18,11 @@ e-lite run --network signet --manage managed \
 - `run` starts Core if needed, waits for RPC, initializes the DB and indexes.
 - `prune_mib=1` is manual pruning: Core never deletes on its own; e-lite’s prune
   gate keeps the cut below `index - 288`.
-- Electrum: `127.0.0.1:50001` (plain). Optional TLS listener: configure
-  `[server] tls_listen/tls_cert/tls_key`. Status: `127.0.0.1:9184`.
+- Electrum: `0.0.0.0:55011` (plain) and `0.0.0.0:55022` (TLS) for mainnet;
+  testnet4 uses `55111`/`55122`, signet `55211`/`55222`, regtest `55311`/`55322`.
+  TLS is on by default and uses a generated self-signed certificate unless
+  `[server] tls_cert/tls_key` are set. Status/metrics: `127.0.0.1:55084`
+  (`55184`, `55284`, `55384`).
 - Stop with Ctrl+C/SIGTERM. With `stop_on_exit=true`, a Core started by e-lite is
   stopped too.
 
@@ -113,29 +116,70 @@ metrics. Every `[index] milestone_blocks` (default 10,000) or
 interval throughput and the disk usage of the e-lite index and Core datadir.
 This works on every network, including small regtest/signet chains.
 
-## Electrum TLS (optional)
+## Multiple instances (one per network)
 
-The plain listener (`[server] listen`, default `127.0.0.1:50001`) keeps working.
-TLS is a separate, opt-in listener:
+Each network has its own data directory, Core datadir, TLS certificate, onion
+key and ports, so four instances can run at once:
+
+```bash
+e-lite run --network mainnet  --allow-mainnet
+e-lite run --network testnet4
+e-lite run --network signet
+e-lite run --network regtest
+```
+
+| Network | Plain | TLS | Metrics | Data / Core datadir |
+|---|---:|---:|---:|---|
+| mainnet | 55011 | 55022 | 55084 | `~/e-lite/mainnet` + `/bitcoin` |
+| testnet4 | 55111 | 55122 | 55184 | `~/e-lite/testnet4` + `/bitcoin` |
+| signet | 55211 | 55222 | 55284 | `~/e-lite/signet` + `/bitcoin` |
+| regtest | 55311 | 55322 | 55384 | `~/e-lite/regtest` + `/bitcoin` |
+
+**Bitcoin Core cannot serve two chains from the same datadir at once.** With
+`manage = auto`/`managed`, each instance starts its own Core in
+`<data-dir>/bitcoin`. To use an external Core per network, set
+`[core] core_datadir` and `[core] rpc_url` in each instance (different RPC
+ports). Never point two instances at the same Core datadir.
+
+Moving an existing installation: stop e-lite, then move the index and the Core
+datadir into the new per-network folder (same filesystem, so it is a rename):
+
+```bash
+mkdir -p ~/e-lite
+mv ~/.local/share/e-lite/signet ~/e-lite/signet        # if it exists
+mv ~/e-lite/bitcoin ~/e-lite/signet/bitcoin            # Core signet datadir
+```
+
+Two legacy Core candidates (`~/.bitcoin` and `~/e-lite/bitcoin`) are treated as
+ambiguous; e-lite then refuses to guess and asks for an explicit
+`[core] core_datadir` instead of starting a fresh download.
+
+## Electrum TLS
+
+TLS is **on by default** on a separate listener. Without operator PEMs, e-lite
+generates a self-signed certificate in `<data-dir>/tls/` on first start and
+prints its path and SHA-256. Disable it with `tls = false` or `--no-tls`.
 
 ```toml
 [server]
-listen = "127.0.0.1:50001"
-tls_listen = "0.0.0.0:50002"
-tls_cert = "/etc/e-lite/tls/fullchain.pem"
-tls_key = "/etc/e-lite/tls/privkey.pem"
+listen = "0.0.0.0:55011"      # empty = 0.0.0.0:<network plain port>
+tls = true
+tls_listen = "0.0.0.0:55022"  # empty = host of listen + <network TLS port>
+# tls_cert = "/etc/e-lite/tls/fullchain.pem"   # optional, operator-managed
+# tls_key = "/etc/e-lite/tls/privkey.pem"
 ```
 
 The certificate is validated against the name the wallet uses, not the server
 IP:
 
 - a public-domain certificate works when the wallet connects to
-  `electrum.example.com:50002`. On a LAN, use split-DNS so that name resolves to
+  `electrum.example.com:55022`. On a LAN, use split-DNS so that name resolves to
   the LAN address;
 - connecting to `192.168.x.x` or `127.0.0.1` with a public-domain certificate
   fails with a name mismatch (public CAs do not issue certificates for private
   IPs);
-- loopback wallets should keep using plain `127.0.0.1:50001`.
+- loopback wallets can use plain `127.0.0.1:55011` or trust the generated
+  certificate for `127.0.0.1:55022`.
 
 A self-signed or internal-CA certificate also works if the wallet trusts it
 (Sparrow uses the Java trust store, so importing a private CA is possible but
@@ -160,11 +204,11 @@ requires a restart; only the file contents are reloaded automatically.
 ### Verify and test
 
 ```bash
-openssl s_client -connect electrum.example.com:50002 \
+openssl s_client -connect electrum.example.com:55022 \
   -servername electrum.example.com </dev/null
 ```
 
-In Sparrow/Electrum use the host and `50002` and enable SSL. There is **no client
+In Sparrow/Electrum use the host and `55022` and enable SSL. There is **no client
 authentication**: TLS encrypts the connection but does not restrict who can
 connect. Use a firewall, SSH/VPN or Tor in front of any non-loopback listener.
 
@@ -176,8 +220,8 @@ loopback and proxy to it:
 ```nginx
 stream {
     server {
-        listen 50002 ssl;
-        proxy_pass 127.0.0.1:50001;
+        listen 55022 ssl;
+        proxy_pass 127.0.0.1:55011;
         ssl_certificate     /etc/letsencrypt/live/electrum.example.com/fullchain.pem;
         ssl_certificate_key /etc/letsencrypt/live/electrum.example.com/privkey.pem;
     }
@@ -191,17 +235,16 @@ publish Electrum as an onion service. The address is stable across restarts and
 is created automatically on the first `run`/`serve`:
 
 ```
-[e-lite] Tor onion: <56 chars>.onion:50001 (plain), :50002 (tls)
+[e-lite] Tor onion: <56 chars>.onion:55011 (plain), :55022 (tls)
 [e-lite] Tor ready (bootstrapped 100%)
 ```
 
-- plain: `<addr>.onion:50001`
-- TLS: `<addr>.onion:50002`
+- plain: `<addr>.onion:<network plain port>`
+- TLS: `<addr>.onion:<network TLS port>`
 
 The TLS port uses an automatically generated self-signed certificate unless
 `[server] tls_cert`/`tls_key` are configured; the SAN includes the onion address.
-If `[server] tls_listen` is empty, it defaults to `127.0.0.1:50002` when Tor TLS
-is enabled.
+TLS works the same when Tor is off or unavailable; only the onion is lost.
 
 ```bash
 e-lite onion show  --network mainnet --allow-mainnet
@@ -302,8 +345,8 @@ The protocol has no banner push, so a connected wallet may need to reconnect.
 e-lite status
 e-lite status --json
 e-lite core status
-curl -s http://127.0.0.1:9184/status | python3 -m json.tool
-curl -s http://127.0.0.1:9184/metrics | grep -E 'e_lite_(lag|tuning|tx_per_sec|commit)'
+curl -s http://127.0.0.1:55084/status | python3 -m json.tool
+curl -s http://127.0.0.1:55084/metrics | grep -E 'e_lite_(lag|tuning|tx_per_sec|commit)'
 ```
 
 Useful fields: `state`, `ready`, `at_core_tip`, `fully_synced`, `offline`,
@@ -346,7 +389,7 @@ offline. `WAITING_FOR_CORE` means no index initialization has happened yet.
 
 ### Electrum cannot connect
 
-Check `127.0.0.1:50001`, that the SSL checkbox is off for the plain port, and the
+Check `127.0.0.1:55011`, that the SSL checkbox is off for the plain port, and the
 firewall. For TLS use the configured `tls_listen` port, enable SSL, and connect
 to the certificate's hostname (not a private IP). Do not expose the plain port to
 the Internet: it has no TLS or authentication. The TLS listener also has no

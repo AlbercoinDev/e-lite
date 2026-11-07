@@ -36,17 +36,18 @@ version          print version
 | `--config <path>` | TOML file (default `~/.config/e-lite/config.toml`) |
 | `--public-servers <path>` | provider list (default: `public-servers.toml` next to the config) |
 | `--network <name>` | `auto`, `regtest`, `signet`, `testnet4`, `mainnet` |
-| `--data-dir <path>` | index directory |
+| `--data-dir <path>` | index directory (default `~/e-lite/<network>`) |
 | `--core-rpc <url>` | Core RPC URL (HTTP; use SSH/VPN for WAN) |
 | `--set core.require_loopback_rpc=true` | refuse a non-loopback Core RPC endpoint |
 | `--rpc-user`, `--rpc-password`, `--cookie-file` | Core credentials |
-| `--core-datadir <path>`, `--blocks-dir <path>` | Core datadir / block files |
+| `--core-datadir <path>`, `--blocks-dir <path>` | Core datadir (default `<data-dir>/bitcoin`) / block files |
 | `--block-source <src>` | `auto`, `rpc`, `files` |
 | `--manage <mode>` | `external`, `auto`, `managed` |
 | `--prune-mib <n>` | `1` manual (default), `0` full, `>=550` auto + opt-in |
 | `--min-free-gib <n>`, `--critical-free-gib <n>` | disk guards |
-| `--listen <addr>`, `--metrics <addr>` | Electrum / metrics listeners |
-| `--tls-listen <addr>`, `--tls-cert`, `--tls-key` | optional Electrum TLS |
+| `--listen <addr>`, `--metrics <addr>` | Electrum plain / metrics listeners |
+| `--tls` / `--no-tls` | enable (default) or disable Electrum TLS |
+| `--tls-listen <addr>`, `--tls-cert`, `--tls-key` | TLS listener and PEM files |
 | `--json` | JSON output for `status` |
 | `--allow-mainnet` | required for mainnet |
 | `--set <key=value>` | override any TOML field |
@@ -177,8 +178,33 @@ e-lite run --network mainnet --allow-mainnet \
 | `--set rawtx.p2p_timeout_seconds=<n>` | P2P connect/handshake/block timeout | `8` |
 | `--set public_servers.require_ready=false` | start without a ready provider | `true` |
 | `--no-rawtx` | `rawtx.enabled=false` | enabled |
-| `--tls-listen <addr>` | `server.tls_listen` | disabled |
-| `--tls-cert`, `--tls-key` | `server.tls_cert`, `server.tls_key` | none |
+| `--tls` / `--no-tls` | `server.tls` | `true` |
+| `--tls-listen <addr>` | `server.tls_listen` | host of `listen` + network TLS port |
+| `--tls-cert`, `--tls-key` | `server.tls_cert`, `server.tls_key` | auto-generated self-signed |
+| `--set server.tls_auto_cert=false` | `server.tls_auto_cert` | `true` |
+
+## Listener defaults per network
+
+Empty values are filled from the active network, so several e-lite instances
+(one per chain) can run at once:
+
+| Network | Plain | TLS | Metrics (loopback) | Default data dir | Default Core datadir |
+|---|---:|---:|---:|---|---|
+| mainnet | 55011 | 55022 | 55084 | `~/e-lite/mainnet` | `~/e-lite/mainnet/bitcoin` |
+| testnet4 | 55111 | 55122 | 55184 | `~/e-lite/testnet4` | `~/e-lite/testnet4/bitcoin` |
+| signet | 55211 | 55222 | 55284 | `~/e-lite/signet` | `~/e-lite/signet/bitcoin` |
+| regtest | 55311 | 55322 | 55384 | `~/e-lite/regtest` | `~/e-lite/regtest/bitcoin` |
+
+The plain listener binds `0.0.0.0`; the TLS listener copies its host, so
+`[server] listen = "127.0.0.1:55011"` keeps TLS on loopback. `--listen`,
+`--tls-listen` and `--metrics` override the ports.
+
+The default data directory only applies to new installs. An existing
+`~/.local/share/e-lite/<network>` is still used until it is moved. A single
+legacy Core datadir (`~/.bitcoin` or `~/e-lite/bitcoin`) with chain data is
+detected automatically; if two candidates exist, set `[core] core_datadir`
+explicitly. Each network must use its own Core datadir: Bitcoin Core cannot
+serve two chains from the same datadir at once.
 
 Requests above `server.rate_limit` **wait for the next token** instead of
 returning an error, so a wallet's initial gap scan is not aborted.

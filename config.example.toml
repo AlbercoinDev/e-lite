@@ -5,12 +5,16 @@
 
 [network]
 name = "auto"                       # auto | mainnet | testnet4 | signet | regtest
-# data_dir = "/home/USER/.local/share/e-lite"
+# One self-contained folder per network: ~/e-lite/<network>.
+# data_dir = "/home/USER/e-lite/mainnet"
 
 [core]
 manage = "auto"                     # external | auto | managed
 bitcoind = "bitcoind"
-core_datadir = "/home/USER/.bitcoin"
+# Core datadir. Empty = <data-dir>/bitcoin, so each network/instance has its
+# own. A single legacy datadir (~/.bitcoin or ~/e-lite/bitcoin) is detected;
+# with two candidates, set this explicitly.
+# core_datadir = "/home/USER/e-lite/mainnet/bitcoin"
 # blocks_dir = "/srv/core/blocks"   # only for -blocksdir or a custom layout
 # rpc_url = "http://127.0.0.1:8332" # default port depends on the network
 # rpc_user = ""                     # remote Core credentials
@@ -60,20 +64,30 @@ repair_max_gap_blocks = 2048        # auto-repair a prune gap from verified sour
 poll_seconds = 10
 
 [server]
-listen = "127.0.0.1:50001"
+# Empty = 0.0.0.0:<network plain port>:
+# mainnet 55011, testnet4 55111, signet 55211, regtest 55311.
+listen = ""
+# TLS is on by default. A self-signed certificate is generated on first start
+# in <data-dir>/tls (SANs: localhost, 127.0.0.1, ::1, hostname and the onion
+# address once known). Set tls = false to disable it.
+tls = true
+# Empty = host of `listen` + the network TLS port:
+# mainnet 55022, testnet4 55122, signet 55222, regtest 55322.
+tls_listen = ""
+# Empty = generated self-signed certificate/key. Operator PEMs are never
+# overwritten and keep working with a public-domain certificate.
+# tls_cert = "/etc/e-lite/tls/fullchain.pem"
+# tls_key = "/etc/e-lite/tls/privkey.pem"
+# tls_auto_cert = true
 max_clients = 32
 # Per-client Electrum request budget. Same policy for every client; requests
 # over the rate wait for the next token (they are not rejected). 0 disables it.
 # rate_limit = 200                 # requests/second per client
 # rate_burst = 5000                # initial burst tokens per client
-# Optional TLS listener. Empty disables TLS; the plain listener keeps working.
 # The certificate is validated against the hostname the client connects to, so
 # a public-domain certificate only works when the wallet uses that name (use
 # split-DNS for LAN access). A self-signed/internal CA certificate also works if
 # the wallet trusts it. The PEM files are reloaded when they change on disk.
-# tls_listen = "127.0.0.1:50002"
-# tls_cert = "/etc/e-lite/tls/fullchain.pem"
-# tls_key = "/etc/e-lite/tls/privkey.pem"
 # Optional wallet banner template. Empty = built-in banners. If set and missing,
 # e-lite creates it with [indexing]/[ready] sections and placeholders.
 # banner_file = "banner.txt"
@@ -82,9 +96,9 @@ max_clients = 32
 # managed = e-lite runs its own Tor and publishes Electrum as an onion service.
 # off     = no Tor, no onion (rawtx still uses [rawtx] tor_socks).
 mode = "managed"
-plain = true                        # publish the plain Electrum port (50001)
-tls = true                          # publish the TLS Electrum port (50002)
-tls_auto_cert = true                # self-signed cert when tls_cert/tls_key are empty
+plain = true                        # publish the plain Electrum port
+tls = true                          # publish the TLS Electrum port
+tls_auto_cert = true                # deprecated: use [server] tls_auto_cert
 onion_port = 0                      # 0 = same as the plain Electrum listener
 onion_tls_port = 0                  # 0 = same as the TLS listener
 socks_port = 0                      # managed Tor SOCKS; 0 = 9050 if free, else 19050+
@@ -96,7 +110,9 @@ start_timeout_seconds = 120
 
 [metrics]
 enabled = true
-listen = "127.0.0.1:9184"
+# Empty = 127.0.0.1:<network metrics port>: mainnet 55084, testnet4 55184,
+# signet 55284, regtest 55384. Each instance needs its own metrics port.
+listen = ""
 
 [rawtx]
 enabled = true

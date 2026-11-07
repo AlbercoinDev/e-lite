@@ -215,8 +215,35 @@ impl Chain {
         }
     }
 
+    /// Plain Electrum listener. Offsets by network so several instances (one
+    /// per chain) can run side by side without colliding.
     pub fn default_electrum_port(self) -> u16 {
-        50001
+        match self {
+            Chain::Mainnet => 55011,
+            Chain::Testnet4 => 55111,
+            Chain::Signet => 55211,
+            Chain::Regtest => 55311,
+        }
+    }
+
+    /// TLS Electrum listener, paired with `default_electrum_port`.
+    pub fn default_electrum_tls_port(self) -> u16 {
+        match self {
+            Chain::Mainnet => 55022,
+            Chain::Testnet4 => 55122,
+            Chain::Signet => 55222,
+            Chain::Regtest => 55322,
+        }
+    }
+
+    /// Loopback metrics listener, one per network so instances do not clash.
+    pub fn default_metrics_port(self) -> u16 {
+        match self {
+            Chain::Mainnet => 55084,
+            Chain::Testnet4 => 55184,
+            Chain::Signet => 55284,
+            Chain::Regtest => 55384,
+        }
     }
 
     pub fn default_p2p_port(self) -> u16 {

@@ -3,6 +3,7 @@ mod core_supervisor;
 mod logging;
 mod public_servers;
 mod snapshot;
+mod tls;
 mod tor;
 mod tuning;
 
@@ -194,6 +195,7 @@ struct Args {
     blocks_dir: Option<String>,
     cookie_file: Option<String>,
     listen: Option<String>,
+    tls: Option<bool>,
     tls_listen: Option<String>,
     tls_cert: Option<String>,
     tls_key: Option<String>,
@@ -297,6 +299,8 @@ fn parse_args() -> R<Args> {
             "--rpc-password" => args.rpc_password = Some(value("--rpc-password")?),
             "--listen" => args.listen = Some(value("--listen")?),
             "--tls-listen" => args.tls_listen = Some(value("--tls-listen")?),
+            "--tls" => args.tls = Some(true),
+            "--no-tls" => args.tls = Some(false),
             "--tls-cert" => args.tls_cert = Some(value("--tls-cert")?),
             "--tls-key" => args.tls_key = Some(value("--tls-key")?),
             "--metrics" => args.metrics = Some(value("--metrics")?),
@@ -475,6 +479,9 @@ fn effective_config(args: &Args) -> R<(Config, Chain)> {
     }
     if let Some(l) = &args.listen {
         cfg.server.listen = l.clone();
+    }
+    if let Some(v) = args.tls {
+        cfg.server.tls = v;
     }
     if let Some(l) = &args.tls_listen {
         cfg.server.tls_listen = l.clone();
@@ -678,8 +685,50 @@ fn effective_config(args: &Args) -> R<(Config, Chain)> {
             cfg.index.block_source
         ));
     }
-    cfg.validate()?;
     let chain = resolve_chain(&cfg)?;
+    // Listener/metrics/TLS defaults depend on the network; resolve them before
+    // validation and binding.
+    cfg.apply_network_defaults(chain);
+    cfg.validate()?;
+    // Never start a fresh Core datadir while an existing one holds this chain's
+    // data, and never guess when two candidates exist.
+    if cfg.core.core_datadir.is_none() && cfg.network.data_dir.is_none() {
+        let preferred = config::home().join("e-lite").join(chain.name());
+        let data = cfg.data_dir(chain);
+        if data != preferred {
+            eprintln!(
+                "[e-lite] WARNING: using legacy data dir {}; move it to {} to use the \
+                 per-network layout",
+                data.display(),
+                preferred.display()
+            );
+        }
+    }
+    if cfg.core.core_datadir.is_none() {
+        let current = cfg.data_dir(chain).join("bitcoin");
+        if !current.exists() {
+            match cfg.legacy_core_datadirs(chain).as_slice() {
+                [] => {}
+                [only] => eprintln!(
+                    "[e-lite] WARNING: using legacy Core datadir {}; move it to {} so each \
+                     network keeps its own Core",
+                    only.display(),
+                    current.display()
+                ),
+                many => {
+                    return fail(format!(
+                        "several legacy Core datadirs contain {} data ({}); set \
+                         [core] core_datadir (or --core-datadir) to the one to use",
+                        chain.name(),
+                        many.iter()
+                            .map(|p| p.display().to_string())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ));
+                }
+            }
+        }
+    }
     if chain.requires_explicit_opt_in() && !cfg.safety.allow_mainnet {
         return fail(
             "mainnet requires explicit opt-in: pass --allow-mainnet or set [safety] allow_mainnet = true",
@@ -781,7 +830,7 @@ fn core_client_with_timeout(cfg: &Config, chain: Chain, timeout: Duration) -> R<
     let cc = CoreConfig {
         rpc_url: cfg.rpc_url(chain),
         cookie_file: cfg.cookie_file(),
-        core_datadir: Some(cfg.core_datadir()),
+        core_datadir: Some(cfg.core_datadir(chain)),
         rpc_user: cfg.core.rpc_user.clone(),
         rpc_password: cfg.core.rpc_password.clone(),
         chain,
@@ -837,7 +886,7 @@ fn effective_cache_mib(cfg: &Config) -> u64 {
 fn min_free_bytes(cfg: &Config, chain: Chain) -> Option<u64> {
     match (
         el_chain::disk_free_bytes(&cfg.data_dir(chain)),
-        el_chain::disk_free_bytes(&cfg.core_datadir()),
+        el_chain::disk_free_bytes(&cfg.core_datadir(chain)),
     ) {
         (Some(a), Some(b)) => Some(a.min(b)),
         (Some(a), None) => Some(a),
@@ -1090,11 +1139,12 @@ OPTIONS:
     --manage <mode>         external | auto | managed (default auto)
     --prune-mib <n>         Core prune mode: 1 manual (default), 0 full, >=550 auto (needs opt-in)
     --min-free-gib <n>      pause Core downloads below this free space
-    --listen <addr>         Electrum listen address (default 127.0.0.1:50001)
-    --tls-listen <addr>     optional Electrum TLS listener (e.g. 127.0.0.1:50002)
-    --tls-cert <path>       PEM certificate chain for --tls-listen
-    --tls-key <path>        PEM private key for --tls-listen
-    --metrics <addr>        status/metrics listen address (default 127.0.0.1:9184)
+    --listen <addr>         Electrum plain listen (default 0.0.0.0:<network port>)
+    --tls / --no-tls        enable (default) or disable Electrum TLS
+    --tls-listen <addr>     Electrum TLS listen (default <listen host>:<network TLS port>)
+    --tls-cert <path>       PEM certificate chain (default: generated self-signed)
+    --tls-key <path>        PEM private key (default: generated with the certificate)
+    --metrics <addr>        status/metrics listen (default 127.0.0.1:<network port>)
     --batch <n>             blocks per atomic commit (default 256)
     --reorg-window <n>      undo window in blocks (default 288)
     --allow-mainnet         required for mainnet
@@ -1470,7 +1520,7 @@ fn cmd_doctor(cfg: &Config, chain: Chain) -> R<()> {
         }
     );
 
-    let core_free = el_chain::disk_free_bytes(&cfg.core_datadir()).unwrap_or(0);
+    let core_free = el_chain::disk_free_bytes(&cfg.core_datadir(chain)).unwrap_or(0);
     let data_free = el_chain::disk_free_bytes(&cfg.data_dir(chain)).unwrap_or(0);
     println!(
         "disk free: index {} GiB, core datadir {} GiB (guard pauses below {} GiB)",
@@ -1546,7 +1596,7 @@ fn cmd_doctor(cfg: &Config, chain: Chain) -> R<()> {
             Err(e) => problems.push(format!("electrum TLS certificate/key: {e}")),
         }
     } else {
-        println!("electrum TLS: disabled (set [server] tls_listen to enable)");
+        println!("electrum TLS: disabled (set [server] tls = true to enable)");
     }
     let tor_status = tor::status(cfg, chain);
     println!(
@@ -1600,10 +1650,10 @@ fn cmd_doctor(cfg: &Config, chain: Chain) -> R<()> {
                 problems.push(e);
             }
         }
-    } else if cfg.tor.tls && cfg.server.tls_listen.trim().is_empty() {
+    } else if cfg.server.tls_enabled() {
         println!(
-            "tor TLS: will use {} with a self-signed certificate when Tor runs",
-            tor::DEFAULT_TLS_LISTEN
+            "tor TLS: publishes {} over the onion when Tor runs (cert {})",
+            cfg.server.tls_listen, cfg.server.tls_cert
         );
     }
     if cfg.metrics.enabled {
@@ -1835,7 +1885,7 @@ impl Indexer {
         chain: Chain,
     ) -> Self {
         let data_dir = cfg.data_dir(chain);
-        let core_datadir = cfg.core_datadir();
+        let core_datadir = cfg.core_datadir(chain);
         let blocks_dir = cfg.blocks_dir(chain);
         let pause_marker = data_dir.join("core-paused-by-e-lite");
         let tip = store.committed_tip().ok().flatten();
@@ -3530,6 +3580,7 @@ fn reload_hot(
     supervisor: &mut el_chain::Supervisor,
     shared: Option<&Arc<Shared>>,
     can_control_core: bool,
+    chain: Chain,
 ) {
     let Some(path) = config_path() else {
         eprintln!("[e-lite] reload requested but no config file was resolved");
@@ -3537,7 +3588,8 @@ fn reload_hot(
     };
     let path_str = path.to_string_lossy().to_string();
     match Config::load(Some(&path_str)) {
-        Ok(new) => {
+        Ok(mut new) => {
+            new.apply_network_defaults(chain);
             if let Err(e) = new.validate() {
                 eprintln!("[e-lite] reload rejected ({e}); keeping the previous config");
                 return;
@@ -3645,7 +3697,14 @@ fn index_loop(
 
     loop {
         if reload_flag().swap(false, Ordering::SeqCst) {
-            reload_hot(cfg, &idx, &mut supervisor, shared.as_ref(), can_control);
+            reload_hot(
+                cfg,
+                &idx,
+                &mut supervisor,
+                shared.as_ref(),
+                can_control,
+                chain,
+            );
         }
         if flag.load(Ordering::SeqCst) {
             if shared.is_none() {
@@ -3779,7 +3838,7 @@ fn index_loop(
                     &idx.store,
                     idx.readers.as_deref(),
                     &cfg.data_dir(chain),
-                    &cfg.core_datadir(),
+                    &cfg.core_datadir(chain),
                     &cfg.blocks_dir(chain),
                     shared.as_ref(),
                 ) {
@@ -3806,7 +3865,7 @@ fn index_loop(
                 &idx.store,
                 idx.readers.as_deref(),
                 &cfg.data_dir(chain),
-                &cfg.core_datadir(),
+                &cfg.core_datadir(chain),
                 &cfg.blocks_dir(chain),
                 shared.as_ref(),
             ) {
@@ -4044,7 +4103,7 @@ fn build_shared(
         db_bytes: Mutex::new(el_serve::DbBytesCache::default()),
         dirty_scripts: el_serve::DirtyScripts::new(),
         data_dir: cfg.data_dir(chain),
-        core_datadir: cfg.core_datadir(),
+        core_datadir: cfg.core_datadir(chain),
         log_file,
         listen: cfg.server.listen.clone(),
         tls_listen: if cfg.server.tls_enabled() {
@@ -4220,16 +4279,12 @@ fn cmd_serve(cfg: &Config, chain: Chain) -> R<()> {
     let started_at = SystemTime::now();
     let started = Instant::now();
     let mut prepared = cfg.clone();
-    let auto_cert = match tor::prepare(&mut prepared, chain) {
-        Ok(v) => v,
-        Err(e) => {
-            eprintln!("[e-lite] WARNING: Tor TLS disabled: {e}");
-            prepared.server.tls_listen.clear();
-            prepared.server.tls_cert.clear();
-            prepared.server.tls_key.clear();
-            false
-        }
-    };
+    // TLS does not depend on Tor. Generate or reuse the certificate first so a
+    // Tor failure only costs the onion service.
+    let auto_cert = tls::prepare(&mut prepared, chain)?;
+    if let Err(e) = tor::prepare(&mut prepared, chain) {
+        eprintln!("[e-lite] WARNING: managed Tor unavailable: {e}");
+    }
     let cfg = &prepared;
     let store = open_store(cfg, chain)?;
     let core = core_client(cfg, chain)?;
@@ -4388,16 +4443,12 @@ fn cmd_run(cfg: &Config, chain: Chain) -> R<()> {
     let started_at = SystemTime::now();
     let started = Instant::now();
     let mut prepared = cfg.clone();
-    let auto_cert = match tor::prepare(&mut prepared, chain) {
-        Ok(v) => v,
-        Err(e) => {
-            eprintln!("[e-lite] WARNING: Tor TLS disabled: {e}");
-            prepared.server.tls_listen.clear();
-            prepared.server.tls_cert.clear();
-            prepared.server.tls_key.clear();
-            false
-        }
-    };
+    // TLS does not depend on Tor. Generate or reuse the certificate first so a
+    // Tor failure only costs the onion service.
+    let auto_cert = tls::prepare(&mut prepared, chain)?;
+    if let Err(e) = tor::prepare(&mut prepared, chain) {
+        eprintln!("[e-lite] WARNING: managed Tor unavailable: {e}");
+    }
     let cfg = &prepared;
     let rotational = tuning::is_rotational(&cfg.data_dir(chain));
     let tunables = Arc::new(Tunables::new(cfg, rotational));
@@ -4408,6 +4459,9 @@ fn cmd_run(cfg: &Config, chain: Chain) -> R<()> {
     let mut core_sup = CoreSupervisor::new(cfg, chain);
     // `run` waits for Core. Building Shared only after RPC is ready means peer
     // discovery, mempool and the index loop never see a half-started Core.
+    // A stored identity lets `run` serve the local index while Core is down
+    // (state CORE_UNAVAILABLE); the index loop keeps retrying Core. A first run
+    // with no identity still waits for Core, because the genesis is unknown.
     let Some(live) = ensure_identity_blocking(
         cfg,
         chain,
@@ -4415,7 +4469,7 @@ fn cmd_run(cfg: &Config, chain: Chain) -> R<()> {
         &core_client(cfg, chain)?,
         &mut core_sup,
         &flag,
-        true,
+        false,
         None,
     )?
     else {

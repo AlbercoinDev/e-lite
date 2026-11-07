@@ -53,15 +53,15 @@ export PATH="$HOME/.local/bin:$PATH"
 ## Pinned version
 
 ```bash
-curl -fsSL https://github.com/AlbercoinDev/e-lite/releases/download/v0.1.0-alpha.29.3.7/install.sh \
-  | sh -s -- --version 0.1.0-alpha.29.3.7 --yes
+curl -fsSL https://github.com/AlbercoinDev/e-lite/releases/download/v0.1.0-alpha.29.4.0/install.sh \
+  | sh -s -- --version 0.1.0-alpha.29.4.0 --yes
 ```
 
 With Core:
 
 ```bash
-curl -fsSL https://github.com/AlbercoinDev/e-lite/releases/download/v0.1.0-alpha.29.3.7/install.sh \
-  | sh -s -- --version 0.1.0-alpha.29.3.7 --with-core --yes
+curl -fsSL https://github.com/AlbercoinDev/e-lite/releases/download/v0.1.0-alpha.29.4.0/install.sh \
+  | sh -s -- --version 0.1.0-alpha.29.4.0 --with-core --yes
 ```
 
 ## System-wide .deb
@@ -105,20 +105,23 @@ sha256sum -c SHA256SUMS   # inside the release artifact directory
 
 ## Electrum connection
 
-Wallets connect to `127.0.0.1:50001` by default (plain TCP). TLS is optional and
-uses a separate listener:
+Wallets connect to `0.0.0.0:55011` (plain) or `0.0.0.0:55022` (TLS) for
+mainnet; testnet4 uses `55111`/`55122`, signet `55211`/`55222` and regtest
+`55311`/`55322`. TLS is enabled by default and a self-signed certificate is
+generated on first start in `<data-dir>/tls/`; the startup log prints its path
+and SHA-256. Use `[server] tls = false` or `--no-tls` to disable it, or point
+`tls_cert`/`tls_key` at an operator certificate:
 
 ```toml
 [server]
-tls_listen = "127.0.0.1:50002"
 tls_cert = "/etc/e-lite/tls/fullchain.pem"
 tls_key = "/etc/e-lite/tls/privkey.pem"
 ```
 
 The certificate must match the name the wallet uses (not a private IP). See
-[`OPERATIONS.md`](OPERATIONS.md#electrum-tls-optional) for Let's Encrypt reuse,
-renewal without restart, split-DNS and the nginx `stream` alternative. No TLS
-configuration is needed for a local-only setup.
+[`OPERATIONS.md`](OPERATIONS.md#electrum-tls) for trust, Let's Encrypt reuse,
+renewal without restart, split-DNS and the nginx `stream` alternative. To keep
+access local, set `[server] listen = "127.0.0.1:55011"`; TLS follows that host.
 
 ## Public providers
 

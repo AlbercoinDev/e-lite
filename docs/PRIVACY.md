@@ -164,8 +164,9 @@ and should be restricted to loopback/self-hosted use.
   balances and UTXOs still work from the index.
 - External providers can be unavailable, rate-limited or blocked. Configure
   multiple `esplora_urls`/`p2p_peers` or use a full node if this matters.
-- Electrum has an optional TLS listener (`[server] tls_listen`) for LAN/WAN
-  wallets. TLS protects the transport but does not authenticate the wallet; use
+- Electrum serves TLS on a separate listener by default (`[server] tls_listen`)
+  for wallets that use SSL. TLS protects the transport but does not authenticate
+  the wallet; use
   loopback, SSH/VPN, a firewall or a TLS reverse proxy. Core RPC is HTTP only:
   e-lite warns when `rpc_url` is non-loopback and `[core]
   require_loopback_rpc = true` makes it fatal; use an SSH/VPN tunnel.

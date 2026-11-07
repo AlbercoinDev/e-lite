@@ -4,7 +4,7 @@
 any `scriptPubKey` in the active chain without registering wallets. Core remains
 the authority for consensus and the active chain; e-lite never invents data.
 
-> **Status: `v0.1.0-alpha.29.3.7` — experimental, no funds.**
+> **Status: `v0.1.0-alpha.29.4.0` — experimental, no funds.**
 > Test on regtest/signet/testnet4 before mainnet.
 > Electrum is plain TCP on loopback by default. Optional TLS is available on a
 > separate listener; e-lite also runs its own Tor and publishes an onion service
@@ -40,18 +40,23 @@ e-lite run    --network signet --manage managed \
   --core-datadir "$CORE" --data-dir "$DATA" --prune-mib 1
 ```
 
-Electrum/Sparrow: `127.0.0.1:50001` (plain). Optional TLS: configure
-`[server] tls_listen`/`tls_cert`/`tls_key` and connect to that port with SSL.
-`e-lite run`/`serve` also start a managed Tor and show an onion address:
+Electrum/Sparrow: `0.0.0.0:55011` plain and `0.0.0.0:55022` TLS for mainnet
+(`55111`/`55122` testnet4, `55211`/`55222` signet, `55311`/`55322` regtest).
+TLS is on by default: on first start e-lite generates a self-signed certificate
+in `<data-dir>/tls/` and prints its path and SHA-256. Use a wallet that trusts
+it, or configure `[server] tls_cert`/`tls_key` with a public-CA certificate.
+`tls = false` (or `--no-tls`) disables TLS. `e-lite run`/`serve` also start a
+managed Tor and show an onion address:
 
 ```
-[e-lite] Tor onion: <addr>.onion:50001 (plain), :50002 (tls)
+[e-lite] Tor onion: <addr>.onion:55011 (plain), :55022 (tls)
 ```
 
 Use `e-lite onion show` to print it and `e-lite onion reset` to rotate it (stop
 e-lite first). `--no-tor` disables Tor for one run. See
 [`docs/TOR.md`](docs/TOR.md).
-Status and metrics: `http://127.0.0.1:9184/status` and `/metrics`. The same
+Status and metrics: `http://127.0.0.1:55084/status` and `/metrics` (one port
+per network: `55184`, `55284`, `55384`). The same
 console output is written to `<data-dir>/e-lite.log`. Wallets see a dynamic
 INDEXING/READY banner; customize it with `[server] banner_file`.
 
@@ -93,10 +98,12 @@ See [`docs/CLI.md`](docs/CLI.md) for every flag and `--set` example.
 
 ## Security notes
 
-- Electrum listens on `127.0.0.1:50001` by default. Optional TLS on a separate
-  listener (`tls_listen`) encrypts the connection, but there is **no client
-  authentication**: restrict access with a firewall, SSH/VPN tunnel or Tor. Do not
-  expose the plain port publicly.
+- Electrum listens on `0.0.0.0:55011` (plain) and `0.0.0.0:55022` (TLS) by
+  default for mainnet. TLS encrypts the connection but there is **no client
+  authentication**: restrict access with a firewall, SSH/VPN tunnel or Tor. If
+  you only want local access, set `[server] listen = "127.0.0.1:55011"` (the TLS
+  listener follows the same host). Each network has its own ports, so several
+  instances can run side by side.
 - Core RPC is HTTP. LAN/WAN use requires SSH/VPN; never expose the RPC port.
 - External rawtx lookup is local-first and Tor-first; it requests whole blocks by
   hash and validates them. Public providers live in the editable

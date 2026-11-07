@@ -71,12 +71,14 @@ Never treat a version number in this file as authoritative over the code/tag.
   provider outage cannot stop local block progress.
 - `commit_sync = auto` relaxes the RocksDB fsync in bulk; `txids.dat` is always
   fsynced and live mode is strict.
-- Electrum listens on `127.0.0.1:50001` (plain) by default. Optional TLS uses a
-  separate listener (`tls_listen`). `[tor] mode = "managed"` runs e-lite's own
-  Tor and publishes plain 50001 and TLS 50002 as a v3 onion service; TLS uses an
-  auto-generated self-signed certificate when none is configured. Neither
-  listener authenticates clients; the onion address is the access secret. Do not
-  expose them publicly without a tunnel/firewall/access plan.
+- Electrum binds per-network defaults: plain/TLS/metrics are
+  `55011/55022/55084` (mainnet), `55111/55122/55184` (testnet4),
+  `55211/55222/55284` (signet) and `55311/55322/55384` (regtest), on `0.0.0.0`
+  for Electrum and loopback for metrics. TLS is **on by default** (`server.tls`)
+  with an auto-generated self-signed certificate; TLS is independent of Tor.
+  `[tor] mode = "managed"` publishes the same plain/TLS ports as a v3 onion
+  service. Neither listener authenticates clients; the onion address is the
+  access secret. Do not expose them publicly without a tunnel/firewall plan.
 - Electrum rate limiting is a per-connection token bucket, not authentication:
   `rate_limit` defaults to 200 req/s for every client (LAN and public alike),
   `rate_burst` to 5000, and `0` disables it. Over-budget requests **wait for the
@@ -160,23 +162,31 @@ Never treat a version number in this file as authoritative over the code/tag.
   (`crates/el-serve/src/lib.rs`, `build_tls_config`). A wallet validates the cert
   against the name it connects to: a cert for `example.com` fails for `.onion`
   and the auto self-signed cert fails for any public hostname.
-- The self-signed cert (`<data-dir>/tls/self-signed.*`) is generated only when
-  both `[server] tls_cert` and `tls_key` are empty (and Tor is managed); its SAN
-  is `localhost`, `127.0.0.1` and the onion address. Operator certificates are
-  never overwritten or regenerated (`bin/e-lite/src/tor.rs`, `ensure_self_signed`).
+- The self-signed cert (`<data-dir>/tls/self-signed.*`) is generated when TLS is
+  enabled and `[server] tls_cert`/`tls_key` point at the auto paths (defaults).
+  It does not require Tor. SANs: `localhost`, `127.0.0.1`, `::1`, the hostname
+  and the onion address once known. Operator certificates are never overwritten
+  or regenerated (`bin/e-lite/src/tls.rs`, `ensure_self_signed`).
 - Consequence: a public domain certificate in `[server] tls_cert`/`tls_key`
   disables the auto onion certificate, and `.onion` wallets then get a hostname
   mismatch. Pick one identity per instance: auto self-signed (onion), or a
   domain cert with `[tor] tls = false` / plain-only onion, or an explicit
   `target_tls` design. Do not "fix" one by breaking the other blindly.
-- Config validation: `tls_listen` requires both PEM files and must differ from
-  `listen`; cert/key without `tls_listen` is an error. Managed Tor auto-enables
-  `127.0.0.1:50002` when `tls_listen` is empty and the port is free.
+- Config validation: `tls_listen` must differ from `listen`; `tls_cert` and
+  `tls_key` must be set together; `server.tls = false` forbids the TLS fields.
+  Empty `listen`/`tls_listen`/`metrics.listen` are filled from the network in
+  `Config::apply_network_defaults` before validation.
 - `CertWatcher` reloads changed PEMs by mtime without restart and keeps the old
   cert if the new pair is invalid (Let's Encrypt renewals need no restart).
 - TLS only encrypts; there is no client auth and rate limiting is only a
-  throttle (AUD-010). A public domain also needs a reachable bind
-  (`0.0.0.0`/IP, not the default loopback) plus a firewall/VPN/allowlist plan.
+  throttle (AUD-010). The default bind is `0.0.0.0`; restrict with a
+  firewall/VPN/allowlist, or set `listen = "127.0.0.1:..."` (TLS follows it).
+- Data layout: `~/e-lite/<network>` holds the index, TLS, Tor and logs, and
+  `<data-dir>/bitcoin` is that network's Core datadir. Two instances must never
+  share a Core datadir (Core cannot serve two chains from one at once). The
+  legacy `~/.local/share/e-lite/<network>` and a single legacy Core datadir are
+  detected; `~/.bitcoin` plus `~/e-lite/bitcoin` together are ambiguous and
+  require an explicit `[core] core_datadir`.
 
 ## Quality gates
 
