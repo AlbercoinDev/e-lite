@@ -655,7 +655,9 @@ fn d_core_resume_ahead() -> u32 {
     5_000
 }
 fn d_prune_defer_free() -> u64 {
-    50
+    // Space-first default: do not defer normal pruning just because the disk
+    // is large. `min_gain_blocks` still suppresses churn.
+    0
 }
 fn d_prune_interval() -> u64 {
     30

@@ -823,8 +823,12 @@ impl Shared {
         let verification =
             self.stats.core_verification_bps.load(Ordering::Relaxed) as f64 / 10_000.0;
         let offline = self.get_state() == state::CORE_UNAVAILABLE;
-        let at_core_tip = core_height > 0 && height.saturating_add(1) >= core_height;
-        let fully_synced = !core_ibd && headers > 0 && height.saturating_add(1) >= headers;
+        // `height + 1 >= core_height` would call an index one block behind
+        // "at tip". Require the exact tip, and full sync also requires Core's
+        // headers to be at the same height.
+        let at_core_tip = core_height > 0 && height == core_height;
+        let fully_synced =
+            !core_ibd && core_height > 0 && height == core_height && headers == core_height;
         let ready = at_core_tip || (offline && height > 0);
         let pct = |value: u64, total: u64| {
             if total == 0 {

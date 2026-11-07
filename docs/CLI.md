@@ -122,7 +122,7 @@ e-lite run --network mainnet --allow-mainnet \
 | `--pause-core-during-bulk` | `pruning.pause_core_during_bulk` | `true` |
 | `--no-pause-core-during-bulk` | same | disable the full bulk pause |
 | `--core-resume-ahead-blocks <n>` | `pruning.core_resume_ahead_blocks` | `5000` |
-| `--prune-defer-free-gib <n>` | `pruning.prune_defer_free_gib` | `50` |
+| `--prune-defer-free-gib <n>` | `pruning.prune_defer_free_gib` | `0` |
 | `--min-gain-blocks <n>` | `pruning.min_gain_blocks` | `10000` |
 | `--prune-interval-seconds <n>` | `pruning.prune_interval_seconds` | `30` |
 | `--poll-seconds <n>` | `pruning.poll_seconds` | `10` |
@@ -143,8 +143,9 @@ guard only.
 still fsynced, so a crash only reindexes the last interval) and returns to
 strict `sync=true` when live. Use `always` or `txids` to force a policy.
 
-Normal pruning is deferred while free space is at or above
-`prune_defer_free_gib` (50 GiB). Low-disk emergency pruning still runs.
+Normal pruning is not deferred by free space by default
+(`prune_defer_free_gib = 0`); the 10k-block gain and 30 s interval still apply.
+Set a positive value to defer normal pruning on a large disk.
 
 Low-RAM Core example:
 

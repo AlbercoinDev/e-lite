@@ -58,7 +58,13 @@ Never treat a version number in this file as authoritative over the code/tag.
 - `prune_mib >= 550` requires `[pruning] allow_auto_prune = true`.
 - Snapshots are optional; they are never required by the from-zero flow.
 - Long bulk catch-up pauses Core by default and resumes 5,000 blocks early to
-  pre-warm peers; normal prune is deferred above 50 GiB free.
+  pre-warm peers; normal pruning is not deferred by free space by default
+  (`prune_defer_free_gib = 0`), only by the 10k-block gain and 30 s interval.
+- Never authorise a Core prune from a tip that is not durable: flush RocksDB/WAL
+  first. A failed prune RPC must retry the same safe height after backoff.
+- Pause/resume state must reflect `setnetworkactive` success; never let a lag
+  resume override a disk pause. Start indexing before the provider gate so a
+  provider outage cannot stop local block progress.
 - `commit_sync = auto` relaxes the RocksDB fsync in bulk; `txids.dat` is always
   fsynced and live mode is strict.
 - Electrum listens on `127.0.0.1:50001` (plain) by default. Optional TLS uses a

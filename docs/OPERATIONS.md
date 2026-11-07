@@ -226,8 +226,8 @@ security model.
 
 Manual mode: the prune gate uses min(`index - 288`, readers, `tip - 288`) and
 throttles requests. By default it evaluates pruning every **10,000** safe blocks
-(`min_gain_blocks`) and defers normal pruning while free space is at or above
-**50 GiB** (`prune_defer_free_gib`); low disk still triggers an emergency prune.
+(`min_gain_blocks`); free-space deferral is off by default
+(`prune_defer_free_gib = 0`). Low disk still triggers an emergency prune.
 Core may return a lower height because it prunes whole files.
 
 During a long bulk catch-up, Core is paused by default

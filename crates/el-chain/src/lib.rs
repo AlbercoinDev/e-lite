@@ -207,6 +207,11 @@ pub struct Supervisor {
     /// Wall-clock time of the last prune request. Core may flush block files
     /// when asked to prune, so no-op requests are rate-limited as well.
     last_prune_at: Option<Instant>,
+    /// Earliest time to retry a failed prune at the same safe height. Without
+    /// this, a failed RPC would never be retried until the safe height moved.
+    retry_at: Option<Instant>,
+    /// Height whose prune RPC failed, eligible for retry at `retry_at`.
+    retry_height: Option<u32>,
 }
 
 impl Supervisor {
@@ -222,6 +227,8 @@ impl Supervisor {
             last_prune: None,
             last_attempt: None,
             last_prune_at: None,
+            retry_at: None,
+            retry_height: None,
         }
     }
 
@@ -322,20 +329,22 @@ impl Supervisor {
                 .last_prune_at
                 .map(|at| at.elapsed() >= emergency_interval)
                 .unwrap_or(true);
-            let last = [self.last_attempt, self.last_prune]
-                .into_iter()
-                .flatten()
-                .max()
-                .unwrap_or(0);
+            let retry_due = self.retry_at.map(|at| Instant::now() >= at).unwrap_or(true);
+            let last_success = self.last_prune.unwrap_or(0);
+            let last = last_success.max(self.last_attempt.unwrap_or(0));
+            let retry_same = self.retry_height == Some(safe) && retry_due;
             // Emergency pruning (low disk) bypasses the gain and the normal
-            // interval, but still requires some new safe height and a durable
-            // index ahead of the cut.
+            // interval, but still requires a durable index ahead of the cut.
+            // A failed request at the same safe height may be retried after
+            // `retry_at`; otherwise normal pruning needs a new gain.
             let advanced = safe > input.core_pruneheight
-                && safe > last
+                && safe > last_success
+                && (safe > self.last_attempt.unwrap_or(0) || retry_same)
                 && if emergency {
                     emergency_due
                 } else {
-                    safe >= last.saturating_add(self.cfg.min_gain) && interval_elapsed
+                    (retry_same || safe >= last.saturating_add(self.cfg.min_gain))
+                        && interval_elapsed
                 };
             if advanced && safe > 0 {
                 self.state = State::PruneEligible;
@@ -356,16 +365,23 @@ impl Supervisor {
     pub fn on_prune_requested(&mut self, height: u32) {
         self.last_attempt = Some(height);
         self.last_prune_at = Some(Instant::now());
+        self.retry_at = None;
+        self.retry_height = None;
         self.state = State::Pruning;
     }
 
     pub fn on_pruned(&mut self, height: u32) {
         self.last_prune = Some(height);
+        self.retry_at = None;
+        self.retry_height = None;
         self.state = State::CatchUp;
     }
 
     pub fn on_prune_failed(&mut self) {
-        // Do not update last_prune: retry on the next tick after backoff.
+        // Keep the height: a transient RPC failure must be retried even if the
+        // safe height did not move.
+        self.retry_at = Some(Instant::now() + Duration::from_secs(30));
+        self.retry_height = self.last_attempt;
         self.state = State::CatchUp;
     }
 }
@@ -512,6 +528,22 @@ mod tests {
         assert!(s.tick(&i).is_empty(), "gain below min_gain: no retry");
         i.committed_height = 110;
         assert_eq!(s.tick(&i), vec![Action::Prune(100)]);
+    }
+
+    #[test]
+    fn failed_prune_retries_the_same_height_after_backoff() {
+        let mut s = Supervisor::new(cfg());
+        let mut i = input(100, 200);
+        i.core_pruneheight = 80;
+        assert_eq!(s.tick(&i), vec![Action::Prune(90)]);
+        s.on_prune_requested(90);
+        s.on_prune_failed();
+        assert!(
+            s.tick(&i).is_empty(),
+            "a failed prune must not spin immediately"
+        );
+        s.retry_at = Some(Instant::now() - Duration::from_secs(1));
+        assert_eq!(s.tick(&i), vec![Action::Prune(90)]);
     }
 
     #[test]

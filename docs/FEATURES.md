@@ -18,7 +18,7 @@ available**.
 | Automatic pruning `>=550` + opt-in | experimental | hard lag cap + verified gap repair |
 | Parallel decode/txid/Merkle | experimental | readers prepare blocks; apply does UTXO/batch |
 | Commit sync policy | experimental | `auto` (txids in bulk, strict live), `always`, `txids` |
-| Prune cadence and deferral | experimental | every 10k safe blocks; deferred above 50 GiB |
+| Prune cadence and deferral | experimental | every 10k safe blocks; no free-space deferral by default |
 | Core bulk pause + peer warm-up | experimental | pause during bulk; resume 5k blocks early |
 | Disk guard with download/index split | experimental | cgroup/LXC aware |
 | Adaptive profiles and hot reload | experimental | `auto/hdd/ssd/nvme/manual`, `SIGUSR1` |

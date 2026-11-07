@@ -1,7 +1,7 @@
 # Code audit
 
-**Base:** `0.1.0-alpha.29.3.4` → published `0.1.0-alpha.29.3.5` · **Scope:** `bin/e-lite`, `crates/*` (26 Rust files,
-~19k lines) · **Status:** findings fixed in `0.1.0-alpha.29.3.5` where noted.
+**Base:** `0.1.0-alpha.29.3.5` → published `0.1.0-alpha.29.3.6` · **Scope:** `bin/e-lite`, `crates/*` (26 Rust files,
+~19k lines) · **Status:** findings fixed in `0.1.0-alpha.29.3.6` where noted.
 
 This audit is not a claim of formal verification. It records static checks,
 manual review areas, concrete findings and residual risks.
@@ -78,6 +78,11 @@ Additional checks performed:
 | AUD-058 | P2 | Prefetch and cache | `crates/el-serve/src/lib.rs`, `crates/el-rawtx/src/cache.rs` | Prefetch marked a height as seen even when the queue was full and deduped by height, not block; status computation triggered downloads. Cache reads/fsync held the metadata lock and a lowered capacity was only applied on the next write. | Dedup by block hash with queue-full/failure retry, status never prefetches, reads/fsync outside the state lock, and capacity enforced at open. |
 | AUD-059 | P2 | JSON-RPC parameters | `crates/el-serve/src/lib.rs` | `u64` heights, `cp_height` and `txout_idx` were truncated with `as u32`; oversized values could address a different height/output. | Checked `u32::try_from` with `-32602` errors; `testmempoolaccept` maps `reject-reason` to `reason`. |
 | AUD-060 | P2 | Notifier blocking | `crates/el-serve/src/lib.rs` | Outpoint status can resolve raw funding/spending transactions through Core or providers; running it in the single notifier thread blocked header/scripthash notifications for every wallet. | Outpoint jobs run in a 2-worker, queue-256 pool with pending retry; the notifier only enqueues. Reorg forcing is preserved. |
+| AUD-061 | P1 | Prune durability | `bin/e-lite/src/main.rs`, `crates/el-store/src/lib.rs` | Bulk commits may use `sync=false`; the prune gate used `committed_tip` without forcing the WAL/SST to disk, so a crash could recover an older index after Core had already deleted the blocks. | Flush all CFs and WAL before issuing `pruneblockchain`; if the flush fails, skip the prune and retry later. |
+| AUD-062 | P1 | Prune retry | `crates/el-chain/src/lib.rs` | A failed prune RPC kept `last_attempt`, so the same safe height was never retried until it advanced. | Retry the same height after a 30 s backoff, while keeping the normal 10k gain/interval rules. Test added. |
+| AUD-063 | P1 | Pause state | `bin/e-lite/src/main.rs` | `pause_downloads`/`resume_downloads` changed internal state before confirming `setnetworkactive`; lag resumes could override a disk pause. | RPC-first transitions; failed calls are retried and lag resumes check the disk pause. |
+| AUD-064 | P2 | Disk/readiness | `bin/e-lite/src/main.rs`, `crates/el-serve/src/lib.rs` | Cold start between low/resume watermarks paused unnecessarily; `height + 1` could report READY one block early; prune/resume forced READY. | Only start pauses below the low watermark, require exact tips, and recompute READY/BUILDING from durable state. |
+| AUD-065 | P2 | Indexing pipeline | `bin/e-lite/src/main.rs`, `crates/el-blocks/src/lib.rs` | Provider readiness could block indexing; out-of-order results could grow; long 512-block calls delayed pruning; pruned files stayed open; custom `blocks_dir` was not monitored. | Start indexing before the provider gate, add a prepared-block window, yield to the supervisor after the poll interval, drop the bulk reader cache after prune, and include `blocks_dir` in free-space checks. |
 
 ## Residual risks and intentional limits
 

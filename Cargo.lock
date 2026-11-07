@@ -335,7 +335,7 @@ dependencies = [
 
 [[package]]
 name = "e-lite"
-version = "0.1.0-alpha.29.3.5"
+version = "0.1.0-alpha.29.3.6"
 dependencies = [
  "bitcoin",
  "el-blocks",
@@ -368,7 +368,7 @@ checksum = "0e9c71c2167ca323c882b99918929403426e2373ea17242ff5653e0d5e1058be"
 
 [[package]]
 name = "el-blocks"
-version = "0.1.0-alpha.29.3.5"
+version = "0.1.0-alpha.29.3.6"
 dependencies = [
  "bitcoin",
  "el-model",
@@ -377,14 +377,14 @@ dependencies = [
 
 [[package]]
 name = "el-chain"
-version = "0.1.0-alpha.29.3.5"
+version = "0.1.0-alpha.29.3.6"
 dependencies = [
  "libc",
 ]
 
 [[package]]
 name = "el-index"
-version = "0.1.0-alpha.29.3.5"
+version = "0.1.0-alpha.29.3.6"
 dependencies = [
  "bitcoin",
  "el-model",
@@ -395,7 +395,7 @@ dependencies = [
 
 [[package]]
 name = "el-mempool"
-version = "0.1.0-alpha.29.3.5"
+version = "0.1.0-alpha.29.3.6"
 dependencies = [
  "bitcoin",
  "el-model",
@@ -407,7 +407,7 @@ dependencies = [
 
 [[package]]
 name = "el-model"
-version = "0.1.0-alpha.29.3.5"
+version = "0.1.0-alpha.29.3.6"
 dependencies = [
  "bitcoin",
  "hex",
@@ -416,7 +416,7 @@ dependencies = [
 
 [[package]]
 name = "el-rawtx"
-version = "0.1.0-alpha.29.3.5"
+version = "0.1.0-alpha.29.3.6"
 dependencies = [
  "bip324",
  "bitcoin",
@@ -432,7 +432,7 @@ dependencies = [
 
 [[package]]
 name = "el-rpc"
-version = "0.1.0-alpha.29.3.5"
+version = "0.1.0-alpha.29.3.6"
 dependencies = [
  "el-model",
  "serde",
@@ -441,7 +441,7 @@ dependencies = [
 
 [[package]]
 name = "el-serve"
-version = "0.1.0-alpha.29.3.5"
+version = "0.1.0-alpha.29.3.6"
 dependencies = [
  "bitcoin",
  "el-chain",
@@ -460,7 +460,7 @@ dependencies = [
 
 [[package]]
 name = "el-store"
-version = "0.1.0-alpha.29.3.5"
+version = "0.1.0-alpha.29.3.6"
 dependencies = [
  "el-model",
  "hex",

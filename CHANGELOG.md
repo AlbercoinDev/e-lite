@@ -1,5 +1,36 @@
 # Changelog
 
+## 0.1.0-alpha.29.3.6 — 2026-11-07
+
+### Patch: durable pruning, confirmed pauses and bounded indexing memory
+
+- **Durability before prune**: e-lite flushes RocksDB/WAL before asking Core to
+  delete block files, so the height authorising the cut is durable even when
+  bulk commits used `sync=false`.
+- **Failed prune retries**: a failed `pruneblockchain` RPC is retried at the same
+  safe height after a 30 s backoff instead of waiting for the safe height to
+  move. The normal 10k-block gain and interval still apply.
+- **Confirmed Core pauses**: pause/resume only update internal state after
+  `setnetworkactive` succeeds; a failed RPC is retried instead of being treated
+  as done. Lag-guard resumes no longer override a disk pause.
+- **Disk hysteresis fixed**: a cold start above the low watermark no longer
+  pauses just because it is below the resume watermark.
+- **Exact readiness**: `READY`/`FULLY SYNCED` require the exact indexed tip, not
+  `height + 1`; prune/resume paths recompute the state instead of forcing READY.
+- **Indexing independent of providers**: `run` starts indexing immediately and
+  only gates the wallet listeners on provider readiness, so a provider outage
+  cannot stop local block progress.
+- **Bounded prepared blocks**: an explicit window limits fetched/decoded/prevout
+  blocks held in the channel and out-of-order `pending` map.
+- **Supervisor cadence**: a long 512-block catch-up yields after the poll
+  interval so pruning/disk actions are not delayed.
+- **Space-first default**: `prune_defer_free_gib = 0` by default; pruning is
+  bounded by the 10k gain and 30 s interval, not by free space.
+- **Pruned block files**: dropping the bulk reader cache after a prune releases
+  descriptors/handles that could keep deleted files allocated. Disk checks now
+  include a custom `blocks_dir`.
+- Tests: prune retry, existing chain/index tests, regtest and pruned-IBD e2e.
+
 ## 0.1.0-alpha.29.3.5 — 2026-11-07
 
 ### Patch: outpoint notifications off the notifier thread, complete protocol matrix

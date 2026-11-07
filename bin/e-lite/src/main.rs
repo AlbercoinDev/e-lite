@@ -1790,6 +1790,7 @@ struct Indexer {
     pause_marker: std::path::PathBuf,
     data_dir: std::path::PathBuf,
     core_datadir: std::path::PathBuf,
+    blocks_dir: std::path::PathBuf,
     last_disk_check: Mutex<Instant>,
     progress_started: Instant,
     progress_start_height: u64,
@@ -1835,6 +1836,7 @@ impl Indexer {
     ) -> Self {
         let data_dir = cfg.data_dir(chain);
         let core_datadir = cfg.core_datadir();
+        let blocks_dir = cfg.blocks_dir(chain);
         let pause_marker = data_dir.join("core-paused-by-e-lite");
         let tip = store.committed_tip().ok().flatten();
         let start_height = tip.as_ref().map(|t| t.height as u64).unwrap_or(0);
@@ -1858,6 +1860,7 @@ impl Indexer {
             pause_marker,
             data_dir,
             core_datadir,
+            blocks_dir,
             last_disk_check: Mutex::new(
                 Instant::now()
                     .checked_sub(Duration::from_secs(60))
@@ -1903,15 +1906,14 @@ impl Indexer {
             }
             *last = Instant::now();
         }
-        let free = match (
+        let free = [
             el_chain::disk_free_bytes(&self.data_dir),
             el_chain::disk_free_bytes(&self.core_datadir),
-        ) {
-            (Some(a), Some(b)) => Some(a.min(b)),
-            (Some(a), None) => Some(a),
-            (None, Some(b)) => Some(b),
-            (None, None) => None,
-        };
+            el_chain::disk_free_bytes(&self.blocks_dir),
+        ]
+        .into_iter()
+        .flatten()
+        .min();
         let Some(free) = free else {
             return false;
         };
@@ -1958,33 +1960,42 @@ impl Indexer {
             return true;
         }
 
-        // Between the critical floor and the low watermark: stop new blocks,
-        // keep draining the backlog so pruning can free space. An external
-        // Core cannot be paused, so indexing must stop instead.
-        if self.is_paused() && self.can_control_core {
-            self.set_paused(false);
-            eprintln!(
-                "[e-lite] disk above critical floor: {} MiB free; resumed indexing while downloads stay paused",
-                free / (1024 * 1024)
-            );
-        }
-        if !self.can_control_core {
-            if !self.is_paused() {
-                self.set_paused(true);
-                if let Some(sh) = &self.shared {
-                    sh.stats.disk_low.store(true, Ordering::Relaxed);
-                    sh.set_state(state::PAUSE_DOWNLOAD);
+        // Below the download watermark: stop new blocks. A managed Core keeps
+        // draining its backlog (and pruning can free space); an external Core
+        // cannot be paused, so indexing stops as well.
+        if free < low {
+            if !self.can_control_core {
+                if !self.is_paused() {
+                    self.set_paused(true);
+                    if let Some(sh) = &self.shared {
+                        sh.stats.disk_low.store(true, Ordering::Relaxed);
+                        sh.set_state(state::PAUSE_DOWNLOAD);
+                    }
+                    eprintln!(
+                        "[e-lite] disk low: {} MiB free (threshold {} MiB); paused indexing (Core is external)",
+                        free / (1024 * 1024),
+                        low / (1024 * 1024)
+                    );
                 }
+                return true;
+            }
+            // Between the critical floor and the low watermark: resume
+            // indexing (drain the backlog) while Core downloads stay paused.
+            if self.is_paused() {
+                self.set_paused(false);
                 eprintln!(
-                    "[e-lite] disk low: {} MiB free (threshold {} MiB); paused indexing (Core is external)",
-                    free / (1024 * 1024),
-                    low / (1024 * 1024)
+                    "[e-lite] disk above critical floor: {} MiB free; resumed indexing while downloads stay paused",
+                    free / (1024 * 1024)
                 );
             }
-            return true;
+            self.pause_downloads("disk low");
+            return false;
         }
-        self.pause_downloads("disk low");
-        false
+
+        // Between `low` and `resume`: do not start a new pause, and keep an
+        // existing pause (hysteresis) until `resume` is reached. Cold starts in
+        // this band must not pause at all.
+        self.is_paused()
     }
 
     fn downloads_paused(&self) -> bool {
@@ -1997,12 +2008,17 @@ impl Indexer {
         if self.downloads_paused.swap(true, Ordering::SeqCst) {
             return;
         }
-        self.mark_paused(true);
+        // Confirm the RPC before claiming the pause; otherwise a failed request
+        // would leave the internal state lying and future retries would be
+        // skipped.
         if self.can_control_core {
             if let Err(e) = self.core.set_network_active(false) {
-                eprintln!("[e-lite] cannot pause Core downloads: {e}");
+                self.downloads_paused.store(false, Ordering::SeqCst);
+                eprintln!("[e-lite] cannot pause Core downloads: {e}; will retry");
+                return;
             }
         }
+        self.mark_paused(true);
         if let Some(sh) = &self.shared {
             sh.stats.core_network_active.store(false, Ordering::Relaxed);
             sh.stats.disk_low.store(true, Ordering::Relaxed);
@@ -2023,12 +2039,14 @@ impl Indexer {
             eprintln!("[e-lite] {reason}: disk pressure cleared; Core stays paused by lag guard");
             return;
         }
-        self.mark_paused(false);
         if self.can_control_core {
             if let Err(e) = self.core.set_network_active(true) {
-                eprintln!("[e-lite] cannot resume Core downloads: {e}");
+                self.downloads_paused.store(true, Ordering::SeqCst);
+                eprintln!("[e-lite] cannot resume Core downloads: {e}; will retry");
+                return;
             }
         }
+        self.mark_paused(false);
         if let Some(sh) = &self.shared {
             sh.stats.core_network_active.store(true, Ordering::Relaxed);
             sh.stats.disk_low.store(false, Ordering::Relaxed);
@@ -2131,7 +2149,7 @@ impl Indexer {
                 if let Some(sh) = &self.shared {
                     sh.headers.invalidate_from(check_height as u32);
                     sh.dirty_scripts.mark_all_subscriptions();
-                    sh.set_state(state::READY);
+                    refresh_ready_state(sh);
                 }
             }
             return Ok(());
@@ -2246,12 +2264,12 @@ impl Indexer {
 
         if bulk_limit == 0 && !auto_enabled {
             self.bulk_lag_baseline.store(u64::MAX, Ordering::Relaxed);
-            if paused && self.core.set_network_active(true).is_ok() {
+            if paused && !self.downloads_paused() && self.core.set_network_active(true).is_ok() {
                 self.lag_paused.store(false, Ordering::Relaxed);
                 self.mark_paused(false);
                 if let Some(sh) = &self.shared {
                     sh.stats.core_network_active.store(true, Ordering::Relaxed);
-                    sh.set_state(state::READY);
+                    refresh_ready_state(sh);
                 }
                 eprintln!("[e-lite] resumed Core downloads");
             }
@@ -2263,12 +2281,13 @@ impl Indexer {
                 self.bulk_lag_baseline.store(u64::MAX, Ordering::Relaxed);
                 self.bulk_started.store(false, Ordering::Relaxed);
                 self.bulk_full_pause.store(false, Ordering::Relaxed);
-                if paused && self.core.set_network_active(true).is_ok() {
+                if paused && !self.downloads_paused() && self.core.set_network_active(true).is_ok()
+                {
                     self.lag_paused.store(false, Ordering::Relaxed);
                     self.mark_paused(false);
                     if let Some(sh) = &self.shared {
                         sh.stats.core_network_active.store(true, Ordering::Relaxed);
-                        sh.set_state(state::READY);
+                        refresh_ready_state(sh);
                     }
                     eprintln!("[e-lite] resumed Core downloads after IBD");
                 }
@@ -2312,24 +2331,26 @@ impl Indexer {
             }
         } else {
             if !info.pruned {
-                if paused && self.core.set_network_active(true).is_ok() {
+                if paused && !self.downloads_paused() && self.core.set_network_active(true).is_ok()
+                {
                     self.lag_paused.store(false, Ordering::Relaxed);
                     self.mark_paused(false);
                     if let Some(sh) = &self.shared {
                         sh.stats.core_network_active.store(true, Ordering::Relaxed);
-                        sh.set_state(state::READY);
+                        refresh_ready_state(sh);
                     }
                     eprintln!("[e-lite] Core is no longer pruned: resumed downloads");
                 }
                 return;
             }
             if info.pruneheight == 0 {
-                if paused && self.core.set_network_active(true).is_ok() {
+                if paused && !self.downloads_paused() && self.core.set_network_active(true).is_ok()
+                {
                     self.lag_paused.store(false, Ordering::Relaxed);
                     self.mark_paused(false);
                     if let Some(sh) = &self.shared {
                         sh.stats.core_network_active.store(true, Ordering::Relaxed);
-                        sh.set_state(state::READY);
+                        refresh_ready_state(sh);
                     }
                     eprintln!("[e-lite] Core has no pruned blocks: resumed downloads");
                 }
@@ -2401,7 +2422,7 @@ impl Indexer {
                     }
                     if let Some(sh) = &self.shared {
                         sh.stats.core_network_active.store(true, Ordering::Relaxed);
-                        sh.set_state(state::READY);
+                        refresh_ready_state(sh);
                     }
                     if prewarm {
                         eprintln!(
@@ -2514,6 +2535,16 @@ impl Indexer {
         let hashes = Arc::new(hashes);
         let next_index = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let (tx, rx) = std::sync::mpsc::sync_channel::<(usize, FetchResult)>(workers * 2);
+        // Bound prepared blocks (fetched/decoded/prevout-mapped) to a small
+        // window. The channel alone only bounds queued results; the apply
+        // thread can keep draining out-of-order results into `pending`, so an
+        // explicit window is needed to cap memory.
+        let window = (workers * 2).clamp(4, 32);
+        let (permit_tx, permit_rx) = std::sync::mpsc::sync_channel::<()>(window);
+        for _ in 0..window {
+            let _ = permit_tx.send(());
+        }
+        let permit_rx = Arc::new(Mutex::new(permit_rx));
         let stop = Arc::new(AtomicBool::new(false));
         let mut readers = Vec::with_capacity(workers);
         for _ in 0..workers {
@@ -2526,9 +2557,17 @@ impl Indexer {
             let hashes = Arc::clone(&hashes);
             let next_index = Arc::clone(&next_index);
             let stop_thread = Arc::clone(&stop);
+            let permit_rx = Arc::clone(&permit_rx);
             let tx = tx.clone();
             readers.push(std::thread::spawn(move || loop {
                 if stop_thread.load(Ordering::Relaxed) {
+                    break;
+                }
+                let acquired = permit_rx
+                    .lock()
+                    .map(|rx| rx.recv().is_ok())
+                    .unwrap_or(false);
+                if !acquired || stop_thread.load(Ordering::Relaxed) {
                     break;
                 }
                 let i = next_index.fetch_add(1, Ordering::Relaxed);
@@ -2586,6 +2625,11 @@ impl Indexer {
         let mut paused_by_disk = false;
         let mut group_started = Instant::now();
         let mut last_lag_check = Instant::now();
+        // Give the supervisor a chance to prune/act even when a 512-block
+        // catch-up call is slow; this bounds prune latency independently of
+        // the number of blocks processed.
+        let supervisor_deadline =
+            Instant::now() + Duration::from_secs(self.cfg.pruning.poll_seconds.max(1));
 
         let mut pending: PendingMap = PendingMap::new();
         let mut next_apply = 0usize;
@@ -2614,6 +2658,7 @@ impl Indexer {
             let (height, prepared, prevouts) = match item {
                 Ok(v) => v,
                 Err(e) => {
+                    let _ = permit_tx.send(());
                     result = Err(e.into());
                     break;
                 }
@@ -2683,10 +2728,12 @@ impl Indexer {
                     }
                 }
                 Err(e) => {
+                    let _ = permit_tx.send(());
                     result = Err(e.into());
                     break;
                 }
             }
+            let _ = permit_tx.send(());
             let commit_due = count >= self.tunables.batch_blocks().max(1)
                 || group_txids.len() >= self.tunables.max_group_txs()
                 || group_started.elapsed() >= self.tunables.commit_interval();
@@ -2742,6 +2789,9 @@ impl Indexer {
                 count = 0;
                 group_started = Instant::now();
             }
+            if Instant::now() >= supervisor_deadline {
+                break;
+            }
         }
 
         if result.is_ok() && count > 0 && !paused_by_disk && !self.disk_guard() {
@@ -2794,6 +2844,7 @@ impl Indexer {
         }
 
         stop.store(true, Ordering::Relaxed);
+        drop(permit_tx);
         drop(rx);
         for reader in readers {
             let _ = reader.join();
@@ -3062,15 +3113,22 @@ fn supervisor_config(cfg: &Config, can_control_core: bool) -> el_chain::Supervis
         min_gain: cfg.pruning.min_gain_blocks,
         prune_interval: Duration::from_secs(cfg.pruning.prune_interval_seconds),
         prune_defer_free_bytes: {
-            let gib = cfg
-                .pruning
-                .prune_defer_free_gib
-                .max(cfg.pruning.min_free_gib);
-            (gib > 0).then_some(gib.saturating_mul(GIB_BYTES))
+            // 0 means "do not defer": it must not be raised to min_free_gib.
+            if cfg.pruning.prune_defer_free_gib == 0 {
+                None
+            } else {
+                Some(
+                    cfg.pruning
+                        .prune_defer_free_gib
+                        .max(cfg.pruning.min_free_gib)
+                        .saturating_mul(GIB_BYTES),
+                )
+            }
         },
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn supervisor_tick(
     sup: &mut el_chain::Supervisor,
     core: &CoreClient,
@@ -3078,21 +3136,21 @@ fn supervisor_tick(
     readers: Option<&el_chain::ReaderTracker>,
     data_dir: &std::path::Path,
     core_dir: &std::path::Path,
+    blocks_dir: &std::path::Path,
     shared: Option<&Arc<Shared>>,
 ) -> R<Vec<el_chain::Action>> {
     // Watch both filesystems: e-lite's index and Core's datadir may be on
     // different disks, and either one running out must stop both writers.
     // Read this before Core RPC so a slow/unreachable Core cannot hide a full
     // disk.
-    let free = match (
+    let free = [
         el_chain::disk_free_bytes(data_dir),
         el_chain::disk_free_bytes(core_dir),
-    ) {
-        (Some(a), Some(b)) => Some(a.min(b)),
-        (Some(a), None) => Some(a),
-        (None, Some(b)) => Some(b),
-        (None, None) => None,
-    };
+        el_chain::disk_free_bytes(blocks_dir),
+    ]
+    .into_iter()
+    .flatten()
+    .min();
     let info = match core.blockchain_info() {
         Ok(info) => info,
         Err(_) => return Ok(sup.disk_tick(free)),
@@ -3130,6 +3188,20 @@ fn supervisor_tick(
         readers_min: readers.and_then(|r| r.earliest()),
     };
     Ok(sup.tick(&input))
+}
+
+/// Recompute READY vs BUILDING from the durable tip and Core stats instead of
+/// assuming that a prune/resume left us at the tip.
+fn refresh_ready_state(shared: &Shared) {
+    if shared.stats.disk_low.load(Ordering::Relaxed) {
+        shared.set_state(state::PAUSE_DOWNLOAD);
+        return;
+    }
+    if shared.sync_status().ready {
+        shared.set_state(state::READY);
+    } else {
+        shared.set_state(state::BUILDING);
+    }
 }
 
 fn apply_supervisor_actions(
@@ -3182,14 +3254,14 @@ fn apply_supervisor_actions(
                         i.set_paused(false);
                         if let Some(sh) = shared {
                             sh.stats.disk_low.store(false, Ordering::Relaxed);
-                            sh.set_state(state::READY);
+                            refresh_ready_state(sh);
                         }
                         eprintln!("[e-lite] disk recovered: resumed indexing");
                     }
                 } else {
                     if let Some(sh) = shared {
                         sh.stats.disk_low.store(false, Ordering::Relaxed);
-                        sh.set_state(state::READY);
+                        refresh_ready_state(sh);
                     }
                     if can_control_core {
                         match core.set_network_active(true) {
@@ -3205,6 +3277,18 @@ fn apply_supervisor_actions(
                 if !can_control_core {
                     continue;
                 }
+                // A bulk index may have committed the tip with sync=false. Make
+                // that tip durable before Core deletes the blocks it needs.
+                if let Some(i) = idx {
+                    if let Err(e) = i.store.flush_all() {
+                        eprintln!("[e-lite] cannot sync the index before pruning: {e}");
+                        sup.on_prune_failed();
+                        if let Some(sh) = shared {
+                            sh.stats.prune_failures.fetch_add(1, Ordering::Relaxed);
+                        }
+                        continue;
+                    }
+                }
                 sup.on_prune_requested(height);
                 if let Some(sh) = shared {
                     sh.stats.prune_requests.fetch_add(1, Ordering::Relaxed);
@@ -3214,6 +3298,11 @@ fn apply_supervisor_actions(
                     Ok(got) if got > 0 => {
                         let got = (got as u64).min(u32::MAX as u64) as u32;
                         sup.on_pruned(got);
+                        if let Some(i) = idx {
+                            if let Some(bulk) = &i.bulk {
+                                bulk.clear_cache();
+                            }
+                        }
                         eprintln!("[e-lite] pruned Core blocks below {got} (requested {height})");
                     }
                     Ok(got) => {
@@ -3236,7 +3325,7 @@ fn apply_supervisor_actions(
                     }
                 }
                 if let Some(sh) = shared {
-                    sh.set_state(state::READY);
+                    refresh_ready_state(sh);
                 }
             }
         }
@@ -3585,7 +3674,7 @@ fn index_loop(
                     idx.tunables.apply_store(&idx.store);
                 }
                 if let Some(sh) = &shared {
-                    let caught_up = !core_ibd && height + 1 >= core_height;
+                    let caught_up = !core_ibd && height >= core_height;
                     let next = if idx.is_paused() || idx.downloads_paused() || supervisor.paused() {
                         state::PAUSE_DOWNLOAD
                     } else if caught_up {
@@ -3683,6 +3772,7 @@ fn index_loop(
                     idx.readers.as_deref(),
                     &cfg.data_dir(chain),
                     &cfg.core_datadir(),
+                    &cfg.blocks_dir(chain),
                     shared.as_ref(),
                 ) {
                     Ok(actions) => apply_supervisor_actions(
@@ -3709,6 +3799,7 @@ fn index_loop(
                 idx.readers.as_deref(),
                 &cfg.data_dir(chain),
                 &cfg.core_datadir(),
+                &cfg.blocks_dir(chain),
                 shared.as_ref(),
             ) {
                 Ok(actions) => apply_supervisor_actions(
@@ -4343,34 +4434,6 @@ fn cmd_run(cfg: &Config, chain: Chain) -> R<()> {
             std::thread::sleep(Duration::from_millis(500));
         }
     }
-    refresh_providers(&shared, cfg, true);
-    if requires_ready_provider(cfg, chain) && !shared.provider_ready.load(Ordering::Relaxed) {
-        return fail(format!(
-            "no public provider answered for {}: wallets would receive incomplete histories. \
-             Check public-servers.toml, Tor/clearnet access and the provider URLs, or set \
-             [public_servers] require_ready = false to start in local-only mode.",
-            chain.name()
-        ));
-    }
-    if !shared.provider_ready.load(Ordering::Relaxed)
-        && cfg.rawtx.enabled
-        && chain != Chain::Regtest
-    {
-        eprintln!(
-            "[e-lite] WARNING: no public provider is ready; serving local data only \
-             (some wallet histories may be incomplete)"
-        );
-    }
-    let transports = start_transports(&shared, cfg)?;
-    println!(
-        "e-lite {}: started at {} — indexing and serving on {} (network {}, core {}, manage {:?})",
-        VERSION,
-        format_local_time(started_at),
-        cfg.server.listen,
-        chain.name(),
-        cfg.rpc_url(chain),
-        cfg.core.manage
-    );
     let bulk = build_bulk(cfg, chain, shared.identity().genesis, tunables.readers())?;
     let can_control = core_sup.can_control_core();
     let idx = Indexer::new(
@@ -4387,15 +4450,93 @@ fn cmd_run(cfg: &Config, chain: Chain) -> R<()> {
         can_control,
         chain,
     );
-    let result = index_loop(
-        cfg,
-        chain,
-        Some(Arc::clone(&shared)),
-        idx,
-        &mut core_sup,
-        Arc::clone(&flag),
-        false,
+    // Start indexing before waiting for providers. A provider outage must not
+    // stop local block progress; the readiness gate only controls when the
+    // wallet listener opens.
+    let index_cfg = cfg.clone();
+    let index_shared = Arc::clone(&shared);
+    let index_flag = Arc::clone(&flag);
+    let index_thread = std::thread::spawn(move || {
+        let mut core_sup = core_sup;
+        let result = index_loop(
+            &index_cfg,
+            chain,
+            Some(index_shared),
+            idx,
+            &mut core_sup,
+            index_flag,
+            false,
+        );
+        core_sup.stop();
+        result
+    });
+
+    let require_ready = requires_ready_provider(cfg, chain);
+    refresh_providers(&shared, cfg, true);
+    let mut warned = false;
+    while require_ready
+        && !shared.provider_ready.load(Ordering::Relaxed)
+        && !flag.load(Ordering::SeqCst)
+        && !index_thread.is_finished()
+    {
+        if !warned {
+            eprintln!(
+                "[e-lite] no public provider is ready yet; indexing continues and \
+                 Electrum will open when one answers"
+            );
+            warned = true;
+        }
+        std::thread::sleep(Duration::from_secs(5));
+        refresh_providers(&shared, cfg, true);
+    }
+    if flag.load(Ordering::SeqCst) || index_thread.is_finished() {
+        shared.shutdown.store(true, Ordering::SeqCst);
+        if let Some(rt) = &mut tor_runtime {
+            rt.stop();
+        }
+        let result = index_thread
+            .join()
+            .unwrap_or_else(|_| fail("index thread panicked"));
+        println!(
+            "[e-lite] stopped at {} (uptime {})",
+            format_local_time(SystemTime::now()),
+            format_uptime(started.elapsed())
+        );
+        return result;
+    }
+    if !shared.provider_ready.load(Ordering::Relaxed)
+        && cfg.rawtx.enabled
+        && chain != Chain::Regtest
+    {
+        eprintln!(
+            "[e-lite] WARNING: no public provider is ready; serving local data only \
+             (some wallet histories may be incomplete)"
+        );
+    }
+    let transports = match start_transports(&shared, cfg) {
+        Ok(t) => t,
+        Err(e) => {
+            flag.store(true, Ordering::SeqCst);
+            shared.shutdown.store(true, Ordering::SeqCst);
+            if let Some(rt) = &mut tor_runtime {
+                rt.stop();
+            }
+            let _ = index_thread.join();
+            return Err(e);
+        }
+    };
+    println!(
+        "e-lite {}: started at {} — indexing and serving on {} (network {}, core {}, manage {:?})",
+        VERSION,
+        format_local_time(started_at),
+        cfg.server.listen,
+        chain.name(),
+        cfg.rpc_url(chain),
+        cfg.core.manage
     );
+    while !flag.load(Ordering::SeqCst) && !index_thread.is_finished() {
+        std::thread::sleep(Duration::from_secs(1));
+    }
     shared.shutdown.store(true, Ordering::SeqCst);
     if let Some(rt) = &mut tor_runtime {
         rt.stop();
@@ -4403,7 +4544,9 @@ fn cmd_run(cfg: &Config, chain: Chain) -> R<()> {
     let _ = transports.mempool.join();
     let _ = transports.notifications.join();
     let _ = transports.memory.join();
-    core_sup.stop();
+    let result = index_thread
+        .join()
+        .unwrap_or_else(|_| fail("index thread panicked"));
     println!(
         "[e-lite] stopped at {} (uptime {})",
         format_local_time(SystemTime::now()),

@@ -609,6 +609,12 @@ struct Reader {
 }
 
 impl Reader {
+    fn clear_cache(&self) {
+        if let Ok(mut map) = self.files.lock() {
+            map.clear();
+        }
+    }
+
     fn open_file(&self, num: u32) -> Result<Option<Arc<File>>> {
         if let Ok(map) = self.files.lock() {
             if let Some(f) = map.get(&num) {
@@ -864,6 +870,12 @@ impl BulkSource {
 
     pub fn blocks_dir(&self) -> &Path {
         &self.dir
+    }
+
+    /// Drop open block-file descriptors. Call after Core prunes so deleted
+    /// files do not keep disk space alive through an open handle.
+    pub fn clear_cache(&self) {
+        self.reader.clear_cache();
     }
 
     pub fn entries(&self) -> usize {

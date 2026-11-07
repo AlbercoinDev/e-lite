@@ -215,7 +215,7 @@ e-lite finishes. After that, `max_bulk_lag_blocks` (20,000) bounds additional
 growth relative to the lowest lag seen and resumes at half.
 
 Normal pruning runs every `min_gain_blocks` safe blocks (default **10,000**) and
-is deferred while free space is at or above `prune_defer_free_gib` (50 GiB).
+is not deferred by free space by default (`prune_defer_free_gib = 0`).
 Low-disk emergency pruning still runs. `--core-arg` can also reduce Core's
 memory/IO footprint (for example `--core-arg=-dbcache=128`).
 
