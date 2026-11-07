@@ -135,7 +135,8 @@ require_ready = true      # run: refuse wallets until a provider answers
 ## P2P details
 
 - Minimal Bitcoin P2P client: `version`/`verack`, `ping`/`pong`, `getdata` for
-  `MSG_BLOCK` only.
+  `MSG_WITNESS_BLOCK` only (BIP144). Peers must advertise `NODE_WITNESS`;
+  stripped legacy blocks are rejected and the peer is cooled down.
 - BIP324 v2 is attempted first; v1 is the fallback within the same per-peer
   timeout budget.
 - Peers are discovered from Core's current connections first, then from
