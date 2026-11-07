@@ -78,7 +78,7 @@ available**.
 | Block hash/header/Merkle/witness validation | experimental | before serving/caching |
 | Configurable Esplora endpoints | experimental | editable `public-servers.toml`; shipped defaults; fail-closed if no provider and `require_ready` |
 | Provider readiness gate | experimental | probes `/block-height/0` + genesis raw block before opening Electrum; `require_ready`, latency/state in `/status` |
-| Provider health cooldown | experimental | failed Tor or direct provider is skipped for `provider_cooldown_seconds` (300 s); last good provider goes first |
+| Provider health cooldown | experimental | failed Tor/direct provider skipped for `provider_cooldown_seconds` (300 s); last good first and cooled for max 30 s; forced attempt when all are cooling |
 | In-flight block dedup | experimental | concurrent tx/prefetch of the same block share one download; `max_parallel_fetches=4` |
 | History block prefetch | experimental | background fetch of confirmed history blocks before `transaction.get`; 1 worker, 16 heights per history, bounded queue, no decoys |
 | P2P peers auto/config | experimental | connected peers first, last-good peer first, failed-peer cooldown, total timeout; BIP324 v2 + v1 |

@@ -13,7 +13,6 @@ bitcoin.workspace = true
 sha2.workspace = true
 hex.workspace = true
 reqwest.workspace = true
-socks.workspace = true
 rand.workspace = true
 filetime.workspace = true
 bip324.workspace = true

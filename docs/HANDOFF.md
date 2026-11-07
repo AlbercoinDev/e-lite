@@ -1,9 +1,9 @@
 # Session handoff
 
 **Updated:** 2026-11-07
-**Latest published release:** `0.1.0-alpha.29.3.1`
-**Release:** https://github.com/AlbercoinDev/e-lite/releases/tag/v0.1.0-alpha.29.3.1
-**Main commit at handoff:** tag `v0.1.0-alpha.29.3.1`
+**Latest published release:** `0.1.0-alpha.29.3.2`
+**Release:** https://github.com/AlbercoinDev/e-lite/releases/tag/v0.1.0-alpha.29.3.2
+**Main commit at handoff:** tag `v0.1.0-alpha.29.3.2`
 
 This file is the short “where we are” for a new session. The invariants live in
 [`AGENTS.md`](../AGENTS.md) and [`PROJECT_MEMORY.md`](PROJECT_MEMORY.md); the
@@ -79,6 +79,22 @@ no repitas contexto ni rehagas decisiones ya documentadas.
   the onion setup, reset and security.
 - `docs/ROADMAP.md` contains future features/improvements. Do not present them as
   available.
+
+## Last change (alpha.29.3.2)
+
+- **Never fail without a network attempt**: if every provider is cooling down,
+  e-lite forces one attempt (last good first). A provider that already answered
+  is cooled for at most 30 s after a failure, so one transient error cannot
+  disable the only working source for the full 300 s.
+- **Bounded SOCKS5 handshake**: P2P Tor uses a minimal SOCKS5 CONNECT with the
+  P2P timeout on connect/auth/request/reply; the `socks` crate had no timeouts
+  and could block indefinitely on a stalled proxy.
+- **Inflight panic guard**: a panicking external fetch completes the shared
+  entry with an error instead of leaving followers waiting.
+- **Diagnostics**: `get_history` and rawtx failures log the scripthash/txid,
+  height and block hash.
+- Tests: forced attempt while cooling, failed-provider skip with a healthy
+  alternative, SOCKS timeout and password handshake. No schema/protocol change.
 
 ## Last change (alpha.29.3.1)
 
@@ -472,6 +488,6 @@ startup/shutdown/memory assertions, `e-lite.log` presence, 1.6 and 1.7
 negotiation on the same instance, scriptpubkey/outpoint checks, outpoint
 notification, real testmempoolaccept, the rate-limit burst test, the strict
 Core RPC check and the Sparrow sequence with confirmed verbose transaction)
-passed on the alpha.29.3.1 code. Full signet/testnet4 acceptance
+passed on the alpha.29.3.2 code. Full signet/testnet4 acceptance
 is still operator-run; results belong in `docs/GETTING-STARTED.md`/release notes
 when available.

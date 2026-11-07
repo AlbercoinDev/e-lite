@@ -148,6 +148,51 @@ impl EsploraSource {
             m.remove(base);
         }
     }
+
+    fn is_last_good(&self, base: &str) -> bool {
+        self.last_good
+            .lock()
+            .map(|good| good.as_deref() == Some(base))
+            .unwrap_or(false)
+    }
+
+    /// A provider that answered recently should not be disabled for the full
+    /// cooldown after one transient error; retry it soon.
+    fn failure_cooldown(&self, base: &str) -> Duration {
+        if self.is_last_good(base) {
+            self.cooldown.min(Duration::from_secs(30))
+        } else {
+            self.cooldown
+        }
+    }
+
+    fn attemptable(&self, base: &str) -> bool {
+        let is_onion = base.to_ascii_lowercase().contains(".onion");
+        let tor_ok = self.tor_client.is_some() && !Self::cooled(&self.tor_failures, base);
+        let direct_ok =
+            !is_onion && self.direct_client.is_some() && !Self::cooled(&self.direct_failures, base);
+        tor_ok || direct_ok
+    }
+
+    /// When every provider is cooling down, force one attempt instead of
+    /// failing the wallet request without touching the network.
+    fn force_one(&self, order: &[usize]) {
+        let idx = order
+            .iter()
+            .copied()
+            .find(|&i| self.is_last_good(&self.bases[i]))
+            .or_else(|| order.first().copied());
+        let Some(idx) = idx else {
+            return;
+        };
+        let base = &self.bases[idx];
+        if let Ok(mut m) = self.tor_failures.lock() {
+            m.remove(base);
+        }
+        if let Ok(mut m) = self.direct_failures.lock() {
+            m.remove(base);
+        }
+    }
 }
 
 impl BlockSource for EsploraSource {
@@ -171,6 +216,9 @@ impl BlockSource for EsploraSource {
                 order.insert(0, idx);
             }
         }
+        if !order.iter().any(|&i| self.attemptable(&self.bases[i])) {
+            self.force_one(&order);
+        }
 
         let mut errors = Vec::new();
         for idx in order {
@@ -187,7 +235,8 @@ impl BlockSource for EsploraSource {
                             return Ok(bytes);
                         }
                         Err(e) => {
-                            Self::mark_failed(&self.tor_failures, base, self.cooldown);
+                            let cooldown = self.failure_cooldown(base);
+                            Self::mark_failed(&self.tor_failures, base, cooldown);
                             errors.push(format!("tor {e}"));
                         }
                     }
@@ -212,7 +261,8 @@ impl BlockSource for EsploraSource {
                             return Ok(bytes);
                         }
                         Err(e) => {
-                            Self::mark_failed(&self.direct_failures, base, self.cooldown);
+                            let cooldown = self.failure_cooldown(base);
+                            Self::mark_failed(&self.direct_failures, base, cooldown);
                             errors.push(format!("direct {e}"));
                         }
                     }
@@ -263,18 +313,31 @@ mod tests {
         handle.join().unwrap();
     }
 
-    #[test]
-    fn direct_failure_is_cooled_down() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        use std::sync::Arc;
-
+    fn serve_ok(body: Vec<u8>, requests: std::sync::Arc<std::sync::atomic::AtomicUsize>) -> String {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
-        let requests = Arc::new(AtomicUsize::new(0));
-        let counter = Arc::clone(&requests);
         std::thread::spawn(move || {
             while let Ok((mut sock, _)) = listener.accept() {
-                counter.fetch_add(1, Ordering::SeqCst);
+                requests.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let mut buf = [0u8; 4096];
+                let _ = sock.read(&mut buf);
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = sock.write_all(resp.as_bytes());
+                let _ = sock.write_all(&body);
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    fn serve_500(requests: std::sync::Arc<std::sync::atomic::AtomicUsize>) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            while let Ok((mut sock, _)) = listener.accept() {
+                requests.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 let mut buf = [0u8; 4096];
                 let _ = sock.read(&mut buf);
                 let _ = sock.write_all(
@@ -282,9 +345,20 @@ mod tests {
                 );
             }
         });
+        format!("http://{addr}")
+    }
 
+    #[test]
+    fn failed_provider_is_skipped_when_another_works() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let bad_requests = Arc::new(AtomicUsize::new(0));
+        let good_requests = Arc::new(AtomicUsize::new(0));
+        let bad = serve_500(Arc::clone(&bad_requests));
+        let good = serve_ok(vec![1, 2, 3, 4], Arc::clone(&good_requests));
         let src = EsploraSource::new(
-            vec![format!("http://{addr}")],
+            vec![bad, good],
             None,
             true,
             false,
@@ -292,12 +366,43 @@ mod tests {
             Duration::from_secs(60),
         )
         .unwrap();
-        assert!(src.fetch_block(&Hash32([0x22; 32])).is_err());
-        assert!(src.fetch_block(&Hash32([0x22; 32])).is_err());
+        assert_eq!(
+            src.fetch_block(&Hash32([0x22; 32])).unwrap(),
+            vec![1, 2, 3, 4]
+        );
+        assert_eq!(
+            src.fetch_block(&Hash32([0x23; 32])).unwrap(),
+            vec![1, 2, 3, 4]
+        );
+        assert!(
+            bad_requests.load(Ordering::SeqCst) <= 1,
+            "the failed provider must not be retried on every block"
+        );
+        assert!(good_requests.load(Ordering::SeqCst) >= 2);
+    }
+
+    #[test]
+    fn all_providers_cooling_down_still_get_one_attempt() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let requests = Arc::new(AtomicUsize::new(0));
+        let bad = serve_500(Arc::clone(&requests));
+        let src = EsploraSource::new(
+            vec![bad],
+            None,
+            true,
+            false,
+            Duration::from_secs(2),
+            Duration::from_secs(60),
+        )
+        .unwrap();
+        assert!(src.fetch_block(&Hash32([0x24; 32])).is_err());
+        assert!(src.fetch_block(&Hash32([0x25; 32])).is_err());
         assert_eq!(
             requests.load(Ordering::SeqCst),
-            1,
-            "a cooled provider must not be retried for every block"
+            2,
+            "each request gets one forced attempt instead of failing while cooling"
         );
     }
 

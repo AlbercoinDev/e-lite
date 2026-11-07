@@ -14,7 +14,7 @@ use rand::thread_rng;
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::io::{self, BufReader, Read, Write};
-use std::net::{TcpStream, ToSocketAddrs};
+use std::net::{IpAddr, TcpStream, ToSocketAddrs};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -248,6 +248,159 @@ fn check_block(payload: &[u8], hash: &Hash32, peer: &str) -> Result<()> {
     Ok(())
 }
 
+fn split_host_port(peer: &str) -> io::Result<(&str, u16)> {
+    if let Some(rest) = peer.strip_prefix('[') {
+        let (host, tail) = rest
+            .split_once(']')
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "bad IPv6 peer"))?;
+        let port = tail
+            .strip_prefix(':')
+            .and_then(|p| p.parse::<u16>().ok())
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "bad peer port"))?;
+        return Ok((host, port));
+    }
+    let (host, port) = peer
+        .rsplit_once(':')
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "bad peer address"))?;
+    let port = port
+        .parse::<u16>()
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "bad peer port"))?;
+    Ok((host, port))
+}
+
+/// Minimal SOCKS5 CONNECT with bounded connect/read/write timeouts.
+///
+/// The `socks` crate does not expose timeouts, so a stalled Tor SOCKS proxy
+/// could block a P2P fetch indefinitely. This performs the same handshake with
+/// the P2P timeout applied to every step.
+fn socks_connect(proxy: &str, peer: &str, timeout: Duration) -> io::Result<TcpStream> {
+    let proxy_addrs: Vec<_> = proxy.to_socket_addrs()?.collect();
+    let mut stream = None;
+    for addr in proxy_addrs {
+        if let Ok(sock) = TcpStream::connect_timeout(&addr, timeout) {
+            stream = Some(sock);
+            break;
+        }
+    }
+    let mut stream = stream.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::TimedOut,
+            format!("socks proxy {proxy} did not accept a connection"),
+        )
+    })?;
+    stream.set_read_timeout(Some(timeout))?;
+    stream.set_write_timeout(Some(timeout))?;
+
+    // Offer no-auth and username/password (Tor uses the username for circuit
+    // isolation).
+    stream.write_all(&[5, 2, 0, 2])?;
+    let mut resp = [0u8; 2];
+    stream.read_exact(&mut resp)?;
+    if resp[0] != 5 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "bad SOCKS version",
+        ));
+    }
+    match resp[1] {
+        0 => {}
+        2 => {
+            let user = format!("e-lite-{}", rand::random::<u64>());
+            let user = user.as_bytes();
+            let pass = b"e-lite";
+            let mut auth = Vec::with_capacity(3 + user.len() + pass.len());
+            auth.push(1);
+            auth.push(user.len() as u8);
+            auth.extend_from_slice(user);
+            auth.push(pass.len() as u8);
+            auth.extend_from_slice(pass);
+            stream.write_all(&auth)?;
+            let mut status = [0u8; 2];
+            stream.read_exact(&mut status)?;
+            if status[0] != 1 || status[1] != 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "SOCKS authentication failed",
+                ));
+            }
+        }
+        0xff => {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "SOCKS proxy rejected all auth methods",
+            ))
+        }
+        _ => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "unsupported SOCKS auth method",
+            ))
+        }
+    }
+
+    let (host, port) = split_host_port(peer)?;
+    let mut request = vec![5, 1, 0];
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        match ip {
+            IpAddr::V4(v4) => {
+                request.push(1);
+                request.extend_from_slice(&v4.octets());
+            }
+            IpAddr::V6(v6) => {
+                request.push(4);
+                request.extend_from_slice(&v6.octets());
+            }
+        }
+    } else {
+        let host = host.as_bytes();
+        if host.len() > 255 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "peer host too long",
+            ));
+        }
+        request.push(3);
+        request.push(host.len() as u8);
+        request.extend_from_slice(host);
+    }
+    request.extend_from_slice(&port.to_be_bytes());
+    stream.write_all(&request)?;
+
+    let mut head = [0u8; 4];
+    stream.read_exact(&mut head)?;
+    if head[0] != 5 || head[1] != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::ConnectionRefused,
+            format!("SOCKS connect failed (reply {})", head[1]),
+        ));
+    }
+    match head[3] {
+        1 => {
+            let mut skip = [0u8; 4];
+            stream.read_exact(&mut skip)?;
+        }
+        4 => {
+            let mut skip = [0u8; 16];
+            stream.read_exact(&mut skip)?;
+        }
+        3 => {
+            let mut len = [0u8; 1];
+            stream.read_exact(&mut len)?;
+            let mut skip = vec![0u8; len[0] as usize];
+            stream.read_exact(&mut skip)?;
+        }
+        _ => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "bad SOCKS reply address type",
+            ))
+        }
+    }
+    let mut port = [0u8; 2];
+    stream.read_exact(&mut port)?;
+    Ok(stream)
+}
+
 impl P2pSource {
     pub fn new(
         peers: Vec<String>,
@@ -322,18 +475,12 @@ impl P2pSource {
                     )));
                 }
             } else {
-                let user = format!("e-lite-{}", rand::random::<u64>());
-                match socks::Socks5Stream::connect_with_password(
-                    proxy.as_str(),
-                    peer,
-                    &user,
-                    "e-lite",
-                ) {
+                match socks_connect(proxy, peer, timeout) {
                     Ok(s) => {
                         if let Ok(mut until) = self.tor_cooldown_until.lock() {
                             *until = None;
                         }
-                        s.into_inner()
+                        s
                     }
                     Err(e) => {
                         self.bump(|stats| {
@@ -638,6 +785,57 @@ mod tests {
         TxMerkleNode, TxOut, Witness,
     };
     use std::net::TcpListener;
+
+    #[test]
+    fn socks_connect_is_bounded_by_timeout() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        std::thread::spawn(move || {
+            if let Ok((mut sock, _)) = listener.accept() {
+                let mut buf = [0u8; 16];
+                let _ = sock.read(&mut buf);
+                std::thread::sleep(Duration::from_secs(2));
+            }
+        });
+        let started = Instant::now();
+        let result = socks_connect(&addr, "127.0.0.1:8333", Duration::from_millis(200));
+        assert!(result.is_err());
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "SOCKS handshake must not block past the timeout"
+        );
+    }
+
+    #[test]
+    fn socks_connect_completes_password_handshake() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        std::thread::spawn(move || {
+            let (mut sock, _) = listener.accept().unwrap();
+            let mut greeting = [0u8; 4];
+            sock.read_exact(&mut greeting).unwrap();
+            sock.write_all(&[5, 2]).unwrap();
+            let mut auth_head = [0u8; 2];
+            sock.read_exact(&mut auth_head).unwrap();
+            let mut user = vec![0u8; auth_head[1] as usize];
+            sock.read_exact(&mut user).unwrap();
+            let mut plen = [0u8; 1];
+            sock.read_exact(&mut plen).unwrap();
+            let mut pass = vec![0u8; plen[0] as usize];
+            sock.read_exact(&mut pass).unwrap();
+            sock.write_all(&[1, 0]).unwrap();
+            // CONNECT 127.0.0.1:8333 is 4 + 4 + 2 bytes.
+            let mut request = [0u8; 10];
+            sock.read_exact(&mut request).unwrap();
+            sock.write_all(&[5, 0, 0, 1, 127, 0, 0, 1, 0, 0]).unwrap();
+            std::thread::sleep(Duration::from_secs(1));
+        });
+        let stream = socks_connect(&addr, "127.0.0.1:8333", Duration::from_secs(2)).unwrap();
+        assert_eq!(
+            stream.peer_addr().unwrap().ip(),
+            std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
+        );
+    }
 
     #[test]
     fn failed_peer_is_cooled_down() {

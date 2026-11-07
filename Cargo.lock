@@ -193,12 +193,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "72f5acc6cb2ba439de613abc23857ec3d78374d8ed5ac84e9d11336e87da8649"
 
 [[package]]
-name = "byteorder"
-version = "1.5.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1fd0f2584146f6f2ef48085050886acf353beff7305ebd1ae69500e27c67f64b"
-
-[[package]]
 name = "bytes"
 version = "1.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -341,7 +335,7 @@ dependencies = [
 
 [[package]]
 name = "e-lite"
-version = "0.1.0-alpha.29.3.1"
+version = "0.1.0-alpha.29.3.2"
 dependencies = [
  "bitcoin",
  "el-blocks",
@@ -374,7 +368,7 @@ checksum = "0e9c71c2167ca323c882b99918929403426e2373ea17242ff5653e0d5e1058be"
 
 [[package]]
 name = "el-blocks"
-version = "0.1.0-alpha.29.3.1"
+version = "0.1.0-alpha.29.3.2"
 dependencies = [
  "bitcoin",
  "el-model",
@@ -383,14 +377,14 @@ dependencies = [
 
 [[package]]
 name = "el-chain"
-version = "0.1.0-alpha.29.3.1"
+version = "0.1.0-alpha.29.3.2"
 dependencies = [
  "libc",
 ]
 
 [[package]]
 name = "el-index"
-version = "0.1.0-alpha.29.3.1"
+version = "0.1.0-alpha.29.3.2"
 dependencies = [
  "bitcoin",
  "el-model",
@@ -401,7 +395,7 @@ dependencies = [
 
 [[package]]
 name = "el-mempool"
-version = "0.1.0-alpha.29.3.1"
+version = "0.1.0-alpha.29.3.2"
 dependencies = [
  "bitcoin",
  "el-model",
@@ -413,7 +407,7 @@ dependencies = [
 
 [[package]]
 name = "el-model"
-version = "0.1.0-alpha.29.3.1"
+version = "0.1.0-alpha.29.3.2"
 dependencies = [
  "bitcoin",
  "hex",
@@ -422,7 +416,7 @@ dependencies = [
 
 [[package]]
 name = "el-rawtx"
-version = "0.1.0-alpha.29.3.1"
+version = "0.1.0-alpha.29.3.2"
 dependencies = [
  "bip324",
  "bitcoin",
@@ -434,12 +428,11 @@ dependencies = [
  "rand 0.8.8",
  "reqwest",
  "sha2",
- "socks",
 ]
 
 [[package]]
 name = "el-rpc"
-version = "0.1.0-alpha.29.3.1"
+version = "0.1.0-alpha.29.3.2"
 dependencies = [
  "el-model",
  "serde",
@@ -448,7 +441,7 @@ dependencies = [
 
 [[package]]
 name = "el-serve"
-version = "0.1.0-alpha.29.3.1"
+version = "0.1.0-alpha.29.3.2"
 dependencies = [
  "bitcoin",
  "el-chain",
@@ -467,7 +460,7 @@ dependencies = [
 
 [[package]]
 name = "el-store"
-version = "0.1.0-alpha.29.3.1"
+version = "0.1.0-alpha.29.3.2"
 dependencies = [
  "el-model",
  "hex",
@@ -1565,17 +1558,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "socks"
-version = "0.3.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f0c3dbbd9ae980613c6dd8e28a9407b50509d3803b57624d5dfe8315218cd58b"
-dependencies = [
- "byteorder",
- "libc",
- "winapi",
-]
-
-[[package]]
 name = "stable_deref_trait"
 version = "1.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1985,28 +1967,6 @@ checksum = "f5f280bbb2b287bc8e7de7e3852945a0ff50d1bbcb5ed42b6c7a568c546df171"
 dependencies = [
  "rustls-pki-types",
 ]
-
-[[package]]
-name = "winapi"
-version = "0.3.9"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5c839a674fcd7a98952e593242ea400abe93992746761e38641405d28b00f419"
-dependencies = [
- "winapi-i686-pc-windows-gnu",
- "winapi-x86_64-pc-windows-gnu",
-]
-
-[[package]]
-name = "winapi-i686-pc-windows-gnu"
-version = "0.4.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ac3b87c63620426dd9b991e5ce0329eff545bccbbb34f3be09ff6fb6ab51b7b6"
-
-[[package]]
-name = "winapi-x86_64-pc-windows-gnu"
-version = "0.4.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "712e227841d057c1ee1cd2fb22fa7e5a5461ae8e48fa2ca79ec42cfc1931183f"
 
 [[package]]
 name = "windows-link"

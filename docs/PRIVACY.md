@@ -116,6 +116,10 @@ require_ready = true      # run: refuse wallets until a provider answers
   the genesis raw block with a matching header hash before opening the Electrum
   listeners (`require_ready = true` by default). This prevents a wallet from
   receiving a history it cannot fully resolve.
+- A provider that fails a Tor or direct request is skipped temporarily; the
+  last provider that answered is retried first and cooled for at most 30 s. If
+  every provider is cooling down, one request is still attempted rather than
+  failing the wallet's history/tx load.
 - `allow_clearnet = true` permits direct clearnet access if you explicitly
   accept the privacy trade-off. It is not the default.
 - `decoys = 1` fetches one extra random block after a real external fetch, so

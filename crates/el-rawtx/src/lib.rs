@@ -17,6 +17,7 @@ use rand::seq::SliceRandom;
 use rand::thread_rng;
 use std::collections::HashMap;
 use std::fmt;
+use std::panic::AssertUnwindSafe;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
@@ -416,7 +417,16 @@ impl Resolver {
                 "no external source configured (or Tor is required and unavailable)".to_string(),
             ));
         }
-        let bytes = self.fetch_external_block(&rec.hash)?;
+        let bytes = match self.fetch_external_block(&rec.hash) {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                eprintln!(
+                    "[e-lite] rawtx {txid} at height {height} (block {}) failed: {e}",
+                    rec.hash
+                );
+                return Err(e);
+            }
+        };
         match self.verified_tx(&bytes, &rec, txid) {
             Ok(hex) => {
                 if allow_decoys {
@@ -457,7 +467,14 @@ impl Resolver {
         };
 
         if leader {
-            let result = self.fetch_from_external_sources(hash);
+            let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
+                self.fetch_from_external_sources(hash)
+            }))
+            .unwrap_or_else(|_| {
+                Err(RawtxError::Unavailable(
+                    "external block fetch panicked".into(),
+                ))
+            });
             *entry
                 .result
                 .lock()

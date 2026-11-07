@@ -85,8 +85,11 @@ Never treat a version number in this file as authoritative over the code/tag.
   dead peers.
 - Provider health is sticky: a failed Tor **or direct** request cools that
   provider for `provider_cooldown_seconds` (300 s), and the last successful
-  provider is tried first. `max_parallel_fetches` (4) bounds total external
-  downloads; concurrent requests for the same block share one download.
+  provider is tried first. A provider that already answered is cooled for at
+  most 30 s after a failure; if every provider is cooling down, e-lite forces
+  one attempt rather than failing the wallet request. `max_parallel_fetches`
+  (4) bounds total external downloads; concurrent requests for the same block
+  share one download.
 - Decoys default to 1, at most 2 are in flight, and the prefetch never spawns
   decoys. The prefetcher enqueues up to 16 confirmed history heights per
   history response with one worker; it is an optimisation, never correctness.

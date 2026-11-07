@@ -1,5 +1,27 @@
 # Changelog
 
+## 0.1.0-alpha.29.3.2 — 2026-11-07
+
+### Patch: never fail a wallet request without trying a provider
+
+- **All-provider cooldown fallback**: when every provider is cooling down,
+  e-lite now makes one forced attempt (last good provider first) instead of
+  returning an error immediately. A single transient failure no longer turns
+  into minutes of failed `transaction.get`/history loads.
+- **Last good provider retried sooner**: after one failure it cools down for at
+  most 30 s (never-successful providers keep the full cooldown).
+- **Bounded SOCKS5 handshake**: the P2P Tor path no longer depends on the
+  `socks` crate (which has no connect/read timeout). A minimal SOCKS5 CONNECT
+  uses the P2P timeout for connect, auth, request and reply, so a stalled Tor
+  SOCKS proxy cannot block a fetch indefinitely.
+- **Inflight panic guard**: a panicking external fetch now completes the shared
+  inflight entry with an error instead of leaving followers waiting.
+- **Diagnostics**: failed `get_history` (scripthash) and failed rawtx
+  resolutions are logged with the scripthash/txid, height and block hash.
+- Tests: all-cooled providers still get one attempt, a failed provider is
+  skipped when another works, SOCKS handshake timeout and password handshake.
+- No schema or Electrum protocol changes.
+
 ## 0.1.0-alpha.29.3.1 — 2026-11-07
 
 ### Patch: stop dead providers and peers from stalling rawtx

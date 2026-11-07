@@ -1,7 +1,7 @@
 # Code audit
 
-**Base:** `0.1.0-alpha.29.3` → published `0.1.0-alpha.29.3.1` · **Scope:** `bin/e-lite`, `crates/*` (26 Rust files,
-~19k lines) · **Status:** findings fixed in `0.1.0-alpha.29.3.1` where noted.
+**Base:** `0.1.0-alpha.29.3.1` → published `0.1.0-alpha.29.3.2` · **Scope:** `bin/e-lite`, `crates/*` (26 Rust files,
+~19k lines) · **Status:** findings fixed in `0.1.0-alpha.29.3.2` where noted.
 
 This audit is not a claim of formal verification. It records static checks,
 manual review areas, concrete findings and residual risks.
@@ -68,6 +68,8 @@ Additional checks performed:
 | AUD-048 | P3 | Rawtx latency | `crates/el-serve/src/lib.rs`, `crates/el-rawtx/src/esplora.rs` | With a pruned Core, `transaction.get` fetched one whole block per request; a slow or unresponsive Tor provider could add ~60 s per transaction. | Esplora per-request timeout is 15 s (`rawtx.request_timeout_seconds`) and a failed provider's Tor path is skipped for 120 s (`rawtx.provider_cooldown_seconds`). Confirmed history heights are enqueued in a bounded (512), deduplicated, 2-worker prefetcher so later `transaction.get` hits the block cache. Optimisation only: cache misses still resolve synchronously; no schema change. |
 | AUD-049 | P1 | Provider health | `crates/el-rawtx/src/esplora.rs`, `bin/e-lite/src/config.rs` | Only Tor failures were cooled; a dead direct provider (mempool signet timing out) was retried on every block, adding ~15 s each time. Provider order was random, so the timeout recurred. | Direct failures now get the same cooldown (`provider_cooldown_seconds`, 300 s); the last successful provider is tried first; `request_timeout_seconds` defaults to 8 s. Tests cover a failing direct provider not being retried; e2e stays green. |
 | AUD-050 | P1 | Rawtx concurrency | `crates/el-rawtx/src/lib.rs`, `crates/el-rawtx/src/p2p.rs` | Concurrent wallet/prefetch requests for the same block each downloaded it, and P2P tried up to 4 peers × v2/v1 × the 30 s Core timeout with no memory of failures. One block could take minutes (`dac454` failed after 134 s). | In-flight block dedup, `max_parallel_fetches=4`, P2P `p2p_timeout_seconds=8` with a 2× total cap, connected-peers-first discovery, last-good-first ordering, failed-peer cooldown, `connect_timeout`, and a Tor circuit breaker. Silent-peer, cooldown and shared-download tests added. |
+| AUD-051 | P1 | Rawtx availability | `crates/el-rawtx/src/esplora.rs`, `crates/el-rawtx/src/lib.rs` | A single provider failure put it in a 300 s cooldown; if the only working provider failed, every request returned "cooling down" without touching the network, aborting Sparrow's wallet loading. | If no provider is attemptable, e-lite forces one attempt (last good first); a provider that already answered is cooled for at most 30 s. Inflight leader panics are converted to errors. Tests cover forced attempt and skip-with-healthy-alternative. |
+| AUD-052 | P1 | P2P Tor timeout | `crates/el-rawtx/src/p2p.rs` | The `socks` crate's `Socks5Stream::connect_with_password` has no connect/read/write timeout; a stalled Tor SOCKS proxy could block a P2P fetch indefinitely, ignoring `p2p_timeout_seconds`. | Replaced with a minimal SOCKS5 CONNECT that applies the P2P timeout to proxy connect, greeting, authentication, request and reply. Tests cover a silent proxy timing out and a password-auth handshake. |
 
 ## Residual risks and intentional limits
 

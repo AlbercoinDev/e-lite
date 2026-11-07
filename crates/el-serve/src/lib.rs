@@ -1890,7 +1890,13 @@ fn mempool_value(shared: &Shared, script: ScriptHash) -> RpcResult<Value> {
 
 fn scripthash_history(shared: &Shared, params: &Value) -> RpcResult<Value> {
     let script = param_scripthash(params)?;
-    history_value(shared, script, -32000)
+    history_value(shared, script, -32000).inspect_err(|e| {
+        eprintln!(
+            "[e-lite] get_history {} failed: {}",
+            script.to_electrum_hex(),
+            e.message
+        );
+    })
 }
 
 fn scripthash_balance(shared: &Shared, params: &Value) -> RpcResult<Value> {
