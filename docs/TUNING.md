@@ -214,8 +214,11 @@ it `core_resume_ahead_blocks` (5,000) before the tip, so peers reconnect while
 e-lite finishes. After that, `max_bulk_lag_blocks` (20,000) bounds additional
 growth relative to the lowest lag seen and resumes at half.
 
-Normal pruning runs every `min_gain_blocks` safe blocks (default **10,000**) and
-is not deferred by free space by default (`prune_defer_free_gib = 0`).
+Normal pruning runs every `min_gain_blocks` safe blocks (default **1,000**) and
+is not deferred by free space by default (`prune_defer_free_gib = 0`). At an
+average mainnet block size of ~1.5 MiB, 1,000 blocks is roughly 1.5 GiB of
+retained tail before Core rounds the cut to whole block files; 10,000 blocks was
+roughly 15 GiB. Increase the gain only if prune I/O is a measured problem.
 Low-disk emergency pruning still runs. `--core-arg` can also reduce Core's
 memory/IO footprint (for example `--core-arg=-dbcache=128`).
 

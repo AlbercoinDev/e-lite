@@ -13,12 +13,12 @@ available**.
 | Local Core, LAN Core, WAN via SSH/VPN | experimental | RPC-only for LAN/WAN; no remote block files |
 | Core RPC exposure guard | experimental | warns on non-loopback; `require_loopback_rpc` makes it fatal; no native TLS |
 | Block source `files`, `rpc`, `auto` | experimental | files reads `blk*.dat`, XOR aware, read-only |
-| From-zero pruned IBD with `prune_mib=1` | experimental | manual prune gate; default 10k safe-block gain |
+| From-zero pruned IBD with `prune_mib=1` | experimental | manual prune gate; default 1k safe-block gain |
 | Full node `prune_mib=0` | experimental | no pruning |
 | Automatic pruning `>=550` + opt-in | experimental | hard lag cap + verified gap repair |
 | Parallel decode/txid/Merkle | experimental | readers prepare blocks; apply does UTXO/batch |
 | Commit sync policy | experimental | `auto` (txids in bulk, strict live), `always`, `txids` |
-| Prune cadence and deferral | experimental | every 10k safe blocks; no free-space deferral by default |
+| Prune cadence and deferral | experimental | every 1k safe blocks; no free-space deferral by default |
 | Core bulk pause + peer warm-up | experimental | pause during bulk; resume 5k blocks early |
 | Disk guard with download/index split | experimental | cgroup/LXC aware |
 | Adaptive profiles and hot reload | experimental | `auto/hdd/ssd/nvme/manual`, `SIGUSR1` |

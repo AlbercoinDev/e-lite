@@ -646,7 +646,9 @@ fn d_max_lag() -> u32 {
     192
 }
 fn d_min_gain() -> u32 {
-    10_000
+    // Core deletes whole block files anyway. 1k safe blocks (~1.5 GiB on
+    // mainnet) keeps the retained tail small without meaningful prune churn.
+    1_000
 }
 fn d_max_bulk_lag() -> u32 {
     20_000
@@ -1060,8 +1062,8 @@ mod tests {
     }
 
     #[test]
-    fn prune_gain_default_is_ten_thousand_blocks() {
-        assert_eq!(Config::default().pruning.min_gain_blocks, 10_000);
+    fn prune_gain_default_is_one_thousand_blocks() {
+        assert_eq!(Config::default().pruning.min_gain_blocks, 1_000);
     }
 
     #[test]

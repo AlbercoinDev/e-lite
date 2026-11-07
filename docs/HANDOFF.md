@@ -1,9 +1,9 @@
 # Session handoff
 
 **Updated:** 2026-11-07
-**Latest published release:** `0.1.0-alpha.29.3.6`
-**Release:** https://github.com/AlbercoinDev/e-lite/releases/tag/v0.1.0-alpha.29.3.6
-**Main commit at handoff:** tag `v0.1.0-alpha.29.3.6`
+**Latest published release:** `0.1.0-alpha.29.3.7`
+**Release:** https://github.com/AlbercoinDev/e-lite/releases/tag/v0.1.0-alpha.29.3.7
+**Main commit at handoff:** tag `v0.1.0-alpha.29.3.7`
 
 This file is the short “where we are” for a new session. The invariants live in
 [`AGENTS.md`](../AGENTS.md) and [`PROJECT_MEMORY.md`](PROJECT_MEMORY.md); the
@@ -81,6 +81,18 @@ no repitas contexto ni rehagas decisiones ya documentadas.
 - `docs/ROADMAP.md` contains future features/improvements. Do not present them as
   available.
 
+## Last change (alpha.29.3.7)
+
+- **Pruned-file locator cleanup**: sidecar locators for missing `blk*.dat` files
+  are dropped at open and the sidecar is compacted before the scanner starts;
+  after a prune the in-memory map is filtered and file descriptors are closed.
+- **ReaderTracker**: rawtx guards are taken only for blocks Core can still serve
+  (height >= pruneheight); external-only resolutions and prefetch no longer
+  block pruning.
+- **Disk-first gain**: `min_gain_blocks` defaults to 1,000 (≈1.5 GiB retained
+  tail on mainnet, rounded to whole block files) instead of 10,000.
+- Regtest and pruned-IBD e2e pass; no schema/wire change.
+
 ## Last change (alpha.29.3.6)
 
 - **Durable prune**: RocksDB/WAL is flushed before the prune cut is authorised;
@@ -93,7 +105,7 @@ no repitas contexto ni rehagas decisiones ya documentadas.
   only the wallet listeners; provider outages no longer stop block progress.
 - **Bounded pipeline**: explicit prepared-block window; long catch-ups yield to
   the supervisor after the poll interval.
-- **Space-first default**: `prune_defer_free_gib = 0`; 10k gain and 30 s
+- **Space-first default**: `prune_defer_free_gib = 0`; 1k gain and 30 s
   interval still bound churn. Bulk reader cache is dropped after prune and disk
   checks include a custom `blocks_dir`.
 - Regtest and pruned-IBD e2e pass.
@@ -410,7 +422,7 @@ transaction).
   is always fsynced; startup truncates extras.
 - **Core bulk pause + pre-warm**: pause during bulk, resume 5,000 blocks early
   so peers reconnect, then relative 20k guard.
-- **Prune not deferred by free space by default**; normal cadence every 10k safe blocks;
+- **Prune not deferred by free space by default**; normal cadence every 1k safe blocks;
   emergency low-disk prune remains.
 - **READY / FULLY SYNCED** in log, `/status`, `/metrics`, `e-lite status`.
 - **Wallet banner**: built-in INDEXING/READY templates plus optional
@@ -547,6 +559,6 @@ startup/shutdown/memory assertions, `e-lite.log` presence, 1.6 and 1.7
 negotiation on the same instance, scriptpubkey/outpoint checks, outpoint
 notification, real testmempoolaccept, the rate-limit burst test, the strict
 Core RPC check and the Sparrow sequence with confirmed verbose transaction)
-passed on the alpha.29.3.6 code. Full signet/testnet4 acceptance
+passed on the alpha.29.3.7 code. Full signet/testnet4 acceptance
 is still operator-run; results belong in `docs/GETTING-STARTED.md`/release notes
 when available.

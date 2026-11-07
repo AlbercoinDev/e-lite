@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.1.0-alpha.29.3.7 — 2026-11-07
+
+### Patch: prune locator cleanup, external rawtx guards, disk-first gain
+
+- **Sidecar cleanup**: on open, locators for pruned `blk*.dat` files are dropped
+  and the sidecar is rewritten compactly before the scanner starts. After a
+  prune, the in-memory locator map is filtered and cached file descriptors are
+  closed. This prevents stale entries and deleted files kept open.
+- **ReaderTracker only for local heights**: rawtx resolution enters a reader
+  guard only when the block is at or above Core's prune height. External-only
+  resolutions no longer block pruning. Prefetch also no longer holds a guard.
+- **Disk-first gain**: `min_gain_blocks` default lowered from 10,000 to 1,000.
+  On mainnet that bounds the retained tail to roughly ~1.5 GiB above the safe
+  cut instead of ~15 GiB; Core still prunes whole files, so actual retention
+  rounds to file boundaries. `prune_interval_seconds` remains 30 s.
+- Tests for locator filtering and sidecar compaction; regtest and pruned-IBD e2e
+  pass.
+- No schema or wire-format change.
+
 ## 0.1.0-alpha.29.3.6 — 2026-11-07
 
 ### Patch: durable pruning, confirmed pauses and bounded indexing memory

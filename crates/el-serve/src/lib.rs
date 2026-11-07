@@ -673,7 +673,7 @@ impl Prefetcher {
 
     pub fn new(
         resolver: Arc<Resolver>,
-        readers: Arc<ReaderTracker>,
+        _readers: Arc<ReaderTracker>,
         workers: usize,
         queue: usize,
     ) -> Self {
@@ -683,7 +683,6 @@ impl Prefetcher {
         let seen = Arc::new(Mutex::new(HashSet::new()));
         for _ in 0..workers.max(1) {
             let resolver = Arc::clone(&resolver);
-            let readers = Arc::clone(&readers);
             let rx = Arc::clone(&rx);
             let done = Arc::clone(&done);
             let seen = Arc::clone(&seen);
@@ -698,7 +697,8 @@ impl Prefetcher {
                 let Ok((block_hash, txid, height)) = item else {
                     return;
                 };
-                let _guard = readers.enter(height);
+                // No reader guard: prefetch is an optimisation and may resolve
+                // from external sources. It must never block pruning.
                 if resolver.raw_tx_prefetch(txid, height).is_err() {
                     // Allow a later history request to retry this block.
                     if let Ok(mut seen) = seen.lock() {
@@ -2094,8 +2094,20 @@ fn decode_raw_tx(raw: &str) -> RpcResult<bitcoin::Transaction> {
         .map_err(|e| RpcError::server(format!("rawtx decode: {e}")))
 }
 
+/// Only blocks Core can still serve need a reader guard. A block below
+/// Core's prune height is resolved from cache/P2P/Esplora; holding a guard for
+/// it would block pruning without any benefit.
+fn rawtx_reader_guard(shared: &Shared, height: u32) -> Option<el_chain::ReaderGuard> {
+    let pruneheight = shared.stats.core_pruneheight.load(Ordering::Relaxed);
+    if (height as u64) < pruneheight {
+        None
+    } else {
+        Some(shared.readers.enter(height))
+    }
+}
+
 fn resolve_raw(shared: &Shared, txid: Hash32, height: u32) -> RpcResult<String> {
-    let _guard = shared.readers.enter(height);
+    let _guard = rawtx_reader_guard(shared, height);
     shared
         .resolver
         .raw_tx(txid, height)
@@ -2368,7 +2380,7 @@ fn transaction_get(shared: &Shared, params: &Value) -> RpcResult<Value> {
         // getrawtransaction(txid, true, blockhash) would fail.
         if let Some((height, _)) = occ.first().copied() {
             let raw = {
-                let _guard = shared.readers.enter(height);
+                let _guard = rawtx_reader_guard(shared, height);
                 shared
                     .resolver
                     .raw_tx(txid_hash, height)
@@ -2410,8 +2422,9 @@ fn transaction_get(shared: &Shared, params: &Value) -> RpcResult<Value> {
 
     match occ.first().copied() {
         Some((height, _)) => {
-            // Keep the prune gate away from this height while we resolve.
-            let _guard = shared.readers.enter(height);
+            // Keep the prune gate away from this height only when Core can
+            // still serve it; external-only heights must not block pruning.
+            let _guard = rawtx_reader_guard(shared, height);
             shared
                 .resolver
                 .raw_tx(txid_hash, height)

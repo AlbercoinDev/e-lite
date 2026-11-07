@@ -3300,7 +3300,15 @@ fn apply_supervisor_actions(
                         sup.on_pruned(got);
                         if let Some(i) = idx {
                             if let Some(bulk) = &i.bulk {
-                                bulk.clear_cache();
+                                match bulk.forget_missing_files() {
+                                    Ok(0) => {}
+                                    Ok(n) => eprintln!(
+                                        "[e-lite] dropped {n} block locators for pruned files"
+                                    ),
+                                    Err(e) => {
+                                        eprintln!("[e-lite] cannot clean block locators: {e}")
+                                    }
+                                }
                             }
                         }
                         eprintln!("[e-lite] pruned Core blocks below {got} (requested {height})");

@@ -119,7 +119,7 @@ data dir/network require restart.
 - [ ] `<data-dir>/e-lite.log` contains the same lines as the console (start/stop, progress, milestones).
 - [ ] `READY`/`FULLY SYNCED` appears in the log/status and `server.banner` shows INDEXING then READY.
 - [ ] Custom `banner_file` is created if missing and its placeholders are substituted.
-- [ ] Prune gate advances in 10k-safe-block steps; free-space deferral is off by default.
+- [ ] Prune gate advances in 1k-safe-block steps; free-space deferral is off by default.
 - [ ] `--profile hdd|ssd|nvme|manual` and `--set` work without a config file.
 - [ ] Raw tx works from Core/cache; pruned fallback is explicit if unavailable.
 - [ ] Disk-low pauses downloads; indexing continues until the critical floor.

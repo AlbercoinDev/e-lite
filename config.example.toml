@@ -54,7 +54,7 @@ max_bulk_lag_blocks = 20000         # relative growth window after the bulk paus
 pause_core_during_bulk = true       # pause Core during a long catch-up
 core_resume_ahead_blocks = 5000     # resume early so peers reconnect
 prune_defer_free_gib = 0            # 0 = prune whenever the safe height allows
-min_gain_blocks = 10000              # evaluate/execute prune every ~10k safe blocks
+min_gain_blocks = 1000               # evaluate/execute prune every ~1k safe blocks
 prune_interval_seconds = 30         # minimum time between prune requests (low disk bypasses)
 repair_max_gap_blocks = 2048        # auto-repair a prune gap from verified sources
 poll_seconds = 10

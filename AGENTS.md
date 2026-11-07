@@ -59,9 +59,13 @@ Never treat a version number in this file as authoritative over the code/tag.
 - Snapshots are optional; they are never required by the from-zero flow.
 - Long bulk catch-up pauses Core by default and resumes 5,000 blocks early to
   pre-warm peers; normal pruning is not deferred by free space by default
-  (`prune_defer_free_gib = 0`), only by the 10k-block gain and 30 s interval.
+  (`prune_defer_free_gib = 0`), only by the 1k-block gain and 30 s interval.
 - Never authorise a Core prune from a tip that is not durable: flush RocksDB/WAL
   first. A failed prune RPC must retry the same safe height after backoff.
+- Drop locators for deleted `blk*.dat` files (sidecar compaction at open and
+  in-memory filtering after prune) and only hold a ReaderTracker guard when the
+  block is still at/above Core's prune height; external resolutions must not
+  block pruning. `min_gain_blocks` defaults to 1,000 for the disk-first goal.
 - Pause/resume state must reflect `setnetworkactive` success; never let a lag
   resume override a disk pause. Start indexing before the provider gate so a
   provider outage cannot stop local block progress.

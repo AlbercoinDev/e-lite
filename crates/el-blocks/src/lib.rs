@@ -251,6 +251,17 @@ impl BlockFileIndex {
         self.inner.lock().ok().and_then(|m| m.get(hash).copied())
     }
 
+    /// Drop locators whose block file no longer exists (Core pruned it).
+    pub fn retain_files(&self, files: &std::collections::HashSet<u32>) -> usize {
+        let mut removed = 0usize;
+        if let Ok(mut map) = self.inner.lock() {
+            let before = map.len();
+            map.retain(|_, loc| files.contains(&loc.file));
+            removed = before.saturating_sub(map.len());
+        }
+        removed
+    }
+
     pub fn wait_for(&self, hash: &Hash32, timeout: Duration) -> Option<BlockLocation> {
         let deadline = Instant::now() + timeout;
         let mut guard = self.inner.lock().ok()?;
@@ -389,6 +400,33 @@ impl Drop for Sidecar {
 struct LoadedSidecar {
     map: HashMap<Hash32, BlockLocation>,
     cursor: (u32, u64),
+}
+
+/// Rewrite the sidecar without locators for missing block files. Called before
+/// the scanner starts, so no writer is active.
+fn compact_sidecar(path: &Path, header: &[u8], map: &HashMap<Hash32, BlockLocation>) -> Result<()> {
+    let tmp = path.with_extension("idx.tmp");
+    {
+        let mut file = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&tmp)
+            .map_err(|e| BulkError::Sidecar(format!("{}: {e}", tmp.display())))?;
+        file.write_all(header)?;
+        for (hash, loc) in map {
+            let mut rec = [0u8; LOC_RECORD];
+            rec[0..32].copy_from_slice(hash.as_bytes());
+            rec[32..36].copy_from_slice(&loc.file.to_le_bytes());
+            rec[36..44].copy_from_slice(&loc.offset.to_le_bytes());
+            rec[44..48].copy_from_slice(&loc.size.to_le_bytes());
+            file.write_all(&rec)?;
+        }
+        file.sync_data()?;
+    }
+    std::fs::rename(&tmp, path)
+        .map_err(|e| BulkError::Sidecar(format!("{}: {e}", path.display())))?;
+    Ok(())
 }
 
 fn load_sidecar(
@@ -771,7 +809,7 @@ impl BulkSource {
             }
         }
         let sidecar_path = cache_dir.join(SIDECAR_NAME);
-        let loaded = load_sidecar(&sidecar_path, chain, &genesis, &xor)?;
+        let mut loaded = load_sidecar(&sidecar_path, chain, &genesis, &xor)?;
         let header = sidecar_header(chain, &genesis, &xor);
         let needs_header = match std::fs::read(&sidecar_path) {
             Ok(buf) => !buf.starts_with(&header),
@@ -780,6 +818,29 @@ impl BulkSource {
         if needs_header {
             let side = Sidecar::create(&sidecar_path, &header)?;
             drop(side);
+        }
+
+        // Core prunes whole blocks files. Drop locators that point at files
+        // which no longer exist and rewrite the sidecar compactly before the
+        // scanner starts. Doing this at open avoids racing the active scanner.
+        let existing_files: std::collections::HashSet<u32> = list_block_files(&blocks_dir)?
+            .into_iter()
+            .map(|(num, _)| num)
+            .collect();
+        let before = loaded.map.len();
+        loaded
+            .map
+            .retain(|_, loc| existing_files.contains(&loc.file));
+        if loaded.map.len() != before || needs_header {
+            if !needs_header {
+                compact_sidecar(&sidecar_path, &header, &loaded.map)?;
+            }
+            loaded.cursor = loaded
+                .map
+                .values()
+                .map(|loc| (loc.file, loc.offset + 8 + loc.size as u64))
+                .max()
+                .unwrap_or((0, 0));
         }
 
         // If the locator was loaded, validate its cursor against the actual
@@ -878,6 +939,18 @@ impl BulkSource {
         self.reader.clear_cache();
     }
 
+    /// Remove in-memory locators for pruned block files and close cached
+    /// descriptors. The sidecar is compacted on the next open.
+    pub fn forget_missing_files(&self) -> Result<usize> {
+        let files: std::collections::HashSet<u32> = list_block_files(&self.dir)?
+            .into_iter()
+            .map(|(num, _)| num)
+            .collect();
+        let removed = self.index.retain_files(&files);
+        self.reader.clear_cache();
+        Ok(removed)
+    }
+
     pub fn entries(&self) -> usize {
         self.index.len()
     }
@@ -955,6 +1028,63 @@ mod tests {
             header_hash(&header).unwrap(),
             Hash32::from_hex(&genesis.block_hash().to_string()).unwrap()
         );
+    }
+
+    #[test]
+    fn retain_files_drops_pruned_locators() {
+        let index = BlockFileIndex::new();
+        let kept = Hash32([1u8; 32]);
+        let pruned = Hash32([2u8; 32]);
+        index.insert(
+            kept,
+            BlockLocation {
+                file: 2,
+                offset: 0,
+                size: 100,
+            },
+        );
+        index.insert(
+            pruned,
+            BlockLocation {
+                file: 1,
+                offset: 0,
+                size: 100,
+            },
+        );
+        let files = std::iter::once(2u32).collect();
+        assert_eq!(index.retain_files(&files), 1);
+        assert!(index.get(&kept).is_some());
+        assert!(index.get(&pruned).is_none());
+    }
+
+    #[test]
+    fn sidecar_compaction_round_trips() {
+        let dir = tmp("sidecar-compact");
+        let path = dir.join(SIDECAR_NAME);
+        let xor = XorKey([0u8; 8]);
+        let genesis = Hash32([9u8; 32]);
+        let header = sidecar_header(Chain::Regtest, &genesis, &xor);
+        let mut map = HashMap::new();
+        map.insert(
+            Hash32([3u8; 32]),
+            BlockLocation {
+                file: 1,
+                offset: 0,
+                size: 100,
+            },
+        );
+        map.insert(
+            Hash32([4u8; 32]),
+            BlockLocation {
+                file: 2,
+                offset: 100,
+                size: 200,
+            },
+        );
+        compact_sidecar(&path, &header, &map).unwrap();
+        let loaded = load_sidecar(&path, Chain::Regtest, &genesis, &xor).unwrap();
+        assert_eq!(loaded.map.len(), 2);
+        assert_eq!(loaded.map.get(&Hash32([4u8; 32])).unwrap().file, 2);
     }
 
     #[test]

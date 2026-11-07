@@ -1,7 +1,7 @@
 # Code audit
 
-**Base:** `0.1.0-alpha.29.3.5` → published `0.1.0-alpha.29.3.6` · **Scope:** `bin/e-lite`, `crates/*` (26 Rust files,
-~19k lines) · **Status:** findings fixed in `0.1.0-alpha.29.3.6` where noted.
+**Base:** `0.1.0-alpha.29.3.6` → published `0.1.0-alpha.29.3.7` · **Scope:** `bin/e-lite`, `crates/*` (26 Rust files,
+~19k lines) · **Status:** findings fixed in `0.1.0-alpha.29.3.7` where noted.
 
 This audit is not a claim of formal verification. It records static checks,
 manual review areas, concrete findings and residual risks.
@@ -83,6 +83,9 @@ Additional checks performed:
 | AUD-063 | P1 | Pause state | `bin/e-lite/src/main.rs` | `pause_downloads`/`resume_downloads` changed internal state before confirming `setnetworkactive`; lag resumes could override a disk pause. | RPC-first transitions; failed calls are retried and lag resumes check the disk pause. |
 | AUD-064 | P2 | Disk/readiness | `bin/e-lite/src/main.rs`, `crates/el-serve/src/lib.rs` | Cold start between low/resume watermarks paused unnecessarily; `height + 1` could report READY one block early; prune/resume forced READY. | Only start pauses below the low watermark, require exact tips, and recompute READY/BUILDING from durable state. |
 | AUD-065 | P2 | Indexing pipeline | `bin/e-lite/src/main.rs`, `crates/el-blocks/src/lib.rs` | Provider readiness could block indexing; out-of-order results could grow; long 512-block calls delayed pruning; pruned files stayed open; custom `blocks_dir` was not monitored. | Start indexing before the provider gate, add a prepared-block window, yield to the supervisor after the poll interval, drop the bulk reader cache after prune, and include `blocks_dir` in free-space checks. |
+| AUD-066 | P2 | Pruned block locators | `crates/el-blocks/src/lib.rs`, `bin/e-lite/src/main.rs` | The sidecar kept locators for deleted `blk*.dat` files and the reader cache kept descriptors open, so pruned space could remain allocated and stale locators were tried. | Filter missing files at open and compact the sidecar before the scanner starts; after a prune filter the in-memory map and clear the reader cache. Tests cover locator filtering/compaction. |
+| AUD-067 | P2 | Reader guard vs pruning | `crates/el-serve/src/lib.rs` | `ReaderTracker` was entered for every rawtx height, including blocks below Core's prune height that must be resolved externally, blocking pruning for no reason. | Enter a guard only when `height >= core_pruneheight`; prefetch never holds a guard. |
+| AUD-068 | P3 | Prune gain | `bin/e-lite/src/config.rs` | 10k safe blocks retained a large tail (~15 GiB mainnet) despite the space-first goal. | Lower default to 1k (~1.5 GiB, rounded to Core block files); 30 s interval remains. |
 
 ## Residual risks and intentional limits
 
