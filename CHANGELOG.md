@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.1.0-alpha.29.3.5 — 2026-11-07
+
+### Patch: outpoint notifications off the notifier thread, complete protocol matrix
+
+- **Outpoint resolution moved to bounded workers**: `blockchain.outpoint.subscribe`
+  status may need Core or an external raw transaction. It now runs in a
+  2-worker, queue-256 pool with pending-job retry instead of blocking the
+  single notifier thread and delaying every other wallet. Reorg notifications
+  are preserved.
+- **Removed the temporary live provider test** (`live_esplora_health_cooldown`);
+  the provider cooldown remains covered by the deterministic local tests.
+- **Electrum protocol matrix**: added `docs/ELECTRUM_PROTOCOL.md` with the
+  method/version matrix (1.4–1.4.2, 1.6, 1.7), notification semantics, limits,
+  deliberate deviations and performance notes.
+- No schema or wire-format change.
+
 ## 0.1.0-alpha.29.3.4 — 2026-11-07
 
 ### Patch: BIP144 witness requests, BIP141 validation and Electrum protocol audit

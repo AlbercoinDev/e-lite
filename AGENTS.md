@@ -93,7 +93,8 @@ Never treat a version number in this file as authoritative over the code/tag.
 - Electrum 1.7 scripthash and scriptpubkey subscriptions are kept in separate
   maps so a client using both receives both notifications. Outpoint and
   scriptpubkey subscriptions get a forced notification on reorg even if the
-  status string is unchanged.
+  status string is unchanged. Outpoint status resolution runs in a bounded
+  worker pool, never in the notifier thread.
 - Provider health is sticky: a failed Tor **or direct** request cools that
   provider for `provider_cooldown_seconds` (300 s), and the last successful
   provider is tried first. A provider that already answered is cooled for at

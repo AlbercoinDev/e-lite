@@ -1,7 +1,7 @@
 # Code audit
 
-**Base:** `0.1.0-alpha.29.3.3` → published `0.1.0-alpha.29.3.4` · **Scope:** `bin/e-lite`, `crates/*` (26 Rust files,
-~19k lines) · **Status:** findings fixed in `0.1.0-alpha.29.3.4` where noted.
+**Base:** `0.1.0-alpha.29.3.4` → published `0.1.0-alpha.29.3.5` · **Scope:** `bin/e-lite`, `crates/*` (26 Rust files,
+~19k lines) · **Status:** findings fixed in `0.1.0-alpha.29.3.5` where noted.
 
 This audit is not a claim of formal verification. It records static checks,
 manual review areas, concrete findings and residual risks.
@@ -77,6 +77,7 @@ Additional checks performed:
 | AUD-057 | P2 | Electrum 1.7 notifications | `crates/el-serve/src/lib.rs` | Scripthash/scriptpubkey shared one status map, so a client subscribed through both could lose one notification; outpoint subscriptions were not forced on reorg. | Separate maps and method-specific notifications; forced notification for scriptpubkey and outpoint on reorg. Existing 1.6/1.7 protocol tests stay green. |
 | AUD-058 | P2 | Prefetch and cache | `crates/el-serve/src/lib.rs`, `crates/el-rawtx/src/cache.rs` | Prefetch marked a height as seen even when the queue was full and deduped by height, not block; status computation triggered downloads. Cache reads/fsync held the metadata lock and a lowered capacity was only applied on the next write. | Dedup by block hash with queue-full/failure retry, status never prefetches, reads/fsync outside the state lock, and capacity enforced at open. |
 | AUD-059 | P2 | JSON-RPC parameters | `crates/el-serve/src/lib.rs` | `u64` heights, `cp_height` and `txout_idx` were truncated with `as u32`; oversized values could address a different height/output. | Checked `u32::try_from` with `-32602` errors; `testmempoolaccept` maps `reject-reason` to `reason`. |
+| AUD-060 | P2 | Notifier blocking | `crates/el-serve/src/lib.rs` | Outpoint status can resolve raw funding/spending transactions through Core or providers; running it in the single notifier thread blocked header/scripthash notifications for every wallet. | Outpoint jobs run in a 2-worker, queue-256 pool with pending retry; the notifier only enqueues. Reorg forcing is preserved. |
 
 ## Residual risks and intentional limits
 

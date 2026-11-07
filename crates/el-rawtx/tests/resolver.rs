@@ -374,54 +374,6 @@ fn live_esplora_signet_block() {
     eprintln!("live esplora signet block 1000: {} bytes", bytes.len());
 }
 
-/// Live provider health: a dead provider may cost one timeout, but the last
-/// good provider and the direct cooldown must keep the following blocks fast.
-#[test]
-#[ignore]
-fn live_esplora_health_cooldown() {
-    let client = reqwest::blocking::Client::builder()
-        .timeout(Duration::from_secs(15))
-        .build()
-        .unwrap();
-    let good = "https://blockstream.info/signet/api";
-    let hashes: Vec<String> = (1000..1004)
-        .map(|h| {
-            client
-                .get(format!("{good}/block-height/{h}"))
-                .send()
-                .unwrap()
-                .text()
-                .unwrap()
-                .trim()
-                .to_string()
-        })
-        .collect();
-    let src = el_rawtx::EsploraSource::new(
-        vec![
-            "https://mempool.space/signet/api".to_string(),
-            good.to_string(),
-        ],
-        None,
-        true,
-        false,
-        Duration::from_secs(8),
-        Duration::from_secs(300),
-    )
-    .unwrap();
-    for hash in hashes {
-        let hash = Hash32::from_hex(&hash).unwrap();
-        let started = Instant::now();
-        let result = src.fetch_block(&hash);
-        eprintln!(
-            "live provider fetch {:?} -> {}",
-            started.elapsed(),
-            result
-                .map(|b| format!("{} bytes", b.len()))
-                .unwrap_or_else(|e| e.to_string())
-        );
-    }
-}
-
 /// Live end-to-end external resolution: fetch a real signet tip block through
 /// Esplora, verify it against a locally stored header, then hit the cache.
 #[test]

@@ -1,9 +1,9 @@
 # Session handoff
 
 **Updated:** 2026-11-07
-**Latest published release:** `0.1.0-alpha.29.3.4`
-**Release:** https://github.com/AlbercoinDev/e-lite/releases/tag/v0.1.0-alpha.29.3.4
-**Main commit at handoff:** tag `v0.1.0-alpha.29.3.4`
+**Latest published release:** `0.1.0-alpha.29.3.5`
+**Release:** https://github.com/AlbercoinDev/e-lite/releases/tag/v0.1.0-alpha.29.3.5
+**Main commit at handoff:** tag `v0.1.0-alpha.29.3.5`
 
 This file is the short “where we are” for a new session. The invariants live in
 [`AGENTS.md`](../AGENTS.md) and [`PROJECT_MEMORY.md`](PROJECT_MEMORY.md); the
@@ -20,7 +20,7 @@ wins; update this file.
 5. `docs/FEATURES.md` and `docs/ROADMAP.md`
 6. `docs/AUDIT.md`
 7. The specific docs for the task (`CLI`, `INSTALL`, `ARCHITECTURE`, `OPERATIONS`,
-   `PRIVACY`, `TUNING`, `GETTING-STARTED`).
+   `PRIVACY`, `TUNING`, `ELECTRUM_PROTOCOL`, `GETTING-STARTED`).
 
 Suggested prompt:
 
@@ -80,6 +80,16 @@ no repitas contexto ni rehagas decisiones ya documentadas.
   the onion setup, reset and security.
 - `docs/ROADMAP.md` contains future features/improvements. Do not present them as
   available.
+
+## Last change (alpha.29.3.5)
+
+- **Outpoint notifications** are resolved by a bounded worker pool (2 workers,
+  queue 256, pending retry) instead of the notifier thread, so a Core/provider
+  lookup cannot delay other wallets. Reorg forcing stays.
+- Removed the temporary live provider test; deterministic cooldown tests remain.
+- Added `docs/ELECTRUM_PROTOCOL.md` with the complete 1.4–1.7 method/version
+  matrix, notification rules, limits, deviations and performance notes.
+- No schema or wire-format change.
 
 ## Last change (alpha.29.3.4)
 
@@ -520,6 +530,6 @@ startup/shutdown/memory assertions, `e-lite.log` presence, 1.6 and 1.7
 negotiation on the same instance, scriptpubkey/outpoint checks, outpoint
 notification, real testmempoolaccept, the rate-limit burst test, the strict
 Core RPC check and the Sparrow sequence with confirmed verbose transaction)
-passed on the alpha.29.3.4 code. Full signet/testnet4 acceptance
+passed on the alpha.29.3.5 code. Full signet/testnet4 acceptance
 is still operator-run; results belong in `docs/GETTING-STARTED.md`/release notes
 when available.
