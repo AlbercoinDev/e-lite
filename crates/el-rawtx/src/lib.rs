@@ -509,7 +509,7 @@ impl Resolver {
             return result;
         }
 
-        let deadline = Instant::now() + Duration::from_secs(120);
+        let deadline = Instant::now() + Duration::from_secs(45);
         let mut done = entry
             .done
             .lock()
@@ -540,8 +540,13 @@ impl Resolver {
         let _permit = self.external_slots.acquire();
         let mut order: Vec<usize> = (0..self.external.len()).collect();
         order.shuffle(&mut thread_rng());
+        let started = Instant::now();
         let mut errors = Vec::new();
         for idx in order {
+            if started.elapsed() >= Duration::from_secs(30) {
+                errors.push("external fetch deadline exceeded".to_string());
+                break;
+            }
             let source = &self.external[idx];
             match source.fetch_block(hash) {
                 Ok(bytes) => {

@@ -18,6 +18,9 @@ pub struct BlockCache {
     dir: PathBuf,
     capacity: u64,
     state: Mutex<State>,
+    /// Serializes writers so capacity accounting stays exact without holding
+    /// the state lock across fsync.
+    write_lock: Mutex<()>,
 }
 
 impl BlockCache {
@@ -43,11 +46,22 @@ impl BlockCache {
                 size += md.len();
             }
         }
-        Ok(BlockCache {
+        let cache = BlockCache {
             dir: dir.to_path_buf(),
             capacity,
             state: Mutex::new(State { size, entries }),
-        })
+            write_lock: Mutex::new(()),
+        };
+        // A lowered capacity (for example the new 256 MiB default) must take
+        // effect at open time, not only after the next write.
+        if let Ok(mut state) = cache.state.lock() {
+            while state.size > cache.capacity {
+                if !evict_one(&cache.dir, &mut state) {
+                    break;
+                }
+            }
+        }
+        Ok(cache)
     }
 
     fn path(&self, hash: &Hash32) -> PathBuf {
@@ -62,11 +76,15 @@ impl BlockCache {
     }
 
     pub fn get(&self, hash: &Hash32) -> Option<Vec<u8>> {
-        let mut st = self.state.lock().ok()?;
-        if !st.entries.contains_key(hash) {
-            return None;
-        }
-        let path = self.path(hash);
+        let path = {
+            let st = self.state.lock().ok()?;
+            if !st.entries.contains_key(hash) {
+                return None;
+            }
+            self.path(hash)
+        };
+        // Read outside the state lock: a large block read must not block
+        // metadata checks or other readers.
         match fs::read(&path) {
             Ok(bytes) => {
                 // Refresh mtime so this entry is the most recently used.
@@ -75,8 +93,10 @@ impl BlockCache {
                 Some(bytes)
             }
             Err(_) => {
-                if let Some(sz) = st.entries.remove(hash) {
-                    st.size = st.size.saturating_sub(sz);
+                if let Ok(mut st) = self.state.lock() {
+                    if let Some(sz) = st.entries.remove(hash) {
+                        st.size = st.size.saturating_sub(sz);
+                    }
                 }
                 None
             }
@@ -90,21 +110,12 @@ impl BlockCache {
         if bytes.len() as u64 > self.capacity {
             return Ok(()); // never let one block evict the whole cache
         }
-        let mut st = self
-            .state
+        let _write = self
+            .write_lock
             .lock()
-            .map_err(|_| RawtxError::Io("cache lock poisoned".into()))?;
-
-        if let Some(old) = st.entries.get(hash).copied() {
-            st.size = st.size.saturating_sub(old);
-            st.entries.remove(hash);
-        }
-        while st.size + bytes.len() as u64 > self.capacity {
-            if !evict_one(&self.dir, &mut st) {
-                break;
-            }
-        }
-
+            .map_err(|_| RawtxError::Io("cache write lock poisoned".into()))?;
+        // Write and fsync the temporary file before touching the old entry, so
+        // a failed write does not lose a cache hit.
         let path = self.path(hash);
         let tmp = path.with_extension("tmp");
         {
@@ -115,6 +126,20 @@ impl BlockCache {
             f.sync_data()
                 .map_err(|e| RawtxError::Io(format!("cache sync: {e}")))?;
         }
+
+        let mut st = self
+            .state
+            .lock()
+            .map_err(|_| RawtxError::Io("cache lock poisoned".into()))?;
+        if let Some(old) = st.entries.get(hash).copied() {
+            st.size = st.size.saturating_sub(old);
+            st.entries.remove(hash);
+        }
+        while st.size + bytes.len() as u64 > self.capacity {
+            if !evict_one(&self.dir, &mut st) {
+                break;
+            }
+        }
         fs::rename(&tmp, &path).map_err(|e| RawtxError::Io(format!("cache rename: {e}")))?;
         st.size += bytes.len() as u64;
         st.entries.insert(*hash, bytes.len() as u64);
@@ -122,12 +147,16 @@ impl BlockCache {
     }
 
     pub fn remove(&self, hash: &Hash32) -> Result<()> {
-        let mut st = self
-            .state
-            .lock()
-            .map_err(|_| RawtxError::Io("cache lock poisoned".into()))?;
-        if let Some(sz) = st.entries.remove(hash) {
-            st.size = st.size.saturating_sub(sz);
+        let removed = {
+            let mut st = self
+                .state
+                .lock()
+                .map_err(|_| RawtxError::Io("cache lock poisoned".into()))?;
+            st.entries.remove(hash).map(|sz| {
+                st.size = st.size.saturating_sub(sz);
+            })
+        };
+        if removed.is_some() {
             let _ = fs::remove_file(self.path(hash));
         }
         Ok(())

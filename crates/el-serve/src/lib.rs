@@ -524,9 +524,10 @@ pub struct ClientState {
     pub id: u64,
     pub writer: Mutex<Wire>,
     pub subs: Mutex<HashMap<ScriptHash, Option<String>>>,
-    /// Scripts subscribed through `blockchain.scriptpubkey.subscribe`; these
-    /// receive a notification on reorg even when the status did not change.
-    pub spk_subs: Mutex<HashSet<ScriptHash>>,
+    /// Scripts subscribed through `blockchain.scriptpubkey.subscribe`, with
+    /// their last status. Kept separate from scripthash subscriptions so a
+    /// client using both receives the correct method-specific notification.
+    pub spk_subs: Mutex<HashMap<ScriptHash, Option<String>>>,
     /// Outpoint subscriptions from `blockchain.outpoint.subscribe`.
     pub outpoints: Mutex<HashMap<(Hash32, u32), OutpointSub>>,
     /// Per-connection request budget (rate limiting).
@@ -603,7 +604,7 @@ impl ClientRegistry {
             id,
             writer: Mutex::new(wire),
             subs: Mutex::new(HashMap::new()),
-            spk_subs: Mutex::new(HashSet::new()),
+            spk_subs: Mutex::new(HashMap::new()),
             outpoints: Mutex::new(HashMap::new()),
             budget: Mutex::new(RateLimit::new(
                 self.rate_burst.load(Ordering::Relaxed),
@@ -654,8 +655,8 @@ impl ClientRegistry {
 /// waiting for a provider. Deduplicated by height, bounded queue, and only used
 /// when external sources exist.
 pub struct Prefetcher {
-    tx: Option<mpsc::SyncSender<(Hash32, u32)>>,
-    seen: Mutex<HashSet<u32>>,
+    tx: Option<mpsc::SyncSender<(Hash32, Hash32, u32)>>,
+    seen: Arc<Mutex<HashSet<Hash32>>>,
     queued: Arc<AtomicU64>,
     done: Arc<AtomicU64>,
 }
@@ -664,7 +665,7 @@ impl Prefetcher {
     pub fn disabled() -> Self {
         Self {
             tx: None,
-            seen: Mutex::new(HashSet::new()),
+            seen: Arc::new(Mutex::new(HashSet::new())),
             queued: Arc::new(AtomicU64::new(0)),
             done: Arc::new(AtomicU64::new(0)),
         }
@@ -676,14 +677,16 @@ impl Prefetcher {
         workers: usize,
         queue: usize,
     ) -> Self {
-        let (tx, rx) = mpsc::sync_channel::<(Hash32, u32)>(queue.max(1));
+        let (tx, rx) = mpsc::sync_channel::<(Hash32, Hash32, u32)>(queue.max(1));
         let rx = Arc::new(Mutex::new(rx));
         let done = Arc::new(AtomicU64::new(0));
+        let seen = Arc::new(Mutex::new(HashSet::new()));
         for _ in 0..workers.max(1) {
             let resolver = Arc::clone(&resolver);
             let readers = Arc::clone(&readers);
             let rx = Arc::clone(&rx);
             let done = Arc::clone(&done);
+            let seen = Arc::clone(&seen);
             std::thread::spawn(move || loop {
                 let item = {
                     let guard = match rx.lock() {
@@ -692,17 +695,22 @@ impl Prefetcher {
                     };
                     guard.recv()
                 };
-                let Ok((txid, height)) = item else {
+                let Ok((block_hash, txid, height)) = item else {
                     return;
                 };
                 let _guard = readers.enter(height);
-                let _ = resolver.raw_tx_prefetch(txid, height);
+                if resolver.raw_tx_prefetch(txid, height).is_err() {
+                    // Allow a later history request to retry this block.
+                    if let Ok(mut seen) = seen.lock() {
+                        seen.remove(&block_hash);
+                    }
+                }
                 done.fetch_add(1, Ordering::Relaxed);
             });
         }
         Self {
             tx: Some(tx),
-            seen: Mutex::new(HashSet::new()),
+            seen: Arc::clone(&seen),
             queued: Arc::new(AtomicU64::new(0)),
             done,
         }
@@ -718,7 +726,7 @@ impl Prefetcher {
 
     /// Enqueue one txid per block height. Duplicates and a full queue are
     /// dropped silently: prefetch is an optimisation, never a correctness path.
-    pub fn enqueue(&self, txid: Hash32, height: u32) -> bool {
+    pub fn enqueue(&self, block_hash: Hash32, txid: Hash32, height: u32) -> bool {
         let Some(tx) = &self.tx else {
             return false;
         };
@@ -728,11 +736,16 @@ impl Prefetcher {
         if seen.len() >= 20_000 {
             seen.clear();
         }
-        if seen.insert(height) && tx.try_send((txid, height)).is_ok() {
-            self.queued.fetch_add(1, Ordering::Relaxed);
-            return true;
+        if !seen.insert(block_hash) {
+            return false;
         }
-        false
+        if tx.try_send((block_hash, txid, height)).is_err() {
+            // Queue full or worker gone: do not mark it as done.
+            seen.remove(&block_hash);
+            return false;
+        }
+        self.queued.fetch_add(1, Ordering::Relaxed);
+        true
     }
 }
 
@@ -1654,12 +1667,12 @@ fn headers_subscribe(shared: &Shared, client: Option<&Arc<ClientState>>) -> RpcR
 }
 
 fn param_u32(params: &Value, idx: usize) -> RpcResult<u32> {
-    params
+    let value = params
         .as_array()
         .and_then(|a| a.get(idx))
         .and_then(|v| v.as_u64())
-        .map(|v| v as u32)
-        .ok_or_else(|| RpcError::invalid("expected an integer parameter"))
+        .ok_or_else(|| RpcError::invalid("expected an integer parameter"))?;
+    u32::try_from(value).map_err(|_| RpcError::invalid("integer parameter out of range"))
 }
 
 fn header_chain(shared: &Shared, cp_height: u32) -> RpcResult<Vec<Hash32>> {
@@ -1700,7 +1713,9 @@ fn block_header(shared: &Shared, params: &Value) -> RpcResult<Value> {
     if cp_height == 0 {
         return Ok(json!(header));
     }
-    let (root, branch) = checkpoint_proof(shared, height, cp_height as u32)?;
+    let cp_height =
+        u32::try_from(cp_height).map_err(|_| RpcError::invalid("cp_height out of range"))?;
+    let (root, branch) = checkpoint_proof(shared, height, cp_height)?;
     Ok(json!({
         "header": header,
         "branch": branch.iter().map(|h| h.to_hex()).collect::<Vec<_>>(),
@@ -1716,6 +1731,8 @@ fn block_headers(shared: &Shared, params: &Value, version: ProtocolVersion) -> R
         .and_then(|a| a.get(2))
         .and_then(|v| v.as_u64())
         .unwrap_or(0);
+    let cp_height =
+        u32::try_from(cp_height).map_err(|_| RpcError::invalid("cp_height out of range"))?;
     let mut headers = Vec::new();
     let mut got = 0u32;
     for h in start..start.saturating_add(count) {
@@ -1747,7 +1764,7 @@ fn block_headers(shared: &Shared, params: &Value, version: ProtocolVersion) -> R
     };
     if cp_height != 0 && got > 0 {
         let last = start + got - 1;
-        let (root, branch) = checkpoint_proof(shared, last, cp_height as u32)?;
+        let (root, branch) = checkpoint_proof(shared, last, cp_height)?;
         result["root"] = json!(root.to_hex());
         result["branch"] = json!(branch.iter().map(|h| h.to_hex()).collect::<Vec<_>>());
     }
@@ -1769,6 +1786,7 @@ fn history_entries_with_code(
     shared: &Shared,
     script: ScriptHash,
     too_large_code: i64,
+    prefetch: bool,
 ) -> RpcResult<Vec<HistoryRow>> {
     let entries = shared
         .store
@@ -1805,7 +1823,7 @@ fn history_entries_with_code(
             .store
             .txid_at(txnum)
             .map_err(|e| RpcError::server(e.to_string()))?;
-        if prefetched < 16 && shared.prefetch.enqueue(txid, height) {
+        if prefetch && prefetched < 16 && shared.prefetch.enqueue(rec.hash, txid, height) {
             prefetched += 1;
         }
         out.push((
@@ -1820,7 +1838,7 @@ fn history_entries_with_code(
 }
 
 fn history_value(shared: &Shared, script: ScriptHash, too_large_code: i64) -> RpcResult<Value> {
-    let entries = history_entries_with_code(shared, script, too_large_code)?;
+    let entries = history_entries_with_code(shared, script, too_large_code, true)?;
     let mem = shared
         .mempool
         .read()
@@ -1905,7 +1923,7 @@ fn status_value(
     script: ScriptHash,
     too_large_code: i64,
 ) -> RpcResult<Option<String>> {
-    let entries = history_entries_with_code(shared, script, too_large_code)?;
+    let entries = history_entries_with_code(shared, script, too_large_code, false)?;
     let mem = shared
         .mempool
         .read()
@@ -2025,11 +2043,8 @@ fn scriptpubkey_subscribe(
     let script = param_scriptpubkey(params)?;
     let status = status_value(shared, script, 10001)?;
     if let Some(c) = client {
-        if let Ok(mut subs) = c.subs.lock() {
-            subs.insert(script, status.clone());
-        }
         if let Ok(mut spk) = c.spk_subs.lock() {
-            spk.insert(script);
+            spk.insert(script, status.clone());
         }
     }
     match status {
@@ -2041,17 +2056,11 @@ fn scriptpubkey_subscribe(
 fn scriptpubkey_unsubscribe(client: Option<&Arc<ClientState>>, params: &Value) -> RpcResult<Value> {
     let script = param_scriptpubkey(params)?;
     let removed = client
-        .map(|c| {
-            let in_subs = c
-                .subs
+        .and_then(|c| {
+            c.spk_subs
                 .lock()
                 .ok()
                 .map(|mut subs| subs.remove(&script).is_some())
-                .unwrap_or(false);
-            if let Ok(mut spk) = c.spk_subs.lock() {
-                spk.remove(&script);
-            }
-            in_subs
         })
         .unwrap_or(false);
     Ok(json!(removed))
@@ -2065,10 +2074,12 @@ fn param_outpoint(params: &Value) -> RpcResult<(Hash32, u32, ScriptHash)> {
         .and_then(Value::as_str)
         .ok_or_else(|| RpcError::invalid("expected tx_hash hex"))?;
     let txid = Hash32::from_hex(txid).map_err(RpcError::invalid)?;
-    let vout = arr
-        .get(1)
-        .and_then(Value::as_u64)
-        .ok_or_else(|| RpcError::invalid("expected txout_idx"))? as u32;
+    let vout = u32::try_from(
+        arr.get(1)
+            .and_then(Value::as_u64)
+            .ok_or_else(|| RpcError::invalid("expected txout_idx"))?,
+    )
+    .map_err(|_| RpcError::invalid("txout_idx out of range"))?;
     let script = param_scriptpubkey(&json!([arr.get(2).cloned().unwrap_or(Value::Null)]))?;
     Ok((txid, vout, script))
 }
@@ -2269,10 +2280,12 @@ fn outpoint_unsubscribe(client: Option<&Arc<ClientState>>, params: &Value) -> Rp
         .and_then(Value::as_str)
         .ok_or_else(|| RpcError::invalid("expected tx_hash hex"))?;
     let txid = Hash32::from_hex(txid).map_err(RpcError::invalid)?;
-    let vout = arr
-        .get(1)
-        .and_then(Value::as_u64)
-        .ok_or_else(|| RpcError::invalid("expected txout_idx"))? as u32;
+    let vout = u32::try_from(
+        arr.get(1)
+            .and_then(Value::as_u64)
+            .ok_or_else(|| RpcError::invalid("expected txout_idx"))?,
+    )
+    .map_err(|_| RpcError::invalid("txout_idx out of range"))?;
     let removed = client
         .and_then(|c| {
             c.outpoints
@@ -2633,10 +2646,25 @@ fn test_mempool_accept(shared: &Shared, params: &Value) -> RpcResult<Value> {
             "testmempoolaccept expects a non-empty array of raw transactions",
         ));
     }
-    shared
+    let value = shared
         .core
         .test_mempool_accept(&raw_txs)
-        .map_err(|e| RpcError::server(format!("testmempoolaccept: {e}")))
+        .map_err(|e| RpcError::server(format!("testmempoolaccept: {e}")))?;
+    // Electrum documents `reason`; Core names it `reject-reason`.
+    let Some(items) = value.as_array() else {
+        return Ok(value);
+    };
+    let mapped = items
+        .iter()
+        .map(|item| {
+            let mut obj = item.as_object().cloned().unwrap_or_default();
+            if let Some(reason) = obj.remove("reject-reason") {
+                obj.insert("reason".to_string(), reason);
+            }
+            Value::Object(obj)
+        })
+        .collect();
+    Ok(Value::Array(mapped))
 }
 
 fn silent_payments(shared: &Shared, method: &str) -> RpcResult<Value> {
@@ -2877,12 +2905,31 @@ pub fn start_notifications(shared: Arc<Shared>) -> std::thread::JoinHandle<()> {
                 if !scan_scripts {
                     continue;
                 }
-                let subs: Vec<(ScriptHash, Option<String>)> = client
-                    .subs
-                    .lock()
-                    .map(|s| s.iter().map(|(k, v)| (*k, v.clone())).collect())
-                    .unwrap_or_default();
-                for (script, old) in subs {
+                // Scripthash and scriptpubkey subscriptions are independent:
+                // a client may use both for the same script and must receive
+                // one notification per method.
+                let (sh_subs, spk_subs) = {
+                    let sh = client
+                        .subs
+                        .lock()
+                        .map(|s| s.iter().map(|(k, v)| (*k, v.clone())).collect::<Vec<_>>())
+                        .unwrap_or_default();
+                    let spk = client
+                        .spk_subs
+                        .lock()
+                        .map(|s| s.iter().map(|(k, v)| (*k, v.clone())).collect::<Vec<_>>())
+                        .unwrap_or_default();
+                    (sh, spk)
+                };
+                for (script, old, method, force_reorg) in sh_subs
+                    .into_iter()
+                    .map(|(s, o)| (s, o, "blockchain.scripthash.subscribe", false))
+                    .chain(
+                        spk_subs
+                            .into_iter()
+                            .map(|(s, o)| (s, o, "blockchain.scriptpubkey.subscribe", reorg)),
+                    )
+                {
                     if !(force_all || reorg || dirty.contains(&script)) {
                         continue;
                     }
@@ -2895,18 +2942,7 @@ pub fn start_notifications(shared: Arc<Shared>) -> std::thread::JoinHandle<()> {
                             Err(_) => continue,
                         }
                     };
-                    let is_spk = client
-                        .spk_subs
-                        .lock()
-                        .map(|spk| spk.contains(&script))
-                        .unwrap_or(false);
-                    let force_reorg = reorg && is_spk;
                     if new != old || force_reorg {
-                        let method = if is_spk {
-                            "blockchain.scriptpubkey.subscribe"
-                        } else {
-                            "blockchain.scripthash.subscribe"
-                        };
                         let notification = json!({
                             "jsonrpc": "2.0",
                             "method": method,
@@ -2917,7 +2953,12 @@ pub fn start_notifications(shared: Arc<Shared>) -> std::thread::JoinHandle<()> {
                                 .stats
                                 .notifications_sent
                                 .fetch_add(1, Ordering::Relaxed);
-                            if let Ok(mut subs) = client.subs.lock() {
+                            let store = if method == "blockchain.scripthash.subscribe" {
+                                &client.subs
+                            } else {
+                                &client.spk_subs
+                            };
+                            if let Ok(mut subs) = store.lock() {
                                 subs.insert(script, new);
                             }
                         } else {
@@ -2939,7 +2980,7 @@ pub fn start_notifications(shared: Arc<Shared>) -> std::thread::JoinHandle<()> {
                         Ok(value) => value,
                         Err(_) => continue,
                     };
-                    if new != sub.status {
+                    if new != sub.status || reorg {
                         let notification = json!({
                             "jsonrpc": "2.0",
                             "method": "blockchain.outpoint.subscribe",

@@ -83,7 +83,7 @@ available**.
 | Provider health cooldown | experimental | failed Tor/direct provider skipped for `provider_cooldown_seconds` (300 s); last good first and cooled for max 30 s; forced attempt when all are cooling |
 | In-flight block dedup | experimental | concurrent tx/prefetch of the same block share one download; `max_parallel_fetches=4` |
 | History block prefetch | experimental | background fetch of confirmed history blocks before `transaction.get`; 1 worker, 16 heights per history, bounded queue, no decoys |
-| P2P peers auto/config | experimental | connected peers first, last-good peer first, failed-peer cooldown, total timeout; BIP324 v2 + v1 |
+| P2P peers auto/config | experimental | `MSG_WITNESS_BLOCK`, `NODE_WITNESS` required, connected peers first, last-good peer first, failed-peer cooldown, total timeout; BIP324 v2 + v1 |
 | Prune-gap repair from verified sources | experimental | bounded by `repair_max_gap_blocks` |
 | Silent payments privacy | **not available** | gate only |
 

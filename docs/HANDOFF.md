@@ -1,9 +1,9 @@
 # Session handoff
 
 **Updated:** 2026-11-07
-**Latest published release:** `0.1.0-alpha.29.3.3`
-**Release:** https://github.com/AlbercoinDev/e-lite/releases/tag/v0.1.0-alpha.29.3.3
-**Main commit at handoff:** tag `v0.1.0-alpha.29.3.3`
+**Latest published release:** `0.1.0-alpha.29.3.4`
+**Release:** https://github.com/AlbercoinDev/e-lite/releases/tag/v0.1.0-alpha.29.3.4
+**Main commit at handoff:** tag `v0.1.0-alpha.29.3.4`
 
 This file is the short “where we are” for a new session. The invariants live in
 [`AGENTS.md`](../AGENTS.md) and [`PROJECT_MEMORY.md`](PROJECT_MEMORY.md); the
@@ -80,6 +80,23 @@ no repitas contexto ni rehagas decisiones ya documentadas.
   the onion setup, reset and security.
 - `docs/ROADMAP.md` contains future features/improvements. Do not present them as
   available.
+
+## Last change (alpha.29.3.4)
+
+- **P2P BIP144 fix**: `getdata` requests `MSG_WITNESS_BLOCK` (0x40000002), peers
+  must advertise `NODE_WITNESS`, `notfound` is immediate, and the witness
+  commitment is validated inside the P2P source before a peer is marked good.
+  This removes the repeated `missing witness reserved value` errors.
+- **BIP141**: highest-index coinbase commitment and exactly one 32-byte
+  reserved witness item.
+- **Electrum 1.7**: scripthash and scriptpubkey subscriptions are separate;
+  reorg notifications are forced for scriptpubkey and outpoint subscriptions.
+- **Protocol hardening**: checked numeric parameters, `testmempoolaccept`
+  `reason`, prefetch dedup by block hash with retry, and no prefetch side effect
+  from status computation.
+- **Cache/perf**: reads and fsync outside the metadata lock; capacity enforced
+  at open. External fetch deadline 30 s; inflight wait 45 s.
+- Tests updated; no schema change.
 
 ## Last change (alpha.29.3.3)
 
@@ -503,6 +520,6 @@ startup/shutdown/memory assertions, `e-lite.log` presence, 1.6 and 1.7
 negotiation on the same instance, scriptpubkey/outpoint checks, outpoint
 notification, real testmempoolaccept, the rate-limit burst test, the strict
 Core RPC check and the Sparrow sequence with confirmed verbose transaction)
-passed on the alpha.29.3.3 code. Full signet/testnet4 acceptance
+passed on the alpha.29.3.4 code. Full signet/testnet4 acceptance
 is still operator-run; results belong in `docs/GETTING-STARTED.md`/release notes
 when available.

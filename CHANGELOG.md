@@ -1,5 +1,38 @@
 # Changelog
 
+## 0.1.0-alpha.29.3.4 — 2026-11-07
+
+### Patch: BIP144 witness requests, BIP141 validation and Electrum protocol audit
+
+- **P2P requests witness blocks**: `getdata` now uses `MSG_WITNESS_BLOCK`
+  (`0x40000002`) instead of `MSG_BLOCK`. The previous code advertised
+  `NODE_WITNESS` but asked for the legacy serialization, so peers returned
+  blocks without witnesses and validation failed with `missing witness reserved
+  value`.
+- **P2P peer checks**: peers without `NODE_WITNESS` are rejected, `notfound` is
+  an immediate error, and the witness commitment is verified inside the P2P
+  source before a peer is marked good. A bad peer is cooled instead of being
+  retried for every transaction.
+- **BIP141 correctness**: the highest-index coinbase commitment output is used,
+  and the coinbase witness must contain exactly one 32-byte reserved value.
+- **Electrum 1.7 notifications**: scripthash and scriptpubkey subscriptions are
+  independent maps, so a client using both receives both notifications.
+  Outpoint subscriptions also force a notification on reorg.
+- **JSON-RPC parameters**: heights, counts, `cp_height` and `txout_idx` use
+  checked conversions instead of truncating `u64` to `u32`.
+- **Prefetch**: deduplication is by block hash, failed/queue-full work is not
+  marked as done, and computing a subscription status no longer triggers
+  external block downloads.
+- **Cache**: block reads and `fsync` no longer hold the metadata lock; a lowered
+  cache capacity is enforced at open, not only after the next write.
+- **testmempoolaccept**: Core's `reject-reason` is mapped to Electrum's
+  `reason`.
+- **Bounded external work**: a 30 s deadline across external sources and a 45 s
+  inflight wait prevent a single rawtx request from hanging for minutes.
+- Tests updated for witness-block getdata, witness-service peers, BIP141
+  commitment selection/reserved value, and the protocol changes. No schema
+  change.
+
 ## 0.1.0-alpha.29.3.3 — 2026-11-07
 
 ### Patch: wallet-friendly rate limit and disk-minimal defaults

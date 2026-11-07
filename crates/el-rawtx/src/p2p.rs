@@ -24,6 +24,8 @@ const MAX_MESSAGE: u32 = 4 * 1024 * 1024 + 1024;
 const NODE_NETWORK: u64 = 1;
 const NODE_NETWORK_LIMITED: u64 = 1 << 10;
 const NODE_WITNESS: u64 = 1 << 3;
+/// BIP144: request the witness serialization explicitly.
+const MSG_WITNESS_BLOCK: u32 = 2 | (1 << 30);
 
 pub struct P2pSource {
     peers: Vec<String>,
@@ -159,7 +161,7 @@ fn pong_payload(ping: &[u8]) -> Vec<u8> {
 fn getdata_payload(hash: &Hash32) -> Vec<u8> {
     let mut p = Vec::with_capacity(37);
     put_varint(1, &mut p);
-    p.extend_from_slice(&2u32.to_le_bytes());
+    p.extend_from_slice(&MSG_WITNESS_BLOCK.to_le_bytes());
     p.extend_from_slice(&hash.reversed().0);
     p
 }
@@ -235,17 +237,12 @@ fn v2_parse(contents: &[u8]) -> io::Result<(String, Vec<u8>)> {
     }
 }
 
-fn check_block(payload: &[u8], hash: &Hash32, peer: &str) -> Result<()> {
-    let block: bitcoin::Block = bitcoin::consensus::deserialize(payload)
-        .map_err(|e| RawtxError::Verify(format!("{peer} bad block: {e}")))?;
-    let got = Hash32::from_hex(&block.block_hash().to_string())
-        .map_err(|e| RawtxError::Verify(e.to_string()))?;
-    if got != *hash {
-        return Err(RawtxError::Verify(format!(
-            "{peer} served hash {got}, expected {hash}"
-        )));
-    }
-    Ok(())
+fn check_block(payload: &[u8], hash: &Hash32, peer: &str) -> Result<bitcoin::Block> {
+    let block = crate::verify_block_by_hash(payload, hash)
+        .map_err(|e| RawtxError::Verify(format!("{peer}: {e}")))?;
+    crate::verify_witness_commitment(&block)
+        .map_err(|e| RawtxError::Verify(format!("{peer}: {e}")))?;
+    Ok(block)
 }
 
 fn split_host_port(peer: &str) -> io::Result<(&str, u16)> {
@@ -592,6 +589,11 @@ impl P2pSource {
                     check_block(&payload, hash, peer)?;
                     return Ok(payload);
                 }
+                "notfound" => {
+                    return Err(RawtxError::Unavailable(format!(
+                        "{peer} notfound for {hash}"
+                    )))
+                }
                 "ping" => {
                     let _ = send_message(&mut stream, self.magic, "pong", &pong_payload(&payload));
                 }
@@ -646,6 +648,11 @@ impl P2pSource {
                     check_block(&payload, hash, peer)?;
                     return Ok(payload);
                 }
+                "notfound" => {
+                    return Err(RawtxError::Unavailable(format!(
+                        "{peer} notfound for {hash}"
+                    )))
+                }
                 "ping" => {
                     let _ = self.v2_send(&mut protocol, "pong", &pong_payload(&payload));
                 }
@@ -688,6 +695,11 @@ impl P2pSource {
             return Err(RawtxError::Unavailable(format!(
                 "{peer} does not serve full blocks (services={services:#x}{})",
                 if limited { ", limited" } else { "" }
+            )));
+        }
+        if services & NODE_WITNESS == 0 {
+            return Err(RawtxError::Unavailable(format!(
+                "{peer} does not serve witness blocks (services={services:#x})"
             )));
         }
         Ok(())
@@ -887,6 +899,14 @@ mod tests {
     }
 
     #[test]
+    fn getdata_requests_witness_blocks() {
+        let payload = getdata_payload(&Hash32([0x33; 32]));
+        let inv_type = u32::from_le_bytes(payload[1..5].try_into().unwrap());
+        assert_eq!(inv_type, MSG_WITNESS_BLOCK);
+        assert_eq!(inv_type & (1 << 30), 1 << 30);
+    }
+
+    #[test]
     fn version_advertises_witness() {
         let payload = version_payload(NODE_WITNESS, 0);
         let services = u64::from_le_bytes(payload[4..12].try_into().unwrap());
@@ -1020,7 +1040,7 @@ mod tests {
         let block = test_block();
         let bytes = bitcoin::consensus::serialize(&block);
         let hash = Hash32::from_hex(&block.block_hash().to_string()).unwrap();
-        let addr = mock_peer_v1(NODE_NETWORK, bytes.clone(), false);
+        let addr = mock_peer_v1(NODE_NETWORK | NODE_WITNESS, bytes.clone(), false);
         let src = P2pSource::new(
             vec![addr],
             None,
@@ -1038,7 +1058,7 @@ mod tests {
         let block = test_block();
         let bytes = bitcoin::consensus::serialize(&block);
         let hash = Hash32::from_hex(&block.block_hash().to_string()).unwrap();
-        let addr = mock_peer_v2(NODE_NETWORK, bytes.clone());
+        let addr = mock_peer_v2(NODE_NETWORK | NODE_WITNESS, bytes.clone());
         let src = P2pSource::new(
             vec![addr],
             None,
@@ -1056,7 +1076,7 @@ mod tests {
         let block = test_block();
         let bytes = bitcoin::consensus::serialize(&block);
         let hash = Hash32::from_hex(&block.block_hash().to_string()).unwrap();
-        let addr = mock_peer_v1(NODE_NETWORK, bytes.clone(), true);
+        let addr = mock_peer_v1(NODE_NETWORK | NODE_WITNESS, bytes.clone(), true);
         let src = P2pSource::new(
             vec![addr],
             None,
@@ -1067,6 +1087,25 @@ mod tests {
             Duration::from_secs(5),
         );
         assert_eq!(src.fetch_block(&hash).unwrap(), bytes);
+    }
+
+    #[test]
+    fn rejects_peer_without_witness_service() {
+        let block = test_block();
+        let bytes = bitcoin::consensus::serialize(&block);
+        let hash = Hash32::from_hex(&block.block_hash().to_string()).unwrap();
+        let addr = mock_peer_v1(NODE_NETWORK, bytes, false);
+        let src = P2pSource::new(
+            vec![addr],
+            None,
+            Duration::from_secs(5),
+            Chain::Regtest,
+            false,
+            false,
+            Duration::from_secs(5),
+        );
+        let err = src.fetch_block(&hash).unwrap_err();
+        assert!(format!("{err}").contains("witness"), "{err}");
     }
 
     #[test]

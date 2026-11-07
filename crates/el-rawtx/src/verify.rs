@@ -74,8 +74,10 @@ pub fn verify_block_by_hash(bytes: &[u8], expected_hash: &Hash32) -> Result<Bloc
 /// BIP141 witness commitment check. Required for every served transaction: the
 /// TXID commits to the non-witness data only.
 pub fn verify_witness_commitment(block: &Block) -> Result<()> {
+    // BIP141: if several outputs match, the one with the highest index is
+    // the commitment.
     let commitment = block.txdata.first().and_then(|cb| {
-        cb.output.iter().find_map(|out| {
+        cb.output.iter().rev().find_map(|out| {
             let s = out.script_pubkey.as_bytes();
             if s.len() >= 38 && s[0] == 0x6a && s[1] == 0x24 && s[2..6] == [0xaa, 0x21, 0xa9, 0xed]
             {
@@ -101,10 +103,18 @@ pub fn verify_witness_commitment(block: &Block) -> Result<()> {
                 .txdata
                 .first()
                 .ok_or_else(|| RawtxError::Verify("empty block".into()))?;
+            // BIP141: the coinbase input witness must contain exactly one
+            // 32-byte reserved value.
             let reserved = coinbase
                 .input
                 .first()
-                .and_then(|i| i.witness.last())
+                .and_then(|i| {
+                    if i.witness.len() == 1 {
+                        i.witness.iter().next()
+                    } else {
+                        None
+                    }
+                })
                 .ok_or_else(|| RawtxError::Verify("missing witness reserved value".into()))?;
             if reserved.len() != 32 {
                 return Err(RawtxError::Verify(format!(
@@ -225,6 +235,27 @@ mod tests {
     fn accepts_valid_witness_block() {
         let block = witness_block();
         assert!(verify_witness_commitment(&block).is_ok());
+    }
+
+    #[test]
+    fn uses_the_highest_index_commitment_output() {
+        let mut block = witness_block();
+        // Put a deliberately wrong commitment first and the valid one last.
+        let valid = block.txdata[0].output[0].script_pubkey.clone();
+        block.txdata[0].output[0].script_pubkey =
+            commitment_script(&Hash32([0xaa; 32]), &[0xbb; 32]);
+        block.txdata[0].output.push(TxOut {
+            value: Amount::from_sat(0),
+            script_pubkey: valid,
+        });
+        assert!(verify_witness_commitment(&block).is_ok());
+    }
+
+    #[test]
+    fn rejects_extra_coinbase_witness_items() {
+        let mut block = witness_block();
+        block.txdata[0].input[0].witness.push(vec![0u8; 32]);
+        assert!(verify_witness_commitment(&block).is_err());
     }
 
     #[test]

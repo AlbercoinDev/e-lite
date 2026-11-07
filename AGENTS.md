@@ -78,12 +78,22 @@ Never treat a version number in this file as authoritative over the code/tag.
   template; a missing file means local data only (fail closed), never a hidden
   fallback list. Only whole blocks are requested by hash, and clearnet entries
   must be HTTPS (`.onion` over Tor is the only plain-HTTP exception).
-- P2P rawtx must advertise `NODE_WITNESS` (bit 3) in `version`; without it peers
-  strip witnesses from blocks, which looks like a valid block hash but fails the
-  BIP141 check. P2P is fail-fast: connected peers first, last-good peer first,
-  per-peer timeout/failed-peer cooldown, total 2× timeout, and a Tor circuit
-  breaker before clearnet fallback. Never let one block spend minutes trying
-  dead peers.
+- P2P rawtx must advertise `NODE_WITNESS` (bit 3) **and request
+  `MSG_WITNESS_BLOCK` (0x40000002) in `getdata`**. Advertising alone is not
+  enough: `MSG_BLOCK` returns a block without witnesses, which still matches the
+  header hash/merkle root but fails the BIP141 check with `missing witness
+  reserved value`. Reject peers that do not advertise `NODE_WITNESS`, and
+  validate the witness commitment inside the P2P source before marking a peer
+  good. P2P is fail-fast: connected peers first, last-good peer first, per-peer
+  timeout/failed-peer cooldown, total 2× timeout, and a Tor circuit breaker
+  before clearnet fallback. Never let one block spend minutes trying dead peers.
+- BIP141: when several coinbase outputs match the commitment pattern, the
+  highest output index is the commitment; the coinbase witness must be exactly
+  one 32-byte reserved value.
+- Electrum 1.7 scripthash and scriptpubkey subscriptions are kept in separate
+  maps so a client using both receives both notifications. Outpoint and
+  scriptpubkey subscriptions get a forced notification on reorg even if the
+  status string is unchanged.
 - Provider health is sticky: a failed Tor **or direct** request cools that
   provider for `provider_cooldown_seconds` (300 s), and the last successful
   provider is tried first. A provider that already answered is cooled for at

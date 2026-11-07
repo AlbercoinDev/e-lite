@@ -1,7 +1,7 @@
 # Code audit
 
-**Base:** `0.1.0-alpha.29.3.2` → published `0.1.0-alpha.29.3.3` · **Scope:** `bin/e-lite`, `crates/*` (26 Rust files,
-~19k lines) · **Status:** findings fixed in `0.1.0-alpha.29.3.3` where noted.
+**Base:** `0.1.0-alpha.29.3.3` → published `0.1.0-alpha.29.3.4` · **Scope:** `bin/e-lite`, `crates/*` (26 Rust files,
+~19k lines) · **Status:** findings fixed in `0.1.0-alpha.29.3.4` where noted.
 
 This audit is not a claim of formal verification. It records static checks,
 manual review areas, concrete findings and residual risks.
@@ -72,6 +72,11 @@ Additional checks performed:
 | AUD-052 | P1 | P2P Tor timeout | `crates/el-rawtx/src/p2p.rs` | The `socks` crate's `Socks5Stream::connect_with_password` has no connect/read/write timeout; a stalled Tor SOCKS proxy could block a P2P fetch indefinitely, ignoring `p2p_timeout_seconds`. | Replaced with a minimal SOCKS5 CONNECT that applies the P2P timeout to proxy connect, greeting, authentication, request and reply. Tests cover a silent proxy timing out and a password-auth handshake. |
 | AUD-053 | P1 | Electrum rate limit | `crates/el-serve/src/lib.rs`, `bin/e-lite/src/main.rs` | A hard 50/s + burst-300 bucket on exposed listeners returned `-32000` during a wallet gap scan; Sparrow aborted at ~55 addresses and required a reconnect. | Uniform 200/s + burst 5000 for every client; over-budget requests wait for the next token instead of erroring. `0` disables. Updated unit/integration tests assert delay and success, not rejection. |
 | AUD-054 | P2 | Disk footprint | `bin/e-lite/src/config.rs`, `crates/el-rawtx/src/lib.rs`, `crates/el-serve/src/lib.rs` | The rawtx cache defaulted to 2 GiB on disk and logs to 64 MiB; with Core pruned to the maximum this was the largest avoidable footprint. | Cache default 256 MiB, optional `rawtx.cache_dir` (tmpfs keeps blocks off disk), log rotation 16 MiB, and `/status.disk` breaks down index/txids/cache/log/snapshots. Snapshots remain manual. No schema change. |
+| AUD-055 | P1 | P2P witness request | `crates/el-rawtx/src/p2p.rs` | `getdata` used `MSG_BLOCK`; BIP144 only includes witnesses for `MSG_WITNESS_BLOCK`. Peers returned stripped blocks whose hash/merkle matched, then BIP141 failed with `missing witness reserved value` and the same peer was retried. | Request `0x40000002`, require `NODE_WITNESS`, treat `notfound` as an error, and validate the witness commitment inside the P2P source before marking a peer good. Tests cover the inv type and non-witness peers. |
+| AUD-056 | P1 | BIP141 validation | `crates/el-rawtx/src/verify.rs` | The first matching coinbase commitment was used instead of the highest output index, and extra coinbase witness items were accepted. | Use the highest-index matching output and require exactly one 32-byte reserved value. Tests cover multiple commitments and extra witness items. |
+| AUD-057 | P2 | Electrum 1.7 notifications | `crates/el-serve/src/lib.rs` | Scripthash/scriptpubkey shared one status map, so a client subscribed through both could lose one notification; outpoint subscriptions were not forced on reorg. | Separate maps and method-specific notifications; forced notification for scriptpubkey and outpoint on reorg. Existing 1.6/1.7 protocol tests stay green. |
+| AUD-058 | P2 | Prefetch and cache | `crates/el-serve/src/lib.rs`, `crates/el-rawtx/src/cache.rs` | Prefetch marked a height as seen even when the queue was full and deduped by height, not block; status computation triggered downloads. Cache reads/fsync held the metadata lock and a lowered capacity was only applied on the next write. | Dedup by block hash with queue-full/failure retry, status never prefetches, reads/fsync outside the state lock, and capacity enforced at open. |
+| AUD-059 | P2 | JSON-RPC parameters | `crates/el-serve/src/lib.rs` | `u64` heights, `cp_height` and `txout_idx` were truncated with `as u32`; oversized values could address a different height/output. | Checked `u32::try_from` with `-32602` errors; `testmempoolaccept` maps `reject-reason` to `reason`. |
 
 ## Residual risks and intentional limits
 
