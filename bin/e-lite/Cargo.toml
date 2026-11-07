@@ -31,4 +31,5 @@ libc.workspace = true
 tar.workspace = true
 flate2.workspace = true
 rcgen.workspace = true
+rustls.workspace = true
 reqwest.workspace = true

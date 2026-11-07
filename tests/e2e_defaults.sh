@@ -105,12 +105,28 @@ assert st["tls_handshakes"] >= 1, st.get("tls_handshakes")
 print("plain", st["listen"], "tls", st["tls_listen"], "state", st["state"])
 PY
 
-openssl x509 -in "$DATA/tls/self-signed.crt" -noout -text | grep -q "DNS:localhost" || {
+TEXT=$(openssl x509 -in "$DATA/tls/self-signed.crt" -noout -text)
+echo "$TEXT" | grep -q "DNS:localhost" || {
   echo "self-signed certificate lacks the localhost SAN" >&2
   exit 1
 }
-# Operator PEMs must not be replaced by the auto path.
-grep -q "TLS certificate:" "$RUN/serve.log" || { echo "missing TLS log line" >&2; exit 1; }
+# A LAN address, when the host has one, must be covered so a wallet connecting
+# by IP can validate the certificate.
+LAN_IP=$(hostname -I 2>/dev/null | awk '{print $1}')
+if [ -n "$LAN_IP" ]; then
+  echo "$TEXT" | grep -q "IP Address:$LAN_IP" || {
+    echo "self-signed certificate lacks the LAN IP SAN $LAN_IP" >&2
+    exit 1
+  }
+fi
+# The logged fingerprint must be the DER fingerprint openssl prints.
+FP=$(openssl x509 -in "$DATA/tls/self-signed.crt" -noout -fingerprint -sha256 \
+  | sed 's/.*=//; s/://g' | tr 'A-F' 'a-f')
+grep -qi "sha256 $FP" "$RUN/serve.log" || {
+  echo "logged fingerprint does not match openssl ($FP)" >&2
+  grep "TLS certificate" "$RUN/serve.log" >&2
+  exit 1
+}
 
 kill -TERM "$(cat "$RUN/serve.pid")"
 wait "$(cat "$RUN/serve.pid")" || true

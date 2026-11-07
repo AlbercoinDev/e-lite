@@ -108,11 +108,17 @@ operator certificate, e-lite generates and reuses:
 <data-dir>/tls/self-signed.san
 ```
 
-The SAN covers `localhost`, `127.0.0.1`, `::1`, the machine hostname and the
-onion address once it exists. The certificate is regenerated when the SAN set
-changes; `CertWatcher` reloads it without restarting. Operator-provided
-certificates are never overwritten. The startup log prints the certificate path
-and its SHA-256 so it can be imported into a wallet.
+The SAN covers `localhost`, `127.0.0.1`, `::1`, the machine hostname, the
+non-loopback IPs of the local interfaces and the onion address once it exists.
+The certificate is regenerated when the SAN set changes (including a new LAN
+address); the key is reused and `CertWatcher` reloads the PEM without
+restarting. Files are written `0600` atomically. A corrupt generated pair is
+rebuilt. Operator-provided certificates are never overwritten; if
+`tls_auto_cert = false`, an existing valid generated pair is still served.
+
+The startup log prints the certificate path and the SHA-256 of the DER leaf
+certificate, the same value `openssl x509 -in <cert> -fingerprint -sha256
+-noout` prints (without colons).
 
 If Tor is unavailable, the clearnet plain and TLS listeners keep working; only
 the onion is missing. The same is true in reverse: `[tor] mode = "off"` serves

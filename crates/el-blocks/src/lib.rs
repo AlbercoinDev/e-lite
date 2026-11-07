@@ -1085,6 +1085,7 @@ mod tests {
         let loaded = load_sidecar(&path, Chain::Regtest, &genesis, &xor).unwrap();
         assert_eq!(loaded.map.len(), 2);
         assert_eq!(loaded.map.get(&Hash32([4u8; 32])).unwrap().file, 2);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

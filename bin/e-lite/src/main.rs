@@ -2186,6 +2186,15 @@ impl Indexer {
             // Core's chain can be shorter than the index (invalidateblock,
             // manual rollback). Drop the blocks above Core's tip.
             if (tip.height as u64) > core_tip {
+                let window = self.cfg.index.reorg_window as u64;
+                if (tip.height as u64).saturating_sub(core_tip) > window {
+                    return fail(format!(
+                        "Core tip {core_tip} is {} blocks below the index ({}), beyond the \
+                         {window}-block undo window: NEEDS_RECOVERY (restore a snapshot or reindex)",
+                        (tip.height as u64).saturating_sub(core_tip),
+                        tip.height
+                    ));
+                }
                 if let Some(sh) = &self.shared {
                     sh.set_state(state::REORG);
                 }
@@ -2716,12 +2725,12 @@ impl Indexer {
             let t0 = Instant::now();
             // Undo is only useful for the reorg window. Writing it for every
             // historical block and deleting it a few commits later was pure
-            // write amplification; keep a safety margin for an interrupted
-            // catch-up call.
-            let keep_undo = height
-                .saturating_add(self.cfg.index.reorg_window as u64)
-                .saturating_add(64)
-                >= core_tip;
+            // write amplification. Anchor the window to the highest block this
+            // catch-up call may apply (`target`), not to Core's tip: when the
+            // index lags, the last blocks it commits are its own tip and must
+            // stay rewindable even if Core is far ahead. Keep a safety margin
+            // for an interrupted catch-up.
+            let keep_undo = should_store_undo(height, target, self.cfg.index.reorg_window);
             match apply_prepared_with_prefetch(
                 &self.store,
                 height as u32,
@@ -3103,6 +3112,14 @@ fn commit_sync_policy(mode: &str, ibd: bool, height: u64, core_tip: u64) -> bool
         "txids" => false,
         _ => !(ibd || height.saturating_add(1_000) < core_tip),
     }
+}
+
+/// Whether the undo record for `height` must be stored. Undo is anchored to the
+/// last block this catch-up call may apply (`batch_end`), so a lagging index
+/// keeps the reorg window at its **own** tip instead of only near Core's tip.
+/// The extra 64 blocks cover an interrupted batch.
+fn should_store_undo(height: u64, batch_end: u64, window: u32) -> bool {
+    height.saturating_add(window as u64).saturating_add(64) >= batch_end
 }
 
 /// Bulk lag guard window. `u64::MAX` means "no baseline yet". The baseline
@@ -4930,6 +4947,19 @@ mod tests {
         assert!(commit_sync_policy("auto", false, 200_000, 200_000));
         assert!(commit_sync_policy("always", true, 100_000, 200_000));
         assert!(!commit_sync_policy("txids", false, 200_000, 200_000));
+    }
+
+    #[test]
+    fn undo_is_kept_at_the_batch_tip_even_when_core_is_far_ahead() {
+        // 512-block catch-up from 0 while Core is at 100k: the last ~352
+        // blocks of the batch keep undo, so the committed tip stays rewindable
+        // if the call is interrupted.
+        assert!(!should_store_undo(100, 511, 288));
+        assert!(should_store_undo(160, 511, 288));
+        assert!(should_store_undo(511, 511, 288));
+        // A short batch (near the tip) keeps undo throughout.
+        assert!(should_store_undo(0, 100, 288));
+        assert!(should_store_undo(0, 0, 288));
     }
 
     #[test]

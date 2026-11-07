@@ -62,6 +62,13 @@ Never treat a version number in this file as authoritative over the code/tag.
   (`prune_defer_free_gib = 0`), only by the 1k-block gain and 30 s interval.
 - Never authorise a Core prune from a tip that is not durable: flush RocksDB/WAL
   first. A failed prune RPC must retry the same safe height after backoff.
+- Anchor the undo window to the highest block of the **catch-up batch**, not to
+  Core's tip (`should_store_undo`). A lagging index must keep the last
+  `reorg_window + 64` blocks rewindable at its own committed tip. A Core
+  rollback deeper than the window is `NEEDS_RECOVERY`, never a silent reindex.
+- Crash recovery: SIGKILL during indexing, a write failure and a reorg at the
+  indexed tip must all recover through RocksDB/WAL and undo. Covered by
+  `tests/e2e_recovery.sh`; run it after touching commit, undo or rewind.
 - Drop locators for deleted `blk*.dat` files (sidecar compaction at open and
   in-memory filtering after prune) and only hold a ReaderTracker guard when the
   block is still at/above Core's prune height; external resolutions must not
@@ -164,9 +171,15 @@ Never treat a version number in this file as authoritative over the code/tag.
   and the auto self-signed cert fails for any public hostname.
 - The self-signed cert (`<data-dir>/tls/self-signed.*`) is generated when TLS is
   enabled and `[server] tls_cert`/`tls_key` point at the auto paths (defaults).
-  It does not require Tor. SANs: `localhost`, `127.0.0.1`, `::1`, the hostname
-  and the onion address once known. Operator certificates are never overwritten
-  or regenerated (`bin/e-lite/src/tls.rs`, `ensure_self_signed`).
+  It does not require Tor. SANs: `localhost`, `127.0.0.1`, `::1`, the hostname,
+  the non-loopback IPs of the local interfaces and the onion address once
+  known. The key is reused when only the SAN set changes; a corrupt pair is
+  regenerated. Files are written `0600` through a temporary file and an atomic
+  rename. `tls_auto_cert = false` may still serve an existing valid pair.
+  Operator certificates are never overwritten or regenerated
+  (`bin/e-lite/src/tls.rs`, `ensure_self_signed`). The logged fingerprint is the
+  SHA-256 of the DER leaf certificate (what `openssl x509 -fingerprint -sha256`
+  prints), not of the PEM text.
 - Consequence: a public domain certificate in `[server] tls_cert`/`tls_key`
   disables the auto onion certificate, and `.onion` wallets then get a hostname
   mismatch. Pick one identity per instance: auto self-signed (onion), or a
@@ -174,8 +187,12 @@ Never treat a version number in this file as authoritative over the code/tag.
   `target_tls` design. Do not "fix" one by breaking the other blindly.
 - Config validation: `tls_listen` must differ from `listen`; `tls_cert` and
   `tls_key` must be set together; `server.tls = false` forbids the TLS fields.
-  Empty `listen`/`tls_listen`/`metrics.listen` are filled from the network in
-  `Config::apply_network_defaults` before validation.
+  Default cert/key paths are filled only when **neither** was configured, so a
+  half pair fails instead of being completed with a mismatched key. Empty
+  `listen`/`tls_listen`/`metrics.listen` are filled from the network in
+  `Config::apply_network_defaults` before validation. A legacy Core datadir is
+  detected only when the chain's blocks directory exists, not from a bare
+  `bitcoin.conf`.
 - `CertWatcher` reloads changed PEMs by mtime without restart and keeps the old
   cert if the new pair is invalid (Let's Encrypt renewals need no restart).
 - TLS only encrypts; there is no client auth and rate limiting is only a

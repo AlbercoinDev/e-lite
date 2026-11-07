@@ -1,5 +1,37 @@
 # Changelog
 
+## 0.1.0-alpha.29.4.1 — 2026-11-07
+
+### Patch: undo at the committed tip, TLS hardening and input validation
+
+- **Undo anchored to the batch tip**: during bulk catch-up, undo is now kept
+  for the last ~`reorg_window + 64` blocks of each catch-up batch instead of
+  only near Core's tip. A lagging index can therefore rewind at its own
+  committed tip after an interrupted batch. A Core rollback deeper than the
+  window now fails with an explicit `NEEDS_RECOVERY` message instead of a
+  missing-undo error.
+- **TLS certificate hardening** (`bin/e-lite/src/tls.rs`):
+  - SANs include the non-loopback IPs of the local interfaces, in addition to
+    `localhost`, `127.0.0.1`, `::1`, the hostname and the onion.
+  - The printed fingerprint is the SHA-256 of the DER leaf certificate (the
+    value `openssl x509 -fingerprint -sha256` shows).
+  - Key/certificate files are written with `0600` via a temporary file and an
+    atomic rename; the key is reused when only the SAN set changes.
+  - A corrupt auto-generated pair is detected and regenerated.
+  - `tls_auto_cert = false` now accepts an existing valid pair instead of
+    refusing to start; it only errors when no usable certificate exists.
+  - Operator PEMs are validated as a pair at startup.
+- **Config input validation**: default TLS paths are filled only when neither
+  `tls_cert` nor `tls_key` was set, so a half-configured pair fails validation.
+  Legacy Core datadirs are only detected when the chain's block directory
+  exists, not merely because a `bitcoin.conf` is present.
+- **Tests**: `tests/e2e_recovery.sh` (repeated SIGKILL, reorg at the indexed
+  tip, write failure from a file-size limit, then clean recovery), plus TLS
+  SAN/fingerprint assertions in `tests/e2e_defaults.sh` and unit tests for the
+  undo window, corrupt-pair regeneration, opt-out with an existing pair and
+  operator certificate preservation.
+- Docs and AGENTS invariants updated.
+
 ## 0.1.0-alpha.29.4.0 — 2026-11-07
 
 ### Feature: per-network ports, automatic TLS and isolated instances

@@ -28,19 +28,24 @@ Every documentation rewrite must cover:
 - current features (`docs/FEATURES.md`);
 - future features and proposed improvements (`docs/ROADMAP.md`).
 
-Do not claim client authentication, rate limiting, Electrum 1.7, BIP352 silent
-payments or external-provider features that are not implemented. Electrum TLS on
-a separate listener is implemented; authentication and rate limiting are not.
+Do not claim client authentication, BIP352 silent payments or external-provider
+features that are not implemented. Electrum 1.7, TLS on a separate listener and
+the per-client rate limiter are implemented; client authentication is not.
 
 ## Safety defaults
 
 - `prune_mib = 1` for from-zero pruned IBD; `prune_mib >= 550` needs
-  `allow_auto_prune = true`. The prune gate evaluates every 10,000 safe blocks
-  by default; low disk triggers an emergency prune.
+  `allow_auto_prune = true`. The prune gate advances in 1,000-safe-block steps
+  with a 30 s minimum interval and no free-space deferral by default; low disk
+  triggers an emergency prune.
 - Snapshots are optional, never required by the from-zero flow.
-- Electrum is plain TCP and loopback by default; TLS is an optional separate
-  listener and does not authenticate clients. A managed Tor publishes an onion
-  (plain + TLS) by default; the address is the access secret.
+- Electrum binds per-network ports (55011/55022/55084 mainnet, 55111/55122/
+  55184 testnet4, 55211/55222/55284 signet, 55311/55322/55384 regtest) on
+  `0.0.0.0`. TLS is enabled by default with a generated self-signed certificate
+  and does not authenticate clients. A managed Tor publishes an onion (plain +
+  TLS) by default; the address is the access secret. The per-connection rate
+  limiter delays requests instead of rejecting them, so it is a throttle, not
+  access control.
 - Core RPC is HTTP; use SSH/VPN for LAN/WAN.
 - RocksDB memtables use a global `RAM/8` budget inside a memory ceiling of 75 %
   of total RAM, with `max(1024, RAM/8)` reserved for the OS/Core/page cache; the

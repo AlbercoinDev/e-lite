@@ -1,9 +1,9 @@
 # Session handoff
 
 **Updated:** 2026-11-07
-**Latest published release:** `0.1.0-alpha.29.4.0`
-**Release:** https://github.com/AlbercoinDev/e-lite/releases/tag/v0.1.0-alpha.29.4.0
-**Main commit at handoff:** tag `v0.1.0-alpha.29.4.0`
+**Latest published release:** `0.1.0-alpha.29.4.1`
+**Release:** https://github.com/AlbercoinDev/e-lite/releases/tag/v0.1.0-alpha.29.4.1
+**Main commit at handoff:** tag `v0.1.0-alpha.29.4.1`
 
 This file is the short “where we are” for a new session. The invariants live in
 [`AGENTS.md`](../AGENTS.md) and [`PROJECT_MEMORY.md`](PROJECT_MEMORY.md); the
@@ -83,6 +83,19 @@ no repitas contexto ni rehagas decisiones ya documentadas.
   the onion setup, reset and security.
 - `docs/ROADMAP.md` contains future features/improvements. Do not present them as
   available.
+
+## Last change (alpha.29.4.1)
+
+- **Undo at the committed tip**: bulk catch-up keeps undo for the last
+  `reorg_window + 64` blocks of each batch, not only near Core's tip; a deep
+  Core rollback now reports `NEEDS_RECOVERY` explicitly.
+- **TLS hardening**: LAN IP SANs, DER SHA-256 fingerprint, atomic `0600` writes,
+  key reuse, corrupt-pair regeneration, `tls_auto_cert = false` accepts an
+  existing pair, and operator PEM pairs are validated at startup.
+- **Validation**: a half-configured `tls_cert`/`tls_key` fails instead of being
+  completed silently; legacy Core datadirs require the chain's blocks directory.
+- New `tests/e2e_recovery.sh` (SIGKILL, reorg at the tip, write failure);
+  regtest, pruned-IBD, defaults, resilience and wait-Core e2e pass.
 
 ## Last change (alpha.29.4.0)
 
@@ -577,6 +590,6 @@ startup/shutdown/memory assertions, `e-lite.log` presence, 1.6 and 1.7
 negotiation on the same instance, scriptpubkey/outpoint checks, outpoint
 notification, real testmempoolaccept, the rate-limit burst test, the strict
 Core RPC check and the Sparrow sequence with confirmed verbose transaction)
-passed on the alpha.29.4.0 code. Full signet/testnet4 acceptance
+passed on the alpha.29.4.1 code. Full signet/testnet4 acceptance
 is still operator-run; results belong in `docs/GETTING-STARTED.md`/release notes
 when available.

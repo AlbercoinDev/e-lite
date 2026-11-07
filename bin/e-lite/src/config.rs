@@ -832,9 +832,11 @@ impl Config {
             home().join("e-lite").join("bitcoin"),
         ];
         candidates.retain(|dir| {
-            *dir != current
-                && (dir.join("bitcoin.conf").is_file()
-                    || el_blocks::default_blocks_dir(dir, chain).is_dir())
+            // Only count a datadir that actually holds this chain's block
+            // files. A bare bitcoin.conf (or a wallet-only ~/.bitcoin) does not
+            // mean the chain data lives there, and guessing would hide a real
+            // migration instead of warning about it.
+            *dir != current && el_blocks::default_blocks_dir(dir, chain).is_dir()
         });
         candidates.dedup();
         candidates
@@ -912,10 +914,11 @@ impl Config {
                 self.server.tls_listen = format!("{host}:{}", chain.default_electrum_tls_port());
             }
             let tls_dir = self.data_dir(chain).join("tls");
-            if self.server.tls_cert.trim().is_empty() {
+            // Fill both paths only when neither was configured. A half pair
+            // must reach validation and fail instead of being "completed"
+            // silently with a key that does not match the operator cert.
+            if self.server.tls_cert.trim().is_empty() && self.server.tls_key.trim().is_empty() {
                 self.server.tls_cert = tls_dir.join("self-signed.crt").display().to_string();
-            }
-            if self.server.tls_key.trim().is_empty() {
                 self.server.tls_key = tls_dir.join("self-signed.key").display().to_string();
             }
         } else {

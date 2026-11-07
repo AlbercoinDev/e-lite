@@ -158,7 +158,10 @@ ambiguous; e-lite then refuses to guess and asks for an explicit
 
 TLS is **on by default** on a separate listener. Without operator PEMs, e-lite
 generates a self-signed certificate in `<data-dir>/tls/` on first start and
-prints its path and SHA-256. Disable it with `tls = false` or `--no-tls`.
+prints its path and the SHA-256 of the DER certificate (the value
+`openssl x509 -fingerprint -sha256` shows). The SANs include `localhost`, the
+loopback addresses, the hostname, the local LAN IPs and the onion address.
+Disable it with `tls = false` or `--no-tls`.
 
 ```toml
 [server]
