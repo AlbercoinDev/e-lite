@@ -6,3 +6,4 @@
 *.sha256
 /.cache
 *.zip
+__pycache__/
