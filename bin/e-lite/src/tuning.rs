@@ -98,6 +98,7 @@ pub struct Tunables {
     max_commit_ms: u64,
     min_cache_mib: u64,
     max_cache_mib: u64,
+    cache_floor_mib: u64,
     min_batch: u32,
     max_batch: u32,
 
@@ -119,6 +120,12 @@ pub struct Tunables {
     pub commit_ewma: AtomicU64,
     pub tx_per_sec: AtomicU64,
     pub blocks_per_sec: AtomicU64,
+    pub total_read_us: AtomicU64,
+    pub total_decode_us: AtomicU64,
+    pub total_prefetch_us: AtomicU64,
+    pub total_wait_us: AtomicU64,
+    pub total_apply_us: AtomicU64,
+    pub total_commit_us: AtomicU64,
 
     last_change: Mutex<Instant>,
 }
@@ -192,7 +199,11 @@ impl Tunables {
             memory_info().available_mib,
             memory_info().cached_mib,
         );
-        let max_cache_mib = budget.cache_max_mib.max(64);
+        // Do not let the adaptive cache swallow the whole memory ceiling: a
+        // stable quarter of RAM keeps the recent UTXO working set cached while
+        // leaving room for Core and the page cache during IBD.
+        let max_cache_mib = budget.cache_max_mib.min((ram_mib / 4).max(1024)).max(64);
+        let cache_floor_mib = (ram_mib / 8).clamp(512, 4096).min(max_cache_mib);
         // Keep a single hard ceiling; the profile only changes the starting
         // point. The controller never raises readers on a rotational disk.
         let max_readers = match profile {
@@ -236,6 +247,7 @@ impl Tunables {
             max_commit_ms: 30_000,
             min_cache_mib: 64,
             max_cache_mib,
+            cache_floor_mib,
             min_batch: 16,
             max_batch: 4096,
             total_mib: ram_mib,
@@ -253,6 +265,12 @@ impl Tunables {
             commit_ewma: AtomicU64::new(0),
             tx_per_sec: AtomicU64::new(0),
             blocks_per_sec: AtomicU64::new(0),
+            total_read_us: AtomicU64::new(0),
+            total_decode_us: AtomicU64::new(0),
+            total_prefetch_us: AtomicU64::new(0),
+            total_wait_us: AtomicU64::new(0),
+            total_apply_us: AtomicU64::new(0),
+            total_commit_us: AtomicU64::new(0),
             last_change: Mutex::new(
                 Instant::now()
                     .checked_sub(Duration::from_secs(120))
@@ -339,22 +357,34 @@ impl Tunables {
     }
 
     pub fn record_read(&self, d: Duration) {
+        let us = d.as_micros() as u64;
         ewma(&self.read_ms, d.as_millis() as u64);
+        self.total_read_us.fetch_add(us, Ordering::Relaxed);
     }
     pub fn record_apply(&self, d: Duration) {
+        let us = d.as_micros() as u64;
         ewma(&self.apply_ms, d.as_millis() as u64);
+        self.total_apply_us.fetch_add(us, Ordering::Relaxed);
     }
     pub fn record_decode(&self, d: Duration) {
+        let us = d.as_micros() as u64;
         ewma(&self.decode_ms, d.as_millis() as u64);
+        self.total_decode_us.fetch_add(us, Ordering::Relaxed);
     }
     pub fn record_wait(&self, d: Duration) {
+        let us = d.as_micros() as u64;
         ewma(&self.wait_ms, d.as_millis() as u64);
+        self.total_wait_us.fetch_add(us, Ordering::Relaxed);
     }
     pub fn record_prefetch(&self, d: Duration) {
+        let us = d.as_micros() as u64;
         ewma(&self.prefetch_ms, d.as_millis() as u64);
+        self.total_prefetch_us.fetch_add(us, Ordering::Relaxed);
     }
     pub fn record_commit(&self, d: Duration) {
+        let us = d.as_micros() as u64;
         ewma(&self.commit_ewma, d.as_millis() as u64);
+        self.total_commit_us.fetch_add(us, Ordering::Relaxed);
     }
     pub fn record_tx_rate(&self, tx_per_sec: u64) {
         ewma(&self.tx_per_sec, tx_per_sec);
@@ -620,7 +650,9 @@ impl Tunables {
         let new = match action {
             CacheAction::Grow => (old + 256).min(self.max_cache_mib),
             CacheAction::Shrink => {
-                let floor = 256u64.min(old.max(1));
+                // Keep a working set for prevout lookups; collapsing to a few
+                // hundred MiB turns every block into random disk reads.
+                let floor = self.cache_floor_mib.min(old.max(1));
                 (old * 3 / 4).max(floor)
             }
             CacheAction::Hold => old,
@@ -729,6 +761,30 @@ impl Tunables {
             .store(self.tx_per_sec.load(Ordering::Relaxed), Ordering::Relaxed);
         stats.tuning_blocks_per_sec.store(
             self.blocks_per_sec.load(Ordering::Relaxed),
+            Ordering::Relaxed,
+        );
+        stats.stage_read_us.store(
+            self.total_read_us.load(Ordering::Relaxed),
+            Ordering::Relaxed,
+        );
+        stats.stage_decode_us.store(
+            self.total_decode_us.load(Ordering::Relaxed),
+            Ordering::Relaxed,
+        );
+        stats.stage_prefetch_us.store(
+            self.total_prefetch_us.load(Ordering::Relaxed),
+            Ordering::Relaxed,
+        );
+        stats.stage_wait_us.store(
+            self.total_wait_us.load(Ordering::Relaxed),
+            Ordering::Relaxed,
+        );
+        stats.stage_apply_us.store(
+            self.total_apply_us.load(Ordering::Relaxed),
+            Ordering::Relaxed,
+        );
+        stats.stage_commit_us.store(
+            self.total_commit_us.load(Ordering::Relaxed),
             Ordering::Relaxed,
         );
         stats
@@ -1031,17 +1087,18 @@ pub enum CacheAction {
 /// RocksDB cache evicts it, so it is the guard that keeps block reads fast.
 pub fn cache_action(
     available_mib: u64,
-    cached_mib: u64,
+    _cached_mib: u64,
     reserve_mib: u64,
     cache_mib: u64,
     cache_max_mib: u64,
 ) -> CacheAction {
-    if available_mib < reserve_mib || cached_mib < reserve_mib / 2 {
+    // `MemAvailable` already accounts for reclaimable page cache, so it is the
+    // right signal. A low page-cache number is expected while the RocksDB
+    // block cache holds the UTXO working set; shrinking because of it caused
+    // cache oscillation (6 GiB -> 256 MiB) and random-read stalls.
+    if available_mib < reserve_mib {
         CacheAction::Shrink
-    } else if available_mib >= reserve_mib + reserve_mib / 2
-        && cached_mib >= reserve_mib
-        && cache_mib < cache_max_mib
-    {
+    } else if available_mib >= reserve_mib + reserve_mib / 2 && cache_mib < cache_max_mib {
         CacheAction::Grow
     } else {
         CacheAction::Hold
@@ -1154,11 +1211,9 @@ mod tests {
             cache_action(800, 2708, 1024, 2000, 4000),
             CacheAction::Shrink
         );
-        // Page cache below half the reserve: shrink even with free RAM.
-        assert_eq!(
-            cache_action(4000, 400, 1024, 2000, 4000),
-            CacheAction::Shrink
-        );
+        // Low page cache alone must not shrink the RocksDB cache: MemAvailable
+        // already accounts for reclaimable memory.
+        assert_eq!(cache_action(4000, 400, 1024, 2000, 4000), CacheAction::Grow);
         // Between 1x and 1.5x reserve: hold.
         assert_eq!(
             cache_action(1200, 2000, 1024, 2000, 4000),

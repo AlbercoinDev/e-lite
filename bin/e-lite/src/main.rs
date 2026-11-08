@@ -2295,6 +2295,31 @@ impl Indexer {
             }
         }
         self.stats_tip(tip, last_block_ms);
+        if let Some(sh) = &self.shared {
+            sh.stats.commits.fetch_add(1, Ordering::Relaxed);
+            sh.stats
+                .committed_txs
+                .fetch_add(txids.len() as u64, Ordering::Relaxed);
+            let (ct, cd) = self.store.last_commit_timings_us();
+            sh.stats.commit_txids_us.store(ct, Ordering::Relaxed);
+            sh.stats.commit_db_us.store(cd, Ordering::Relaxed);
+            let c = self.store.compaction_stats();
+            sh.stats
+                .rocksdb_pending_compaction_bytes
+                .store(c.pending_compaction_bytes, Ordering::Relaxed);
+            sh.stats
+                .rocksdb_running_compactions
+                .store(c.running_compactions, Ordering::Relaxed);
+            sh.stats
+                .rocksdb_memtable_bytes
+                .store(c.memtable_bytes, Ordering::Relaxed);
+            sh.stats
+                .rocksdb_block_cache_bytes
+                .store(c.block_cache_bytes, Ordering::Relaxed);
+            sh.stats
+                .rocksdb_sst_bytes
+                .store(c.sst_files_bytes, Ordering::Relaxed);
+        }
         Ok(())
     }
 

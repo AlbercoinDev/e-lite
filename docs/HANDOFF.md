@@ -1,9 +1,9 @@
 # Session handoff
 
 **Updated:** 2026-11-07
-**Latest published release:** `0.1.0-alpha.29.4.3`
-**Release:** https://github.com/AlbercoinDev/e-lite/releases/tag/v0.1.0-alpha.29.4.3
-**Main commit at handoff:** tag `v0.1.0-alpha.29.4.3`
+**Latest published release:** `0.1.0-alpha.29.4.4`
+**Release:** https://github.com/AlbercoinDev/e-lite/releases/tag/v0.1.0-alpha.29.4.4
+**Main commit at handoff:** tag `v0.1.0-alpha.29.4.4`
 
 This file is the short “where we are” for a new session. The invariants live in
 [`AGENTS.md`](../AGENTS.md) and [`PROJECT_MEMORY.md`](PROJECT_MEMORY.md); the
@@ -83,6 +83,19 @@ no repitas contexto ni rehagas decisiones ya documentadas.
   the onion setup, reset and security.
 - `docs/ROADMAP.md` contains future features/improvements. Do not present them as
   available.
+
+## Last change (alpha.29.4.4)
+
+- **Mainnet baseline with defaults**: 4.2–4.8 blocks/s at ~640k; per-block
+  cost dominated by prevout prefetch (100–1500 ms), not block reads. Commit is
+  ~7–8 ms/block amortised. The block cache oscillated 6.6 GiB → 256 MiB.
+- **Stable cache defaults**: max cache RAM/4, adaptive floor
+  `clamp(RAM/8, 512 MiB, 4096 MiB)`, cache decisions based on `MemAvailable`.
+- **Prevout path**: index/bloom filters stay out of the data block cache and
+  `max_open_files = 8192`, so a shrinking cache does not evict filters.
+- **Instrumentation**: cumulative stage microseconds, commit split (txids
+  fsync vs RocksDB write), compaction/memtable/SST counters in `/status`;
+  `tests/bench_ibd.sh` joint Core+e-lite benchmark.
 
 ## Last change (alpha.29.4.3)
 
@@ -617,6 +630,6 @@ startup/shutdown/memory assertions, `e-lite.log` presence, 1.6 and 1.7
 negotiation on the same instance, scriptpubkey/outpoint checks, outpoint
 notification, real testmempoolaccept, the rate-limit burst test, the strict
 Core RPC check and the Sparrow sequence with confirmed verbose transaction)
-passed on the alpha.29.4.3 code. Full signet/testnet4 acceptance
+passed on the alpha.29.4.4 code. Full signet/testnet4 acceptance
 is still operator-run; results belong in `docs/GETTING-STARTED.md`/release notes
 when available.

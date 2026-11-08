@@ -19,6 +19,8 @@ use std::fs::{File, OpenOptions};
 use std::io;
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Instant;
 
 pub mod failpoints {
     //! Deterministic failure injection for crash tests (no env races).
@@ -33,6 +35,15 @@ pub mod failpoints {
     pub fn get() -> u8 {
         STATE.load(Ordering::SeqCst)
     }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct CompactionStats {
+    pub pending_compaction_bytes: u64,
+    pub running_compactions: u64,
+    pub memtable_bytes: u64,
+    pub block_cache_bytes: u64,
+    pub sst_files_bytes: u64,
 }
 
 pub const CF_NAMES: [&str; 7] = [
@@ -93,6 +104,9 @@ pub struct Store {
     path: PathBuf,
     txids_path: PathBuf,
     txids: File,
+    /// Last commit split: txids append+fsync and RocksDB write.
+    commit_txids_us: AtomicU64,
+    commit_db_us: AtomicU64,
 }
 
 /// Tunables for the RocksDB instance. `Store::open` uses conservative
@@ -116,7 +130,9 @@ impl Default for StoreOptions {
             write_buffer_total_bytes: 256 * 1024 * 1024,
             max_write_buffer_number: 3,
             max_total_wal_bytes: 256 * 1024 * 1024,
-            max_open_files: 1024,
+            // Keep every SST reader open: table-cache churn shows up as random
+            // read latency in prevout prefetch on large indexes.
+            max_open_files: 8192,
             background_jobs: 4,
         }
     }
@@ -183,7 +199,11 @@ impl Store {
             let mut table = BlockBasedOptions::default();
             table.set_block_cache(&cache);
             table.set_bloom_filter(10.0, true);
-            table.set_cache_index_and_filter_blocks(true);
+            // Index and bloom filters stay in the table readers instead of
+            // competing with data blocks in the block cache. When the cache
+            // shrinks under pressure, evicting filters would turn every
+            // prevout lookup into an extra disk read.
+            table.set_cache_index_and_filter_blocks(false);
             table.set_pin_l0_filter_and_index_blocks_in_cache(true);
             cf_opts.set_block_based_table_factory(&table);
             descriptors.push(ColumnFamilyDescriptor::new(name, cf_opts));
@@ -204,6 +224,8 @@ impl Store {
             path,
             txids_path,
             txids,
+            commit_txids_us: AtomicU64::new(0),
+            commit_db_us: AtomicU64::new(0),
         };
         store.check_schema()?;
         store.reconcile_txids()?;
@@ -647,7 +669,12 @@ impl Store {
             ));
         }
         let start = tip.txnum - txids.len() as u64;
+        let txids_started = Instant::now();
         self.append_txids(start, txids)?;
+        self.commit_txids_us.store(
+            txids_started.elapsed().as_micros() as u64,
+            Ordering::Relaxed,
+        );
 
         if failpoints::get() == failpoints::BEFORE_COMMIT {
             return err("failpoint: before_commit (txids appended, db unchanged)");
@@ -655,7 +682,10 @@ impl Store {
 
         let mut batch = batch;
         self.put_tip(&mut batch, tip)?;
+        let db_started = Instant::now();
         self.write_batch(batch, sync)?;
+        self.commit_db_us
+            .store(db_started.elapsed().as_micros() as u64, Ordering::Relaxed);
 
         if failpoints::get() == failpoints::AFTER_COMMIT {
             return err("failpoint: after_commit (db committed)");
@@ -755,6 +785,30 @@ impl Store {
         }
         out.push(("txids".to_string(), hex::encode(hasher.finalize())));
         Ok(out)
+    }
+
+    /// RocksDB compaction/memory counters used by the indexing benchmark and
+    /// `/status`. Property reads are cheap and only sampled at commit time.
+    pub fn compaction_stats(&self) -> CompactionStats {
+        let read =
+            |name: &str| -> u64 { self.db.property_int_value(name).ok().flatten().unwrap_or(0) };
+        CompactionStats {
+            pending_compaction_bytes: read("rocksdb.estimate-pending-compaction-bytes"),
+            running_compactions: read("rocksdb.num-running-compactions"),
+            memtable_bytes: read("rocksdb.cur-size-all-mem-tables"),
+            block_cache_bytes: read("rocksdb.block-cache-usage"),
+            sst_files_bytes: read("rocksdb.total-sst-files-size"),
+        }
+    }
+
+    /// Microseconds spent in the last commit's txids append+fsync and in the
+    /// RocksDB write. Used by the indexing benchmark to separate fsync cost
+    /// from compaction/write stalls.
+    pub fn last_commit_timings_us(&self) -> (u64, u64) {
+        (
+            self.commit_txids_us.load(Ordering::Relaxed),
+            self.commit_db_us.load(Ordering::Relaxed),
+        )
     }
 
     pub fn disk_usage_bytes(&self) -> u64 {

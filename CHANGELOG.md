@@ -1,5 +1,36 @@
 # Changelog
 
+## 0.1.0-alpha.29.4.4 — 2026-11-08
+
+### Performance: stable RocksDB cache and prevout read path (mainnet defaults)
+
+Measured on a real mainnet IBD with default settings (~640k height):
+
+- 4.2–4.8 blocks/s and ~9.5–10k tx/s.
+- Per-block cost was dominated by **prevout prefetch (100–1500 ms)**, then
+  decode (~25 ms), apply (~20–100 ms) and commit (~7–8 ms/block amortised).
+  `read` was ~1–10 ms: block reading was not the bottleneck.
+- The adaptive cache grew to 6.6 GiB and then collapsed to 256 MiB while the
+  page cache fell to ~150 MiB, turning prevout lookups into random disk reads.
+
+Defaults changed:
+
+- **Block cache is capped at RAM/4** (not the whole memory ceiling) with a
+  floor of `clamp(RAM/8, 512 MiB, 4096 MiB)` for adaptive shrinks. This keeps
+  the recent UTXO working set stable instead of oscillating between 6 GiB and
+  256 MiB.
+- **Cache decisions use `MemAvailable`**, not a low page-cache reading: the
+  RocksDB block cache is expected to hold the working set, and shrinking it
+  because page cache is low caused thrash.
+- **Index and bloom filters stay out of the data block cache** and every SST
+  reader is kept open (`max_open_files = 8192`), so a shrinking data cache
+  cannot evict the filters needed by prevout lookups.
+- New `/status` fields for the next measurement: cumulative stage totals in
+  microseconds, commit count/txs, `commit_breakdown_us` (txids fsync vs RocksDB
+  write) and RocksDB pending compaction/memtable/SST counters.
+- `tests/bench_ibd.sh` + `tests/bench_sample.py` measure a joint feeder-Core
+  IBD with e-lite indexing, including CPU/RAM/disk, pauses and stage totals.
+
 ## 0.1.0-alpha.29.4.3 — 2026-11-07
 
 ### Fix: Java/Sparrow TLS trust (local CA + server certificate)

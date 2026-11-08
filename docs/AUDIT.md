@@ -1,7 +1,7 @@
 # Code audit
 
-**Base:** `0.1.0-alpha.29.4.2` → published `0.1.0-alpha.29.4.3` · **Scope:** `bin/e-lite`, `crates/*` (26 Rust files,
-~19k lines) · **Status:** findings fixed in `0.1.0-alpha.29.4.3` where noted.
+**Base:** `0.1.0-alpha.29.4.3` → published `0.1.0-alpha.29.4.4` · **Scope:** `bin/e-lite`, `crates/*` (26 Rust files,
+~19k lines) · **Status:** findings fixed in `0.1.0-alpha.29.4.4` where noted.
 
 This audit is not a claim of formal verification. It records static checks,
 manual review areas, concrete findings and residual risks.
@@ -96,6 +96,8 @@ Additional checks performed:
 | AUD-076 | P2 | Multi-instance | `crates/el-model/src/types.rs`, `bin/e-lite/src/tor.rs` | Managed Tor used 9050 for every network, so two instances starting together could race for the same SOCKS port. | Per-network defaults (9050 mainnet, 55150/55250/55350 others) with the old fallback; explicit `tor.socks_port` still wins. `tests/e2e_multi_instance.sh` runs two instances and checks listeners, certificates, RSS and independent stop/restart. |
 | AUD-077 | P2 | TLS trust test | `tests/e2e_defaults.sh` | TLS tests used `CERT_NONE`, so they proved encryption but not trust or hostname/IP validation. | The generated certificate is loaded as a CA with `check_hostname` for `localhost` and the LAN IP, and a hostname outside the SAN must fail. |
 | AUD-078 | P1 | Wallet TLS trust | `bin/e-lite/src/tls.rs` | The generated identity was a single self-signed server certificate. Java/Sparrow treats the trusted certificate as a `TrustAnchor` and rejects it because it is not a CA (`TrustAnchor ... is not a CA certificate`), so wallets could not connect with TLS even after importing the cert. | Generate a per-instance local CA (`ca.crt`, `CA:TRUE`, key 0600) and sign the server leaf with it; `self-signed.crt` is now the leaf+CA chain. Trust `ca.crt` in the wallet. The leaf is re-signed with the same CA on SAN changes; old single-cert installs migrate on next start. Tests check the chain structure, migration, `openssl verify`, `CA:TRUE` and wallet-style hostname/LAN-IP validation. |
+| AUD-079 | P1 | Mainnet indexing | `crates/el-store/src/lib.rs`, `bin/e-lite/src/tuning.rs` | Real mainnet defaults ran at 4.2–4.8 blocks/s; prevout prefetch was 100–1500 ms/block, and the RocksDB block cache oscillated from 6.6 GiB to 256 MiB because the controller shrank it when page cache was low. Index and filters shared the shrinking cache, turning lookups into random disk reads. | Cap the adaptive cache at RAM/4 with a floor of `clamp(RAM/8, 512 MiB, 4096 MiB)`, decide with `MemAvailable`, keep index/filters out of the data cache and `max_open_files = 8192`. Re-measure with `bench_ibd`/`/status`. |
+| AUD-080 | P2 | Instrumentation | `crates/el-store`, `crates/el-serve`, `bin/e-lite` | The default mainnet log showed stage times but not cumulative totals, commit fsync vs DB write, or RocksDB compaction/memtable pressure, so the bottleneck could not be attributed. | Add cumulative stage microseconds, commit count/txs, `commit_breakdown_us` (txids fsync vs RocksDB), compaction/memtable/SST counters and a joint feeder-Core benchmark. |
 
 ## Residual risks and intentional limits
 

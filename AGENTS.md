@@ -71,6 +71,12 @@ Never treat a version number in this file as authoritative over the code/tag.
 - Crash recovery: SIGKILL during indexing, a write failure and a reorg at the
   indexed tip must all recover through RocksDB/WAL and undo. Covered by
   `tests/e2e_recovery.sh`; run it after touching commit, undo or rewind.
+- Real mainnet default baseline (alpha.29.4.3): ~4.2–4.8 blocks/s at ~640k;
+  per-block cost dominated by prevout prefetch (100–1500 ms), then decode
+  (~25 ms), apply (20–100 ms) and commit (~7–8 ms/block amortised); read
+  1–10 ms. The block cache oscillated 6.6 GiB → 256 MiB. Re-measure with
+  `tests/bench_ibd.sh` and `/status` stage/commit/rocksdb counters after any
+  change to the prefetch, cache or commit path.
 - Multi-instance: one Core datadir per network, per-network Electrum/TLS/metrics
   ports and per-network managed-Tor SOCKS ports (9050 mainnet; 55150/55250/
   55350 for testnet4/signet/regtest). `tests/e2e_multi_instance.sh` covers two

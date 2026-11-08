@@ -214,6 +214,30 @@ it `core_resume_ahead_blocks` (5,000) before the tip, so peers reconnect while
 e-lite finishes. After that, `max_bulk_lag_blocks` (20,000) bounds additional
 growth relative to the lowest lag seen and resumes at half.
 
+### Measured on a real mainnet IBD with defaults (2026-11-08)
+
+At ~640k height on a 32 GiB machine, default settings:
+
+| Signal | Observation |
+|---|---|
+| Throughput | 4.2–4.8 blocks/s, ~9.5–10k tx/s |
+| Per-block cost | prevout prefetch **100–1500 ms** (dominant), decode ~25 ms, apply 20–100 ms, commit ~7–8 ms amortised, read 1–10 ms |
+| Commit group | adaptive interval escalated to 30 s; commit ~1.4–8.4 s per group |
+| Block cache | grew to 6.6 GiB, then collapsed to 256 MiB; page cache ~150 MiB |
+
+Conclusions applied as defaults in 0.1.0-alpha.29.4.4:
+
+- The cache is capped at `RAM/4` with a floor of
+  `clamp(RAM/8, 512 MiB, 4096 MiB)`; shrinking uses `MemAvailable`, not a low
+  page-cache number.
+- Index and bloom filters stay out of the data block cache and
+  `max_open_files = 8192`, so prefetch lookups do not pay an extra disk read
+  when the data cache shrinks.
+- `commit` is not the dominant per-block cost; prefetch is. Measure the
+  `commit_breakdown_us` split before changing fsync policy.
+- The 30 s adaptive commit interval is still under evaluation; it improved
+  neither block rate nor lag in this run.
+
 ### Measured on the test LXC (4 vCPU, 8 GiB, 2026-11-07)
 
 `tests/bench_index.sh` mines a disposable regtest chain and indexes it with

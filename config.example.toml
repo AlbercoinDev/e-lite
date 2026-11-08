@@ -33,7 +33,7 @@ stop_on_exit = true                 # stop only a Core launched by e-lite
 [index]
 block_source = "auto"               # auto | rpc | files
 readers = 0                         # 0 = profile/adaptive
-cache_mib = 0                       # 0 = auto; >0 = maximum block cache
+cache_mib = 0                       # 0 = auto (RAM/4 max, RAM/8 floor); >0 = maximum
 reorg_window = 288                  # undo records kept for reorgs
 batch_blocks = 256                  # blocks per atomic commit (initial; adaptive may change)
 profile = "auto"                    # auto | hdd | ssd | nvme | manual
