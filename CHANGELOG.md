@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.1.0-alpha.29.4.5 — 2026-11-08
+
+### Fix: cap RocksDB open files to the process limit
+
+- `max_open_files = 8192` (alpha.29.4.4) would fail table opens on hosts with a
+  low `RLIMIT_NOFILE`. The value is now capped to `ulimit -n - 64` (minimum 256)
+  before configuring RocksDB, so the prevout read improvement cannot turn into
+  an `EMFILE` startup failure.
+
 ## 0.1.0-alpha.29.4.4 — 2026-11-08
 
 ### Performance: stable RocksDB cache and prevout read path (mainnet defaults)

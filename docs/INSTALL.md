@@ -53,15 +53,15 @@ export PATH="$HOME/.local/bin:$PATH"
 ## Pinned version
 
 ```bash
-curl -fsSL https://github.com/AlbercoinDev/e-lite/releases/download/v0.1.0-alpha.29.4.4/install.sh \
-  | sh -s -- --version 0.1.0-alpha.29.4.4 --yes
+curl -fsSL https://github.com/AlbercoinDev/e-lite/releases/download/v0.1.0-alpha.29.4.5/install.sh \
+  | sh -s -- --version 0.1.0-alpha.29.4.5 --yes
 ```
 
 With Core:
 
 ```bash
-curl -fsSL https://github.com/AlbercoinDev/e-lite/releases/download/v0.1.0-alpha.29.4.4/install.sh \
-  | sh -s -- --version 0.1.0-alpha.29.4.4 --with-core --yes
+curl -fsSL https://github.com/AlbercoinDev/e-lite/releases/download/v0.1.0-alpha.29.4.5/install.sh \
+  | sh -s -- --version 0.1.0-alpha.29.4.5 --with-core --yes
 ```
 
 ## System-wide .deb

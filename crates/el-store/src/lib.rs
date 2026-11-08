@@ -46,6 +46,22 @@ pub struct CompactionStats {
     pub sst_files_bytes: u64,
 }
 
+/// Cap RocksDB's open-file target to the process limit. A value above
+/// `RLIMIT_NOFILE` makes table opens fail under load instead of evicting.
+fn fd_budget(requested: i32) -> i32 {
+    let mut limit = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    let soft = if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) } == 0 {
+        limit.rlim_cur as i64
+    } else {
+        1024
+    };
+    let ceiling = (soft.saturating_sub(64)).clamp(256, i32::MAX as i64) as i32;
+    requested.max(64).min(ceiling)
+}
+
 pub const CF_NAMES: [&str; 7] = [
     "meta",
     "blocks",
@@ -176,7 +192,7 @@ impl Store {
             max_buffers,
         );
         opts.set_max_total_wal_size(store_opts.max_total_wal_bytes.max(32 * 1024 * 1024) as u64);
-        opts.set_max_open_files(store_opts.max_open_files.max(64));
+        opts.set_max_open_files(fd_budget(store_opts.max_open_files));
         opts.set_max_background_jobs(store_opts.background_jobs.max(1));
         opts.set_bytes_per_sync(1024 * 1024);
         opts.set_wal_bytes_per_sync(1024 * 1024);

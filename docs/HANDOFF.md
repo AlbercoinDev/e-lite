@@ -1,9 +1,9 @@
 # Session handoff
 
 **Updated:** 2026-11-07
-**Latest published release:** `0.1.0-alpha.29.4.4`
-**Release:** https://github.com/AlbercoinDev/e-lite/releases/tag/v0.1.0-alpha.29.4.4
-**Main commit at handoff:** tag `v0.1.0-alpha.29.4.4`
+**Latest published release:** `0.1.0-alpha.29.4.5`
+**Release:** https://github.com/AlbercoinDev/e-lite/releases/tag/v0.1.0-alpha.29.4.5
+**Main commit at handoff:** tag `v0.1.0-alpha.29.4.5`
 
 This file is the short “where we are” for a new session. The invariants live in
 [`AGENTS.md`](../AGENTS.md) and [`PROJECT_MEMORY.md`](PROJECT_MEMORY.md); the
@@ -83,6 +83,11 @@ no repitas contexto ni rehagas decisiones ya documentadas.
   the onion setup, reset and security.
 - `docs/ROADMAP.md` contains future features/improvements. Do not present them as
   available.
+
+## Last change (alpha.29.4.5)
+
+- Cap RocksDB `max_open_files` to `ulimit -n - 64` (minimum 256) so the prevout
+  read improvement cannot cause `EMFILE` on hosts with a low file limit.
 
 ## Last change (alpha.29.4.4)
 
@@ -630,6 +635,6 @@ startup/shutdown/memory assertions, `e-lite.log` presence, 1.6 and 1.7
 negotiation on the same instance, scriptpubkey/outpoint checks, outpoint
 notification, real testmempoolaccept, the rate-limit burst test, the strict
 Core RPC check and the Sparrow sequence with confirmed verbose transaction)
-passed on the alpha.29.4.4 code. Full signet/testnet4 acceptance
+passed on the alpha.29.4.5 code. Full signet/testnet4 acceptance
 is still operator-run; results belong in `docs/GETTING-STARTED.md`/release notes
 when available.
