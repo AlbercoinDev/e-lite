@@ -125,6 +125,7 @@ pub struct Stats {
     pub rocksdb_block_cache_bytes: AtomicU64,
     pub rocksdb_sst_bytes: AtomicU64,
     pub rocksdb_table_readers_bytes: AtomicU64,
+    pub rocksdb_properties_ok: AtomicBool,
     /// Descriptor budget: requested/effective max_open_files and the process
     /// soft limit. Zero means "not measured".
     pub fd_soft_limit: AtomicU64,
@@ -144,6 +145,9 @@ pub struct Stats {
     pub tuning_wait_ms: AtomicU64,
     pub tuning_commit_ms_ewma: AtomicU64,
     pub tuning_commit_per_block_ms: AtomicU64,
+    /// Wall-clock between the start of consecutive commits. `commit_share`
+    /// must divide by this, not by the configured interval.
+    pub tuning_commit_cycle_ms: AtomicU64,
     pub tuning_adapt_steps: AtomicU64,
     pub tuning_tx_per_sec: AtomicU64,
     pub tuning_blocks_per_sec: AtomicU64,
@@ -163,6 +167,16 @@ pub struct Stats {
     pub mem_reserve_mib: AtomicU64,
     pub mem_budget_mib: AtomicU64,
     pub tor_bootstrapped: AtomicBool,
+    /// Managed Tor: effective loopback SOCKS port (0 = unknown/not managed)
+    /// and whether a control port exists (e-lite does not create one).
+    pub tor_managed: AtomicBool,
+    pub tor_socks_port: AtomicU64,
+    pub tor_control_port: AtomicU64,
+    /// Pipeline work accounting: blocks prepared, applied and discarded when
+    /// a catch-up call ends. Discarded should stay near zero.
+    pub pipeline_prepared: AtomicU64,
+    pub pipeline_applied: AtomicU64,
+    pub pipeline_discarded: AtomicU64,
     pub started: Instant,
 }
 
@@ -204,6 +218,7 @@ impl Default for Stats {
             rocksdb_block_cache_bytes: AtomicU64::new(0),
             rocksdb_sst_bytes: AtomicU64::new(0),
             rocksdb_table_readers_bytes: AtomicU64::new(0),
+            rocksdb_properties_ok: AtomicBool::new(false),
             fd_soft_limit: AtomicU64::new(0),
             fd_reserve: AtomicU64::new(0),
             max_open_files_requested: AtomicU64::new(0),
@@ -221,6 +236,7 @@ impl Default for Stats {
             tuning_wait_ms: AtomicU64::new(0),
             tuning_commit_ms_ewma: AtomicU64::new(0),
             tuning_commit_per_block_ms: AtomicU64::new(0),
+            tuning_commit_cycle_ms: AtomicU64::new(0),
             tuning_adapt_steps: AtomicU64::new(0),
             tuning_tx_per_sec: AtomicU64::new(0),
             tuning_blocks_per_sec: AtomicU64::new(0),
@@ -240,6 +256,12 @@ impl Default for Stats {
             mem_reserve_mib: AtomicU64::new(0),
             mem_budget_mib: AtomicU64::new(0),
             tor_bootstrapped: AtomicBool::new(false),
+            tor_managed: AtomicBool::new(false),
+            tor_socks_port: AtomicU64::new(0),
+            tor_control_port: AtomicU64::new(0),
+            pipeline_prepared: AtomicU64::new(0),
+            pipeline_applied: AtomicU64::new(0),
+            pipeline_discarded: AtomicU64::new(0),
             started: Instant::now(),
         }
     }
@@ -1038,6 +1060,7 @@ impl Shared {
                 "block_cache_bytes": self.stats.rocksdb_block_cache_bytes.load(Ordering::Relaxed),
                 "sst_bytes": self.stats.rocksdb_sst_bytes.load(Ordering::Relaxed),
                 "table_readers_bytes": self.stats.rocksdb_table_readers_bytes.load(Ordering::Relaxed),
+                "properties_ok": self.stats.rocksdb_properties_ok.load(Ordering::Relaxed),
             },
             "file_descriptors": {
                 "soft_limit": self.stats.fd_soft_limit.load(Ordering::Relaxed),
@@ -1065,6 +1088,18 @@ impl Shared {
             "onion_plain_port": self.onion_plain_port,
             "onion_tls_port": self.onion_tls_port,
             "tor_bootstrapped": self.stats.tor_bootstrapped.load(Ordering::Relaxed),
+            "tor": {
+                "managed": self.stats.tor_managed.load(Ordering::Relaxed),
+                "socks_port": self.stats.tor_socks_port.load(Ordering::Relaxed),
+                // e-lite's managed torrc has no ControlPort; Core's own onion
+                // is disabled with -listenonion=0.
+                "control_port": self.stats.tor_control_port.load(Ordering::Relaxed),
+            },
+            "pipeline": {
+                "prepared": self.stats.pipeline_prepared.load(Ordering::Relaxed),
+                "applied": self.stats.pipeline_applied.load(Ordering::Relaxed),
+                "discarded": self.stats.pipeline_discarded.load(Ordering::Relaxed),
+            },
             "tls_handshakes": self.stats.tls_handshakes.load(Ordering::Relaxed),
             "tls_handshake_failures": self
                 .stats
@@ -1094,6 +1129,7 @@ impl Shared {
                 "wait_ms_ewma": self.stats.tuning_wait_ms.load(Ordering::Relaxed),
                 "commit_ms_ewma": self.stats.tuning_commit_ms_ewma.load(Ordering::Relaxed),
                 "commit_per_block_ms": self.stats.tuning_commit_per_block_ms.load(Ordering::Relaxed),
+                "commit_cycle_ms": self.stats.tuning_commit_cycle_ms.load(Ordering::Relaxed),
                 "adapt_steps": self.stats.tuning_adapt_steps.load(Ordering::Relaxed),
                 "tx_per_sec": self.stats.tuning_tx_per_sec.load(Ordering::Relaxed),
                 "blocks_per_sec": self.stats.tuning_blocks_per_sec.load(Ordering::Relaxed),

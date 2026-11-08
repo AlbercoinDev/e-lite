@@ -44,6 +44,10 @@ pub struct CompactionStats {
     pub memtable_bytes: u64,
     pub block_cache_bytes: u64,
     pub sst_files_bytes: u64,
+    pub table_readers_bytes: u64,
+    /// False when any per-CF property was unsupported or failed; a zero is
+    /// then "unknown", not "empty".
+    pub properties_ok: bool,
 }
 
 /// Descriptor plan for the RocksDB instance.
@@ -639,13 +643,23 @@ impl Store {
             return Ok(HashMap::new());
         }
         let cf = self.cf("utxo")?;
-        let keys: Vec<(&rocksdb::ColumnFamily, [u8; 36])> =
-            ops.iter().map(|op| (cf, codec::utxo_key(op))).collect();
-        let values = self.db.multi_get_cf(keys);
-        let mut out = HashMap::with_capacity(ops.len());
-        for (op, value) in ops.iter().zip(values) {
+        // `batched_multi_get_cf` processes point reads in batches for the
+        // block-based table (one CF, sorted keys). Duplicates are removed so a
+        // block spending the same prevout twice does not read it twice.
+        let mut keys: Vec<[u8; 36]> = ops.iter().map(codec::utxo_key).collect();
+        keys.sort_unstable();
+        keys.dedup();
+        let values = self.db.batched_multi_get_cf(cf, keys.iter(), true);
+        let mut by_key: HashMap<[u8; 36], UtxoValue> = HashMap::with_capacity(keys.len());
+        for (key, value) in keys.iter().zip(values) {
             if let Some(raw) = value? {
-                out.insert(*op, codec::parse_utxo_value(&raw)?);
+                by_key.insert(*key, codec::parse_utxo_value(raw.as_ref())?);
+            }
+        }
+        let mut out = HashMap::with_capacity(ops.len());
+        for op in ops {
+            if let Some(v) = by_key.get(&codec::utxo_key(op)) {
+                out.insert(*op, *v);
             }
         }
         Ok(out)
@@ -817,6 +831,17 @@ impl Store {
         self.flush_all()
     }
 
+    /// Make every write accepted so far durable in the WAL without forcing
+    /// memtables to SST files. A single `WriteBatch` is atomic across column
+    /// families and `txids.dat` is fsynced before the batch, so after a
+    /// successful `SyncWAL` the committed tip is recoverable. This is the
+    /// barrier the prune gate needs; `flush_all` additionally settles SSTs
+    /// for size measurements and is not required for durability.
+    pub fn sync_wal_barrier(&self) -> Result<()> {
+        self.db.flush_wal(true)?;
+        Ok(())
+    }
+
     /// Flush every column family and rotate the WAL, so on-disk measurements
     /// and restarts see settled SSTs instead of a growing write-ahead log.
     pub fn flush_all(&self) -> Result<()> {
@@ -893,28 +918,68 @@ impl Store {
         Ok(out)
     }
 
+    /// Sum a property across every column family. Some RocksDB properties are
+    /// per-CF (`estimate-*`, `total-sst-files-size`, memtables); reading them
+    /// through the DB handle only reports the default family.
+    fn sum_cf_property(&self, name: &str) -> (u64, bool) {
+        let mut total = 0u64;
+        let mut ok = true;
+        for cf_name in CF_NAMES {
+            match self.cf(cf_name) {
+                Ok(cf) => match self.db.property_int_value_cf(cf, name) {
+                    Ok(Some(v)) => total = total.saturating_add(v),
+                    Ok(None) | Err(_) => ok = false,
+                },
+                Err(_) => ok = false,
+            }
+        }
+        (total, ok)
+    }
+
     /// RocksDB compaction/memory counters used by the indexing benchmark and
     /// `/status`. Property reads are cheap and only sampled at commit time.
+    ///
+    /// Per-CF properties are summed across all seven families; DB-wide
+    /// properties (`num-running-compactions`, the shared block cache) are read
+    /// once so they are not multiplied by the CF count.
     pub fn compaction_stats(&self) -> CompactionStats {
-        let read =
-            |name: &str| -> u64 { self.db.property_int_value(name).ok().flatten().unwrap_or(0) };
+        let (pending, ok_pending) =
+            self.sum_cf_property("rocksdb.estimate-pending-compaction-bytes");
+        let (memtables, ok_memtables) = self.sum_cf_property("rocksdb.cur-size-all-mem-tables");
+        let (sst, ok_sst) = self.sum_cf_property("rocksdb.total-sst-files-size");
+        let (readers, ok_readers) = self.sum_cf_property("rocksdb.estimate-table-readers-mem");
+        let running = self
+            .db
+            .property_int_value("rocksdb.num-running-compactions")
+            .ok()
+            .flatten();
+        let cache = self
+            .db
+            .property_int_value("rocksdb.block-cache-usage")
+            .ok()
+            .flatten();
         CompactionStats {
-            pending_compaction_bytes: read("rocksdb.estimate-pending-compaction-bytes"),
-            running_compactions: read("rocksdb.num-running-compactions"),
-            memtable_bytes: read("rocksdb.cur-size-all-mem-tables"),
-            block_cache_bytes: read("rocksdb.block-cache-usage"),
-            sst_files_bytes: read("rocksdb.total-sst-files-size"),
+            pending_compaction_bytes: pending,
+            running_compactions: running.unwrap_or(0),
+            memtable_bytes: memtables,
+            block_cache_bytes: cache.unwrap_or(0),
+            sst_files_bytes: sst,
+            table_readers_bytes: readers,
+            properties_ok: ok_pending
+                && ok_memtables
+                && ok_sst
+                && ok_readers
+                && running.is_some()
+                && cache.is_some(),
         }
     }
 
     /// Memory held by table indexes and bloom filters. They live outside the
     /// data block cache, so a budget that ignores them is not a real budget.
+    /// Summed over every CF; zero means "not measured" when the property is
+    /// unavailable.
     pub fn table_readers_bytes(&self) -> u64 {
-        self.db
-            .property_int_value("rocksdb.estimate-table-readers-mem")
-            .ok()
-            .flatten()
-            .unwrap_or(0)
+        self.sum_cf_property("rocksdb.estimate-table-readers-mem").0
     }
 
     /// Live memtables as accounted by the shared WriteBufferManager.
@@ -1056,6 +1121,42 @@ mod tests {
 
     fn identity() -> NetworkIdentity {
         NetworkIdentity::new(Chain::Regtest, Chain::Regtest.known_genesis().unwrap())
+    }
+
+    #[test]
+    fn compaction_properties_are_available_across_column_families() {
+        let _guard = serial();
+        let dir = tmp("stats");
+        let s = Store::open(&dir).unwrap();
+        let stats = s.compaction_stats();
+        // Every per-CF property must be supported; otherwise a zero would be
+        // indistinguishable from an empty database.
+        assert!(stats.properties_ok, "{stats:?}");
+    }
+
+    #[test]
+    fn batched_utxo_lookup_deduplicates_and_preserves_values() {
+        let _guard = serial();
+        let dir = tmp("batched-utxo");
+        let s = Store::open(&dir).unwrap();
+        let op = Outpoint {
+            txid: Hash32::from_hex(&"44".repeat(32)).unwrap(),
+            vout: 7,
+        };
+        let val = UtxoValue {
+            value_sat: 12_345,
+            script_hash: ScriptHash::from_script(b"\x52"),
+            creation_height: 9,
+            coinbase: false,
+        };
+        let mut b = Store::batch();
+        s.put_utxo(&mut b, &op, &val).unwrap();
+        s.write_batch(b, true).unwrap();
+        // The same outpoint appears twice in one block; the batch must read it
+        // once and return one entry.
+        let map = s.get_utxos(&[op, op]).unwrap();
+        assert_eq!(map.len(), 1);
+        assert_eq!(map[&op], val);
     }
 
     #[test]

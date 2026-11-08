@@ -261,6 +261,31 @@ endpoints. Set `--banner-file <path>` (or `[server] banner_file`) to customize:
 The protocol has no banner push: the authoritative readiness signal is the log
 line (`READY`/`FULLY SYNCED`), `/status` and `e-lite status`.
 
+## Performance environment variables
+
+These are escape hatches for measurements, not normal configuration:
+
+| Variable | Effect |
+|---|---|
+| `E_LITE_LAG_POLICY=drain` | Use the opt-in drain-time lag watermark instead of the fixed block window |
+| `E_LITE_LAG_TARGET_SECONDS=<n>` | Drain target for `drain` (default 1800, clamped 120..21600) |
+| `E_LITE_NO_SYNC_LOCK=1` | Allow two intensive syncs at once (not recommended) |
+| `E_LITE_ALLOW_LOW_MEMORY=1` | Bypass the RAM preflight (CI only) |
+
+`/status` exposes the new diagnostics:
+
+- `pipeline.prepared/applied/discarded`: work prepared by readers versus blocks
+  actually applied. `discarded` is the in-flight window of the last 512-block
+  checkpoint, not one window per 10 s.
+- `tor.managed/socks_port/control_port`: effective SOCKS address for external
+  requests. `control_port` is always `0`; e-lite does not create one.
+- `rocksdb.properties_ok`: `false` means a zero in that block is unknown, not
+  empty.
+- `tuning.commit_cycle_ms`: real start-to-start commit interval used by
+  `commit_share`.
+- `commit_breakdown_us.txids_append_fsync` and `rocksdb_write`: separate the
+  flat-file fsync from the RocksDB write.
+
 ## Logging
 
 | Flag | TOML field | Default |

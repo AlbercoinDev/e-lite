@@ -97,6 +97,18 @@ Never treat a version number in this file as authoritative over the code/tag.
   provider outage cannot stop local block progress.
 - `commit_sync = auto` relaxes the RocksDB fsync in bulk; `txids.dat` is always
   fsynced and live mode is strict.
+- The supervisor runs at commit boundaries inside the catch-up pipeline; the
+  only teardown left is the 512-block checkpoint. Do not reintroduce a time
+  deadline that drops prepared blocks/readers. Disk and shutdown checks stay
+  per block. `/status.pipeline.discarded` is the regression signal.
+- The bulk lag window must not rewrite its baseline on a normal resume. Doing
+  so raised the pause threshold by `max_bulk_lag_blocks/2` per cycle. The
+  opt-in `E_LITE_LAG_POLICY=drain` uses the last commit cycle's rate; it stays
+  opt-in until a mainnet A/B.
+- The pre-prune durability barrier is `SyncWAL(true)`, not `flush_all`: a
+  single `WriteBatch` is atomic across CFs and `txids.dat` is fsynced first.
+  Never prune if the barrier fails. `tests/e2e_pruned_ibd.sh` covers
+  prune + SIGKILL + restart.
 - Electrum binds per-network defaults: plain/TLS/metrics are
   `55011/55022/55084` (mainnet), `55111/55122/55184` (testnet4),
   `55211/55222/55284` (signet) and `55311/55322/55384` (regtest), on `0.0.0.0`
@@ -187,24 +199,33 @@ Never treat a version number in this file as authoritative over the code/tag.
   limit in `doctor`/`/status.file_descriptors`; a cap below 2048 warns and a
   limit leaving RocksDB < 20 descriptors is a startup error.
 - A Core started by e-lite gets a fitted `-dbcache` (`clamp(RAM/4, 450, 2048)`,
-  <= `RAM/3`), `-par` (`cpus-1`, 1..8), `-rpcthreads` (4..16) and an explicit
-  `-prune` (including `-prune=0`). Operator values win for those three;
-  `-datadir/-chain/-server/-daemon/-daemonwait/-rpcbind/-rpcport/-rpcallowip/
-  -prune` in `extra_args` are rejected. An external Core is never configured,
-  paused or restarted. Core's shutdown grace is 120 s.
+  <= `RAM/3`), `-par` (`cpus-1`, 1..8), `-rpcthreads` (4..16),
+  `-listenonion=0` and an explicit `-prune` (including `-prune=0`). Core's own
+  onion is disabled because the managed `torrc` has no `ControlPort`; only the
+  Electrum onion is published. Operator values win for `-dbcache`, `-par`,
+  `-rpcthreads` and `-listenonion`; `-datadir/-chain/-server/-daemon/
+  -daemonwait/-rpcbind/-rpcport/-rpcallowip/-prune` in `extra_args` are
+  rejected. An external Core is never configured, paused or restarted. Core's
+  shutdown grace is 120 s.
 - Core RPC is HTTP; LAN/WAN use requires SSH/VPN. e-lite warns on a non-loopback
   `rpc_url`; `[core] require_loopback_rpc = true` makes it fatal. There is no
   native Core RPC TLS.
 - RocksDB memory is budgeted globally through the shared `WriteBufferManager`
   and the fitted budget above; background jobs are CPU-capped, and every knob is
   available via CLI/`--set`. Index/bloom filter memory is reported separately
-  as `table_readers_bytes`.
+  as `table_readers_bytes`. Per-CF properties (pending compaction, memtables,
+  SST size, table readers) are summed; DB-wide properties (`num-running-
+  compactions`, shared block cache) are read once. `/status.rocksdb.
+  properties_ok=false` means a zero is unknown, not empty.
 - `run`/`index`/`serve` tee console output to `<data-dir>/e-lite.log`
   (`--log-file`, `--log-max-mib`, `--no-log-file`).
 - The adaptive controller is its own thread (`el-tune`): a 5 s tick with a 30 s
-  minimum between changes. `commit/blk` is measured from the blocks actually
-  committed (`record_commit_group`). Automatic changes never override an
-  explicit `batch_blocks`.
+  minimum between changes, and one `adapt_gate` mutex covering the check and
+  the mutation. It is the only caller of `maybe_adapt`. `commit/blk` is
+  measured from the blocks actually committed; `commit_share` divides by the
+  real start-to-start commit cycle, not the configured interval. Cache growth
+  requires measured prefetch pressure, not just free RAM. Automatic changes
+  never override an explicit `batch_blocks`.
 - Disk accounting excludes a Core datadir nested inside the data directory;
   otherwise `disk.index_bytes` and the benchmark double-count Core.
 - Raw transactions are local-first. External fallback requests whole blocks by

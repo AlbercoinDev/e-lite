@@ -121,6 +121,8 @@ pub struct Tunables {
     pub commit_ewma: AtomicU64,
     pub tx_per_sec: AtomicU64,
     pub blocks_per_sec: AtomicU64,
+    /// Blocks/s over the last commit cycle, used by the drain-time lag policy.
+    recent_blocks_per_sec: AtomicU64,
     pub total_read_us: AtomicU64,
     pub total_decode_us: AtomicU64,
     pub total_prefetch_us: AtomicU64,
@@ -129,6 +131,9 @@ pub struct Tunables {
     pub total_commit_us: AtomicU64,
     /// Commit microseconds divided by the blocks actually in that commit.
     pub commit_per_block_ms: AtomicU64,
+    /// Wall-clock between the start of consecutive commits. This is the real
+    /// denominator for `commit_share`, not the configured interval.
+    pub commit_cycle_ms: AtomicU64,
     /// Periodic controller: number of completed adaptation steps.
     pub adapt_steps: AtomicU64,
 
@@ -136,8 +141,20 @@ pub struct Tunables {
     // bulk from live mode.
     core_height: AtomicU64,
     core_ibd: AtomicBool,
+    /// Hysteresis for Bulk/Live: leave Bulk only below 500 blocks of lag and
+    /// re-enter it above 2,000, so a noisy tip does not flap the mode.
+    mode_live: AtomicBool,
 
     last_change: Mutex<Instant>,
+    /// Serialises the 30 s rate-limit check with the mutation so two callers
+    /// cannot both pass it (the old code checked under one lock and wrote
+    /// under another).
+    adapt_gate: Mutex<()>,
+    last_commit_start: Mutex<Option<Instant>>,
+    /// Last successful prune. Commit decisions are skipped for 30 s after it:
+    /// the prune RPC/WAL barrier inflates the cycle and would otherwise look
+    /// like commit pain.
+    last_prune: Mutex<Option<Instant>>,
 }
 
 impl Tunables {
@@ -287,6 +304,7 @@ impl Tunables {
             commit_ewma: AtomicU64::new(0),
             tx_per_sec: AtomicU64::new(0),
             blocks_per_sec: AtomicU64::new(0),
+            recent_blocks_per_sec: AtomicU64::new(0),
             total_read_us: AtomicU64::new(0),
             total_decode_us: AtomicU64::new(0),
             total_prefetch_us: AtomicU64::new(0),
@@ -294,14 +312,19 @@ impl Tunables {
             total_apply_us: AtomicU64::new(0),
             total_commit_us: AtomicU64::new(0),
             commit_per_block_ms: AtomicU64::new(0),
+            commit_cycle_ms: AtomicU64::new(0),
             adapt_steps: AtomicU64::new(0),
             core_height: AtomicU64::new(0),
             core_ibd: AtomicBool::new(false),
+            mode_live: AtomicBool::new(false),
             last_change: Mutex::new(
                 Instant::now()
                     .checked_sub(Duration::from_secs(120))
                     .unwrap_or_else(Instant::now),
             ),
+            adapt_gate: Mutex::new(()),
+            last_commit_start: Mutex::new(None),
+            last_prune: Mutex::new(None),
         }
     }
 
@@ -416,10 +439,55 @@ impl Tunables {
     /// Record a commit together with the number of blocks it actually
     /// contained. `commit/blk` must not divide by the configured batch size:
     /// transaction limits and time-based commits produce smaller groups.
-    pub fn record_commit_group(&self, d: Duration, blocks: u64) {
+    pub fn record_commit_group(&self, started: Instant, d: Duration, blocks: u64) {
         self.record_commit(d);
         let per_block = (d.as_millis() as u64) / blocks.max(1);
         self.commit_per_block_ms.store(per_block, Ordering::Relaxed);
+        if let Ok(mut last) = self.last_commit_start.lock() {
+            if let Some(prev) = *last {
+                let cycle = started.saturating_duration_since(prev).as_millis() as u64;
+                self.commit_cycle_ms.store(cycle, Ordering::Relaxed);
+                if cycle > 0 {
+                    self.recent_blocks_per_sec.store(
+                        blocks.saturating_mul(1_000).checked_div(cycle).unwrap_or(0),
+                        Ordering::Relaxed,
+                    );
+                }
+            }
+            *last = Some(started);
+        }
+    }
+
+    /// Blocks/s over the last commit cycle; falls back to the since-start
+    /// average only until a cycle is available. Do not take the maximum: an
+    /// optimistic rate would allow a larger backlog than the target.
+    pub fn recent_blocks_rate(&self) -> u64 {
+        let recent = self.recent_blocks_per_sec.load(Ordering::Relaxed);
+        if recent > 0 {
+            recent
+        } else {
+            self.blocks_per_sec.load(Ordering::Relaxed)
+        }
+    }
+
+    pub fn commit_cycle_ms(&self) -> u64 {
+        self.commit_cycle_ms.load(Ordering::Relaxed)
+    }
+
+    /// Called after a successful prune so the controller ignores the stall.
+    pub fn note_prune(&self) {
+        if let Ok(mut last) = self.last_prune.lock() {
+            *last = Some(Instant::now());
+        }
+    }
+
+    fn prune_recent(&self) -> bool {
+        self.last_prune
+            .lock()
+            .ok()
+            .and_then(|last| *last)
+            .map(|at| at.elapsed() < Duration::from_secs(30))
+            .unwrap_or(false)
     }
 
     /// Update the Core observations used to classify bulk vs live mode.
@@ -439,12 +507,15 @@ impl Tunables {
     pub fn mode_for(&self, committed: u64) -> (Mode, u64) {
         let core = self.core_height();
         let lag = core.saturating_sub(committed);
-        let mode = if self.core_ibd.load(Ordering::Relaxed) || lag > 1_000 {
-            Mode::Bulk
-        } else {
-            Mode::Live
-        };
-        (mode, lag)
+        let ibd = self.core_ibd.load(Ordering::Relaxed);
+        let mut live = self.mode_live.load(Ordering::Relaxed);
+        if ibd || lag > 2_000 {
+            live = false;
+        } else if lag <= 500 {
+            live = true;
+        }
+        self.mode_live.store(live, Ordering::Relaxed);
+        (if live { Mode::Live } else { Mode::Bulk }, lag)
     }
     pub fn record_tx_rate(&self, tx_per_sec: u64) {
         ewma(&self.tx_per_sec, tx_per_sec);
@@ -571,6 +642,10 @@ impl Tunables {
         if !self.adaptive() {
             return None;
         }
+        // One owner: a second caller cannot pass the 30 s gate concurrently.
+        let Ok(_gate) = self.adapt_gate.lock() else {
+            return None;
+        };
         {
             let Ok(last) = self.last_change.lock() else {
                 return None;
@@ -593,10 +668,16 @@ impl Tunables {
 
         // Commit/fsync pain: amortise with larger groups on slow storage. Avoid
         // growing the group when commit already dominates the interval; in that
-        // case shrink the group to reduce the per-commit stall.
-        let commit_share = commit_ms as f64 / self.commit_ms().max(1) as f64;
+        // case shrink the group to reduce the per-commit stall. Use the real
+        // start-to-start cycle, not the configured interval: a time-based
+        // commit or a prune/WAL stall makes the interval lie.
+        let cycle = self.commit_cycle_ms();
+        let cycle_ms = if cycle > 0 { cycle } else { self.commit_ms() }.max(1);
+        let commit_share = commit_ms as f64 / cycle_ms as f64;
+        let prune_recent = self.prune_recent();
         let batch_locked = self.batch_locked.load(Ordering::Relaxed);
-        if !self.commit_locked.load(Ordering::Relaxed)
+        if !prune_recent
+            && !self.commit_locked.load(Ordering::Relaxed)
             && commit_ms > 500
             && commit_share < 0.5
             && self.commit_ms() < self.max_commit_ms
@@ -614,7 +695,8 @@ impl Tunables {
                 "commit {commit_ms}ms ({:.0}% of interval): interval -> {v}ms, batch -> {b}",
                 commit_share * 100.0
             ));
-        } else if !self.commit_locked.load(Ordering::Relaxed)
+        } else if !prune_recent
+            && !self.commit_locked.load(Ordering::Relaxed)
             && !batch_locked
             && commit_share > 0.75
             && self.batch_blocks() > self.min_batch.saturating_mul(4)
@@ -625,7 +707,8 @@ impl Tunables {
                 "commit {commit_ms}ms ({:.0}% of interval): batch -> {b}",
                 commit_share * 100.0
             ));
-        } else if !self.commit_locked.load(Ordering::Relaxed)
+        } else if !prune_recent
+            && !self.commit_locked.load(Ordering::Relaxed)
             && mode == Mode::Live
             && commit_ms < 100
             && self.commit_ms() > 1_500
@@ -682,12 +765,16 @@ impl Tunables {
     /// `cache_mib` is treated as a maximum, not as an immutable value.
     fn memory_step(&self, store: &Store, stats: Option<&Stats>) -> Option<String> {
         let mem = memory_info();
+        // Growing the cache only because RAM is free is not evidence that it
+        // helps. Require measured UTXO-prefetch pressure; the prefetch EWMA is
+        // the closest signal we have to "the block cache would avoid I/O".
         let action = cache_action(
             mem.available_mib,
             mem.cached_mib,
             self.reserve_mib,
             self.cache_mib(),
             self.max_cache_mib,
+            self.prefetch_ms(),
         );
         let dir = match action {
             CacheAction::Grow => 1i8,
@@ -839,6 +926,10 @@ impl Tunables {
             .store(self.commit_ewma.load(Ordering::Relaxed), Ordering::Relaxed);
         stats.tuning_commit_per_block_ms.store(
             self.commit_per_block_ms.load(Ordering::Relaxed),
+            Ordering::Relaxed,
+        );
+        stats.tuning_commit_cycle_ms.store(
+            self.commit_cycle_ms.load(Ordering::Relaxed),
             Ordering::Relaxed,
         );
         stats
@@ -1478,6 +1569,7 @@ pub fn cache_action(
     reserve_mib: u64,
     cache_mib: u64,
     cache_max_mib: u64,
+    prefetch_ms: u64,
 ) -> CacheAction {
     // `MemAvailable` already accounts for reclaimable page cache, so it is the
     // right signal. A low page-cache number is expected while the RocksDB
@@ -1485,7 +1577,12 @@ pub fn cache_action(
     // cache oscillation (6 GiB -> 256 MiB) and random-read stalls.
     if available_mib < reserve_mib {
         CacheAction::Shrink
-    } else if available_mib >= reserve_mib + reserve_mib / 2 && cache_mib < cache_max_mib {
+    } else if available_mib >= reserve_mib + reserve_mib / 2
+        && cache_mib < cache_max_mib
+        && prefetch_ms >= 50
+    {
+        // Only grow when prevout lookups are actually slow: free RAM alone is
+        // not a reason to enlarge the cache.
         CacheAction::Grow
     } else {
         CacheAction::Hold
@@ -1630,27 +1727,35 @@ mod tests {
 
     #[test]
     fn cache_action_grows_and_shrinks_with_hysteresis_inputs() {
-        // Healthy: available > 1.5*reserve and page cache >= reserve.
+        // Healthy and prevout prefetch is actually slow: grow.
         assert_eq!(
-            cache_action(2583, 2708, 1024, 1985, 4000),
+            cache_action(2583, 2708, 1024, 1985, 4000, 300),
             CacheAction::Grow
+        );
+        // Free RAM alone is not a reason to grow.
+        assert_eq!(
+            cache_action(2583, 2708, 1024, 1985, 4000, 5),
+            CacheAction::Hold
         );
         // No room above the ceiling: hold.
         assert_eq!(
-            cache_action(2583, 2708, 1024, 4000, 4000),
+            cache_action(2583, 2708, 1024, 4000, 4000, 300),
             CacheAction::Hold
         );
         // Available below reserve: shrink.
         assert_eq!(
-            cache_action(800, 2708, 1024, 2000, 4000),
+            cache_action(800, 2708, 1024, 2000, 4000, 300),
             CacheAction::Shrink
         );
         // Low page cache alone must not shrink the RocksDB cache: MemAvailable
         // already accounts for reclaimable memory.
-        assert_eq!(cache_action(4000, 400, 1024, 2000, 4000), CacheAction::Grow);
+        assert_eq!(
+            cache_action(4000, 400, 1024, 2000, 4000, 300),
+            CacheAction::Grow
+        );
         // Between 1x and 1.5x reserve: hold.
         assert_eq!(
-            cache_action(1200, 2000, 1024, 2000, 4000),
+            cache_action(1200, 2000, 1024, 2000, 4000, 300),
             CacheAction::Hold
         );
     }

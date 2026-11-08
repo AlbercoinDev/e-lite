@@ -29,7 +29,7 @@ use std::net::TcpStream;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::{Duration, Instant, SystemTime};
-use tuning::{Mode, Tunables};
+use tuning::Tunables;
 
 type E = Box<dyn std::error::Error + Send + Sync>;
 type R<T> = std::result::Result<T, E>;
@@ -1309,6 +1309,32 @@ fn cmd_init(cfg: &Config, chain: Chain) -> R<()> {
     Ok(())
 }
 
+/// Publish the effective Tor SOCKS port (not the configured `0 = auto`) and
+/// the fact that e-lite never allocates a Tor control port.
+fn publish_tor_ports(cfg: &Config, rt: Option<&tor::TorRuntime>, shared: &Shared) {
+    shared
+        .stats
+        .tor_managed
+        .store(cfg.tor.managed(), Ordering::Relaxed);
+    let port = rt
+        .map(|r| r.socks_port() as u64)
+        .or_else(|| {
+            if cfg.rawtx.enabled {
+                cfg.rawtx
+                    .tor_socks
+                    .as_deref()
+                    .and_then(|s| s.rsplit_once(':'))
+                    .and_then(|(_, p)| p.parse::<u64>().ok())
+            } else {
+                None
+            }
+        })
+        .or_else(|| (cfg.tor.socks_port > 0).then_some(cfg.tor.socks_port as u64))
+        .unwrap_or(0);
+    shared.stats.tor_socks_port.store(port, Ordering::Relaxed);
+    shared.stats.tor_control_port.store(0, Ordering::Relaxed);
+}
+
 fn cmd_doctor(cfg: &Config, chain: Chain) -> R<()> {
     let mut problems: Vec<String> = Vec::new();
     println!("e-lite {} doctor", VERSION);
@@ -1748,6 +1774,22 @@ fn cmd_doctor(cfg: &Config, chain: Chain) -> R<()> {
         }
         None => println!("tor onion: not created yet (it is created on `run`/`serve`)"),
     }
+    if cfg.core.manage != CoreManage::External {
+        let forced_onion = cfg.core.extra_args.iter().any(|a| {
+            let name = a.trim();
+            name == "-listenonion" || name.eq_ignore_ascii_case("-listenonion=1")
+        });
+        if forced_onion {
+            println!(
+                "core onion: enabled by operator; the managed torrc has no ControlPort, so Core \
+                 will log 9051 connection errors unless -torcontrol points to a working one"
+            );
+        } else {
+            println!(
+                "core onion: disabled by e-lite (-listenonion=0; only Electrum onion is managed)"
+            );
+        }
+    }
     if cfg.tor.managed() {
         if let Err(e) = tor::loopback_target(&cfg.server.listen) {
             problems.push(e);
@@ -1957,6 +1999,13 @@ struct Indexer {
     bulk_lag_baseline: AtomicU64,
     bulk_started: AtomicBool,
     bulk_full_pause: AtomicBool,
+    /// Opt-in drain-time lag policy (`E_LITE_LAG_POLICY=drain`). The default
+    /// keeps the block window with a fixed baseline (no ratchet).
+    lag_policy_drain: bool,
+    lag_target_secs: u64,
+    /// Latest Core observation shared by a 1 Hz poller thread. Keeps
+    /// `getblockchaininfo` out of the block-application path.
+    core_obs: Arc<Mutex<Option<(BlockchainInfo, Instant)>>>,
 }
 
 impl Drop for Indexer {
@@ -1999,6 +2048,15 @@ impl Indexer {
         let start_height = tip.as_ref().map(|t| t.height as u64).unwrap_or(0);
         let start_txnum = tip.as_ref().map(|t| t.txnum).unwrap_or(0);
         let now = Instant::now();
+        let lag_policy_drain = matches!(
+            std::env::var("E_LITE_LAG_POLICY").ok().as_deref(),
+            Some("drain")
+        );
+        let lag_target_secs = std::env::var("E_LITE_LAG_TARGET_SECONDS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(1_800)
+            .clamp(120, 6 * 3_600);
         Indexer {
             store,
             core,
@@ -2035,7 +2093,28 @@ impl Indexer {
             bulk_lag_baseline: AtomicU64::new(u64::MAX),
             bulk_started: AtomicBool::new(false),
             bulk_full_pause: AtomicBool::new(false),
+            lag_policy_drain,
+            lag_target_secs,
+            core_obs: Arc::new(Mutex::new(None)),
         }
+    }
+
+    /// Shared handle for the Core observation poller.
+    fn core_observation(&self) -> Arc<Mutex<Option<(BlockchainInfo, Instant)>>> {
+        Arc::clone(&self.core_obs)
+    }
+
+    /// Cached observation, falling back to a synchronous RPC only when the
+    /// cached value is missing or older than `max_age`.
+    fn observed_core(&self, max_age: Duration) -> Option<BlockchainInfo> {
+        if let Ok(guard) = self.core_obs.lock() {
+            if let Some((info, at)) = guard.as_ref() {
+                if at.elapsed() <= max_age {
+                    return Some(info.clone());
+                }
+            }
+        }
+        None
     }
 
     /// Disk backpressure with two levels:
@@ -2406,8 +2485,11 @@ impl Indexer {
             let _g = self.lock.write().map_err(|_| "lock poisoned")?;
             let commit_started = Instant::now();
             let result = self.store.commit_with_sync(batch, tip, txids, sync);
-            self.tunables
-                .record_commit_group(commit_started.elapsed(), blocks as u64);
+            self.tunables.record_commit_group(
+                commit_started,
+                commit_started.elapsed(),
+                blocks as u64,
+            );
             if let Err(e) = result {
                 // Whatever happened, keep the flat file aligned with the DB.
                 if let Ok(Some(t)) = self.store.committed_tip() {
@@ -2443,7 +2525,10 @@ impl Indexer {
                 .store(c.sst_files_bytes, Ordering::Relaxed);
             sh.stats
                 .rocksdb_table_readers_bytes
-                .store(self.store.table_readers_bytes(), Ordering::Relaxed);
+                .store(c.table_readers_bytes, Ordering::Relaxed);
+            sh.stats
+                .rocksdb_properties_ok
+                .store(c.properties_ok, Ordering::Relaxed);
             let fd = self.store.fd_plan();
             sh.stats
                 .fd_soft_limit
@@ -2521,11 +2606,24 @@ impl Indexer {
                     self.bulk_full_pause.store(true, Ordering::SeqCst);
                     self.tunables.reset_resume_shrink();
                 }
-                if self.bulk_full_pause.load(Ordering::SeqCst) {
-                    // Full bulk pause: keep Core stopped until the index is
-                    // close enough; then the common resume path pre-warms P2P.
-                    bulk_resume = Some(ahead);
-                    ahead.max(1)
+            } else {
+                self.bulk_started.store(true, Ordering::Relaxed);
+            }
+            if self.bulk_full_pause.load(Ordering::SeqCst) {
+                // Full bulk pause: keep Core stopped until the index is
+                // close enough; then the common resume path pre-warms P2P.
+                bulk_resume = Some(ahead);
+                ahead.max(1)
+            } else if self.lag_policy_drain {
+                // Bound the backlog by how long the index would need to drain
+                // it at the recent rate. Stable by construction: the watermark
+                // does not grow with every resume.
+                let rate = self.tunables.recent_blocks_rate();
+                if rate > 0 {
+                    let (pause_at, resume_at) =
+                        bulk_drain_window(rate, self.lag_target_secs, ahead.max(1));
+                    bulk_resume = Some(resume_at);
+                    pause_at
                 } else {
                     let baseline = self.bulk_lag_baseline.load(Ordering::Relaxed);
                     let (new_baseline, pause_at, resume_at) =
@@ -2536,7 +2634,6 @@ impl Indexer {
                     pause_at
                 }
             } else {
-                self.bulk_started.store(true, Ordering::Relaxed);
                 // Bound *additional* separation, not the absolute lag. With a
                 // 300k-block backlog, an absolute 20k threshold would freeze Core
                 // for the whole catch-up. The baseline follows the lowest lag seen
@@ -2637,7 +2734,12 @@ impl Indexer {
                     self.lag_paused.store(false, Ordering::Relaxed);
                     self.mark_paused(false);
                     let prewarm = is_bulk && self.bulk_full_pause.swap(false, Ordering::SeqCst);
-                    if is_bulk {
+                    if is_bulk && prewarm {
+                        // A full pause drains to `ahead`; anchor the next window
+                        // there. A normal window resume must NOT rewrite the
+                        // baseline: doing so raised the pause threshold by
+                        // limit/2 every cycle (the backlog ratchet seen in the
+                        // 29.5.0 mainnet log).
                         self.bulk_lag_baseline.store(lag, Ordering::Relaxed);
                     }
                     if let Some(sh) = &self.shared {
@@ -2662,9 +2764,41 @@ impl Indexer {
         }
     }
 
-    /// Index at most `max_blocks` before returning, so the supervisor can act
-    /// between steps (disk backpressure, pruning).
-    fn catch_up_limited(&self, max_blocks: u64) -> R<u64> {
+    /// Run one supervisor step from inside the indexing loop. Keeping the
+    /// pipeline alive across these steps is what avoids discarding prepared
+    /// blocks every 10 s; the supervisor cadence is unchanged.
+    fn supervisor_step(&self, supervisor: &mut el_chain::Supervisor) {
+        match supervisor_tick(
+            supervisor,
+            &self.core,
+            &self.store,
+            self.readers.as_deref(),
+            &self.data_dir,
+            &self.core_datadir,
+            &self.blocks_dir,
+            self.shared.as_ref(),
+        ) {
+            Ok(actions) => apply_supervisor_actions(
+                supervisor,
+                &self.core,
+                actions,
+                self.shared.as_ref(),
+                Some(self),
+                self.can_control_core,
+            ),
+            Err(e) => eprintln!("[e-lite] supervisor: {e}"),
+        }
+    }
+
+    /// Index at most `max_blocks` before returning. The supervisor runs at
+    /// commit boundaries, so a long catch-up does not need to tear the
+    /// pipeline down to prune or check the disk.
+    fn catch_up_limited(
+        &self,
+        max_blocks: u64,
+        supervisor: &mut el_chain::Supervisor,
+        last_tick: &mut Instant,
+    ) -> R<u64> {
         let tip_at_start = self.store.committed_tip()?;
         // Check the disks before any Core RPC or block write. If Core is slow
         // or unreachable, this still stops the indexer before the disk fills.
@@ -2850,6 +2984,7 @@ impl Indexer {
         let mut group_scripts: std::collections::HashSet<ScriptHash> =
             std::collections::HashSet::new();
         let mut count = 0u32;
+        let mut applied_total = 0u64;
         let mut last_ms = 0u64;
         let mut group_undo_heights: Vec<u32> = Vec::new();
         let mut result: R<()> = Ok(());
@@ -2859,8 +2994,7 @@ impl Indexer {
         // Give the supervisor a chance to prune/act even when a 512-block
         // catch-up call is slow; this bounds prune latency independently of
         // the number of blocks processed.
-        let supervisor_deadline =
-            Instant::now() + Duration::from_secs(self.cfg.pruning.poll_seconds.max(1));
+        let supervisor_poll = Duration::from_secs(self.cfg.pruning.poll_seconds.max(1));
 
         let mut pending: PendingMap = PendingMap::new();
         let mut next_apply = 0usize;
@@ -2919,6 +3053,7 @@ impl Indexer {
                     }
                     tip = Some(out.tip);
                     count += 1;
+                    applied_total += 1;
                     last_ms = t0.elapsed().as_millis() as u64;
                     self.tunables.record_apply(t0.elapsed());
                     if (self.cfg.core.prune_mib >= 550
@@ -2927,7 +3062,22 @@ impl Indexer {
                         && info.pruned
                         && last_lag_check.elapsed() >= Duration::from_millis(100)
                     {
-                        if let Ok(live) = self.core.blockchain_info() {
+                        // Use the 1 Hz observation. Auto-prune keeps a
+                        // synchronous fallback (at most every 2 s) because
+                        // Core could otherwise outrun a stale snapshot.
+                        let max_age = if self.cfg.core.prune_mib >= 550 {
+                            Duration::from_secs(2)
+                        } else {
+                            Duration::from_secs(5)
+                        };
+                        let live = self.observed_core(max_age).or_else(|| {
+                            if self.cfg.core.prune_mib >= 550 {
+                                self.core.blockchain_info().ok()
+                            } else {
+                                None
+                            }
+                        });
+                        if let Some(live) = live {
                             self.stats_core_height(live.blocks);
                             if let Some(sh) = &self.shared {
                                 sh.stats
@@ -2938,7 +3088,9 @@ impl Indexer {
                                     .core_ibd
                                     .store(live.initialblockdownload, Ordering::Relaxed);
                             }
-                            let committed = tip.map(|t| t.height as u64).unwrap_or(0);
+                            // Pause decisions use the last *committed* tip, not
+                            // applied-but-uncommitted progress.
+                            let committed = committed_height;
                             if live.pruneheight > committed.saturating_add(1) {
                                 eprintln!(
                                     "[e-lite] WARNING: Core pruned to {} but the index is at {}; \
@@ -3016,9 +3168,10 @@ impl Indexer {
                 overlay.clear();
                 count = 0;
                 group_started = Instant::now();
-            }
-            if Instant::now() >= supervisor_deadline {
-                break;
+                if last_tick.elapsed() >= supervisor_poll {
+                    self.supervisor_step(supervisor);
+                    *last_tick = Instant::now();
+                }
             }
         }
 
@@ -3079,9 +3232,25 @@ impl Indexer {
 
         stop.store(true, Ordering::Relaxed);
         drop(permit_tx);
-        drop(rx);
         for reader in readers {
             let _ = reader.join();
+        }
+        // Work prepared but never applied is waste. It is expected at the end
+        // of a 512-block call (the window in flight), not every 10 s.
+        let mut discarded = pending.len() as u64;
+        while rx.try_recv().is_ok() {
+            discarded += 1;
+        }
+        if let Some(sh) = &self.shared {
+            sh.stats
+                .pipeline_prepared
+                .fetch_add(applied_total + discarded, Ordering::Relaxed);
+            sh.stats
+                .pipeline_applied
+                .fetch_add(applied_total, Ordering::Relaxed);
+            sh.stats
+                .pipeline_discarded
+                .fetch_add(discarded, Ordering::Relaxed);
         }
         result?;
         self.refresh_core_height();
@@ -3299,6 +3468,18 @@ fn commit_sync_policy(mode: &str, ibd: bool, height: u64, core_tip: u64) -> bool
 /// just as rewindable as a full batch.
 fn undo_cutoff(tip: u64, window: u32) -> u64 {
     tip.saturating_sub(window as u64)
+}
+
+/// Drain-time window: pause Core when the index would need more than
+/// `target_secs` to consume the backlog at `rate` blocks/s; resume at half.
+/// The thresholds depend only on the measured rate and the configured target,
+/// never on the lag observed at resume, so they cannot ratchet upwards.
+fn bulk_drain_window(rate: u64, target_secs: u64, min_resume: u64) -> (u64, u64) {
+    let pause = rate
+        .saturating_mul(target_secs)
+        .max(min_resume.saturating_mul(2));
+    let resume = (pause / 2).max(min_resume);
+    (pause, resume)
 }
 
 /// Bulk lag guard window. `u64::MAX` means "no baseline yet". The baseline
@@ -3525,8 +3706,12 @@ fn apply_supervisor_actions(
                 }
                 // A bulk index may have committed the tip with sync=false. Make
                 // that tip durable before Core deletes the blocks it needs.
+                // `SyncWAL` is the durability barrier: forcing every memtable
+                // to SST first added a multi-second stall to every prune and
+                // is not required for recovery (a WriteBatch is atomic across
+                // CFs and txids.dat is already fsynced).
                 if let Some(i) = idx {
-                    if let Err(e) = i.store.flush_all() {
+                    if let Err(e) = i.store.sync_wal_barrier() {
                         eprintln!("[e-lite] cannot sync the index before pruning: {e}");
                         sup.on_prune_failed();
                         if let Some(sh) = shared {
@@ -3545,6 +3730,7 @@ fn apply_supervisor_actions(
                         let got = (got as u64).min(u32::MAX as u64) as u32;
                         sup.on_pruned(got);
                         if let Some(i) = idx {
+                            i.tunables.note_prune();
                             if let Some(bulk) = &i.bulk {
                                 match bulk.forget_missing_files() {
                                     Ok(0) => {}
@@ -3947,6 +4133,49 @@ fn reload_hot(
     }
 }
 
+/// Poll Core once per second into a shared snapshot. The block-application
+/// loop then reads that snapshot instead of opening an RPC connection every
+/// 100 ms; auto-prune keeps a synchronous fallback for safety.
+fn spawn_core_observer(idx: &Indexer, flag: Arc<AtomicBool>) {
+    let core = idx.core.clone();
+    let obs = idx.core_observation();
+    let shared = idx.shared.clone();
+    let tunables = Arc::clone(&idx.tunables);
+    let _ = std::thread::Builder::new()
+        .name("el-core-obs".to_string())
+        .spawn(move || {
+            while !flag.load(Ordering::SeqCst) {
+                if let Ok(info) = core.blockchain_info() {
+                    if let Ok(mut guard) = obs.lock() {
+                        *guard = Some((info.clone(), Instant::now()));
+                    }
+                    tunables.set_core_state(info.blocks, info.initialblockdownload);
+                    if let Some(sh) = &shared {
+                        sh.stats.core_height.store(info.blocks, Ordering::Relaxed);
+                        sh.stats.core_headers.store(info.headers, Ordering::Relaxed);
+                        sh.stats
+                            .core_pruneheight
+                            .store(info.pruneheight, Ordering::Relaxed);
+                        sh.stats.core_pruned.store(info.pruned, Ordering::Relaxed);
+                        sh.stats
+                            .core_ibd
+                            .store(info.initialblockdownload, Ordering::Relaxed);
+                        sh.stats.core_verification_bps.store(
+                            (info.verificationprogress.clamp(0.0, 1.0) * 10_000.0) as u64,
+                            Ordering::Relaxed,
+                        );
+                    }
+                }
+                for _ in 0..10 {
+                    if flag.load(Ordering::SeqCst) {
+                        return;
+                    }
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+            }
+        });
+}
+
 /// Shared index loop for `index` and `run`. `stop_at_tip` implements
 /// `--no-follow`; `run` always follows.
 #[allow(clippy::too_many_arguments)]
@@ -3998,6 +4227,14 @@ fn index_loop(
         mem_memtables,
         mem_runtime
     );
+    if idx.lag_policy_drain {
+        eprintln!(
+            "[e-lite] lag policy=drain target={}s (Core pauses when the index would need \
+             more than that to drain the backlog)",
+            idx.lag_target_secs
+        );
+    }
+    spawn_core_observer(&idx, Arc::clone(&flag));
     if let Some(sh) = &shared {
         idx.tunables.publish(&sh.stats);
     }
@@ -4019,7 +4256,7 @@ fn index_loop(
             }
             return Ok(());
         }
-        match idx.catch_up_limited(CATCH_UP_BLOCKS) {
+        match idx.catch_up_limited(CATCH_UP_BLOCKS, &mut supervisor, &mut last_tick) {
             Ok(height) => {
                 if flag.load(Ordering::SeqCst) {
                     return Ok(());
@@ -4035,11 +4272,6 @@ fn index_loop(
                     .map(|s| s.stats.core_ibd.load(Ordering::Relaxed))
                     .unwrap_or_else(|| idx.tunables.core_ibd());
                 let lag = core_height.saturating_sub(height);
-                let mode = if core_ibd || lag > 1_000 {
-                    Mode::Bulk
-                } else {
-                    Mode::Live
-                };
                 // Intensive sync = Core IBD or a large backlog. Only one runs
                 // per user; the others wait here (still serving) and start on
                 // their own once the slot is released.
@@ -4057,13 +4289,9 @@ fn index_loop(
                         );
                     }
                 }
-                if idx
-                    .tunables
-                    .maybe_adapt(mode, lag, &idx.store, shared.as_ref().map(|s| &s.stats))
-                    .is_some()
-                {
-                    idx.tunables.apply_store(&idx.store);
-                }
+                // The `el-tune` thread is the single owner of adaptation. A
+                // second call site here could pass the 30 s gate concurrently
+                // and change cache/readers twice.
                 if let Some(sh) = &shared {
                     let caught_up = !core_ibd && height >= core_height;
                     let next = if idx.is_paused() || idx.downloads_paused() || supervisor.paused() {
@@ -4640,6 +4868,7 @@ fn cmd_serve(cfg: &Config, chain: Chain) -> R<()> {
             None
         }
     };
+    publish_tor_ports(cfg, tor_runtime.as_ref(), &shared);
     if cfg.tor.managed() && tor_runtime.is_some() {
         let deadline =
             Instant::now() + Duration::from_secs(cfg.tor.start_timeout_seconds.clamp(5, 30));
@@ -4829,6 +5058,7 @@ fn cmd_run(cfg: &Config, chain: Chain) -> R<()> {
             None
         }
     };
+    publish_tor_ports(cfg, tor_runtime.as_ref(), &shared);
     if cfg.tor.managed() && tor_runtime.is_some() {
         // Let the managed Tor bootstrap before deciding to fall back to clearnet.
         let deadline =
@@ -5307,6 +5537,19 @@ mod tests {
         assert!(undo_cutoff(1_000, window) < 1_000 - window as u64 + 1);
         // Tip below the window keeps everything.
         assert_eq!(undo_cutoff(100, window), 0);
+    }
+
+    #[test]
+    fn bulk_drain_window_does_not_ratchet() {
+        // 4 blocks/s, 30 min target -> pause at 7200, resume at 3600.
+        assert_eq!(bulk_drain_window(4, 1_800, 100), (7_200, 3_600));
+        // The same inputs produce the same thresholds after a resume; no
+        // dependency on the lag observed at that moment.
+        assert_eq!(bulk_drain_window(4, 1_800, 100), (7_200, 3_600));
+        // Low rates still leave the configured minimum ahead.
+        assert_eq!(bulk_drain_window(1, 1_800, 2_000), (4_000, 2_000));
+        // A very high rate is bounded by the time target, not by a fixed lag.
+        assert_eq!(bulk_drain_window(10, 600, 100), (6_000, 3_000));
     }
 
     #[test]

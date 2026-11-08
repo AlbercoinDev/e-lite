@@ -124,6 +124,12 @@ Additional checks performed:
 | AUD-040 | P3 | Fee estimate | `blockchain.estimatefee` returns a relayfee/mempool fallback instead of `-1` when Core has no estimate; the protocol allows `-1`. | Intentional compatibility choice: some wallets (Sparrow) treat `-1` as a send failure. Documented in `docs/FEATURES.md`; revisit if wallets handle `-1` correctly. |
 | AUD-041 | P3 | Version negotiation | The spec says to close when client and server ranges do not intersect. e-lite instead downgrades to the newest implemented version at or below the client maximum, so a client requesting `1.4.3`/`1.5` connects on `1.4.2` and `1.7` on `1.6`. | Deliberate leniency for wallet compatibility; the negotiated version is returned so a compliant client adapts. Only a client maximum below 1.4 is refused. Tests cover the matrix; documented in `AGENTS.md`/`FEATURES.md`. |
 
+| AUD-091 | P1 | Throughput | `bin/e-lite/src/main.rs` `catch_up_limited` returned every `poll_seconds` (10 s), joined readers and discarded prepared blocks. At 3.3 blocks/s the in-flight window was a large share of each call. | Removed the deadline; the supervisor now runs at commit boundaries and the 512-block checkpoint remains. `/status.pipeline.discarded` is the regression signal; `tests/e2e_pruned_ibd.sh` asserts <5 % waste. |
+| AUD-092 | P1 | Throughput | `bin/e-lite/src/main.rs` stored the current lag as `bulk_lag_baseline` on every resume, raising the next pause threshold by `max_bulk_lag_blocks/2` per cycle (14,884 → 24,858 → 34,858 in the 29.5.0 log). | A normal resume no longer rewrites the baseline; only a full-pause prewarm anchors it. Optional `E_LITE_LAG_POLICY=drain` uses the last commit cycle's rate; opt-in pending a mainnet A/B. |
+| AUD-093 | P2 | Prune stall | `flush_all` forced all seven memtables to SST before every `pruneblockchain`, adding seconds to each prune. Durability only needs the WAL. | `SyncWAL(true)` replaces it. A `WriteBatch` is atomic across CFs and `txids.dat` is fsynced first; a failed barrier skips the prune. Covered by prune + SIGKILL + restart in `tests/e2e_pruned_ibd.sh`. |
+| AUD-094 | P2 | Metrics/control | `property_int_value` reads the default CF for per-CF properties; `commit_share` divided by the configured interval; two `maybe_adapt` call sites could pass the 30 s gate concurrently; cache grew on free RAM alone. | Per-CF sums and DB-wide reads classified; `commit_cycle_ms` is the denominator; one caller plus `adapt_gate`; cache growth requires prefetch pressure; Bulk/Live hysteresis. `/status.rocksdb.properties_ok` marks unknown values. |
+| AUD-095 | P3 | Tor noise | A managed Core kept `-listenonion=1 -torcontrol=127.0.0.1:9051` although the managed `torrc` has no `ControlPort`, logging connection errors forever. | Managed Core gets `-listenonion=0` unless the operator overrides it; `/status.tor` exposes the effective SOCKS port and `control_port: 0`; `doctor` explains/warns. Core's own onion is documented as not managed. |
+
 ## Reviewed and considered correct
 
 - Commit ordering: `txids.dat` fsync happens before the RocksDB batch that
@@ -132,12 +138,15 @@ Additional checks performed:
 - Undo/reorg: rewind is bounded by `reorg_window`; deeper reorgs fail loudly.
 - Prune safety: manual prune requests are capped by committed tip, readers and
   Core's `tip - 288`; auto-prune requires explicit opt-in and a 224-block guard.
+  The pre-prune barrier is `SyncWAL(true)`; it must succeed or the prune is
+  skipped. The prune + SIGKILL recovery test verifies the full history.
 - Merkle/TXID/witness: rawtx blocks are validated against indexed headers,
   merkle roots and witness commitments before use.
 - Prune-gap repair: only verified cache/P2P/Esplora blocks by hash; no snapshot
   requirement.
-- Adaptive tuning: one change per 30 s, memory/disk guards take precedence,
-  explicit knobs are locked.
+- Adaptive tuning: one change per 30 s under a single `adapt_gate`, memory/disk
+  guards take precedence, explicit knobs are locked, and cache growth requires
+  measured prefetch pressure.
 - `unsafe`: only `statvfs` and `kill` wrappers in `el-chain`/`core_supervisor`,
   with checked return values.
 

@@ -26,6 +26,26 @@ The onion mirrors the active network's ports, so instances do not collide:
 The address is stable across restarts as long as `<data-dir>/tor/onion` is
 preserved. `e-lite onion reset` creates a new one.
 
+## Only the Electrum onion is managed
+
+The generated `torrc` contains `SocksPort` and the Electrum `HiddenServicePort`
+entries. It deliberately has **no `ControlPort`**, so e-lite cannot publish an
+onion for Bitcoin Core's P2P listener. A Core started by e-lite therefore gets
+`-listenonion=0`; otherwise Core would default to `-listenonion=1` and retry
+`127.0.0.1:9051` forever, logging `Error connecting to address 127.0.0.1:9051`.
+
+- `/status.tor` reports the effective SOCKS port (`socks_port`), whether it is
+  managed by e-lite, and `control_port: 0`. Use that SOCKS address if you set
+  Core's `-proxy` yourself.
+- `e-lite doctor` prints `core onion: disabled by e-lite` for a managed Core.
+  If you force `-listenonion=1` in `[core] extra_args`, it warns that the
+  managed Tor has no control port.
+- An external Core is never changed by e-lite. Add `-listenonion=0` to its
+  `bitcoin.conf` if you do not need its onion.
+- Supporting Core's own onion would require a per-network control port with
+  cookie authentication; it is not implemented and is not required for wallet
+  access.
+
 ## Installation
 
 The one-line installer downloads the official **Tor expert bundle** from the

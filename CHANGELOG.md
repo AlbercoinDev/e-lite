@@ -1,5 +1,68 @@
 # Changelog
 
+## 0.1.0-alpha.29.6.0 — 2026-11-08
+
+### IBD throughput, safe pruning and Core/Tor coordination
+
+This release applies the performance plan derived from a real 29.5.0 mainnet
+log. It targets work that was being wasted, not a blind increase in cache or
+batch size. No consensus, undo or WAL durability rule was weakened.
+
+**Continuous indexing pipeline.** The catch-up loop no longer returns every
+10 s just to let the supervisor run. At 3.3 blocks/s that deadline tore down
+readers and discarded prepared blocks roughly every 33 blocks. Supervisor
+actions (prune, disk, state) now run at commit boundaries; the 512-block
+checkpoint remains. `/status.pipeline` counts prepared, applied and discarded
+blocks, and `tests/e2e_pruned_ibd.sh` asserts discarded work stays below 5 %.
+
+**No lag ratchet.** The bulk lag baseline was rewritten with the current lag on
+every resume, so the next pause threshold grew by `max_bulk_lag_blocks/2` per
+cycle (14,884 → 24,858 → 34,858 in the log). A normal resume no longer touches
+the baseline; only a full-pause prewarm anchors it. `E_LITE_LAG_POLICY=drain`
+adds an opt-in time-based watermark: pause when the index would need more than
+`E_LITE_LAG_TARGET_SECONDS` (default 1800) to drain the backlog at the last
+commit cycle's rate, resume at half. It stays opt-in pending a mainnet A/B.
+
+**Cheaper, safer prune barrier.** Before `pruneblockchain`, e-lite used to flush
+all seven column families and then the WAL. The durability requirement is
+`SyncWAL(true)`: a single `WriteBatch` is atomic across CFs and `txids.dat` is
+fsynced before the batch. The forced SST flush was a multi-second stall on
+every prune. `tests/e2e_pruned_ibd.sh` now SIGKILLs e-lite after a prune and
+verifies the index recovers with the full history.
+
+**Correct RocksDB metrics.** `estimate-pending-compaction-bytes`,
+`cur-size-all-mem-tables`, `total-sst-files-size` and
+`estimate-table-readers-mem` are per-CF and are summed; `num-running-
+compactions` and `block-cache-usage` are DB-wide and are read once. A zero is
+no longer ambiguous: `/status.rocksdb.properties_ok` says whether every
+property was actually read.
+
+**Commit decisions use the real cycle.** `commit_share` divides by the
+start-to-start commit interval (`commit_cycle_ms`), not by the configured
+interval, and the cache grows only when prevout prefetch is measurably slow —
+free RAM alone is not a reason.
+
+**One controller.** `maybe_adapt` has one caller and one `adapt_gate` mutex
+covering the 30 s check and the mutation. The 15–25 s cache changes seen in the
+29.5.0 log (two callers passing the gate concurrently) cannot recur. Bulk/Live
+mode has hysteresis (leave Bulk below 500 blocks, re-enter above 2,000).
+
+**Faster prevout lookups.** `get_utxos` uses `batched_multi_get_cf` over
+deduplicated, sorted keys in the `utxo` family. Overlay precedence and the
+"missing prevout is absent" contract are unchanged.
+
+**Core/Tor.** A managed Core now gets `-listenonion=0`: the managed `torrc` has
+no `ControlPort`, so Core's default `-listenonion=1 -torcontrol=
+127.0.0.1:9051` retried a dead port forever. The operator can override it in
+`extra_args`. `/status.tor` exposes the effective SOCKS port, whether Tor is
+managed and `control_port: 0`; `doctor` prints the Core onion state and warns
+if an operator forces it on. The per-user sync lock is unchanged and still
+documented as intentional.
+
+Docs: `TUNING.md` (pipeline, lag policy, WAL barrier, per-CF metrics),
+`TOR.md` (only the Electrum onion is managed), `AGENTS.md`, `HANDOFF.md`,
+`AUDIT.md`.
+
 ## 0.1.0-alpha.29.5.0 — 2026-11-09
 
 ### Memory, Core and IBD: one plan for the whole pipeline

@@ -26,8 +26,11 @@ timeout_seconds = 30
 prune_mib = 1                       # 1 = manual pruning (safe from zero); 0 = full node;
                                     # >=550 = automatic pruning, requires allow_auto_prune
 extra_args = []                     # e.g. ["-dbcache=1024"]; e-lite adds a fitted
-                                    # -dbcache/-par/-rpcthreads/-prune unless you set
-                                    # them here. -datadir/-chain/-rpcport are rejected.
+                                    # -dbcache/-par/-rpcthreads/-listenonion=0/-prune
+                                    # unless you set them here. Core's own onion is
+                                    # off because the managed Tor has no ControlPort;
+                                    # set -listenonion=1 only with a working -torcontrol.
+                                    # -datadir/-chain/-rpcport are rejected.
 restart = true                      # restart a Core launched by e-lite
 stop_on_exit = true                 # stop only a Core launched by e-lite
 # log_file = ""                     # default <data-dir>/bitcoind.log

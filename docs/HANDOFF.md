@@ -1,9 +1,9 @@
 # Session handoff
 
-**Updated:** 2026-11-09
-**Latest published release:** `0.1.0-alpha.29.5.0`
-**Release:** https://github.com/AlbercoinDev/e-lite/releases/tag/v0.1.0-alpha.29.5.0
-**Main commit at handoff:** tag `v0.1.0-alpha.29.5.0`
+**Updated:** 2026-11-08
+**Latest published release:** `0.1.0-alpha.29.6.0`
+**Release:** https://github.com/AlbercoinDev/e-lite/releases/tag/v0.1.0-alpha.29.6.0
+**Main commit at handoff:** tag `v0.1.0-alpha.29.6.0`
 
 This file is the short “where we are” for a new session. The invariants live in
 [`AGENTS.md`](../AGENTS.md) and [`PROJECT_MEMORY.md`](PROJECT_MEMORY.md); the
@@ -74,8 +74,9 @@ no repitas contexto ni rehagas decisiones ya documentadas.
   explicit readers/commit overrides locked. Every knob is also available via CLI
   and `--set` (see `docs/CLI.md`).
 - Memory: reserve `max(1024 MiB, RAM/8)`, ceiling 75 % of RAM, memtables `RAM/8`,
-  page-cache floor, cache grows +256 MiB / 30 s and shrinks 25 % under pressure;
-  `cache_mib` is a maximum. Background jobs are capped by the CPU count.
+  page-cache floor; the cache grows in 256 MiB steps only while prevout prefetch
+  is measurably slow (not merely because RAM is free) and shrinks 25 % under
+  pressure; `cache_mib` is a maximum. Background jobs are capped by the CPU count.
 - `run` waits for Core RPC before starting P2P/mempool/listeners; `serve` is the
   offline mode. Shutdown joins background threads and stops managed Tor before
   stopping Core.
@@ -83,6 +84,36 @@ no repitas contexto ni rehagas decisiones ya documentadas.
   the onion setup, reset and security.
 - `docs/ROADMAP.md` contains future features/improvements. Do not present them as
   available.
+
+## Last change (alpha.29.6.0)
+
+IBD throughput and safety pass driven by the 29.5.0 mainnet log.
+
+- **Pipeline continuity**: the 10 s supervisor deadline is gone; supervisor
+  actions run at commit boundaries and the 512-block checkpoint remains.
+  `/status.pipeline` exposes prepared/applied/discarded.
+- **Lag**: no baseline rewrite on a normal resume (the old code raised the next
+  pause threshold by 10,000 blocks per cycle). `E_LITE_LAG_POLICY=drain` is an
+  opt-in time watermark; the default stays the fixed window until a mainnet A/B.
+- **Prune**: `SyncWAL(true)` replaces `flush_all` before `pruneblockchain`.
+  `tests/e2e_pruned_ibd.sh` covers prune + SIGKILL + restart.
+- **Metrics**: per-CF properties summed, DB-wide properties read once,
+  `properties_ok` distinguishes unknown from zero; `commit_cycle_ms` is the
+  real denominator for `commit_share`.
+- **Controller**: one caller and one gate mutex; cache growth needs measured
+  prefetch pressure; Bulk/Live hysteresis.
+- **Prevouts**: `batched_multi_get_cf` over deduplicated sorted keys.
+- **Core/Tor**: managed Core gets `-listenonion=0`; `/status.tor` exposes the
+  effective SOCKS port; `doctor` explains the Core onion state.
+
+### Not yet verified in 29.6.0
+
+- Regtest e2e passed (`regtest`, `recovery`, `multi_instance`, `launch_core`,
+  `pruned_ibd` with prune + SIGKILL). No mainnet A/B was run here.
+- The `drain` lag policy is opt-in and unmeasured on mainnet.
+- Real power loss and true ENOSPC remain untested; the recovery e2e simulates a
+  file-size limit and SIGKILL.
+- The UmbrelOS package is not built here.
 
 ## Last change (alpha.29.5.0)
 

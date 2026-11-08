@@ -127,13 +127,23 @@ When e-lite starts Core (`manage = "auto"` with no running node, or
 | `-dbcache` | `clamp(RAM/4, 450, 2048)` MiB, at most `RAM/3` |
 | `-par` | `cpus - 1`, clamped to 1..8 (leaves a core for the index) |
 | `-rpcthreads` | `clamp(cpus, 4, 16)` |
+| `-listenonion` | `0`: e-lite publishes its own Electrum onion and does not create a Tor control port |
 | `-prune` | always explicit, from `[core] prune_mib` (including `-prune=0`) |
 
 `prune_mib = 0` used to omit the flag, so a `prune=` line in an existing
 `bitcoin.conf` could silently prune a "full" node. It is now always stated.
 
-An operator value in `extra_args` wins for `-dbcache`, `-par` and
-`-rpcthreads`. Arguments that e-lite owns (`-datadir`, `-chain`, `-server`,
+Core's own onion is disabled by default because the managed `torrc` has only a
+`SocksPort` and hidden-service ports, no `ControlPort`. With Core's default
+`-listenonion=1 -torcontrol=127.0.0.1:9051`, Core would retry that port forever
+and log `Error connecting to address 127.0.0.1:9051`. An operator who really
+wants Core's onion can set `-listenonion=1` (and a working `-torcontrol`) in
+`extra_args`; e-lite then leaves the flag alone and `doctor` warns that the
+managed Tor has no control port. An external Core is never reconfigured, so
+disable its onion in `bitcoin.conf` if the log noise is unwanted.
+
+An operator value in `extra_args` wins for `-dbcache`, `-par`, `-rpcthreads` and
+`-listenonion`. Arguments that e-lite owns (`-datadir`, `-chain`, `-server`,
 `-daemon`, `-daemonwait`, `-rpcbind`, `-rpcport`, `-rpcallowip`, `-prune`) are
 rejected with an explanation. An external Core is never configured or
 restarted.
@@ -169,10 +179,32 @@ and the controller treats it as one system:
   the automatic `workers × 2`), instead of a value that was printed but unused.
 - `/status.stage_totals_us` and `commit_breakdown_us` separate read, decode,
   prefetch, wait, apply, fsync of `txids.dat` and the RocksDB write.
+- The supervisor now acts at commit boundaries. A catch-up call is no longer
+  cut every 10 s, so readers and prepared prevouts survive; the only remaining
+  teardown is the 512-block checkpoint. `/status.pipeline` counts prepared,
+  applied and discarded blocks (discarded should be roughly the in-flight
+  window of one checkpoint, not one window per 10 s).
+- The lag window no longer rewrites its baseline on every resume. The old code
+  did `baseline = lag` when Core resumed, which raised the next pause threshold
+  by `max_bulk_lag_blocks/2` per cycle (14,884 → 24,858 → 34,858 in a real
+  29.5.0 log). The default keeps a fixed window. `E_LITE_LAG_POLICY=drain`
+  opts into a time-based watermark: pause when the index would need more than
+  `E_LITE_LAG_TARGET_SECONDS` (default 1800) to drain the backlog at the last
+  commit cycle's rate, resume at half. It is opt-in until a mainnet A/B.
+- RocksDB properties are classified correctly: `estimate-pending-compaction-
+  bytes`, `cur-size-all-mem-tables`, `total-sst-files-size` and
+  `estimate-table-readers-mem` are per-CF and are summed; `num-running-
+  compactions` and `block-cache-usage` are DB-wide and are read once.
+  `/status.rocksdb.properties_ok` distinguishes an unknown value from zero.
+- Prevout lookup uses `batched_multi_get_cf` over deduplicated, sorted keys.
 
-`commit_sync`, the WAL and the prune ordering are unchanged: `txids.dat` is
-fsynced before the tip advances and the index is flushed before Core is allowed
-to delete blocks.
+`commit_sync` and the WAL ordering are unchanged: `txids.dat` is fsynced before
+the tip advances. Before Core deletes blocks, e-lite now calls `SyncWAL(true)`
+instead of forcing every memtable to SST. A single `WriteBatch` is atomic across
+column families and the WAL is enabled, so the committed tip is recoverable;
+the flush was a large stall on every prune and is not needed for durability.
+`tests/e2e_pruned_ibd.sh` SIGKILLs e-lite after a prune and verifies the index
+recovers with the full history.
 
 ## Containers (LXC/Docker)
 

@@ -26,9 +26,16 @@ pub const DEFAULT_TLS_LISTEN: &str = "127.0.0.1:50002";
 pub struct TorRuntime {
     stop: Arc<AtomicBool>,
     handle: Option<JoinHandle<()>>,
+    /// Effective loopback SOCKS port chosen for this instance (not the
+    /// configured value: `[tor] socks_port = 0` means "pick a free one").
+    socks_port: u16,
 }
 
 impl TorRuntime {
+    pub fn socks_port(&self) -> u16 {
+        self.socks_port
+    }
+
     pub fn stop(&mut self) {
         self.stop.store(true, Ordering::SeqCst);
         if let Some(h) = self.handle.take() {
@@ -468,6 +475,7 @@ pub fn spawn(
     Ok(Some(TorRuntime {
         stop,
         handle: Some(handle),
+        socks_port: socks,
     }))
 }
 

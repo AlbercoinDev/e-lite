@@ -50,8 +50,9 @@ the per-client rate limiter are implemented; client authentication is not.
 - Core RPC is HTTP; use SSH/VPN for LAN/WAN.
 - RocksDB memtables use a global `RAM/8` budget inside a memory ceiling of 75 %
   of total RAM, with `max(1024, RAM/8)` reserved for the OS/Core/page cache; the
-  block cache grows/shrinks in 256 MiB steps and `cache_mib` is a maximum. Every
-  knob can be overridden from the CLI or `--set`.
+  block cache grows/shrinks in 256 MiB steps and `cache_mib` is a maximum; growth
+  requires measured prefetch pressure, not merely free RAM. Every knob can be
+  overridden from the CLI or `--set`.
 - `run`/`index`/`serve` keep an application log at `<data-dir>/e-lite.log` with
   the same lines as the console.
 - Ready state is `READY` at Core's validated tip and `FULLY SYNCED` at the

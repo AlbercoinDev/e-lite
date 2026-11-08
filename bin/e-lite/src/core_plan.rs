@@ -115,6 +115,21 @@ pub fn plan_core(cfg: &Config, chain: Chain) -> Result<CorePlan, String> {
         plan.args.push(format!("-rpcthreads={rpcthreads}"));
     }
 
+    // e-lite publishes its own Electrum onion. Core's own onion needs a Tor
+    // control port that the managed torrc does not provide (only SocksPort and
+    // HiddenService* are written), so Core would retry 127.0.0.1:9051 forever
+    // and log an error each time. Disable it unless the operator explicitly
+    // asked for Core's onion and supplies a control port.
+    if operator_sets(cfg, "-listenonion") {
+        plan.notes
+            .push("operator set -listenonion; keeping it".to_string());
+    } else {
+        plan.args.push("-listenonion=0".to_string());
+        plan.notes.push(
+            "Core onion disabled (-listenonion=0); e-lite manages the Electrum onion".to_string(),
+        );
+    }
+
     // `prune_mib = 0` used to omit the flag entirely, so a `prune=` line in an
     // existing bitcoin.conf could turn a full node into a pruned one (or the
     // other way around). Always state it.
@@ -172,6 +187,26 @@ mod tests {
         assert!(!plan.args.iter().any(|a| a.starts_with("-dbcache=")));
         assert_eq!(plan.dbcache_mib, 0);
         assert!(plan.args.iter().any(|a| a.starts_with("-par=")));
+    }
+
+    #[test]
+    fn core_onion_is_disabled_by_default() {
+        let c = cfg();
+        let plan = plan_core(&c, Chain::Mainnet).unwrap();
+        assert!(plan.args.iter().any(|a| a == "-listenonion=0"));
+        assert!(plan.notes.iter().any(|n| n.contains("Core onion disabled")));
+    }
+
+    #[test]
+    fn operator_can_keep_core_onion() {
+        let mut c = cfg();
+        c.core.extra_args = vec!["-listenonion=1".to_string()];
+        let plan = plan_core(&c, Chain::Mainnet).unwrap();
+        assert!(!plan.args.iter().any(|a| a == "-listenonion=0"));
+        assert!(plan
+            .notes
+            .iter()
+            .any(|n| n.contains("operator set -listenonion")));
     }
 
     #[test]

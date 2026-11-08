@@ -131,6 +131,37 @@ echo "history from e-lite index: $ENTRIES entries"
 [ "$ENTRIES" -ge 2000 ] || { echo "history incomplete" >&2; exit 1; }
 [ "$(state)" = READY ] || { echo "server not READY: $(state)"; exit 1; }
 
+echo "== pipeline work accounting =="
+curl -s "http://127.0.0.1:$METRICS/status" | python3 -c '
+import json, sys
+d = json.load(sys.stdin)["pipeline"]
+print("pipeline:", d)
+assert d["prepared"] >= 2000, d
+assert d["applied"] >= 2000, d
+# Discarded work is the in-flight window of the last 512-block call, not a
+# pipeline rebuilt every 10 s.
+assert d["discarded"] * 20 < d["prepared"], d
+'
+
+echo "== SIGKILL after a prune, then restart =="
+# The prune barrier must have made the tip durable. Kill without any cleanup,
+# restart and verify the index still serves the full history.
+kill -KILL "$(cat "$RUN/serve.pid")"
+set +e
+wait "$(cat "$RUN/serve.pid")" 2>/dev/null
+set -e
+"$BIN" run --config "$CONF" >"$RUN/serve2.log" 2>&1 &
+echo $! >"$RUN/serve.pid"
+for _ in $(seq 1 180); do
+  [ "$(state)" = READY ] && [ "$(height)" -ge 2101 ] && break
+  sleep 1
+done
+echo "after SIGKILL: height $(height) state $(state)"
+[ "$(height)" -ge 2101 ] || { tail -60 "$RUN/serve2.log"; exit 1; }
+ENTRIES2=$(python3 tests/query_history.py "$ELECTRUM" "$SH")
+echo "history after recovery: $ENTRIES2 entries"
+[ "$ENTRIES2" -ge 2000 ] || { echo "history lost after recovery" >&2; exit 1; }
+
 echo "== SIGTERM =="
 kill -TERM "$(cat "$RUN/serve.pid")"
 set +e
