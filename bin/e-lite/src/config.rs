@@ -208,6 +208,10 @@ pub struct IndexCfg {
     /// Maximum share of total RAM e-lite may target (0 = 0.75).
     #[serde(default)]
     pub memory_fraction: f64,
+    /// Skip the minimum-RAM check. Unsupported for real use; it exists so
+    /// small CI containers can run regtest.
+    #[serde(default)]
+    pub allow_low_memory: bool,
     /// RocksDB background jobs. 0 = profile default, capped by CPU count.
     #[serde(default)]
     pub background_jobs: usize,
@@ -237,6 +241,7 @@ impl Default for IndexCfg {
             write_buffer_mib: 0,
             memory_reserve_mib: 0,
             memory_fraction: 0.0,
+            allow_low_memory: false,
             background_jobs: 0,
             milestone_blocks: d_milestone_blocks(),
             milestone_seconds: d_milestone_seconds(),
@@ -952,6 +957,12 @@ impl Config {
         }
         if self.index.memory_reserve_mib != 0 && self.index.memory_reserve_mib < 256 {
             return Err("[index] memory_reserve_mib must be 0 (auto) or >= 256".to_string());
+        }
+        if self.index.cache_mib != 0 && self.index.cache_mib < 8 {
+            return Err("[index] cache_mib must be 0 (auto) or >= 8".to_string());
+        }
+        if self.index.write_buffer_mib != 0 && self.index.write_buffer_mib < 16 {
+            return Err("[index] write_buffer_mib must be 0 (auto) or >= 16".to_string());
         }
         if !matches!(self.tor.mode.as_str(), "managed" | "off") {
             return Err("[tor] mode must be managed or off".to_string());

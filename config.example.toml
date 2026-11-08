@@ -25,7 +25,9 @@ bitcoind = "bitcoind"
 timeout_seconds = 30
 prune_mib = 1                       # 1 = manual pruning (safe from zero); 0 = full node;
                                     # >=550 = automatic pruning, requires allow_auto_prune
-extra_args = []                     # e.g. ["-dbcache=1024"]
+extra_args = []                     # e.g. ["-dbcache=1024"]; e-lite adds a fitted
+                                    # -dbcache/-par/-rpcthreads/-prune unless you set
+                                    # them here. -datadir/-chain/-rpcport are rejected.
 restart = true                      # restart a Core launched by e-lite
 stop_on_exit = true                 # stop only a Core launched by e-lite
 # log_file = ""                     # default <data-dir>/bitcoind.log
@@ -33,17 +35,20 @@ stop_on_exit = true                 # stop only a Core launched by e-lite
 [index]
 block_source = "auto"               # auto | rpc | files
 readers = 0                         # 0 = profile/adaptive
-cache_mib = 0                       # 0 = auto (RAM/4 max, RAM/8 floor); >0 = maximum
+cache_mib = 0                       # 0 = auto (fitted inside the memory plan); >0 = maximum
 reorg_window = 288                  # undo records kept for reorgs
 batch_blocks = 256                  # blocks per atomic commit (initial; adaptive may change)
 profile = "auto"                    # auto | hdd | ssd | nvme | manual
 adaptive = true                     # event-driven readers/commit/cache tuning
 commit_sync = "auto"                # auto | always | txids (bulk durability tradeoff)
 commit_interval_ms = 0              # 0 = profile default (500..30000 when set)
-prefetch_blocks = 0                 # reserved for the UTXO prefetch pipeline
-write_buffer_mib = 0                # total RocksDB memtable budget; 0 = RAM/8
-memory_reserve_mib = 0              # RAM left for OS/Core/page cache; 0 = max(1024, RAM/8)
-memory_fraction = 0                 # e-lite ceiling over total RAM; 0 = 0.75
+prefetch_blocks = 0                 # prepared-block window cap; 0 = auto (workers*2)
+write_buffer_mib = 0                # total RocksDB memtable budget; 0 = RAM/8 (fitted)
+memory_reserve_mib = 0              # RAM left for OS/Core/page cache; 0 = auto
+memory_fraction = 0                 # hard ceiling over total RAM; 0 = 0.75. Never
+                                    # raised: cache+memtables+runtime always fit.
+allow_low_memory = false            # skip the minimum-RAM check (unsupported;
+                                    # mainnet needs an 8 GB class machine, others 4 GB)
 background_jobs = 0                 # RocksDB jobs; 0 = profile, capped by CPU count
 milestone_blocks = 10000            # progress report every N blocks (0 = off)
 milestone_seconds = 21600           # or every N seconds (0 = off; 6 h default)

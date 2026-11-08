@@ -5,6 +5,7 @@
 //! node it does not own.
 
 use crate::config::{Config, CoreManage};
+use crate::core_plan;
 use el_model::Chain;
 use el_rpc::CoreClient;
 use serde_json::json;
@@ -35,6 +36,8 @@ pub struct CoreSupervisor {
     rpc_port: u16,
     prune_mib: u64,
     extra_args: Vec<String>,
+    /// Parameters derived from the machine's resources (dbcache/par/...).
+    plan_args: Vec<String>,
     restart: bool,
     stop_on_exit: bool,
     log_file: PathBuf,
@@ -56,6 +59,15 @@ impl CoreSupervisor {
             rpc_port: rpc_port_from_url(&cfg.rpc_url(chain), chain.default_rpc_port()),
             prune_mib: cfg.core.prune_mib,
             extra_args: cfg.core.extra_args.clone(),
+            plan_args: match core_plan::plan_core(cfg, chain) {
+                Ok(plan) => plan.args,
+                Err(e) => {
+                    // Preflight rejects conflicting arguments before we get
+                    // here; never start Core with a half-applied plan.
+                    eprintln!("[e-lite] Core parameter plan rejected: {e}");
+                    Vec::new()
+                }
+            },
             restart: cfg.core.restart,
             stop_on_exit: cfg.core.stop_on_exit,
             log_file: cfg.log_file(chain),
@@ -105,10 +117,11 @@ impl CoreSupervisor {
 
         // Adopt a child left behind by a previous e-lite run.
         if self.owned_pid.is_none() {
-            if let Some(pid) = read_pid(&self.pid_file) {
+            if let Some((pid, token)) = read_pid_entry(&self.pid_file) {
                 if process_alive(pid)
                     && process_is_bitcoind(pid)
                     && process_matches_datadir(pid, &self.datadir)
+                    && token.map(|t| t == process_start_token(pid)).unwrap_or(true)
                 {
                     self.owned_pid = Some(pid);
                     eprintln!(
@@ -179,13 +192,12 @@ impl CoreSupervisor {
         cmd.arg(format!("-chain={chain_arg}"));
         cmd.arg("-daemon=0");
         cmd.arg("-server=1");
-        if self.prune_mib > 0 {
-            cmd.arg(format!("-prune={}", self.prune_mib));
-        }
         cmd.arg("-rpcbind=127.0.0.1");
         cmd.arg(format!("-rpcport={}", self.rpc_port));
         cmd.arg("-rpcallowip=127.0.0.1");
-        for arg in &self.extra_args {
+        // Derived values first, operator arguments last: an operator override
+        // always wins for the knobs e-lite is allowed to suggest.
+        for arg in self.plan_args.iter().chain(self.extra_args.iter()) {
             cmd.arg(arg);
         }
         cmd.stdin(Stdio::null());
@@ -193,31 +205,32 @@ impl CoreSupervisor {
         cmd.stderr(log);
 
         eprintln!(
-            "[e-lite] starting Core: {} -datadir={} -chain={} -prune={}",
+            "[e-lite] starting Core: {} -datadir={} -chain={} -prune={} {}",
             self.bitcoind,
             self.datadir.display(),
             chain_arg,
-            if self.prune_mib > 0 {
-                self.prune_mib.to_string()
-            } else {
-                "0 (full node)".to_string()
-            }
+            self.prune_mib,
+            self.plan_args.join(" ")
         );
         let child = cmd
             .spawn()
             .map_err(|e| format!("cannot start {}: {e}", self.bitcoind))?;
         let pid = child.id();
-        fs::write(&self.pid_file, pid.to_string()).map_err(|e| {
-            format!(
-                "cannot write Core pid file {}: {e}",
-                self.pid_file.display()
-            )
-        })?;
+        // Register the child before touching the filesystem. If writing the
+        // pid file failed here, an untracked Core would keep validating blocks
+        // and e-lite would start a second one on the next attempt.
         self.child = Some(child);
         self.owned_pid = Some(pid);
         self.last_start = Some(Instant::now());
         self.backoff = 1;
         self.last_error = None;
+        let token = process_start_token(pid);
+        if let Err(e) = fs::write(&self.pid_file, format!("{pid} {token}")) {
+            eprintln!(
+                "[e-lite] WARNING: cannot write Core pid file {}: {e}; Core pid {pid} is still                  tracked and will be stopped on exit",
+                self.pid_file.display()
+            );
+        }
         Ok(())
     }
 
@@ -233,11 +246,24 @@ impl CoreSupervisor {
         if let Some(mut child) = self.child.take() {
             let pid = child.id();
             let _ = terminate(pid);
-            let deadline = Instant::now() + Duration::from_secs(30);
+            // A larger -dbcache needs time to flush the chainstate. Killing
+            // Core after 30 s could lose that flush and force a redo next
+            // start, so wait up to two minutes and say so.
+            let started = Instant::now();
+            let deadline = started + CORE_SHUTDOWN_GRACE;
+            let mut warned = false;
             loop {
                 match child.try_wait() {
                     Ok(Some(_)) => break,
                     Ok(None) if Instant::now() < deadline => {
+                        if !warned && started.elapsed() >= Duration::from_secs(30) {
+                            warned = true;
+                            eprintln!(
+                                "[e-lite] Core is still flushing its caches ({}s); waiting up to                                  {}s before forcing exit",
+                                started.elapsed().as_secs(),
+                                CORE_SHUTDOWN_GRACE.as_secs()
+                            );
+                        }
                         std::thread::sleep(Duration::from_millis(200));
                     }
                     _ => {
@@ -250,7 +276,7 @@ impl CoreSupervisor {
             eprintln!("[e-lite] Core pid {pid} stopped");
         } else if let Some(pid) = self.owned_pid {
             let _ = terminate(pid);
-            let deadline = Instant::now() + Duration::from_secs(30);
+            let deadline = Instant::now() + CORE_SHUTDOWN_GRACE;
             while Instant::now() < deadline
                 && process_alive(pid)
                 && process_is_bitcoind(pid)
@@ -312,8 +338,36 @@ fn rpc_port_from_url(url: &str, default_port: u16) -> u16 {
         .unwrap_or(default_port)
 }
 
-fn read_pid(path: &std::path::Path) -> Option<u32> {
-    fs::read_to_string(path).ok()?.trim().parse().ok()
+/// Grace period for a clean Core shutdown. Sized for a multi-GiB UTXO cache.
+const CORE_SHUTDOWN_GRACE: Duration = Duration::from_secs(120);
+
+/// Read `pid` or `pid starttime` from the pid file.
+fn read_pid_entry(path: &std::path::Path) -> Option<(u32, Option<u64>)> {
+    let text = fs::read_to_string(path).ok()?;
+    let mut parts = text.split_whitespace();
+    let pid = parts.next()?.parse().ok()?;
+    let token = parts.next().and_then(|v| v.parse().ok());
+    Some((pid, token))
+}
+
+/// Linux process start time (field 22 of `/proc/<pid>/stat`, in clock ticks).
+/// Guards against PID reuse across restarts.
+fn process_start_token(pid: u32) -> u64 {
+    let Ok(raw) = fs::read_to_string(
+        std::path::Path::new("/proc")
+            .join(pid.to_string())
+            .join("stat"),
+    ) else {
+        return 0;
+    };
+    // The command name is parenthesised and may contain spaces; split after it.
+    let Some(rest) = raw.rsplit_once(')').map(|(_, r)| r) else {
+        return 0;
+    };
+    rest.split_whitespace()
+        .nth(19)
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0)
 }
 
 fn process_alive(pid: u32) -> bool {

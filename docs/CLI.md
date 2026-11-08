@@ -63,6 +63,7 @@ version          print version
 | `--write-buffer-mib <n>` | `index.write_buffer_mib` | `0` (RAM/8) |
 | `--memory-reserve-mib <n>` | `index.memory_reserve_mib` | `0` (max(1024, RAM/8)) |
 | `--memory-fraction <f>` | `index.memory_fraction` | `0` (0.75 of total RAM) |
+| `--allow-low-memory` | `index.allow_low_memory` | `false` (unsupported; CI/regtest only) |
 | `--background-jobs <n>` | `index.background_jobs` | `0` (profile, capped by CPUs) |
 | `--commit-interval-ms <n>` | `index.commit_interval_ms` | `0` (profile; 500..30000) |
 | `--commit-sync <mode>` | `index.commit_sync` | `auto` (`txids` in bulk, `always` live) |

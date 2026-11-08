@@ -11,7 +11,7 @@ use el_model::{
 };
 use rocksdb::{
     BlockBasedOptions, Cache, ColumnFamilyDescriptor, DBCompressionType, Direction, IteratorMode,
-    Options, WriteBatch, WriteOptions, DB,
+    Options, WriteBatch, WriteBufferManager, WriteOptions, DB,
 };
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
@@ -46,20 +46,76 @@ pub struct CompactionStats {
     pub sst_files_bytes: u64,
 }
 
-/// Cap RocksDB's open-file target to the process limit. A value above
-/// `RLIMIT_NOFILE` makes table opens fail under load instead of evicting.
-fn fd_budget(requested: i32) -> i32 {
+/// Descriptor plan for the RocksDB instance.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct FdPlan {
+    pub requested: i32,
+    /// Value actually handed to RocksDB.
+    pub effective: i32,
+    /// Process soft `RLIMIT_NOFILE`, if it is finite.
+    pub soft_limit: Option<u64>,
+    /// Descriptors kept free for sockets, logs, RPC, providers and threads.
+    pub reserve: u64,
+    /// True when the requested value had to be reduced.
+    pub capped: bool,
+}
+
+impl FdPlan {
+    pub fn below_recommended(&self) -> bool {
+        self.capped && self.effective < 2048
+    }
+}
+
+/// Cap RocksDB's open-file target to what the process can really open.
+///
+/// `RLIMIT_NOFILE` can be `RLIM_INFINITY` (u64::MAX); casting that to a signed
+/// integer yields -1 and used to collapse the target to the minimum. The
+/// reserve covers client sockets, RPC, provider connections and log files, so
+/// it must never be subtracted twice or overridden by a floor.
+pub fn fd_plan(requested: i32, reserve: u64) -> FdPlan {
+    fd_plan_with(requested, reserve, process_soft_nofile())
+}
+
+/// Process `RLIMIT_NOFILE`, or `None` when it is unlimited or unreadable.
+fn process_soft_nofile() -> Option<u64> {
     let mut limit = libc::rlimit {
         rlim_cur: 0,
         rlim_max: 0,
     };
-    let soft = if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) } == 0 {
-        limit.rlim_cur as i64
+    // `rlim_t` is u64 on 64-bit and u32 on 32-bit; the conversion is only
+    // redundant on the former.
+    #[allow(clippy::useless_conversion)]
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) } == 0 {
+        Some(u64::from(limit.rlim_cur))
     } else {
-        1024
+        None
+    }
+}
+
+/// Pure form of [`fd_plan`], testable without touching process limits.
+pub fn fd_plan_with(requested: i32, reserve: u64, soft: Option<u64>) -> FdPlan {
+    let requested = requested.max(20);
+    let (effective, capped) = match soft {
+        // RLIM_INFINITY or an absurdly large limit: keep the request.
+        None => (requested, false),
+        Some(soft) if soft >= u64::MAX / 2 => (requested, false),
+        Some(soft) => {
+            let room = soft.saturating_sub(reserve);
+            // RocksDB itself reserves 10 descriptors; never exceed the limit.
+            let target = room.min(requested as u64).min(soft.saturating_sub(10));
+            let target = target as i32;
+            // RocksDB clamps anything below 20 up to 20, which would exceed a
+            // tiny limit; in that case fail loudly instead of lying.
+            (target.max(1), target < requested)
+        }
     };
-    let ceiling = (soft.saturating_sub(64)).clamp(256, i32::MAX as i64) as i32;
-    requested.max(64).min(ceiling)
+    FdPlan {
+        requested,
+        effective,
+        soft_limit: soft.filter(|v| *v < u64::MAX / 2),
+        reserve,
+        capped,
+    }
 }
 
 pub const CF_NAMES: [&str; 7] = [
@@ -120,6 +176,12 @@ pub struct Store {
     path: PathBuf,
     txids_path: PathBuf,
     txids: File,
+    /// Keeps the memtable budget alive for the lifetime of the DB.
+    write_buffer_manager: WriteBufferManager,
+    fd_plan: FdPlan,
+    /// Paths that `disk_usage_bytes` must skip (for example a Core datadir
+    /// nested inside the data directory).
+    exclude: Vec<PathBuf>,
     /// Last commit split: txids append+fsync and RocksDB write.
     commit_txids_us: AtomicU64,
     commit_db_us: AtomicU64,
@@ -136,7 +198,11 @@ pub struct StoreOptions {
     pub max_write_buffer_number: usize,
     pub max_total_wal_bytes: usize,
     pub max_open_files: i32,
+    /// Descriptors kept free for everything that is not RocksDB.
+    pub fd_reserve: u64,
     pub background_jobs: i32,
+    /// Paths skipped by `disk_usage_bytes` (Core datadir, logs, snapshots).
+    pub exclude_paths: Vec<PathBuf>,
 }
 
 impl Default for StoreOptions {
@@ -149,7 +215,9 @@ impl Default for StoreOptions {
             // Keep every SST reader open: table-cache churn shows up as random
             // read latency in prevout prefetch on large indexes.
             max_open_files: 8192,
+            fd_reserve: 320,
             background_jobs: 4,
+            exclude_paths: Vec::new(),
         }
     }
 }
@@ -165,7 +233,10 @@ pub fn per_cf_write_buffer_bytes(
     let slots = cf_count
         .max(1)
         .saturating_mul(max_write_buffer_number.max(1));
-    (total_bytes / slots).clamp(8 * 1024 * 1024, 64 * 1024 * 1024)
+    let ideal = (total_bytes / slots).max(1);
+    // The old 8 MiB floor made a 64 MiB budget configure 168 MiB of buffers.
+    // Cap instead of padding: a smaller memtable is slower, not unsafe.
+    ideal.min(64 * 1024 * 1024)
 }
 
 impl Store {
@@ -192,7 +263,22 @@ impl Store {
             max_buffers,
         );
         opts.set_max_total_wal_size(store_opts.max_total_wal_bytes.max(32 * 1024 * 1024) as u64);
-        opts.set_max_open_files(fd_budget(store_opts.max_open_files));
+        let plan = fd_plan(store_opts.max_open_files, store_opts.fd_reserve);
+        if plan.effective < 20 {
+            return err(format!(
+                "process file limit ({:?}) leaves no room for RocksDB after reserving {} \
+                 descriptors; raise `ulimit -n`",
+                plan.soft_limit, plan.reserve
+            ));
+        }
+        opts.set_max_open_files(plan.effective);
+        // A shared WriteBufferManager enforces the *total* memtable budget
+        // instead of relying on per-CF arithmetic that ignored the CF count.
+        let write_buffer_manager = WriteBufferManager::new_write_buffer_manager(
+            store_opts.write_buffer_total_bytes,
+            false,
+        );
+        opts.set_write_buffer_manager(&write_buffer_manager);
         opts.set_max_background_jobs(store_opts.background_jobs.max(1));
         opts.set_bytes_per_sync(1024 * 1024);
         opts.set_wal_bytes_per_sync(1024 * 1024);
@@ -208,6 +294,7 @@ impl Store {
             cf_opts.set_compression_type(DBCompressionType::Lz4);
             cf_opts.set_write_buffer_size(per_cf_write);
             cf_opts.set_max_write_buffer_number(max_buffers as i32);
+            cf_opts.set_write_buffer_manager(&write_buffer_manager);
             // Bulky sequential ingest: read compaction input in large chunks and
             // keep level 1 big enough that compaction does not run constantly.
             cf_opts.set_compaction_readahead_size(2 * 1024 * 1024);
@@ -240,6 +327,9 @@ impl Store {
             path,
             txids_path,
             txids,
+            write_buffer_manager,
+            fd_plan: plan,
+            exclude: store_opts.exclude_paths.clone(),
             commit_txids_us: AtomicU64::new(0),
             commit_db_us: AtomicU64::new(0),
         };
@@ -817,6 +907,30 @@ impl Store {
         }
     }
 
+    /// Memory held by table indexes and bloom filters. They live outside the
+    /// data block cache, so a budget that ignores them is not a real budget.
+    pub fn table_readers_bytes(&self) -> u64 {
+        self.db
+            .property_int_value("rocksdb.estimate-table-readers-mem")
+            .ok()
+            .flatten()
+            .unwrap_or(0)
+    }
+
+    /// Live memtables as accounted by the shared WriteBufferManager.
+    pub fn memtable_budget_usage(&self) -> usize {
+        self.write_buffer_manager.get_usage()
+    }
+
+    pub fn fd_plan(&self) -> FdPlan {
+        self.fd_plan
+    }
+
+    /// Paths excluded from `disk_usage_bytes`.
+    pub fn excludes(&self) -> &[PathBuf] {
+        &self.exclude
+    }
+
     /// Microseconds spent in the last commit's txids append+fsync and in the
     /// RocksDB write. Used by the indexing benchmark to separate fsync cost
     /// from compaction/write stalls.
@@ -827,13 +941,25 @@ impl Store {
         )
     }
 
+    /// Logical bytes used by the index, skipping excluded subtrees.
+    ///
+    /// With the default layout the Core datadir is `<data-dir>/bitcoin`, so a
+    /// plain recursive walk counted Core as part of the index and the status
+    /// breakdown double-counted it.
     pub fn disk_usage_bytes(&self) -> u64 {
-        fn walk(p: &Path, acc: &mut u64) {
+        fn walk(p: &Path, acc: &mut u64, exclude: &[PathBuf]) {
+            if exclude.iter().any(|x| p == x || p.starts_with(x)) {
+                return;
+            }
             if let Ok(rd) = std::fs::read_dir(p) {
                 for e in rd.flatten() {
+                    let path = e.path();
+                    if exclude.iter().any(|x| path == *x || path.starts_with(x)) {
+                        continue;
+                    }
                     if let Ok(md) = e.metadata() {
                         if md.is_dir() {
-                            walk(&e.path(), acc);
+                            walk(&path, acc, exclude);
                         } else {
                             *acc += md.len();
                         }
@@ -842,7 +968,7 @@ impl Store {
             }
         }
         let mut acc = 0;
-        walk(&self.path, &mut acc);
+        walk(&self.path, &mut acc, &self.exclude);
         acc
     }
 
@@ -875,16 +1001,44 @@ mod tests {
         // 1 GiB total over 7 CFs and 3 memtables = ~48 MiB per CF.
         let per_cf = per_cf_write_buffer_bytes(1024 * 1024 * 1024, 7, 3);
         assert_eq!(per_cf, 1024 * 1024 * 1024 / 21);
-        // Small budgets never go below the 8 MiB floor.
-        assert_eq!(
-            per_cf_write_buffer_bytes(64 * 1024 * 1024, 7, 3),
-            8 * 1024 * 1024
-        );
+        // A small budget must never be padded above what was requested:
+        // 64 MiB / 21 slots is ~3 MiB, not the old 8 MiB floor (168 MiB).
+        let small = per_cf_write_buffer_bytes(64 * 1024 * 1024, 7, 3);
+        assert_eq!(small, 64 * 1024 * 1024 / 21);
+        assert!(small * 21 <= 64 * 1024 * 1024);
         // Large budgets are capped at 64 MiB per CF.
         assert_eq!(
             per_cf_write_buffer_bytes(64 * 1024 * 1024 * 1024, 7, 3),
             64 * 1024 * 1024
         );
+    }
+
+    #[test]
+    fn fd_plan_respects_the_process_limit() {
+        // Unlimited: keep the request.
+        let plan = fd_plan_with(8192, 320, None);
+        assert_eq!(plan.effective, 8192);
+        assert!(!plan.capped);
+        // A 1024-soft-limit container reserves 320 and keeps most of the gain.
+        let plan = fd_plan_with(8192, 320, Some(1024));
+        assert_eq!(plan.effective, 704);
+        assert!(plan.capped);
+        assert!(plan.below_recommended());
+        assert!(plan.effective as u64 + plan.reserve <= 1024);
+        // A generous limit keeps the full request.
+        let plan = fd_plan_with(8192, 320, Some(16384));
+        assert_eq!(plan.effective, 8192);
+        assert!(!plan.capped);
+        // A tiny limit cannot be "fixed" by a floor that exceeds it.
+        let tiny = fd_plan_with(8192, 320, Some(64));
+        assert!(
+            tiny.effective < 20,
+            "a 64-descriptor limit cannot fit RocksDB"
+        );
+        assert!(tiny.capped);
+        // RLIM_INFINITY must not wrap into a negative number and collapse to 256.
+        let inf = fd_plan_with(8192, 320, Some(u64::MAX));
+        assert_eq!(inf.effective, 8192);
     }
 
     fn tmp(name: &str) -> PathBuf {

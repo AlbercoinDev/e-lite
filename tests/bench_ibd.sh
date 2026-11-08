@@ -124,6 +124,7 @@ echo "== e-lite run =="
 "$BIN" run --config "$CONF" >"$RUN/run.log" 2>&1 &
 echo $! >"$RUN/elite.pid"
 
+set +e
 python3 "$SCRIPT_DIR/bench_sample.py" \
   --status-url "http://127.0.0.1:$METRICS/status" \
   --core-cli "bitcoin-cli -regtest -datadir=$SYNC -rpcport=$SYNC_RPC getblockchaininfo" \
@@ -134,10 +135,12 @@ python3 "$SCRIPT_DIR/bench_sample.py" \
   --tip "$TIP" \
   --csv "$RUN/samples.csv" \
   --summary "$RUN/summary.json" \
-  --timeout "$TIMEOUT" || true
+  --timeout "$TIMEOUT"
+SAMPLER_RC=$?
+set -e
 
 echo "== summary =="
-cat "$RUN/summary.json"
+cat "$RUN/summary.json" 2>/dev/null || echo "(no summary)"
 echo
 echo "log: $RUN/run.log"
 if [ "$KEEP" = "1" ]; then
@@ -146,4 +149,8 @@ else
   # Keep the summary in the temp dir only when requested; print the key paths.
   cp "$RUN/summary.json" "${TMPDIR:-/tmp}/e-lite-ibd-summary.json" 2>/dev/null || true
   cp "$RUN/samples.csv" "${TMPDIR:-/tmp}/e-lite-ibd-samples.csv" 2>/dev/null || true
+fi
+if [ "$SAMPLER_RC" -ne 0 ]; then
+  echo "benchmark did not reach the tip (exit $SAMPLER_RC)" >&2
+  exit "$SAMPLER_RC"
 fi

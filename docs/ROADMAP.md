@@ -18,7 +18,7 @@ acceptance signal that would move it to `FEATURES.md`.
 | Priority | Item | Why / acceptance |
 |---|---|---|
 | P2 | HDD sequential mode/readahead | fewer readers in file order, `fadvise`/readahead; A/B on HDD. |
-| P2 | Adaptive controller v2 | queue-wait metrics, compaction/RocksDB signals, safer AIMD, benchmark profiles. Commit-share and CPU-capped readers are already in place. |
+| P2 | Adaptive controller v2 | **Partly delivered in alpha.29.5.0**: dedicated 5 s/30 s thread, fitted memory plan, real `commit/blk`, `batch_locked` honoured. Still missing: queue-wait/byte-budget signals, compaction-driven control and per-profile benchmark tables. |
 | P2 | Parallel compaction/job tuning | expose/test mutable RocksDB options per profile. |
 | P3 | Commit-group batching | interval/batch already extend to 30 s/4096 in bulk; still make durability tradeoff explicit/tested per workload. |
 
@@ -46,7 +46,8 @@ acceptance signal that would move it to `FEATURES.md`.
 | Priority | Item | Why / acceptance |
 |---|---|---|
 | P3 (optional) | Systemd unit and service hardening | **Optional, not a release blocker.** A user can request it; `Restart=always`, resource limits and no privileges, documented. |
-| P2 | Container image (Docker/Podman) | reproducible runtime, mounts for Core/index; no secrets baked in. |
+| P2 | Container image (Docker/Podman) | reproducible runtime, mounts for Core/index; no secrets baked in. UmbrelOS packaging notes are in `TUNING.md` (container RAM/nofile, external Core, volumes, SIGTERM, cross-container sync lock). |
+| P3 | Cross-container sync coordination | the per-user IBD lock does not cross mount namespaces; needs a shared lock medium or orchestrator policy. |
 | P2 | Electrum/Sparrow matrix | scripted versions for 1.4; document known limitations. |
 | P2 | Core version matrix | test oldest supported and latest official; fail clearly. |
 | P3 | Plugin/extension surface | only after core stability; avoid freezing unstable APIs. |

@@ -62,12 +62,13 @@ Never treat a version number in this file as authoritative over the code/tag.
   (`prune_defer_free_gib = 0`), only by the 1k-block gain and 30 s interval.
 - Never authorise a Core prune from a tip that is not durable: flush RocksDB/WAL
   first. A failed prune RPC must retry the same safe height after backoff.
-- Anchor the undo window to the end of the **current commit group**, not to
-  Core's tip (`should_store_undo`). A time-based commit must wait until the tip
-  has its whole `reorg_window + 64` window, and a partial group without undo is
-  not committed. With the default batch every group block is covered; a larger
-  bulk group skips only the prefix that cannot become a commit tip. A Core
-  rollback deeper than the window is `NEEDS_RECOVERY`, never a silent reindex.
+- Undo is generated for **every** applied block and pruned at commit time from
+  the tip that is actually committed (`undo_cutoff`). A commit forced by the
+  time limit, the transaction limit or the supervisor deadline must be as
+  rewindable as a full batch; the old group-end prediction could commit a tip
+  without undo. Pruning must also delete undo added by the same `WriteBatch`
+  (`group_undo_heights`), which a DB-only scan cannot see. A Core rollback
+  deeper than the window is `NEEDS_RECOVERY`, never a silent reindex.
 - Crash recovery: SIGKILL during indexing, a write failure and a reorg at the
   indexed tip must all recover through RocksDB/WAL and undo. Covered by
   `tests/e2e_recovery.sh`; run it after touching commit, undo or rewind.
@@ -81,6 +82,12 @@ Never treat a version number in this file as authoritative over the code/tag.
   ports and per-network managed-Tor SOCKS ports (9050 mainnet; 55150/55250/
   55350 for testnet4/signet/regtest). `tests/e2e_multi_instance.sh` covers two
   simultaneous instances, distinct certificates and independent shutdown.
+  Only one **intensive sync** per user runs at a time: a `flock` in
+  `$XDG_RUNTIME_DIR/e-lite/ibd.lock` (or `/tmp/e-lite-<uid>/ibd.lock`) makes a
+  second instance **wait** (it keeps serving) and start automatically; the lock
+  is taken before a from-zero managed Core starts and released within 1000
+  blocks of Core. The kernel releases it on crash. `E_LITE_NO_SYNC_LOCK=1`
+  disables it. It does not coordinate separate containers.
 - Drop locators for deleted `blk*.dat` files (sidecar compaction at open and
   in-memory filtering after prune) and only hold a ReaderTracker guard when the
   block is still at/above Core's prune height; external resolutions must not
@@ -157,19 +164,49 @@ Never treat a version number in this file as authoritative over the code/tag.
 - Electrum 1.7 `outpoint.*` is resolved on demand from the existing history/UTXO
   data; do not add a persistent spend index to `apply_block` without a benchmark
   and a schema/migration plan. `scriptpubkey.*` reuses the scripthash logic.
-- The memory budget reserves `max(1024 MiB, RAM/8)` for the OS/Core/page cache,
-  caps e-lite at 75 % of total RAM, fixes memtables at `RAM/8`, and grows/shrinks
-  the block cache in 256 MiB steps under `MemAvailable` + page-cache pressure.
-  `cache_mib` is a maximum, not a lock. Before Core resumes downloads after a
-  bulk pause, the cache shrinks to the live budget.
+- The memory budget reserves `memory_reserve_mib`, else `clamp(RAM/8, 512 MiB,
+  2048 MiB)` (`RAM/4` at 2 GiB or less), for the OS/Core/page cache, and fits
+  runtime + memtables + cache inside `min(RAM*memory_fraction, RAM-reserve)`.
+  An explicit fraction is **never raised** to satisfy floors:
+  `planned_mib <= ceiling_mib` is a regression test. Memtables use one shared
+  `WriteBufferManager`; per-CF arithmetic no longer multiplies the budget.
+  `cache_mib` is a maximum, not a lock, and the block cache still moves in
+  256 MiB steps under `MemAvailable`. Below 256 MiB available the soft floor is
+  bypassed, readers are reduced and the cache may reach 8 MiB. Before Core
+  resumes downloads after a bulk pause, the cache shrinks to the live budget.
+- Minimum RAM (`run`/`index`): mainnet 7500 MiB, other networks 3800 MiB, from
+  the effective total after cgroup limits. The check runs before certificates,
+  RocksDB or Core; `serve` is exempt. `--allow-low-memory` /
+  `E_LITE_ALLOW_LOW_MEMORY=1` is CI-only.
+- cgroups are resolved from `/proc/self/cgroup` + `/proc/self/mountinfo` and
+  every ancestor is walked. Each limit is paired with that level's own usage;
+  never `min(limits) - leaf_usage`. `max`/the v1 sentinel mean unlimited, and
+  `doctor` distinguishes limited, unlimited and not detected.
+- `max_open_files` is capped to `RLIMIT_NOFILE - reserve`, handles
+  `RLIM_INFINITY`, never pads back above the limit, and is shown with the soft
+  limit in `doctor`/`/status.file_descriptors`; a cap below 2048 warns and a
+  limit leaving RocksDB < 20 descriptors is a startup error.
+- A Core started by e-lite gets a fitted `-dbcache` (`clamp(RAM/4, 450, 2048)`,
+  <= `RAM/3`), `-par` (`cpus-1`, 1..8), `-rpcthreads` (4..16) and an explicit
+  `-prune` (including `-prune=0`). Operator values win for those three;
+  `-datadir/-chain/-server/-daemon/-daemonwait/-rpcbind/-rpcport/-rpcallowip/
+  -prune` in `extra_args` are rejected. An external Core is never configured,
+  paused or restarted. Core's shutdown grace is 120 s.
 - Core RPC is HTTP; LAN/WAN use requires SSH/VPN. e-lite warns on a non-loopback
   `rpc_url`; `[core] require_loopback_rpc = true` makes it fatal. There is no
   native Core RPC TLS.
-- RocksDB memory is budgeted globally (`RAM/8` for memtables within the memory
-  budget, cache starts at `RAM/4` and adapts), background jobs are CPU-capped,
-  and every knob is available via CLI/`--set`.
+- RocksDB memory is budgeted globally through the shared `WriteBufferManager`
+  and the fitted budget above; background jobs are CPU-capped, and every knob is
+  available via CLI/`--set`. Index/bloom filter memory is reported separately
+  as `table_readers_bytes`.
 - `run`/`index`/`serve` tee console output to `<data-dir>/e-lite.log`
   (`--log-file`, `--log-max-mib`, `--no-log-file`).
+- The adaptive controller is its own thread (`el-tune`): a 5 s tick with a 30 s
+  minimum between changes. `commit/blk` is measured from the blocks actually
+  committed (`record_commit_group`). Automatic changes never override an
+  explicit `batch_blocks`.
+- Disk accounting excludes a Core datadir nested inside the data directory;
+  otherwise `disk.index_bytes` and the benchmark double-count Core.
 - Raw transactions are local-first. External fallback requests whole blocks by
   hash, validates them, uses Tor by default and never sends wallet txids/scripts.
 

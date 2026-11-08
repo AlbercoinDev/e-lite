@@ -3,15 +3,27 @@
 
 The feeder is a separate regtest node; the syncer Core is started by e-lite
 (`manage = managed`), so this exercises the real pause/index/prune pipeline.
+
+Measurement rules enforced here (they were violated by the first version):
+
+* every timestamp is elapsed-monotonic, never an absolute clock mixed with a
+  relative one;
+* CPU percentages use the real `CLK_TCK`, not a hardcoded 100 Hz;
+* peak RSS is the peak of the *simultaneous* sum, not the sum of two peaks;
+* a run that never reaches the tip exits non-zero, so the caller cannot
+  mistake a timeout for a result;
+* units in the header match the columns.
 """
 import argparse
 import json
-import shlex
 import os
+import shlex
 import subprocess
 import sys
 import time
 import urllib.request
+
+CLK_TCK = os.sysconf("SC_CLK_TCK") if hasattr(os, "sysconf") else 100
 
 
 def status(url):
@@ -66,6 +78,8 @@ def cpu_ticks(pid):
 
 
 def du(path):
+    """Apparent size of regular files. Directories may nest; callers must
+    avoid summing overlapping trees (the index excludes the Core datadir)."""
     total = 0
     for root, _dirs, files in os.walk(path):
         for name in files:
@@ -79,7 +93,7 @@ def du(path):
 def pid_from_file(path):
     try:
         with open(path) as f:
-            return int(f.read().strip())
+            return int(f.read().split()[0])
     except Exception:
         return 0
 
@@ -112,21 +126,25 @@ def main():
     paused_since = None
     paused_total = 0.0
     max_rss_core = max_rss_elite = 0
+    # Peak of the simultaneous sum, not the sum of independent peaks.
+    max_rss_combined = 0
     max_disk = 0
     max_pending = 0
     max_compactions = 0
     samples = 0
     last_ticks = {"core": 0, "elite": 0}
-    last_ticks_at = {"core": start, "elite": start}
+    last_ticks_at = {"core": 0.0, "elite": 0.0}
     cpu_pct = {"core": 0.0, "elite": 0.0}
+    last_indexed = 0
+    last_txnum = 0
 
     with open(args.csv, "w") as out:
         out.write(
-            "t,state,indexed,core,lag,network,synced,core_ibd,"
-            "rss_elite_kib,rss_core_kib,disk_bytes,pending_compaction,"
-            "running_compactions,commits,committed_txs,"
-            "stage_read_ms,stage_decode_ms,stage_prefetch_ms,stage_wait_ms,"
-            "stage_apply_us,stage_commit_us,commit_txids_us,commit_db_us,"
+            "t_s,state,indexed,core,lag,networkactive,ready,core_ibd,"
+            "rss_elite_kib,rss_core_kib,rss_combined_kib,disk_bytes,"
+            "pending_compaction_bytes,running_compactions,commits,committed_txs,"
+            "total_read_us,total_decode_us,total_prefetch_us,total_wait_us,"
+            "total_apply_us,total_commit_us,commit_txids_us,commit_db_us,"
             "cpu_elite_pct,cpu_core_pct\n"
         )
         while time.monotonic() - start < args.timeout:
@@ -138,10 +156,12 @@ def main():
 
             elite_pid = pid_from_file(args.elite_pid_file)
             core_pid = pid_from_file(args.core_pid_file)
-            re = rss_kib(elite_pid)
+            re_ = rss_kib(elite_pid)
             rc = rss_kib(core_pid)
-            max_rss_elite = max(max_rss_elite, re)
+            combined = re_ + rc
+            max_rss_elite = max(max_rss_elite, re_)
             max_rss_core = max(max_rss_core, rc)
+            max_rss_combined = max(max_rss_combined, combined)
             disk = du(args.data_dir) + du(args.core_datadir)
             max_disk = max(max_disk, disk)
 
@@ -156,12 +176,15 @@ def main():
                 ticks = cpu_ticks(pid)
                 dt = now - last_ticks_at[key]
                 if ticks >= last_ticks[key] and dt > 0:
-                    cpu_pct[key] = 100.0 * (ticks - last_ticks[key]) / (100.0 * dt)
+                    cpu_pct[key] = 100.0 * (ticks - last_ticks[key]) / (CLK_TCK * dt)
                 last_ticks[key] = ticks
                 last_ticks_at[key] = now
 
             state = st.get("state", "")
             indexed = int(st.get("indexed_height", 0) or 0)
+            txnum = int(st.get("txnum", 0) or 0)
+            last_indexed = indexed
+            last_txnum = txnum
             core_h = int(core.get("blocks", 0) or 0)
             if core_h >= args.tip and tip_seen_at is None:
                 tip_seen_at = now
@@ -178,7 +201,7 @@ def main():
                 f"{now:.3f},{state},{indexed},{core_h},"
                 f"{max(core_h - indexed, 0)},{int(bool(core.get('networkactive', False)))},"
                 f"{int(bool(st.get('ready', False)))},{int(bool(core.get('initialblockdownload', False)))},"
-                f"{re},{rc},{disk},{pending},{compactions},"
+                f"{re_},{rc},{combined},{disk},{pending},{compactions},"
                 f"{st.get('commits', 0)},{st.get('committed_txs', 0)},"
                 f"{stages.get('read', 0)},{stages.get('decode', 0)},{stages.get('prefetch', 0)},"
                 f"{stages.get('wait', 0)},{stages.get('apply', 0)},{stages.get('commit', 0)},"
@@ -196,31 +219,42 @@ def main():
         paused_total += (time.monotonic() - start) - paused_since
 
     st = status(args.status_url)
+    reached = last_indexed >= args.tip
     summary = {
         "tip": args.tip,
         "samples": samples,
+        "completed": reached,
         "total_seconds": round(time.monotonic() - start, 3),
         "core_tip_seconds": round(tip_seen_at, 3) if tip_seen_at else None,
         "index_tip_seconds": round(index_seen_at, 3) if index_seen_at else None,
         "paused_seconds": round(paused_total, 3),
         "max_rss_core_kib": max_rss_core,
         "max_rss_elite_kib": max_rss_elite,
-        "max_combined_rss_kib": max_rss_core + max_rss_elite,
+        "max_combined_rss_kib": max_rss_combined,
         "max_disk_bytes": max_disk,
         "max_pending_compaction_bytes": max_pending,
         "max_running_compactions": max_compactions,
+        "final_indexed": last_indexed,
+        "final_txnum": last_txnum,
         "commits": st.get("commits", 0),
         "committed_txs": st.get("committed_txs", 0),
-        "stage_totals_ms": st.get("stage_totals_ms", {}),
+        "stage_totals_us": st.get("stage_totals_us", {}),
+        "commit_breakdown_us": st.get("commit_breakdown_us", {}),
         "final_state": st.get("state", ""),
-        "final_indexed": st.get("indexed_height", 0),
         "prune_requests": st.get("prune_requests", 0),
         "prune_failures": st.get("prune_failures", 0),
     }
     with open(args.summary, "w") as f:
         json.dump(summary, f, indent=2)
     print(json.dumps(summary, indent=2))
-    return 0 if summary["final_indexed"] and int(summary["final_indexed"]) >= args.tip else 1
+    if not reached:
+        print(
+            f"INCOMPLETE: indexed {last_indexed} of {args.tip} in "
+            f"{summary['total_seconds']}s",
+            file=sys.stderr,
+        )
+        return 1
+    return 0
 
 
 if __name__ == "__main__":

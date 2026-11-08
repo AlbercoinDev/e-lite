@@ -8,203 +8,219 @@ overrides the disk/prune safety guards.
 All settings work on every network. See [`CLI.md`](CLI.md) for the full list of
 command-line overrides and `--set section.key=value`.
 
-## Startup profile
+## Supported minimum and startup checks
 
-`[index] profile` selects the initial values:
+Indexing and validating the chain at the same time is what makes the memory
+requirement non-trivial. e-lite refuses to start `run`/`index` below the
+supported class and explains what it detected:
 
-| Profile | readers | commit | batch | cache | jobs |
-|---|---:|---:|---:|---:|---:|
-| `auto` | detect | profile | profile | profile | CPU-capped |
-| `hdd` | 2 | 5 s | 512 | RAM/4, max 4 GiB | 4 (capped by CPUs) |
-| `ssd` | 8 | 2 s | 256 | RAM/4, max 8 GiB | 8 (capped by CPUs) |
-| `nvme` | 16 | 2 s | 256 | RAM/3, max 16 GiB | 12 (capped by CPUs) |
-| `manual` | config | config | config | config | config |
+| Network | Minimum usable RAM |
+|---|---:|
+| mainnet | **8 GB class** (`7500 MiB` after firmware/kernel reservations) |
+| testnet4, signet, regtest | **4 GB class** (`3800 MiB`) |
 
-`auto` uses the Linux `rotational` hint for the data directory. Virtual
-machines, RAID and network filesystems can report this incorrectly; the hint is
-only the starting point, not a hard classification. Use `--profile` (or
-`--set index.profile=...`) when you know the real hardware.
+The number is the **effective** total: the minimum of `/proc/meminfo` and every
+visible cgroup v2/v1 limit. A container limited to 2 GiB on a 32 GiB host is
+treated as a 2 GiB machine. `doctor` prints the detected source, host total and
+cgroup state; `--allow-low-memory` (or `E_LITE_ALLOW_LOW_MEMORY=1`) skips the
+check for CI/regtest, and is not supported for real use. `serve` does not
+enforce the minimum: it only answers queries from an existing index.
 
-RocksDB memory is budgeted globally, not per column family. The default memtable
-budget is `RAM/8` (256 MiB..2 GiB), split across the 7 CFs. Background jobs are
-capped by the CPU count so a 2-core machine does not run 8 compaction threads.
+`run`/`index` also reject, before creating certificates or opening the
+database, any memory plan that does not fit or any Core argument that e-lite
+must own (see below).
 
 ## Memory budget
 
-e-lite reserves RAM for the OS, Core and the page cache, and uses the rest as a
-ceiling for its own cache/memtables/runtime:
+One accounting, three consumers. e-lite never plans more than its ceiling:
 
 ```
-reserve   = max(1024 MiB, RAM_total/8)
-ceiling   = 75 % of RAM_total
-memtables = RAM_total/8          (fixed at startup)
-runtime   = RAM_total/16         (batch, overlay, prefetch, Tor)
-cache_max = ceiling - memtables - runtime
+reserve   = memory_reserve_mib, else clamp(RAM/8, 512 MiB, 2048 MiB)
+                        (RAM/4 for machines of 2 GiB or less)
+usable    = RAM_total - reserve
+ceiling   = min(RAM_total * memory_fraction, usable)   # 0 -> 0.75, never raised
+runtime   = clamp(RAM_total/32, 96 MiB, 1024 MiB)      # block buffers, overlay,
+                                                        # mempool, queries, Tor
+memtables = write_buffer_mib, else clamp(RAM_total/8, 128 MiB, 2048 MiB)
+            shrunk so that memtables + runtime + 64 MiB <= ceiling
+cache_max = ceiling - runtime - memtables
+            (also capped at max(RAM/4, 1024 MiB) when automatic)
+cache_start = cache_max for an explicit cache_mib, else min(RAM/4, cache_max)
 ```
 
-The block cache starts at the profile value (`RAM/4`) and is adjusted at most
-once every 30 seconds:
+`planned = runtime + memtables + cache_start` is always `<= ceiling`. An
+explicit `memory_fraction` is a hard request: if the components do not fit, the
+memtables and the cache are reduced instead of raising the ceiling. The old
+formula could plan 1738 MiB inside a 1581 MiB ceiling (`RAM=7907`,
+`memory_fraction=0.20`); that case is now a regression test.
 
-- **grow +256 MiB** while `MemAvailable >= 1.5 × reserve`, page cache
-  (`Buffers + Cached`) is at least `reserve`, and the cache is below `cache_max`;
-- **shrink 25 %** (floor 256 MiB) when `MemAvailable < reserve` or page cache is
-  below `reserve/2`;
-- two consecutive samples are required in the same direction (hysteresis).
+Two different budgets are reported and must not be confused:
 
-Growing the RocksDB cache consumes page cache, which is why the page-cache floor
-exists: it keeps block-file reads fast. If `read` latency rises while the cache
-grows, the policy backs off.
+* **planned** — what e-lite intends to keep resident;
+* **observed** — `/status.rocksdb` (`memtable_bytes`, `block_cache_bytes`,
+  `table_readers_bytes`) and the process RSS.
 
-`cache_mib` is a **maximum**, not a fixed value: the controller may use less
-under pressure and grow back up to it. A critical memory situation can shrink
-even a manual value. `write_buffer_mib` is fixed when the store opens.
+Indexes and bloom filters stay outside the data block cache for read speed, so
+their memory (`rocksdb.estimate-table-readers-mem`) is reported separately. The
+plan reserves runtime for them; if they grow past it, raise the reserve or lower
+`max_open_files`.
 
-Before Core resumes downloads after a bulk pause, e-lite shrinks the cache to
-`max(1024 MiB, RAM/4)` so Core has room for its block index and verification.
+`cache_mib` is a **maximum**, not a fixed value. The controller may use less
+under pressure and grow back up to it. `write_buffer_mib` is fixed when the
+store opens (changing it requires a restart).
 
-Explicit values cap the automatic policy:
+The block cache is adjusted at most once every 30 seconds:
 
-```toml
-[index]
-profile = "auto"
-readers = 4              # explicit override
-cache_mib = 4096         # maximum cache, not a fixed value
-write_buffer_mib = 1024  # fixed memtable budget
-memory_reserve_mib = 0   # 0 = max(1024, RAM/8)
-memory_fraction = 0      # 0 = 0.75 of total RAM
-commit_interval_ms = 5000
-adaptive = true
-```
+- **grow +256 MiB** while `MemAvailable >= 1.5 × reserve` and below `cache_max`;
+- **shrink 25 %** when `MemAvailable < reserve`, with a soft floor of
+  `clamp(RAM/8, 512 MiB, 4096 MiB)`;
+- below 256 MiB available the floor no longer applies, readers are reduced, and
+  the cache may fall to 8 MiB — a low-memory emergency must be able to return
+  memory;
+- two consecutive samples in the same direction are required (hysteresis).
 
-Set `adaptive = false` to keep the profile/config values fixed. Explicit
-`readers`/`commit_interval_ms` remain locked; `cache_mib` is a ceiling that the
-memory policy can lower for safety.
+Cache decisions use `MemAvailable` only. A low page-cache number is expected
+while the RocksDB cache holds the UTXO working set; shrinking because of it was
+what produced the 6.6 GiB → 256 MiB oscillation.
 
-The same values can be passed without a config file:
+## Controller cadence
+
+The controller is a dedicated thread (`el-tune`), not part of the indexing
+loop, so one long `catch_up_limited` call cannot delay protection:
+
+| Loop | Cadence | Purpose |
+|---|---:|---|
+| sampling / protection | 5 s tick, acts immediately on critical memory | stop growth, shrink, drop readers |
+| optimization | 30 s minimum between changes | cache/commit/batch/readers |
+
+Every change is logged with the reason and published in
+`/status.tuning.adapt_steps`. Automatic changes never override a locked
+`batch_blocks` value.
+
+## RocksDB descriptors and open files
+
+`max_open_files` defaults to 8192, but it is capped by the process
+`RLIMIT_NOFILE` minus a reserve for client sockets, Core RPC, providers and
+logs. `RLIM_INFINITY` is handled explicitly: it used to wrap to a negative
+integer and collapse the target to 256.
+
+`doctor` and `/status.file_descriptors` show the soft limit, the reserve, the
+requested value and the effective value. A reduction below 2048 logs a warning
+and suggests raising the limit; e-lite never raises it for you.
 
 ```bash
-e-lite run --network mainnet --allow-mainnet --profile nvme
-e-lite run --network signet --profile hdd --readers 4 --cache-mib 1024
-e-lite run --set index.profile=ssd --set index.commit_interval_ms=3000
+# systemd unit or shell
+ulimit -n 16384
 ```
 
-## What the controller observes
+A low limit is not fatal: RocksDB reopens SSTs, which only makes prevout reads
+slower. A limit so low that no descriptor is left for RocksDB (< 20) is a clear
+startup error instead of an `EMFILE` later.
 
-The indexer records EWMA values for:
+## Core parameters chosen by e-lite
 
-- block-read latency (`read_ms`),
-- block decode/hash latency (`decode_ms`),
-- prevout prefetch latency (`prefetch_ms`),
-- pipeline wait (`wait_ms`),
-- `apply_block` latency (`apply_ms`),
-- commit + fsync latency (`commit_ms`) and `commit/blk`,
-- indexed blocks and transactions per second.
+When e-lite starts Core (`manage = "auto"` with no running node, or
+`"managed"`), it adds a fitted plan:
 
-They are exported in `/status` under `tuning` and in `/metrics` as
-`e_lite_tuning_*`, `e_lite_tx_per_sec`, `e_lite_blocks_per_sec` and
-`e_lite_commit_ms`. `prefetch_ms` is shown in the progress line only.
+| Argument | Rule |
+|---|---|
+| `-dbcache` | `clamp(RAM/4, 450, 2048)` MiB, at most `RAM/3` |
+| `-par` | `cpus - 1`, clamped to 1..8 (leaves a core for the index) |
+| `-rpcthreads` | `clamp(cpus, 4, 16)` |
+| `-prune` | always explicit, from `[core] prune_mib` (including `-prune=0`) |
 
-On HDDs and small hosts, prevout lookups were the largest part of `apply`:
-RocksDB point reads for one block ran serially in the apply thread. Since
-alpha.23 the reader threads resolve a block's prevouts speculatively before it
-reaches apply, so random UTXO reads overlap with the previous block's work. The
-result is a superset (group-local creations/deletions are ignored); apply uses
-the group overlay first and falls back to a point lookup, so the pipeline never
-depends on the speculation. If `prefetch` is high and `apply` is low, the disk
-is the limit; if `prefetch` is low and `apply` is high, the remaining cost is
-CPU/HashMap/history work.
+`prune_mib = 0` used to omit the flag, so a `prune=` line in an existing
+`bitcoin.conf` could silently prune a "full" node. It is now always stated.
 
-## What it changes
+An operator value in `extra_args` wins for `-dbcache`, `-par` and
+`-rpcthreads`. Arguments that e-lite owns (`-datadir`, `-chain`, `-server`,
+`-daemon`, `-daemonwait`, `-rpcbind`, `-rpcport`, `-rpcallowip`, `-prune`) are
+rejected with an explanation. An external Core is never configured or
+restarted.
 
-Only these hot fields are adjusted automatically:
+Core's shutdown grace is now two minutes (it was 30 s) so a multi-GiB UTXO
+cache can flush instead of being killed mid-flush.
 
-- `readers`: less on a rotational disk when read latency is high; more only on
-  non-rotational disks when reads are actually slow, never just because a read
-  was fast. Automatic readers are capped at 4 (HDD), 8 (SSD) or 16 (NVMe), by
-  available memory and by `2 × CPU count` (explicit `--readers` wins).
-- `commit_interval_ms` and `batch_blocks`: larger groups when commit/fsync is
-  slow and commit is less than half of the interval; if commit dominates the
-  interval (>75%), the batch shrinks instead. The bulk maximum is 30 s / 4096
-  blocks, with the usual crash-window tradeoff.
-- `cache_mib`: grows/shrinks inside the memory budget described above. The
-  cache-hit metric was removed because RocksDB did not expose it reliably;
-  `--cache-mib` still sets the maximum.
+## One intensive sync at a time
 
-The controller runs at most once every 30 seconds. It is inhibited while the
-disk guard is active, during a prune-gap repair, during a reorg and during
-shutdown. The memory policy uses `MemAvailable` (including the cgroup v2/v1
-limit in LXC/containers) and `Buffers + Cached`; two consecutive samples are
-required before a change. `memory.current` includes reclaimable page cache, so
-`inactive_file` is subtracted before declaring pressure; this avoids the false
-`0 MiB available` state that used to shrink the cache on machines with plenty of
-RAM.
+Each user gets one intensive synchronisation slot (a `flock` under
+`$XDG_RUNTIME_DIR/e-lite/ibd.lock`, or `/tmp/e-lite-<uid>/ibd.lock`). A second
+instance **waits** and logs who holds the slot; it keeps serving its existing
+index and starts automatically when the slot is released. Acquiring happens
+before a from-zero managed Core starts downloading, and the slot is released as
+soon as the instance is within 1000 blocks of Core. The kernel drops the lock on
+crash, so a dead process cannot block the queue. `E_LITE_NO_SYNC_LOCK=1`
+disables it (not recommended).
 
-Every change is logged:
+This is a per-user lock. Separate containers do not see each other's locks.
 
-```text
-[e-lite] adaptive tuning: commit 620ms: interval -> 7500ms, batch -> 768
-[e-lite] memory: available 5317 MiB, buff/cache 4443 MiB, reserve 1024 MiB: cache 1977 -> 2233 MiB (max 4449, memtables 988 MiB, readers 8)
-```
+## End-to-end IBD shape
 
-## Hot reload
+The pipeline is still Core → read → decode/prevout → apply → commit → prune,
+and the controller treats it as one system:
 
-Send `SIGUSR1` to reload the same config file without restarting:
+- `commit/blk` is now measured from the blocks actually committed. The old
+  figure divided by the configured batch, so a 100-block group committing in
+  8 s was reported as 7 ms/block instead of 80 ms/block.
+- Undo is generated for **every** applied block and pruned at commit time from
+  the tip that is really committed. A time- or transaction-limited commit can
+  no longer leave a tip without its reorg window.
+- The prepared-block window is bounded by `prefetch_blocks` when set (0 keeps
+  the automatic `workers × 2`), instead of a value that was printed but unused.
+- `/status.stage_totals_us` and `commit_breakdown_us` separate read, decode,
+  prefetch, wait, apply, fsync of `txids.dat` and the RocksDB write.
 
-```bash
-kill -USR1 "$(pgrep -f 'e-lite run')"
-```
-
-Hot fields:
-
-- `index.readers`
-- `index.cache_mib`
-- `index.commit_interval_ms`
-- `index.batch_blocks`
-- `index.profile`
-- `index.adaptive`
-- pruning thresholds (`min_free_gib`, `critical_free_gib`,
-  `prune_interval_seconds`, `min_gain_blocks`)
-
-Cold fields are reported as requiring a restart:
-
-- `core.prune_mib`
-- `index.block_source`
-- `index.reorg_window`
-- `index.write_buffer_mib`
-- `index.milestone_blocks` / `index.milestone_seconds`
-- `pruning.max_core_lag_blocks` / `pruning.max_bulk_lag_blocks`
-- `network.data_dir`
-- server listeners/TLS paths
-- network/identity and schema
-
-If the file is invalid, the previous configuration stays in effect. Changes
-made through CLI flags are not replayed on reload; put persistent values in the
-TOML file.
-
-## Recommended starting points
-
-- **HDD / SMR**: `profile = "hdd"`, `adaptive = true`, `cache_mib` at least
-  2048–4096 if RAM allows. Fewer readers and larger commit groups usually beat
-  parallelism on a single spindle.
-- **SATA SSD**: `profile = "ssd"`, `adaptive = true`.
-- **NVMe**: `profile = "nvme"`, `adaptive = true`; if the apply thread is the
-  bottleneck, more readers will not help until decode/prefetch is parallelized.
-- **Benchmark/fixed**: `profile = "manual"`, `adaptive = false`, explicit
-  `readers`/`commit_interval_ms`/`cache_mib`.
+`commit_sync`, the WAL and the prune ordering are unchanged: `txids.dat` is
+fsynced before the tip advances and the index is flushed before Core is allowed
+to delete blocks.
 
 ## Containers (LXC/Docker)
 
-Memory accounting uses the lower of `/proc/meminfo` and the cgroup limit
-(`/sys/fs/cgroup/memory.max` or cgroup v1 `memory.limit_in_bytes`). If a
-container still reports the host's memory, the controller also checks
-`memory.current` minus `inactive_file` and backs off readers/cache when truly
-available memory is low. `e-lite doctor` and `/status` show total, available,
-cgroup limit/usage and reclaimable cache.
+Memory is resolved from the process's real position in the cgroup tree:
 
-If the process is killed by the kernel (`Killed` in the shell), check
-`dmesg -T | tail` or `journalctl -k` for the OOM report. Reduce the container's
-`--cache-mib`/`--write-buffer-mib`/`--readers` or set `--no-adaptive` while
-investigating.
+1. `/proc/self/cgroup` gives the path (v2 `0::<path>`, v1 `:memory:<path>`);
+2. `/proc/self/mountinfo` gives the cgroup2/cgroup mount point and its root;
+3. every directory from the leaf up to the mount root is read
+   (`memory.max`, `memory.current`, `memory.stat`; v1 uses the `memory/*`
+   equivalents).
+
+The effective limit is the smallest finite limit on that path, and the
+available memory pairs **each limit with the usage of that same cgroup** — a
+parent's limit is never combined with a child's usage. `memory.max = max` and
+the v1 `2^60` sentinel mean "unlimited"; a missing controller means "host RAM".
+`doctor` distinguishes `detected (limited)`, `detected (unlimited)` and
+`not detected`, instead of printing `0` for all three.
+
+Practical notes:
+
+- The minimum-RAM check uses this effective total, so a container with
+  `--memory=2g` is rejected even on a 64 GiB host.
+- Docker defaults `nofile` to 1024 in most setups; that caps `max_open_files`
+  at `1024 - reserve`. Raise it (`--ulimit nofile=16384:16384`) for the best
+  prevout read speed. e-lite logs the effective value and warns.
+- If the kernel kills the process (`Killed` in the shell), check
+  `dmesg -T | tail` or `journalctl -k`. Lower `--cache-mib`,
+  `--write-buffer-mib` or `--memory-fraction`, not just the cache.
+- Managed Tor runs inside the same container and shares the budget.
+
+### UmbrelOS
+
+The Umbrel package is not built from this repository, so its Compose file is not
+verified here. When packaging e-lite for UmbrelOS/Docker, keep in mind:
+
+- a container memory limit is what e-lite plans against (good, but it must be
+  at least the 4/8 GB class for the selected network);
+- Bitcoin Core usually runs in another container: use `manage = "external"` and
+  an `rpc_url`/cookie that reaches it; e-lite will not configure or restart it;
+- `/proc` and cgroup mounts must be visible for resource detection; with a
+  restricted namespace the check falls back to host RAM, which is wrong inside
+  a small container — keep the cgroup filesystem mounted or set
+  `memory_reserve_mib`/`memory_fraction` explicitly;
+- index, Core blocks and the rawtx cache must be on volumes, not the writable
+  overlay layer, and the Core datadir should not be nested inside e-lite's
+  data directory (it is excluded from the reported index size when it is);
+- allow enough time for SIGTERM: Core can need up to two minutes to flush;
+- the per-user sync lock does not coordinate separate containers.
 
 ## Long catch-up and Core separation
 

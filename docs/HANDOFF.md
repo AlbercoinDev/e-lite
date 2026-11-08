@@ -1,9 +1,9 @@
 # Session handoff
 
-**Updated:** 2026-11-07
-**Latest published release:** `0.1.0-alpha.29.4.5`
-**Release:** https://github.com/AlbercoinDev/e-lite/releases/tag/v0.1.0-alpha.29.4.5
-**Main commit at handoff:** tag `v0.1.0-alpha.29.4.5`
+**Updated:** 2026-11-09
+**Latest published release:** `0.1.0-alpha.29.5.0`
+**Release:** https://github.com/AlbercoinDev/e-lite/releases/tag/v0.1.0-alpha.29.5.0
+**Main commit at handoff:** tag `v0.1.0-alpha.29.5.0`
 
 This file is the short “where we are” for a new session. The invariants live in
 [`AGENTS.md`](../AGENTS.md) and [`PROJECT_MEMORY.md`](PROJECT_MEMORY.md); the
@@ -83,6 +83,39 @@ no repitas contexto ni rehagas decisiones ya documentadas.
   the onion setup, reset and security.
 - `docs/ROADMAP.md` contains future features/improvements. Do not present them as
   available.
+
+## Last change (alpha.29.5.0)
+
+Whole-IBD pass: memory, Core, commits and measurement are now one plan.
+
+- **Minimum RAM enforced before side effects**: mainnet 7500 MiB, other
+  networks 3800 MiB, measured after cgroup limits. `serve` is exempt.
+- **Fitted budget**: `planned = runtime + memtables + cache <= ceiling`; explicit
+  fractions are never raised; a shared `WriteBufferManager` caps memtables.
+- **cgroup v1/v2 hierarchy** resolved from `/proc/self/cgroup` +
+  `/proc/self/mountinfo`, each limit paired with its own usage.
+- **Descriptors**: `RLIM_INFINITY` fixed, socket reserve, visible in
+  `doctor`/`/status.file_descriptors`.
+- **Core plan**: `-dbcache/-par/-rpcthreads` and an explicit `-prune`; operator
+  overrides honoured, managed arguments rejected; child registered before the
+  pid file; 120 s shutdown grace.
+- **Undo for every block**, pruned from the real commit tip, including undo
+  inserted by the same batch. Early commits can no longer lose the window.
+- **`el-tune` thread**: 5 s sampling, 30 s minimum interval, correct bulk/live
+  classification in `index`, `batch_locked` honoured, real `commit/blk`.
+- **Per-user sync slot**: a second intensive sync waits and starts on its own.
+- **Benchmark fixed**: monotonic clocks, `CLK_TCK`, simultaneous RSS peak,
+  matching units, failures propagated; disk accounting excludes nested Core.
+
+### Not yet verified
+
+- The 4 GB testnet4/signet profile is a supported *candidate*: it has unit and
+  logic coverage but no real hard-chain IBD measurement in this release.
+- No real mainnet A/B of the new defaults (adaptive cache, Core plan, undo cost).
+- Real power loss and true ENOSPC remain untested; the recovery e2e simulates a
+  file-size limit and SIGKILL.
+- The UmbrelOS package is not built here; container notes in `TUNING.md` are
+  guidance, not a verified Compose file.
 
 ## Last change (alpha.29.4.5)
 
@@ -635,6 +668,6 @@ startup/shutdown/memory assertions, `e-lite.log` presence, 1.6 and 1.7
 negotiation on the same instance, scriptpubkey/outpoint checks, outpoint
 notification, real testmempoolaccept, the rate-limit burst test, the strict
 Core RPC check and the Sparrow sequence with confirmed verbose transaction)
-passed on the alpha.29.4.5 code. Full signet/testnet4 acceptance
+passed on the alpha.29.5.0 code. Full signet/testnet4 acceptance
 is still operator-run; results belong in `docs/GETTING-STARTED.md`/release notes
 when available.

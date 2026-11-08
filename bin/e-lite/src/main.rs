@@ -1,5 +1,7 @@
 mod config;
+mod core_plan;
 mod core_supervisor;
+mod ibd_lock;
 mod logging;
 mod public_servers;
 mod snapshot;
@@ -225,6 +227,7 @@ struct Args {
     write_buffer_mib: Option<u64>,
     memory_reserve_mib: Option<u64>,
     memory_fraction: Option<f64>,
+    allow_low_memory: bool,
     background_jobs: Option<usize>,
     milestone_blocks: Option<u64>,
     milestone_seconds: Option<u64>,
@@ -330,6 +333,7 @@ fn parse_args() -> R<Args> {
             "--memory-fraction" => {
                 args.memory_fraction = Some(value("--memory-fraction")?.parse()?)
             }
+            "--allow-low-memory" => args.allow_low_memory = true,
             "--background-jobs" => {
                 args.background_jobs = Some(value("--background-jobs")?.parse()?)
             }
@@ -560,6 +564,9 @@ fn effective_config(args: &Args) -> R<(Config, Chain)> {
     }
     if let Some(v) = args.memory_fraction {
         cfg.index.memory_fraction = v;
+    }
+    if args.allow_low_memory {
+        cfg.index.allow_low_memory = true;
     }
     if let Some(v) = args.background_jobs {
         cfg.index.background_jobs = v;
@@ -958,15 +965,54 @@ fn open_store_with(
         background_jobs
     };
     let jobs = requested_jobs.clamp(1, 32).min(cpus.max(1)) as i32;
+    // Descriptors are shared with client sockets, Core RPC, providers and log
+    // files. Reserve them explicitly instead of assuming 64 is enough.
+    let fd_reserve = (cfg.server.max_clients as u64)
+        .saturating_mul(2)
+        .saturating_add(192)
+        .clamp(256, 4096);
+    // The Core datadir normally lives inside the data dir; without excluding
+    // it the status "index" figure and any benchmark disk total would count
+    // Core twice.
+    let mut exclude = Vec::new();
+    let core_dir = cfg.core_datadir(chain);
+    if core_dir.starts_with(&dir) {
+        exclude.push(core_dir);
+    }
     let opts = el_store::StoreOptions {
         cache_bytes,
         write_buffer_total_bytes: (write_mib as usize) * 1024 * 1024,
         max_write_buffer_number: max_buffers,
         max_total_wal_bytes: ((write_mib / 2).clamp(64, 1024) as usize) * 1024 * 1024,
         background_jobs: jobs,
+        fd_reserve,
+        exclude_paths: exclude,
         ..Default::default()
     };
-    Ok(Arc::new(Store::open_with(dir, opts)?))
+    let store = Arc::new(Store::open_with(dir, opts)?);
+    let plan = store.fd_plan();
+    eprintln!(
+        "[e-lite] descriptors: soft limit {}, reserve {}, max_open_files requested {}{}",
+        plan.soft_limit
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| "unlimited".to_string()),
+        plan.reserve,
+        plan.requested,
+        if plan.capped {
+            format!(" -> {}", plan.effective)
+        } else {
+            String::new()
+        }
+    );
+    if plan.below_recommended() {
+        eprintln!(
+            "[e-lite] WARNING: max_open_files was reduced to {} because of the process file \
+             limit; prevout reads will re-open SSTs. Raise `ulimit -n` (16384 is a good value) \
+             for the best indexing speed.",
+            plan.effective
+        );
+    }
+    Ok(store)
 }
 
 fn open_store(cfg: &Config, chain: Chain) -> R<Arc<Store>> {
@@ -1165,6 +1211,7 @@ TUNING (all networks):
     --write-buffer-mib <n>  total RocksDB memtable budget (0 = RAM/8)
     --memory-reserve-mib <n> RAM left for OS/Core/page cache (0 = max(1024, RAM/8))
     --memory-fraction <f>   e-lite ceiling as a share of total RAM (0 = 0.75)
+    --allow-low-memory      skip the minimum-RAM check (unsupported)
     --background-jobs <n>   RocksDB jobs (0 = profile, capped by CPUs)
     --commit-interval-ms <n> commit/fsync interval (0 = profile; 500..30000)
     --commit-sync <mode>    auto | always | txids (bulk durability tradeoff)
@@ -1549,6 +1596,30 @@ fn cmd_doctor(cfg: &Config, chain: Chain) -> R<()> {
         mem.reclaimable_mib.unwrap_or(0)
     );
     println!(
+        "memory limits: source {:?}, host total {} MiB, cgroup {}",
+        mem.source,
+        mem.host_total_mib.unwrap_or(0),
+        if mem.cgroup_detected {
+            if mem.cgroup_unlimited {
+                "detected (unlimited)".to_string()
+            } else {
+                format!("detected (limit {} MiB)", mem.cgroup_limit_mib.unwrap_or(0))
+            }
+        } else {
+            "not detected (host RAM used)".to_string()
+        }
+    );
+    println!(
+        "memory minimum: {} MiB for {} ({} here)",
+        tuning::minimum_ram_mib(chain),
+        chain.name(),
+        if mem.total_mib.unwrap_or(0) >= tuning::minimum_ram_mib(chain) {
+            "met"
+        } else {
+            "NOT MET"
+        }
+    );
+    println!(
         "memory budget: total {} MiB, available {} MiB, cached {} MiB, reserve {} MiB, \
          ceiling {} MiB, cache max {} MiB, memtables {} MiB",
         budget.total_mib,
@@ -1559,6 +1630,42 @@ fn cmd_doctor(cfg: &Config, chain: Chain) -> R<()> {
         budget.cache_max_mib,
         budget.memtables_mib
     );
+    println!(
+        "memory plan: runtime {} MiB, planned {} MiB of {} MiB{}",
+        budget.runtime_mib,
+        budget.planned_mib,
+        budget.ceiling_mib,
+        if budget.over_budget {
+            " (OVER BUDGET)"
+        } else {
+            ""
+        }
+    );
+    match core_plan::plan_core(cfg, chain) {
+        Ok(plan) => println!("core plan: {}", core_plan::describe(&plan)),
+        Err(e) => problems.push(format!("core plan: {e}")),
+    }
+    {
+        let reserve = (cfg.server.max_clients as u64)
+            .saturating_mul(2)
+            .saturating_add(192)
+            .clamp(256, 4096);
+        let fd = el_store::fd_plan(8192, reserve);
+        println!(
+            "descriptors: soft limit {}, reserve {}, max_open_files {} (requested {}){}",
+            fd.soft_limit
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| "unlimited".to_string()),
+            fd.reserve,
+            fd.effective,
+            fd.requested,
+            if fd.below_recommended() {
+                " — raise `ulimit -n` for best indexing speed"
+            } else {
+                ""
+            }
+        );
+    }
     let core_sup = CoreSupervisor::new(cfg, chain);
     println!(
         "core manage: {}",
@@ -2128,6 +2235,7 @@ impl Indexer {
         if let Some(sh) = &self.shared {
             sh.stats.core_height.store(h, Ordering::Relaxed);
         }
+        self.tunables.set_core_state(h, self.tunables.core_ibd());
     }
 
     /// Live Core tip and pruneheight for progress lines. Falls back to the
@@ -2263,29 +2371,43 @@ impl Indexer {
         commit_sync_policy(&self.cfg.index.commit_sync, ibd, height, core_tip)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn commit_group(
         &self,
         batch: WriteBatch,
         tip: &IndexedTip,
         txids: &[Hash32],
+        blocks: u32,
         last_block_ms: u64,
-        prune_undo_records: bool,
+        undo_heights: &[u32],
         sync: bool,
     ) -> R<()> {
         let mut batch = batch;
-        if prune_undo_records {
-            prune_undo(
-                &self.store,
-                tip.height,
-                self.cfg.index.reorg_window,
-                &mut batch,
-            )?;
+        // Undo is written for every applied block so an early commit (time or
+        // transaction limit) can never leave a tip without its reorg window.
+        // Records older than the window are pruned here, including the ones
+        // added to this very batch.
+        prune_undo(
+            &self.store,
+            tip.height,
+            self.cfg.index.reorg_window,
+            &mut batch,
+        )?;
+        let cutoff = undo_cutoff(tip.height as u64, self.cfg.index.reorg_window) as u32;
+        for height in undo_heights {
+            if *height < cutoff {
+                // Deleting a key inserted earlier in the same WriteBatch is
+                // ordered: the delete wins. Without this the batch resurrected
+                // undo the prune had just deleted from the database.
+                self.store.delete_undo(&mut batch, *height)?;
+            }
         }
         {
             let _g = self.lock.write().map_err(|_| "lock poisoned")?;
             let commit_started = Instant::now();
             let result = self.store.commit_with_sync(batch, tip, txids, sync);
-            self.tunables.record_commit(commit_started.elapsed());
+            self.tunables
+                .record_commit_group(commit_started.elapsed(), blocks as u64);
             if let Err(e) = result {
                 // Whatever happened, keep the flat file aligned with the DB.
                 if let Ok(Some(t)) = self.store.committed_tip() {
@@ -2319,6 +2441,20 @@ impl Indexer {
             sh.stats
                 .rocksdb_sst_bytes
                 .store(c.sst_files_bytes, Ordering::Relaxed);
+            sh.stats
+                .rocksdb_table_readers_bytes
+                .store(self.store.table_readers_bytes(), Ordering::Relaxed);
+            let fd = self.store.fd_plan();
+            sh.stats
+                .fd_soft_limit
+                .store(fd.soft_limit.unwrap_or(0), Ordering::Relaxed);
+            sh.stats.fd_reserve.store(fd.reserve, Ordering::Relaxed);
+            sh.stats
+                .max_open_files_requested
+                .store(fd.requested as u64, Ordering::Relaxed);
+            sh.stats
+                .max_open_files_effective
+                .store(fd.effective as u64, Ordering::Relaxed);
         }
         Ok(())
     }
@@ -2537,6 +2673,8 @@ impl Indexer {
         }
         let info = self.core.blockchain_info()?;
         let core_tip = info.blocks;
+        self.tunables
+            .set_core_state(core_tip, info.initialblockdownload);
         self.stats_core_height(core_tip);
         if let Some(sh) = &self.shared {
             sh.stats
@@ -2623,7 +2761,16 @@ impl Indexer {
         // window. The channel alone only bounds queued results; the apply
         // thread can keep draining out-of-order results into `pending`, so an
         // explicit window is needed to cap memory.
-        let window = (workers * 2).clamp(4, 32);
+        // Bound prepared blocks by both worker count and the configured
+        // prefetch depth. A window measured only in blocks ignores that a
+        // full block can be 100x heavier than an empty one.
+        let default_window = (workers * 2).clamp(4, 32);
+        let configured = self.tunables.prefetch_blocks();
+        let window = if configured == 0 {
+            default_window
+        } else {
+            default_window.min(configured.clamp(2, 64))
+        };
         let (permit_tx, permit_rx) = std::sync::mpsc::sync_channel::<()>(window);
         for _ in 0..window {
             let _ = permit_tx.send(());
@@ -2704,7 +2851,7 @@ impl Indexer {
             std::collections::HashSet::new();
         let mut count = 0u32;
         let mut last_ms = 0u64;
-        let mut group_undo = false;
+        let mut group_undo_heights: Vec<u32> = Vec::new();
         let mut result: R<()> = Ok(());
         let mut paused_by_disk = false;
         let mut group_started = Instant::now();
@@ -2748,21 +2895,12 @@ impl Indexer {
                 }
             };
             let t0 = Instant::now();
-            // Undo is only useful for the reorg window. Anchor the window to
-            // the end of the current commit group, not to Core's tip: a commit
-            // always happens at a group boundary, so the blocks that can
-            // become the committed tip keep their undo even when the index is
-            // far behind Core. `group_end` is bounded by the highest block
-            // this catch-up call may apply so the last group is also covered.
-            let batch_blocks = self.tunables.batch_blocks().max(1) as u64;
-            let group_start = height.saturating_sub(count as u64);
-            let group_end = group_start
-                .saturating_add(batch_blocks.saturating_sub(1))
-                .min(target);
-            let keep_undo = should_store_undo(height, group_end, self.cfg.index.reorg_window);
-            // A time-based commit is only safe when the current tip already
-            // has its whole reorg window; otherwise wait for the group end.
-            let undo_ready = keep_undo;
+            // Always generate undo. The previous rule guessed the end of the
+            // commit group, but a time limit, a transaction limit or a
+            // supervisor-deadline break could commit at a lower height and
+            // leave the new tip without its reorg window (or without undo at
+            // all). Extra records are pruned inside the same commit.
+            let undo_ready = true;
             match apply_prepared_with_prefetch(
                 &self.store,
                 height as u32,
@@ -2770,19 +2908,17 @@ impl Indexer {
                 tip,
                 &mut overlay,
                 &mut batch,
-                keep_undo,
+                true,
                 Some(&prevouts),
             ) {
                 Ok(out) => {
                     group_txids.extend_from_slice(&out.txids);
+                    group_undo_heights.push(height as u32);
                     if self.shared.is_some() {
                         group_scripts.extend(out.touched_scripts.iter().copied());
                     }
                     tip = Some(out.tip);
                     count += 1;
-                    if keep_undo {
-                        group_undo = true;
-                    }
                     last_ms = t0.elapsed().as_millis() as u64;
                     self.tunables.record_apply(t0.elapsed());
                     if (self.cfg.core.prune_mib >= 550
@@ -2836,14 +2972,15 @@ impl Indexer {
                     std::mem::take(&mut batch),
                     &current,
                     &group_txids,
+                    count,
                     last_ms,
-                    group_undo,
+                    &group_undo_heights,
                     sync,
                 ) {
                     result = Err(e);
                     break;
                 }
-                group_undo = false;
+                group_undo_heights.clear();
                 committed_height = current.height as u64;
                 let (live_core, live_prune) =
                     self.live_core_and_prune(info.blocks, info.pruneheight);
@@ -2890,15 +3027,16 @@ impl Indexer {
         // (large bulk batches); dropping those applied blocks is cheaper than
         // committing a tip that cannot be rewound. A clean end-of-call always
         // covers the tip, so no progress is lost there.
-        if result.is_ok() && count > 0 && group_undo && !paused_by_disk && !self.disk_guard() {
+        if result.is_ok() && count > 0 && !paused_by_disk && !self.disk_guard() {
             let current = tip.expect("tip set");
             let sync = self.commit_sync(info.initialblockdownload, current.height as u64, core_tip);
             self.commit_group(
                 std::mem::take(&mut batch),
                 &current,
                 &group_txids,
+                count,
                 last_ms,
-                group_undo,
+                &group_undo_heights,
                 sync,
             )?;
             committed_height = current.height as u64;
@@ -3039,7 +3177,9 @@ impl Indexer {
         let wait_ms = self.tunables.wait_ms();
         let apply_ms = self.tunables.apply_ms.load(Ordering::Relaxed);
         let commit_ms = self.tunables.commit_ewma.load(Ordering::Relaxed);
-        let commit_per_block = commit_ms / self.tunables.batch_blocks().max(1) as u64;
+        // Measured from the blocks actually committed: dividing by the
+        // configured batch understated the cost of small groups by 10x.
+        let commit_per_block = self.tunables.commit_per_block_ms.load(Ordering::Relaxed);
         eprintln!(
             "[e-lite] height {} ({})  txnum {}  core {}/{} ({})  prune {}  lag {}  \
              {:.1} blocks/s  {:.0} tx/s  elapsed {}  read {}ms decode {}ms prefetch {}ms wait {}ms \
@@ -3151,12 +3291,14 @@ fn commit_sync_policy(mode: &str, ibd: bool, height: u64, core_tip: u64) -> bool
     }
 }
 
-/// Whether the undo record for `height` must be stored. Undo is anchored to the
-/// last block this catch-up call may apply (`batch_end`), so a lagging index
-/// keeps the reorg window at its **own** tip instead of only near Core's tip.
-/// The extra 64 blocks cover an interrupted batch.
-fn should_store_undo(height: u64, batch_end: u64, window: u32) -> bool {
-    height.saturating_add(window as u64).saturating_add(64) >= batch_end
+/// Oldest height whose undo record must survive a commit at `tip`.
+///
+/// Undo is generated for every applied block and pruned only at commit time,
+/// measured from the tip that is actually committed. A commit forced by the
+/// transaction limit, the time limit or the supervisor deadline is therefore
+/// just as rewindable as a full batch.
+fn undo_cutoff(tip: u64, window: u32) -> u64 {
+    tip.saturating_sub(window as u64)
 }
 
 /// Bulk lag guard window. `u64::MAX` means "no baseline yet". The baseline
@@ -3444,7 +3586,91 @@ fn apply_supervisor_actions(
     }
 }
 
+/// Everything that must be decided before e-lite creates certificates, opens
+/// the database or starts Core: memory class, resource plan and Core
+/// parameters. It has no side effects, so a rejected configuration leaves the
+/// data directory untouched.
+fn preflight(cfg: &Config, chain: Chain, require_min_ram: bool) -> R<()> {
+    if require_min_ram {
+        tuning::check_minimum_ram(cfg, chain)?;
+    }
+    let plan = core_plan::plan_core(cfg, chain)?;
+    if !plan.args.is_empty() {
+        eprintln!("[e-lite] core plan: {}", core_plan::describe(&plan));
+    }
+    let b = tuning::memory_budget(cfg);
+    eprintln!(
+        "[e-lite] memory plan: total {} MiB, reserve {} MiB, ceiling {} MiB -> \
+         cache {}..{} MiB, memtables {} MiB, runtime {} MiB (planned {} MiB)",
+        b.total_mib,
+        b.reserve_mib,
+        b.ceiling_mib,
+        b.cache_start_mib,
+        b.cache_max_mib,
+        b.memtables_mib,
+        b.runtime_mib,
+        b.planned_mib
+    );
+    if b.over_budget {
+        return fail(format!(
+            "the memory plan needs {} MiB but only {} MiB fit inside the ceiling; lower \
+             [index] cache_mib/write_buffer_mib, raise memory_fraction, or free RAM",
+            b.planned_mib, b.ceiling_mib
+        ));
+    }
+    if b.ceiling_mib < 256 {
+        return fail(format!(
+            "only {} MiB of the memory ceiling is available for the index; raise \
+             memory_fraction, lower memory_reserve_mib, or use a larger machine",
+            b.ceiling_mib
+        ));
+    }
+    Ok(())
+}
+
+/// Background controller: runs independently of the indexing pipeline so a
+/// single long `catch_up_limited` call cannot delay memory protection. The
+/// step itself is rate-limited by `maybe_adapt`.
+fn spawn_controller(
+    tunables: Arc<Tunables>,
+    store: Arc<Store>,
+    shared: Option<Arc<Shared>>,
+    flag: Arc<AtomicBool>,
+) -> std::thread::JoinHandle<()> {
+    std::thread::Builder::new()
+        .name("el-tune".to_string())
+        .spawn(move || loop {
+            for _ in 0..5 {
+                if flag.load(Ordering::SeqCst) {
+                    return;
+                }
+                std::thread::sleep(Duration::from_secs(1));
+            }
+            if flag.load(Ordering::SeqCst) {
+                return;
+            }
+            let committed = store
+                .committed_tip()
+                .ok()
+                .flatten()
+                .map(|t| t.height as u64)
+                .unwrap_or(0);
+            let (mode, lag) = tunables.mode_for(committed);
+            if tunables
+                .maybe_adapt(mode, lag, &store, shared.as_ref().map(|s| &s.stats))
+                .is_some()
+            {
+                tunables.apply_store(&store);
+            }
+        })
+        .unwrap_or_else(|e| {
+            eprintln!("[e-lite] cannot start the tuning thread: {e}");
+            std::thread::spawn(|| {})
+        })
+}
+
 fn cmd_index(cfg: &Config, chain: Chain) -> R<()> {
+    preflight(cfg, chain, true)?;
     let started_at = SystemTime::now();
     let started = Instant::now();
     let rotational = tuning::is_rotational(&cfg.data_dir(chain));
@@ -3454,6 +3680,19 @@ fn cmd_index(cfg: &Config, chain: Chain) -> R<()> {
     warn_if_disk_low(cfg, chain);
     let core = core_client(cfg, chain)?;
     let flag = shutdown_flag();
+    // A from-zero managed Core begins downloading immediately, so the slot
+    // must be taken before it starts, not after the first index call.
+    let from_zero = store.committed_tip().ok().flatten().is_none();
+    let initial_lock =
+        if from_zero && cfg.core.manage != CoreManage::External && ibd_lock::IbdLock::enabled() {
+            ibd_lock::IbdLock::acquire_waiting(&flag, chain)
+        } else {
+            None
+        };
+    if flag.load(Ordering::SeqCst) {
+        println!("shutdown requested; index stopped");
+        return Ok(());
+    }
     let mut core_sup = CoreSupervisor::new(cfg, chain);
     let Some(identity) =
         ensure_identity_blocking(cfg, chain, &store, &core, &mut core_sup, &flag, true, None)?
@@ -3469,6 +3708,9 @@ fn cmd_index(cfg: &Config, chain: Chain) -> R<()> {
         chain.name()
     );
     let can_control = core_sup.can_control_core();
+    let store_for_controller = Arc::clone(&store);
+    let tunables_for_controller = Arc::clone(&tunables);
+    let controller_flag = Arc::clone(&flag);
     let idx = Indexer::new(
         store,
         core,
@@ -3483,6 +3725,12 @@ fn cmd_index(cfg: &Config, chain: Chain) -> R<()> {
         can_control,
         chain,
     );
+    let controller = spawn_controller(
+        Arc::clone(&tunables_for_controller),
+        Arc::clone(&store_for_controller),
+        None,
+        Arc::clone(&controller_flag),
+    );
     let result = index_loop(
         cfg,
         chain,
@@ -3491,7 +3739,10 @@ fn cmd_index(cfg: &Config, chain: Chain) -> R<()> {
         &mut core_sup,
         flag,
         !cfg.index.follow,
+        initial_lock,
     );
+    controller_flag.store(true, Ordering::SeqCst);
+    let _ = controller.join();
     core_sup.stop();
     if result.is_ok() {
         println!(
@@ -3698,6 +3949,7 @@ fn reload_hot(
 
 /// Shared index loop for `index` and `run`. `stop_at_tip` implements
 /// `--no-follow`; `run` always follows.
+#[allow(clippy::too_many_arguments)]
 fn index_loop(
     cfg: &Config,
     chain: Chain,
@@ -3706,6 +3958,7 @@ fn index_loop(
     core_sup: &mut CoreSupervisor,
     flag: Arc<AtomicBool>,
     stop_at_tip: bool,
+    mut ibd_lock: Option<ibd_lock::IbdLock>,
 ) -> R<()> {
     let can_control = idx.can_control_core;
     let mut supervisor = el_chain::Supervisor::new(supervisor_config(cfg, can_control));
@@ -3776,17 +4029,34 @@ fn index_loop(
                 let core_height = shared
                     .as_ref()
                     .map(|s| s.stats.core_height.load(Ordering::Relaxed))
-                    .unwrap_or(0);
+                    .unwrap_or_else(|| idx.tunables.core_height());
                 let core_ibd = shared
                     .as_ref()
                     .map(|s| s.stats.core_ibd.load(Ordering::Relaxed))
-                    .unwrap_or(false);
+                    .unwrap_or_else(|| idx.tunables.core_ibd());
                 let lag = core_height.saturating_sub(height);
                 let mode = if core_ibd || lag > 1_000 {
                     Mode::Bulk
                 } else {
                     Mode::Live
                 };
+                // Intensive sync = Core IBD or a large backlog. Only one runs
+                // per user; the others wait here (still serving) and start on
+                // their own once the slot is released.
+                let intensive = core_ibd || lag > 5_000;
+                if intensive && ibd_lock.is_none() && ibd_lock::IbdLock::enabled() {
+                    ibd_lock = ibd_lock::IbdLock::acquire_waiting(&flag, chain);
+                    if flag.load(Ordering::SeqCst) {
+                        return Ok(());
+                    }
+                } else if !intensive && lag <= 1_000 {
+                    if let Some(lock) = ibd_lock.take() {
+                        eprintln!(
+                            "[e-lite] caught up; released the intensive-sync slot ({})",
+                            lock.path.display()
+                        );
+                    }
+                }
                 if idx
                     .tunables
                     .maybe_adapt(mode, lag, &idx.store, shared.as_ref().map(|s| &s.stats))
@@ -4330,6 +4600,7 @@ fn start_transports(shared: &Arc<Shared>, cfg: &Config) -> R<Transports> {
 }
 
 fn cmd_serve(cfg: &Config, chain: Chain) -> R<()> {
+    preflight(cfg, chain, false)?;
     let started_at = SystemTime::now();
     let started = Instant::now();
     let mut prepared = cfg.clone();
@@ -4494,6 +4765,7 @@ fn cmd_serve(cfg: &Config, chain: Chain) -> R<()> {
 }
 
 fn cmd_run(cfg: &Config, chain: Chain) -> R<()> {
+    preflight(cfg, chain, true)?;
     let started_at = SystemTime::now();
     let started = Instant::now();
     let mut prepared = cfg.clone();
@@ -4510,6 +4782,21 @@ fn cmd_run(cfg: &Config, chain: Chain) -> R<()> {
     tunables.apply_store(&store);
     warn_if_disk_low(cfg, chain);
     let flag = shutdown_flag();
+    let from_zero = store.committed_tip().ok().flatten().is_none();
+    let index_lock =
+        if from_zero && cfg.core.manage != CoreManage::External && ibd_lock::IbdLock::enabled() {
+            ibd_lock::IbdLock::acquire_waiting(&flag, chain)
+        } else {
+            None
+        };
+    if flag.load(Ordering::SeqCst) {
+        println!(
+            "[e-lite] stopped at {} (uptime {})",
+            format_local_time(SystemTime::now()),
+            format_uptime(started.elapsed())
+        );
+        return Ok(());
+    }
     let mut core_sup = CoreSupervisor::new(cfg, chain);
     // `run` waits for Core. Building Shared only after RPC is ready means peer
     // discovery, mempool and the index loop never see a half-started Core.
@@ -4572,6 +4859,14 @@ fn cmd_run(cfg: &Config, chain: Chain) -> R<()> {
     let index_cfg = cfg.clone();
     let index_shared = Arc::clone(&shared);
     let index_flag = Arc::clone(&flag);
+    // The controller runs beside the index thread, not inside it: a long
+    // catch-up call must never delay cache/memory protection.
+    let controller = spawn_controller(
+        Arc::clone(&tunables),
+        Arc::clone(&store),
+        Some(Arc::clone(&shared)),
+        Arc::clone(&flag),
+    );
     let index_thread = std::thread::spawn(move || {
         let mut core_sup = core_sup;
         let result = index_loop(
@@ -4582,6 +4877,7 @@ fn cmd_run(cfg: &Config, chain: Chain) -> R<()> {
             &mut core_sup,
             index_flag,
             false,
+            index_lock,
         );
         core_sup.stop();
         result
@@ -4613,6 +4909,8 @@ fn cmd_run(cfg: &Config, chain: Chain) -> R<()> {
         let result = index_thread
             .join()
             .unwrap_or_else(|_| fail("index thread panicked"));
+        flag.store(true, Ordering::SeqCst);
+        let _ = controller.join();
         println!(
             "[e-lite] stopped at {} (uptime {})",
             format_local_time(SystemTime::now()),
@@ -4637,6 +4935,8 @@ fn cmd_run(cfg: &Config, chain: Chain) -> R<()> {
             if let Some(rt) = &mut tor_runtime {
                 rt.stop();
             }
+            flag.store(true, Ordering::SeqCst);
+            let _ = controller.join();
             let _ = index_thread.join();
             return Err(e);
         }
@@ -4660,6 +4960,8 @@ fn cmd_run(cfg: &Config, chain: Chain) -> R<()> {
     let _ = transports.mempool.join();
     let _ = transports.notifications.join();
     let _ = transports.memory.join();
+    flag.store(true, Ordering::SeqCst);
+    let _ = controller.join();
     let result = index_thread
         .join()
         .unwrap_or_else(|_| fail("index thread panicked"));
@@ -4987,27 +5289,24 @@ mod tests {
     }
 
     #[test]
-    fn undo_is_kept_at_the_batch_tip_even_when_core_is_far_ahead() {
-        // 512-block catch-up from 0 while Core is at 100k: the last ~352
-        // blocks of the batch keep undo, so the committed tip stays rewindable
-        // if the call is interrupted.
-        assert!(!should_store_undo(100, 511, 288));
-        assert!(should_store_undo(160, 511, 288));
-        assert!(should_store_undo(511, 511, 288));
-        // A short batch (near the tip) keeps undo throughout.
-        assert!(should_store_undo(0, 100, 288));
-        assert!(should_store_undo(0, 0, 288));
-        // With the default batch (256 <= window + 64) every block in the
-        // group is covered, so a commit at any point in the group is safe.
-        let start = 1_000u64;
-        let end = start + 255;
-        for h in start..=end {
-            assert!(should_store_undo(h, end, 288));
-        }
-        // A 512-block group only skips the part that cannot become a commit
-        // tip (the group commits at its end).
-        assert!(!should_store_undo(start, start + 511, 288));
-        assert!(should_store_undo(start + 160, start + 511, 288));
+    fn undo_window_is_measured_from_the_real_commit_tip() {
+        let window = 288u32;
+        // A 512-block group that commits early at 1159 (time limit) still has
+        // undo for 1158: the old group-end prediction did not.
+        let early = 1_159u64;
+        let cutoff = undo_cutoff(early, window);
+        assert!(
+            1_158 >= cutoff,
+            "the block below an early tip must be undoable"
+        );
+        assert!(early >= cutoff);
+        // A commit forced by the transaction limit at 1100 is fully covered.
+        let limited = 1_100u64;
+        assert!(undo_cutoff(limited, window) <= limited);
+        // Heights older than the window are pruned.
+        assert!(undo_cutoff(1_000, window) < 1_000 - window as u64 + 1);
+        // Tip below the window keeps everything.
+        assert_eq!(undo_cutoff(100, window), 0);
     }
 
     #[test]

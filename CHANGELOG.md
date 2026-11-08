@@ -1,5 +1,72 @@
 # Changelog
 
+## 0.1.0-alpha.29.5.0 — 2026-11-09
+
+### Memory, Core and IBD: one plan for the whole pipeline
+
+This release is about making e-lite use the machine it is installed on, and
+refusing to pretend when it cannot.
+
+**Supported minimum (new).** `run`/`index` check the *effective* RAM (host vs
+cgroup minimum) before creating certificates, opening the database or starting
+Core: mainnet needs an 8 GB class machine (`>= 7500 MiB`), testnet4/signet/
+regtest a 4 GB class one (`>= 3800 MiB`). The failure names the detected source
+and the requirement. `serve` (existing index only) is exempt.
+`--allow-low-memory` / `E_LITE_ALLOW_LOW_MEMORY=1` exists for CI.
+
+**One fitted memory budget.** The ceiling is `min(RAM*fraction, RAM-reserve)`
+and runtime + memtables + cache must fit inside it. An explicit fraction is
+never raised to satisfy floors. The reported case (`RAM=7907`,
+`memory_fraction=0.20`) used to plan 1738 MiB inside 1581 MiB and now fits
+exactly. Memtables are capped through a shared RocksDB `WriteBufferManager`
+(no more 64 MiB request becoming 168 MiB of buffers), and a tiny budget
+degrades instead of panicking. Index/bloom filters stay outside the data cache
+but their memory is reported as `table_readers_bytes`.
+
+**Correct cgroup detection.** Limits are resolved from `/proc/self/cgroup` and
+`/proc/self/mountinfo` and every ancestor is walked. Each limit is paired with
+that level's usage, so a parent limit is not combined with a child's usage.
+`doctor` distinguishes limited, unlimited and not detected.
+
+**Descriptors.** `max_open_files` handles `RLIM_INFINITY` (which used to wrap to
+a negative value and collapse to 256), reserves descriptors for client sockets
+and RPC instead of a fixed 64, never pads above the soft limit, and is shown in
+`doctor` and `/status.file_descriptors` with a warning when capped below 2048.
+
+**Core started with a plan.** A Core that e-lite starts now gets
+`-dbcache=clamp(RAM/4, 450, 2048)` (at most `RAM/3`), `-par=cpus-1` (1..8),
+`-rpcthreads=clamp(cpus, 4, 16)` and an explicit `-prune` (including `-prune=0`,
+which previously let `bitcoin.conf` decide). Operator values in `extra_args`
+win; arguments e-lite owns are rejected with an explanation. The child is
+registered before the pid file is written, adoption checks a start-time token,
+and shutdown waits up to 120 s for a clean flush.
+
+**Safer commits.** Undo is generated for every applied block and pruned at
+commit time from the tip that is really committed. A commit forced by the time
+limit, the transaction limit or the supervisor deadline can no longer leave a
+tip without its reorg window; stale undo inserted by the same `WriteBatch` is
+deleted too.
+
+**Controller.** A dedicated `el-tune` thread samples every 5 s and changes at
+most once per 30 s, so a long catch-up cannot delay memory protection. `index`
+without a serving process no longer classifies every workload as live,
+`batch_locked` is honoured, `prefetch_blocks` actually bounds the prepared
+window, and `commit/blk` uses the blocks actually committed (an 8 s commit of
+100 blocks is 80 ms/block, not 7).
+
+**One intensive sync per user.** A `flock` makes a second simultaneous IBD
+**wait** and start automatically instead of halving both throughputs. It is
+taken before a from-zero managed Core starts and released within 1000 blocks of
+Core. Separate containers are not coordinated.
+
+**Measurement.** `tests/bench_sample.py` now uses monotonic elapsed time, the
+real `CLK_TCK`, the simultaneous RSS peak, matching units and `stage_totals_us`;
+it reports `completed` and the shell propagates a failure instead of hiding it.
+Disk accounting no longer counts a nested Core datadir as index.
+
+Docs: `TUNING.md` (minimum, budget, controller, descriptors, Core plan, containers
+and UmbrelOS), `INSTALL.md`, `CLI.md`, `AGENTS.md`, `AUDIT.md` (AUD-081..090).
+
 ## 0.1.0-alpha.29.4.5 — 2026-11-08
 
 ### Fix: cap RocksDB open files to the process limit

@@ -7,6 +7,15 @@ a `.deb`, and an installer/updater script. The installer never edits
 ## Requirements
 
 - Linux Debian 12+/LMDE 6+ (glibc ≥ 2.36), x86_64.
+- **RAM, measured after cgroup limits:** mainnet needs an **8 GB class** machine
+  (`>= 7500 MiB` usable); testnet4, signet and regtest need a **4 GB class**
+  machine (`>= 3800 MiB`). `run`/`index` refuse to start below the minimum and
+  print what they detected; `doctor` shows the host and cgroup figures. `serve`
+  (existing index only) does not enforce it. `--allow-low-memory` exists for CI
+  and regtest but is unsupported for real use.
+- **File descriptors:** `ulimit -n` at least ~4096; 16384 recommended. e-lite
+  caps RocksDB's `max_open_files` to the process limit and logs the effective
+  value, but a low limit makes prevout reads re-open SSTs.
 - `curl` and `ca-certificates` for the installer.
 - Bitcoin Core 28+ for indexing/serving. `txindex` is not required.
 - The e-lite index directory on a filesystem with enough free space:
@@ -53,15 +62,15 @@ export PATH="$HOME/.local/bin:$PATH"
 ## Pinned version
 
 ```bash
-curl -fsSL https://github.com/AlbercoinDev/e-lite/releases/download/v0.1.0-alpha.29.4.5/install.sh \
-  | sh -s -- --version 0.1.0-alpha.29.4.5 --yes
+curl -fsSL https://github.com/AlbercoinDev/e-lite/releases/download/v0.1.0-alpha.29.5.0/install.sh \
+  | sh -s -- --version 0.1.0-alpha.29.5.0 --yes
 ```
 
 With Core:
 
 ```bash
-curl -fsSL https://github.com/AlbercoinDev/e-lite/releases/download/v0.1.0-alpha.29.4.5/install.sh \
-  | sh -s -- --version 0.1.0-alpha.29.4.5 --with-core --yes
+curl -fsSL https://github.com/AlbercoinDev/e-lite/releases/download/v0.1.0-alpha.29.5.0/install.sh \
+  | sh -s -- --version 0.1.0-alpha.29.5.0 --with-core --yes
 ```
 
 ## System-wide .deb
