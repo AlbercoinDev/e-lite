@@ -24,7 +24,7 @@ available**.
 | Overlap/alternate scheduler | experimental | `overlap` default; `alternate` opt-in (Core and e-lite take turns) |
 | Disk guard with download/index split | experimental | cgroup/LXC aware |
 | Adaptive profiles and hot reload | experimental | `auto/hdd/ssd/nvme/manual`, `SIGUSR1` |
-| Global RocksDB memory budget | experimental | `RAM/8` memtables inside a 75 % ceiling; adaptive cache; CPU-capped jobs |
+| Global RocksDB memory budget | experimental | effective `MemAvailable` budget; memtables `effective/16`; adaptive cache; CPU-capped jobs |
 | Reorg recovery within undo window | experimental | deeper reorg fails clearly |
 | Snapshots export/import | experimental | optional; not required from zero |
 
@@ -97,7 +97,7 @@ available**.
 | Application log `e-lite.log` | experimental | tee of console; 16 MiB rotation; `--log-file`/`--no-log-file` |
 | Disk breakdown | experimental | `/status.disk`: index, txids, rawtx cache, log and snapshot bytes |
 | Wallet banner | experimental | built-in INDEXING/READY + template file |
-| Adaptive memory budget | experimental | hot cache grow/shrink; 75 % ceiling; reserve |
+| Adaptive memory budget | experimental | fitted to available RAM; hot cache ceiling; 75 % ceiling; reserve |
 | READY / FULLY SYNCED status | experimental | log, `/status`, `/metrics`, `e-lite status` |
 | Ordered startup/shutdown | experimental | `run` waits for Core; threads joined before Core stop |
 | CLI overrides and `--set` | stable | every TOML field; see `docs/CLI.md` |

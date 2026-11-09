@@ -43,56 +43,78 @@ At startup e-lite detects the machine and derives the defaults:
   paths as NVMe, SATA SSD, HDD, virtual, network or unknown; it also records
   whether both live on the same device.
 
-Example on a 4C/8T i7-6700T with 32 GiB and a SATA SSD:
+Example on a 4C/8T i7-6700T with 32 GiB, 18 GiB available and a SATA SSD:
 
 ```text
-cpu 4C/8T (eff 8, cpuinfo, smt) | mem 32 GiB (reserve 4 GiB, page floor 2 GiB)
+cpu 4C/8T (eff 8, cpuinfo, smt) | mem total 32 GiB avail 18 GiB effective 14 GiB
+(core reserve 4 GiB, reserve 2 GiB, page floor 0.9 GiB)
 data disk sata-ssd (same=yes) | core par=3 rpcthreads=4 dbcache=4096
-index readers=4 jobs=2 cache=4096 memtables=2048 commit=30000ms batch=512
+index readers=4 jobs=2 cache 3.5..8 GiB memtables=880MiB commit=30000ms batch=512
 ```
 
 The same line is printed at startup and stored in `/status.machine`. Explicit
 settings in `[index]`/`[core]` still win; the plan is the automatic default.
 
-| Machine | readers | jobs | core par | core rpcthreads | cache (32 GiB) |
+| Machine | readers | jobs | core par | core rpcthreads | cache ceiling (32 GiB) |
 |---|---:|---:|---:|---:|---:|
-| 4C/8T SATA SSD | 4 | 2 | 3 | 4 | 4 GiB |
+| 4C/8T SATA SSD | 4 | 2 | 3 | 4 | 8 GiB |
 | 4C/8T NVMe | 4 | 2 | 3 | 4 | 8 GiB |
 | 8C/16T NVMe | 8 | 4 | 7 | 8 | 8 GiB |
-| 2C/4T HDD | 2 | 2 | 1 | 4 | 2 GiB |
+| 2C/4T HDD | 2 | 2 | 1 | 4 | 4 GiB |
 
 Virtual/unknown devices use the SATA values and a warning. Network filesystems
 are treated as the slowest class.
 
-## Memory budget
+## Memory budget (fitted to available RAM)
 
-One accounting, three consumers. e-lite never plans more than its ceiling:
+The installed RAM is a ceiling, not the allocation basis. e-lite plans from
+what the OS can give it now:
 
 ```
-reserve    = memory_reserve_mib, else clamp(RAM/8, 2048 MiB, 4096 MiB)
-                         (RAM/4 for machines of 2 GiB or less)
-page_floor = clamp(RAM/16, 1024 MiB, 4096 MiB)   # page cache the block cache
-                                                  # must not evict
-usable     = RAM_total - reserve
-ceiling    = min(RAM_total * memory_fraction, usable)   # 0 -> 0.75, never raised
-runtime    = clamp(RAM_total/32, 96 MiB, 1024 MiB)      # block buffers, overlay,
-                                                        # mempool, queries, Tor
-memtables  = write_buffer_mib, else clamp(RAM_total/16, 512 MiB, 2048 MiB)
-             shrunk so that memtables + runtime + 64 MiB <= ceiling
-cache_max  = min(ceiling - runtime - memtables, disk cap)
-cache_start = cache_mib or the machine plan, capped by cache_max
+core_reserve = fitted -dbcache if e-lite will start Core (0 for external or
+               already-running Core, whose memory is already in MemAvailable)
+effective    = min(total, MemAvailable - core_reserve)
+reserve      = memory_reserve_mib, else clamp(effective/8, 2048 MiB, 4096 MiB)
+                         (effective/4 for machines of 2 GiB or less)
+page_floor   = clamp(effective/16, 512 MiB, 4096 MiB)   # reported, not added
+                                                        # to the shrink floor
+usable       = effective - reserve
+ceiling      = min(effective * memory_fraction, usable)  # 0 -> 0.75, never raised
+runtime      = clamp(effective/32, 96 MiB, 1024 MiB)
+memtables    = write_buffer_mib, else clamp(effective/16, 512 MiB, 2048 MiB)
+               shrunk so that memtables + runtime + 64 MiB <= ceiling
+cache_max    = min(ceiling - runtime - memtables, disk cap)
+cache_start  = cache_mib or min(effective/4, cache_max)
 ```
 
-The cache shrinks when `MemAvailable < reserve + page_floor` and grows only
-when prevout prefetch is slow and there is room for another quarter of the
-cache. Shrinks are 12.5 % steps, not 25 %, to avoid the 8 GiB ↔ 4.5 GiB
-oscillation that starved the page cache.
+The cache ceiling depends on the disk class:
 
-`planned = runtime + memtables + cache_start` is always `<= ceiling`. An
-explicit `memory_fraction` is a hard request: if the components do not fit, the
-memtables and the cache are reduced instead of raising the ceiling. The old
-formula could plan 1738 MiB inside a 1581 MiB ceiling (`RAM=7907`,
-`memory_fraction=0.20`); that case is now a regression test.
+| Disk | 8 GiB | 16 GiB | 32 GiB |
+|---|---:|---:|---:|
+| NVMe / SATA / unknown / virtual | 2 GiB | 4 GiB | 8 GiB |
+| HDD | 1 GiB | 2 GiB | 4 GiB |
+| Network | 1 GiB | 2 GiB | 2 GiB |
+
+Note: these are **ceilings**, not allocations. The hot controller only grows
+towards them when `MemAvailable` leaves room.
+
+Typical plans (the exact numbers depend on `MemAvailable`):
+
+| Installed | Available | Core reserve | effective | reserve | memtables | cache start..max | planned |
+|---:|---:|---:|---:|---:|---:|---:|---:|
+| 8 GiB | 6 GiB | 1 GiB | 5 GiB | 2 GiB | 512 MiB | 1.25..2 GiB | ~1.9 GiB |
+| 16 GiB | 12 GiB | 2 GiB | 10 GiB | 2 GiB | 640 MiB | 2.5..4 GiB | ~3.5 GiB |
+| 32 GiB | 18 GiB | 4 GiB | 14 GiB | 2 GiB | 880 MiB | 3.5..8 GiB | ~4.8 GiB |
+
+On 8 GiB, e-lite plus Core and the reserve fit in about 5.5-6 GiB, leaving
+room for Umbrel and the page cache. On 16 GiB the cache doubles; on 32 GiB it
+can reach 8 GiB if the OS actually has it free. More RAM means more cache, not
+a bigger fixed reservation.
+
+`planned = runtime + memtables + cache_start` must satisfy
+`planned + reserve <= effective`. An explicit `memory_fraction` is a hard
+request: if the components do not fit, memtables and cache are reduced instead
+of raising the ceiling. Regression tests cover 8 GiB and 16 GiB machines.
 
 Two different budgets are reported and must not be confused:
 
@@ -107,21 +129,35 @@ plan reserves runtime for them; if they grow past it, raise the reserve or lower
 
 `cache_mib` is a **maximum**, not a fixed value. The controller may use less
 under pressure and grow back up to it. `write_buffer_mib` is fixed when the
-store opens (changing it requires a restart).
+store opens (changing it requires a restart); this release deliberately does
+not resize RocksDB memtables hot because `WriteBufferManager::set_buffer_size`
+can force flushes and stall commits.
 
-The block cache is adjusted at most once every 30 seconds:
+### Hot cache controller
 
-- **grow +256 MiB** while `MemAvailable >= 1.5 × reserve` and below `cache_max`;
-- **shrink 25 %** when `MemAvailable < reserve`, with a soft floor of
-  `clamp(RAM/8, 512 MiB, 4096 MiB)`;
-- below 256 MiB available the floor no longer applies, readers are reduced, and
-  the cache may fall to 8 MiB — a low-memory emergency must be able to return
-  memory;
-- two consecutive samples in the same direction are required (hysteresis).
+The ceiling is recomputed from current memory:
+
+```
+current      = cache + memtables + runtime
+effective    = min(total, MemAvailable + current)
+cache_ceiling = min(profile_cap,
+                    effective - reserve - memtables - runtime)
+```
+
+- **grow +256 MiB** only when `MemAvailable >= reserve + cache + margin` and
+  prevout prefetch is slow. `margin = clamp(effective/8, 256 MiB, 2 GiB)`.
+- **shrink** when `cache > cache_ceiling` or `MemAvailable < reserve`.
+- **critical**: below 1 GiB available, act on one sample; below 256 MiB reduce
+  readers and allow the cache to fall to 8 MiB.
+- two consecutive samples and a 5-minute reversal dwell prevent the
+  grow/shrink flapping that previously evicted the UTXO set.
+
+The page-cache floor is **not** added to the shrink threshold: `MemAvailable`
+already includes reclaimable page cache. Adding it double-counted and caused
+the 2048 ↔ 3997 MiB oscillation in the 32 GiB log.
 
 Cache decisions use `MemAvailable` only. A low page-cache number is expected
-while the RocksDB cache holds the UTXO working set; shrinking because of it was
-what produced the 6.6 GiB → 256 MiB oscillation.
+while the RocksDB cache holds the UTXO working set.
 
 ## Controller cadence
 
@@ -164,7 +200,7 @@ When e-lite starts Core (`manage = "auto"` with no running node, or
 
 | Argument | Rule |
 |---|---|
-| `-dbcache` | `clamp(RAM/8, 450, 4096)` MiB, at most `RAM/3` |
+| `-dbcache` | `min(total/8, available/2, 4096)` MiB, at most `RAM/3` |
 | `-par` | physical cores - 1, clamped to 1..8 (leaves a core for the index) |
 | `-rpcthreads` | `clamp(physical cores, 4, 16)` |
 | `-listenonion` | `0`: e-lite publishes its own Electrum onion and does not create a Tor control port |
@@ -400,9 +436,9 @@ At ~640k height on a 32 GiB machine, default settings:
 
 Conclusions applied as defaults in 0.1.0-alpha.29.4.4:
 
-- The cache is capped at `RAM/4` with a floor of
-  `clamp(RAM/8, 512 MiB, 4096 MiB)`; shrinking uses `MemAvailable`, not a low
-  page-cache number.
+- The cache is capped at `total/4` (profile) and by the effective room, with a
+  floor of `clamp(effective/8, 512 MiB, 2048 MiB)`; shrinking uses
+  `MemAvailable` and the OS reserve, not a low page-cache number.
 - Index and bloom filters stay out of the data block cache and
   `max_open_files = 8192`, so prefetch lookups do not pay an extra disk read
   when the data cache shrinks.

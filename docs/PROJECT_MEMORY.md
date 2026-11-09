@@ -52,13 +52,17 @@ the per-client rate limiter are implemented; client authentication is not.
   logical SMT), cgroup CPU quota, and the data/Core disk class
   (NVMe/SATA/HDD/virtual/network). A 4C/8T box gets `readers=4`, `jobs=2`,
   Core `par=3`, `rpcthreads=4`. Explicit config wins.
-- RocksDB memtables use a global `RAM/16` budget (weighted per CF: `utxo` 6,
-  `history`/`utxo_by_script` 4) inside a memory ceiling of 75 % of total RAM,
-  with `clamp(RAM/8, 2-4 GiB)` reserved for the OS/Core/page cache plus a
-  `clamp(RAM/16, 1-4 GiB)` page-cache floor. The block cache shrinks in 12.5 %
-  steps and `cache_mib` is a maximum; growth requires measured prefetch
-  pressure, not merely free RAM. Every knob can be overridden from the CLI or
-  `--set`.
+- The memory budget uses **available** RAM, not installed RAM:
+  `effective = min(total, MemAvailable - core_reserve)`. Memtables use a global
+  `effective/16` budget (weighted per CF: `utxo` 6, `history`/`utxo_by_script`
+  4) inside a ceiling of 75 % of effective, with `clamp(effective/8, 2-4 GiB)`
+  reserved for the OS/Core/page cache. The profile cache ceiling is `total/4`
+  for local SSD/unknown (2 GiB at 8 GiB, 4 at 16, 8 at 32) and `total/8` for
+  HDD/network, capped by the effective room; `cache_mib` is a maximum. The hot
+  controller follows
+  `MemAvailable`, shrinks below the reserve and grows only with a proportional
+  margin and slow prefetch. Memtables are fixed at startup; hot WBM resizing is
+  future work. Every knob can be overridden from the CLI or `--set`.
 - Bulk commits are bounded by 250k transactions, 512 blocks, raw bytes
   (`clamp(RAM/128, 64-256 MiB)`) or 20-60 s by disk class (minimum 8 blocks/60 s);
   live mode commits every 1.5 s. The prune gate uses the committed tip, so this

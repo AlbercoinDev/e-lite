@@ -1,5 +1,72 @@
 # Changelog
 
+## 0.1.0-alpha.29.8.1 — 2026-11-09
+
+### RAM budget follows available memory, not installed RAM
+
+No schema, protocol or consensus change. This is a memory-policy release for
+the 8-16 GiB machines that are the normal deployment; the 32 GiB host is the
+outlier.
+
+**Startup budget from `MemAvailable`.** `budget_with` received `available_mib`
+but calculated every knob from total RAM. It now computes
+
+```text
+effective = min(total, available - core_reserve)
+```
+
+and derives reserve, ceiling, runtime, memtables, cache start, cache floor and
+page-cache floor from `effective`. `core_reserve` is the fitted `-dbcache` when
+e-lite is about to start Core; external Core and an already-running Core are
+already included in `MemAvailable`. On an 8 GiB box with 6 GiB available the
+plan is ~2.2 GiB of e-lite cache/memtables/runtime instead of 7 GiB; on 16 GiB
+it is ~4-5 GiB; on 32 GiB it still grows with what is free.
+
+**Cache ceilings scale with RAM.** Local SATA/unknown/virtual now allow
+`RAM/4` (2 GiB at 8 GiB, 4 GiB at 16 GiB, 8 GiB at 32 GiB) instead of `RAM/8`;
+HDD uses `RAM/8` and network `RAM/8`. The ceiling is not an allocation: the
+hot controller only grows when `MemAvailable` leaves a proportional margin.
+
+**Stable hot cache.** The cache controller now:
+
+- uses `available < reserve` (not `reserve + page_cache_floor`, which
+  double-counted reclaimable page cache) as the shrink trigger;
+- shrinks immediately when the current cache exceeds its dynamic ceiling;
+- requires two samples and a 5-minute reversal dwell, with a fast path below
+  1 GiB;
+- grows with a margin of `(effective/8).clamp(256 MiB, 2 GiB)`, not a fixed
+  2 GiB;
+- recomputes the ceiling as
+  `min(profile_cap, available + current_e-lite - reserve - memtables - runtime)`.
+
+`shrink_for_core_resume` is no longer a no-op: it acts only when
+`MemAvailable < reserve + cache/4`.
+
+**Core and memtables.** Managed Core's `-dbcache` is now
+`min(total/8, available/2, 4096 MiB)`: ~1 GiB on 8 GiB, 2 GiB on 16 GiB, 4 GiB
+on 32 GiB, smaller when the OS has little free memory. Memtables are
+`clamp(effective/16, 512 MiB, 2048 MiB)` at startup. They are not resized hot
+in this release: `WriteBufferManager::set_buffer_size` can force flushes and
+stall commits; the cache is the safe hot knob.
+
+**Block-size watermark.** `avg_block_bytes` uses a 1/1024 EWMA instead of 1/8,
+so a few large blocks cannot move the byte backlog by 3-4x between pause and
+resume.
+
+**Commit controller.** `batch_blocks` is capped at 512 (the catch-up
+checkpoint) and only grows for a `Blocks`-limited group. `Time` groups may grow
+the interval; `Txs`/`Bytes` groups leave both alone. This removes the
+`batch -> 1152` lines while real groups were 47-104 blocks.
+
+**Logs.** Startup/doctor print total, available, effective, core reserve,
+reserve, page floor, ceiling and cache start..max. The hot memory line prints
+the dynamic and profile caps and the effective budget.
+
+Tests: fmt, clippy, workspace; new unit tests cover the 8 GiB and 16 GiB
+budgets, the dynamic cache action, the long block average and the batch cap.
+e2e defaults, regtest, recovery, pruned-IBD, multi-instance and launch-Core
+pass.
+
 ## 0.1.0-alpha.29.8.0 — 2026-11-09
 
 ### Byte backlog watermarks, opt-in alternate scheduler, commit/reader fixes

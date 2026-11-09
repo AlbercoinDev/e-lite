@@ -60,15 +60,15 @@ version          print version
 | `--adaptive` / `--no-adaptive` | `index.adaptive` | `true` |
 | `--readers <n>` | `index.readers` | `0` (profile/auto) |
 | `--cache-mib <n>` | `index.cache_mib` | `0` (auto; explicit = maximum) |
-| `--write-buffer-mib <n>` | `index.write_buffer_mib` | `0` (RAM/8) |
-| `--memory-reserve-mib <n>` | `index.memory_reserve_mib` | `0` (max(1024, RAM/8)) |
-| `--memory-fraction <f>` | `index.memory_fraction` | `0` (0.75 of total RAM) |
+| `--write-buffer-mib <n>` | `index.write_buffer_mib` | `0` (effective/16, 512 MiB..2 GiB) |
+| `--memory-reserve-mib <n>` | `index.memory_reserve_mib` | `0` (clamp(effective/8, 2-4 GiB)) |
+| `--memory-fraction <f>` | `index.memory_fraction` | `0` (0.75 of **effective** RAM) |
 | `--allow-low-memory` | `index.allow_low_memory` | `false` (unsupported; CI/regtest only) |
 | `--background-jobs <n>` | `index.background_jobs` | `0` (profile, capped by CPUs) |
 | `--commit-interval-ms <n>` | `index.commit_interval_ms` | `0` (profile; 500..30000) |
 | `--commit-sync <mode>` | `index.commit_sync` | `auto` (`txids` in bulk, `always` live) |
-| `--prefetch-blocks <n>` | `index.prefetch_blocks` | `0` (reserved) |
-| `--batch <n>` | `index.batch_blocks` | `256`/profile |
+| `--prefetch-blocks <n>` | `index.prefetch_blocks` | `0` (auto; >0 caps the window) |
+| `--batch <n>` | `index.batch_blocks` | `256`/profile, capped at 512 |
 | `--reorg-window <n>` | `index.reorg_window` | `288` |
 | `--milestone-blocks <n>` | `index.milestone_blocks` | `10000` |
 | `--milestone-seconds <n>` | `index.milestone_seconds` | `21600` |
@@ -78,8 +78,10 @@ report it incorrectly; set `--profile ssd` or `--profile nvme` when you know the
 real hardware.
 
 Explicit readers/commit values lock that knob. `cache_mib` is a **maximum**: the
-memory policy can lower it for safety and grow back up to it. See
-[`TUNING.md`](TUNING.md#memory-budget).
+memory policy can lower it for safety and grow back up to it. The automatic
+plan is fitted to `MemAvailable`, not to installed RAM: 8 GiB machines get about
+2 GiB of cache, 16 GiB about 4 GiB and 32 GiB up to 8 GiB, always subject to
+what the OS has free. See [`TUNING.md`](TUNING.md#memory-budget-fitted-to-available-ram).
 
 ### Examples
 

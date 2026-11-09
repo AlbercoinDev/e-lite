@@ -1668,13 +1668,17 @@ fn cmd_doctor(cfg: &Config, chain: Chain) -> R<()> {
         }
     );
     println!(
-        "memory budget: total {} MiB, available {} MiB, cached {} MiB, reserve {} MiB, \
-         ceiling {} MiB, cache max {} MiB, memtables {} MiB",
+        "memory budget: total {} MiB, available {} MiB, effective {} MiB \
+         (core reserve {}), cached {} MiB, reserve {} MiB, ceiling {} MiB, \
+         cache start..max {}..{} MiB, memtables {} MiB",
         budget.total_mib,
         budget.available_mib,
+        budget.effective_mib,
+        budget.core_reserve_mib,
         budget.cached_mib,
         budget.reserve_mib,
         budget.ceiling_mib,
+        budget.cache_start_mib,
         budget.cache_max_mib,
         budget.memtables_mib
     );
@@ -4192,20 +4196,27 @@ fn preflight(cfg: &Config, chain: Chain, require_min_ram: bool) -> R<()> {
         mem.total_mib.unwrap_or(1024),
         mem.available_mib,
         mem.cached_mib,
-        Some(mplan.reserve_mib),
-        Some(mplan.memtables_mib),
+        None,
+        None,
+        mplan.core_reserve_mib,
     );
     b.cache_max_mib = b.cache_max_mib.min(mplan.cache_mib).max(8);
     b.cache_start_mib = b.cache_start_mib.min(b.cache_max_mib);
+    b.cache_floor_mib = b.cache_floor_mib.min(b.cache_max_mib);
     b.planned_mib = b
         .runtime_mib
         .saturating_add(b.memtables_mib)
         .saturating_add(b.cache_start_mib);
-    b.over_budget = b.planned_mib > b.ceiling_mib;
+    b.over_budget = b.planned_mib > b.ceiling_mib
+        || b.planned_mib.saturating_add(b.reserve_mib) > b.effective_mib;
     eprintln!(
-        "[e-lite] memory plan: total {} MiB, reserve {} MiB, page floor {} MiB, ceiling {} MiB -> \
+        "[e-lite] memory plan: total {} MiB, available {} MiB, effective {} MiB \
+         (core reserve {}), reserve {} MiB, page floor {} MiB, ceiling {} MiB -> \
          cache {}..{} MiB, memtables {} MiB, runtime {} MiB (planned {} MiB)",
         b.total_mib,
+        b.available_mib,
+        b.effective_mib,
+        b.core_reserve_mib,
         b.reserve_mib,
         b.page_cache_floor_mib,
         b.ceiling_mib,
@@ -4637,14 +4648,25 @@ fn index_loop(
         idx.tunables.prefetch_blocks(),
         idx.tunables.adaptive()
     );
-    let (mem_total, mem_reserve, mem_ceiling, mem_memtables, mem_runtime) =
-        idx.tunables.memory_numbers();
+    let (
+        mem_total,
+        mem_available,
+        mem_effective,
+        mem_core_reserve,
+        mem_reserve,
+        mem_ceiling,
+        mem_memtables,
+        mem_runtime,
+    ) = idx.tunables.memory_numbers();
     let mem_now = tuning::memory_info();
     eprintln!(
-        "[e-lite] memory: total {} MiB, available {} MiB, buff/cache {} MiB, \
-         reserve {} MiB, ceiling {} MiB -> cache {} MiB, memtables {} MiB, runtime {} MiB",
+        "[e-lite] memory: total {} MiB, available {} MiB, effective {} MiB \
+         (core reserve {}), buff/cache {} MiB, reserve {} MiB, ceiling {} MiB -> \
+         cache {} MiB, memtables {} MiB, runtime {} MiB",
         mem_total,
-        mem_now.available_mib,
+        mem_now.available_mib.max(mem_available),
+        mem_effective,
+        mem_core_reserve,
         mem_now.cached_mib,
         mem_reserve,
         mem_ceiling,

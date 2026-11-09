@@ -1,9 +1,9 @@
 # Session handoff
 
 **Updated:** 2026-11-09
-**Latest published release:** `0.1.0-alpha.29.8.0`
-**Release:** https://github.com/AlbercoinDev/e-lite/releases/tag/v0.1.0-alpha.29.8.0
-**Main commit at handoff:** tag `v0.1.0-alpha.29.8.0`
+**Latest published release:** `0.1.0-alpha.29.8.1`
+**Release:** https://github.com/AlbercoinDev/e-lite/releases/tag/v0.1.0-alpha.29.8.1
+**Main commit at handoff:** tag `v0.1.0-alpha.29.8.1`
 
 This file is the short “where we are” for a new session. The invariants live in
 [`AGENTS.md`](../AGENTS.md) and [`PROJECT_MEMORY.md`](PROJECT_MEMORY.md); the
@@ -73,11 +73,12 @@ no repitas contexto ni rehagas decisiones ya documentadas.
   `auto|hdd|ssd|nvme|manual`, readers capped at 4/8/16, cgroup memory aware,
   explicit readers/commit overrides locked. Every knob is also available via CLI
   and `--set` (see `docs/CLI.md`).
-- Memory: reserve `clamp(RAM/8, 2-4 GiB)`, page-cache floor
-  `clamp(RAM/16, 1-4 GiB)`, ceiling 75 % of RAM, memtables `RAM/16` (weighted
-  per CF); the cache grows only while prevout prefetch is measurably slow and
-  shrinks 12.5 % under pressure; `cache_mib` is a maximum. Readers/jobs come
-  from physical cores and the disk class.
+- Memory: budget fitted to `MemAvailable` (`effective = min(total, available -
+  core_reserve)`), reserve `clamp(effective/8, 2-4 GiB)`, ceiling 75 % of
+  effective, memtables `effective/16` (weighted per CF), local-SSD profile
+  cache ceiling `total/4` (2 GiB at 8, 4 at 16, 8 at 32) capped by the effective
+  room; the hot cache follows available RAM with hysteresis and `cache_mib` is
+  a maximum. Readers/jobs come from physical cores and the disk class.
 - `run` waits for Core RPC before starting P2P/mempool/listeners; `serve` is the
   offline mode. Shutdown joins background threads and stops managed Tor before
   stopping Core.
@@ -85,6 +86,44 @@ no repitas contexto ni rehagas decisiones ya documentadas.
   the onion setup, reset and security.
 - `docs/ROADMAP.md` contains future features/improvements. Do not present them as
   available.
+
+## Last change (alpha.29.8.1)
+
+Memory budget fitted to available RAM, not installed RAM.
+
+- **Effective budget**: `effective = min(total, MemAvailable - core_reserve)`.
+  Reserve, ceiling, runtime, memtables, cache start/floor and page floor derive
+  from it. `core_reserve` is the fitted `-dbcache` when e-lite will start Core;
+  external or already-running Core is already in `MemAvailable`.
+- **8/16 GiB typical**: local SATA/unknown/virtual cache ceiling is `RAM/4`
+  (2 GiB at 8 GiB, 4 at 16, 8 at 32); HDD/network `RAM/8`. Memtables are
+  `effective/16` (512 MiB at 8 GiB, 640 MiB at 16, ~880 MiB at the 32 GiB log
+  with 18 GiB available). `-dbcache` is `min(total/8, available/2, 4096)`.
+- **Hot cache**: dynamic ceiling from `MemAvailable + current`; shrink when
+  `cache > ceiling` or `available < reserve`; grow with a proportional margin;
+  two samples + 5-minute reversal dwell, fast path below 1 GiB. The page-cache
+  floor is no longer added to the shrink floor.
+- **Memtables**: fixed at startup from `effective`; no hot WBM resize in this
+  release because it can force flushes/commits stalls.
+- **Block-size average**: 1/1024 EWMA instead of 1/8, so a burst cannot move
+  the byte backlog 3-4x between pause and resume.
+- **Commit batch**: capped at 512 (the checkpoint); grows only for a
+  `Blocks`-limited group. `Time` may grow the interval; `Txs`/`Bytes` do not
+  touch batch or interval.
+- **Logs**: memory plan prints total, available, effective, core reserve,
+  reserve, page floor, ceiling and cache start..max; `doctor` and
+  `/status.machine` expose the same fields.
+- Tests: fmt, clippy, workspace; new 8/16 GiB budget tests, dynamic cache
+  action, long block average, batch cap. e2e defaults, regtest, recovery,
+  pruned-IBD, multi-instance and launch-Core pass.
+
+### Not yet verified in 29.8.1
+
+- No mainnet run of the new available-RAM budget yet; the 8/16 GiB numbers are
+  unit-tested, not measured on Umbrel.
+- Hot memtable resizing remains future work.
+- `scheduler = "alternate"` is still opt-in; keep `overlap` until a Core-solo
+  measurement beats the break-even.
 
 ## Last change (alpha.29.8.0)
 

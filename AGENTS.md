@@ -212,19 +212,35 @@ Never treat a version number in this file as authoritative over the code/tag.
 - Electrum 1.7 `outpoint.*` is resolved on demand from the existing history/UTXO
   data; do not add a persistent spend index to `apply_block` without a benchmark
   and a schema/migration plan. `scriptpubkey.*` reuses the scripthash logic.
-- The memory budget reserves `memory_reserve_mib`, else `clamp(RAM/8, 512 MiB,
-  2048 MiB)` (`RAM/4` at 2 GiB or less), for the OS/Core/page cache, and fits
-  runtime + memtables + cache inside `min(RAM*memory_fraction, RAM-reserve)`.
+- The memory budget is fitted to **available** RAM, not installed RAM:
+  `effective = min(total, MemAvailable - core_reserve)`, where `core_reserve`
+  is the fitted `-dbcache` when e-lite is about to start Core. Reserve,
+  ceiling, runtime, memtables, cache start/floor and page floor derive from
+  `effective`. The reserve is `memory_reserve_mib`, else
+  `clamp(effective/8, 2048 MiB, 4096 MiB)` (`effective/4` at 2 GiB or less).
+  Memtables are `clamp(effective/16, 512 MiB, 2048 MiB)`; the profile cache
+  ceiling is `total/4` for NVMe/SATA/unknown/virtual (2 GiB at 8 GiB, 4 at 16,
+  8 at 32) and `total/8` for HDD/network, then capped by the effective room
+  (`effective - reserve - memtables - runtime`). The ceiling is not an
+  allocation.
   An explicit fraction is **never raised** to satisfy floors:
-  `planned_mib <= ceiling_mib` is a regression test. Memtables use one shared
-  `WriteBufferManager`; per-CF arithmetic no longer multiplies the budget.
-  `cache_mib` is a maximum, not a lock, and the block cache still moves in
-  256 MiB steps under `MemAvailable`. Below 256 MiB available the soft floor is
-  bypassed, readers are reduced and the cache may reach 8 MiB. Before Core
-  resumes downloads after a bulk pause, the cache shrinks to the live budget.
+  `planned_mib + reserve <= effective_mib` is a regression test. Memtables use
+  one shared `WriteBufferManager`; they are fixed at startup (hot resize can
+  force flushes). `cache_mib` is a maximum, not a lock. The hot ceiling is
+  `min(profile, MemAvailable + current - reserve - memtables - runtime)`; the
+  cache shrinks when `cache > ceiling` or `MemAvailable < reserve`, grows in
+  256 MiB steps only with a `clamp(effective/8, 256 MiB, 2 GiB)` margin and
+  slow prefetch, and needs two samples plus a 5-minute reversal dwell. Below
+  1 GiB it acts immediately; below 256 MiB readers are reduced and the cache
+  may reach 8 MiB. The page-cache floor is reported but not added to the
+  shrink floor (`MemAvailable` already includes reclaimable cache). The
+  pre-Core-resume shrink only acts if `MemAvailable < reserve + cache/4`.
 - Minimum RAM (`run`/`index`): mainnet 7500 MiB, other networks 3800 MiB, from
-  the effective total after cgroup limits. The check runs before certificates,
-  RocksDB or Core; `serve` is exempt. `--allow-low-memory` /
+  the effective total after cgroup limits (8 GB / 4 GB classes). The minimum is
+  checked against total/cgroup, not current `MemAvailable`, so a temporary
+  memory peak does not reject a valid 8 GB machine; the dynamic budget uses
+  `MemAvailable` and reduces cache/memtables instead. The check runs before
+  certificates, RocksDB or Core; `serve` is exempt. `--allow-low-memory` /
   `E_LITE_ALLOW_LOW_MEMORY=1` is CI-only.
 - cgroups are resolved from `/proc/self/cgroup` + `/proc/self/mountinfo` and
   every ancestor is walked. Each limit is paired with that level's own usage;
@@ -234,10 +250,10 @@ Never treat a version number in this file as authoritative over the code/tag.
   `RLIM_INFINITY`, never pads back above the limit, and is shown with the soft
   limit in `doctor`/`/status.file_descriptors`; a cap below 2048 warns and a
   limit leaving RocksDB < 20 descriptors is a startup error.
-- A Core started by e-lite gets a fitted `-dbcache` (`clamp(RAM/8, 450, 4096)`,
-  <= `RAM/3`), `-par` (physical cores - 1, 1..8), `-rpcthreads` (physical
-  cores, 4..16), `-listenonion=0` and an explicit `-prune` (including
-  `-prune=0`). Core's own
+- A Core started by e-lite gets a fitted `-dbcache`
+  (`min(total/8, MemAvailable/2, 4096)`, <= `RAM/3`), `-par` (physical cores -
+  1, 1..8), `-rpcthreads` (physical cores, 4..16), `-listenonion=0` and an
+  explicit `-prune` (including `-prune=0`). Core's own
   onion is disabled because the managed `torrc` has no `ControlPort`; only the
   Electrum onion is published. Operator values win for `-dbcache`, `-par`,
   `-rpcthreads` and `-listenonion`; `-datadir/-chain/-server/-daemon/

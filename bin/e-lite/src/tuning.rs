@@ -312,10 +312,14 @@ impl DiskKind {
     pub fn cache_cap_mib(self, ram_mib: u64) -> u64 {
         match self {
             DiskKind::Nvme => (ram_mib / 4).clamp(1024, 8192),
-            DiskKind::SataSsd => (ram_mib / 8).clamp(1024, 4096),
-            DiskKind::Hdd => (ram_mib / 16).clamp(512, 2048),
-            DiskKind::Virtual | DiskKind::Unknown => (ram_mib / 8).clamp(1024, 4096),
-            DiskKind::Network => (ram_mib / 16).clamp(512, 2048),
+            // Local SATA/unknown/virtual: a quarter of RAM is a safe ceiling
+            // when the budget is fitted to MemAvailable. 8 GiB -> 2 GiB,
+            // 16 GiB -> 4 GiB, 32 GiB -> 8 GiB.
+            DiskKind::SataSsd | DiskKind::Virtual | DiskKind::Unknown => {
+                (ram_mib / 4).clamp(1024, 8192)
+            }
+            DiskKind::Hdd => (ram_mib / 8).clamp(512, 4096),
+            DiskKind::Network => (ram_mib / 8).clamp(512, 2048),
         }
     }
     /// Bulk commit interval. Fewer, larger groups amortise fsync and locks;
@@ -560,9 +564,17 @@ pub struct MachinePlan {
     pub data_disk: DiskInfo,
     pub core_disk: DiskInfo,
     pub same_device: bool,
+    /// Budget basis: `min(total, available - core_reserve)`.
+    pub effective_mib: u64,
+    /// Memory reserved for the Core that e-lite will start (0 for external).
+    pub core_reserve_mib: u64,
     pub readers: usize,
     pub jobs: usize,
+    /// Cache ceiling for this profile. The initial value comes from
+    /// `cache_start_mib` and the hot controller grows towards this cap only
+    /// while the OS has memory available.
     pub cache_mib: u64,
+    pub cache_start_mib: u64,
     pub memtables_mib: u64,
     pub reserve_mib: u64,
     pub page_cache_floor_mib: u64,
@@ -609,34 +621,43 @@ impl MachinePlan {
         } else {
             (physical / 2).clamp(2, data_disk.kind.jobs_cap())
         };
-        let cache_mib = if cfg.index.cache_mib > 0 {
-            cfg.index.cache_mib
+        let core_dbcache_mib = fitted_dbcache_mib(ram_mib, mem.available_mib);
+        let core_reserve_mib = if cfg.core.manage == crate::config::CoreManage::External {
+            0
         } else {
-            data_disk
-                .kind
-                .cache_cap_mib(ram_mib)
-                .min((ram_mib / 4).max(64))
+            core_dbcache_mib
         };
+        // The startup budget is fitted to what the OS can give now, minus the
+        // Core cache if e-lite is about to start Core. Installed RAM only caps
+        // the result; it is not the allocation basis.
+        let budget = budget_with(
+            cfg,
+            ram_mib,
+            mem.available_mib,
+            mem.cached_mib,
+            None,
+            None,
+            core_reserve_mib,
+        );
+        let profile_cap = data_disk.kind.cache_cap_mib(ram_mib);
+        let cache_mib = if cfg.index.cache_mib > 0 {
+            budget.cache_max_mib
+        } else {
+            budget.cache_max_mib.min(profile_cap.max(8))
+        };
+        let cache_start_mib = budget.cache_start_mib.min(cache_mib);
+        let reserve_mib = budget.reserve_mib;
+        let page_cache_floor_mib = budget.page_cache_floor_mib;
+        let memtables_mib = budget.memtables_mib;
         let commit_ms = if cfg.index.commit_interval_ms > 0 {
             cfg.index.commit_interval_ms
         } else {
             data_disk.kind.bulk_commit_ms()
         };
         let batch_blocks = if cfg.index.batch_blocks > 0 && cfg.index.batch_blocks != 256 {
-            cfg.index.batch_blocks
+            cfg.index.batch_blocks.min(512)
         } else {
             512
-        };
-        let reserve_mib = if cfg.index.memory_reserve_mib > 0 {
-            cfg.index.memory_reserve_mib
-        } else {
-            auto_reserve_mib(ram_mib)
-        };
-        let page_cache_floor_mib = (ram_mib / 16).clamp(1024, 4096);
-        let memtables_mib = if cfg.index.write_buffer_mib > 0 {
-            cfg.index.write_buffer_mib
-        } else {
-            (ram_mib / 16).clamp(512, 2048)
         };
         let max_group_txs = if data_disk.kind == DiskKind::Hdd {
             500_000
@@ -652,9 +673,12 @@ impl MachinePlan {
             data_disk,
             core_disk,
             same_device,
+            effective_mib: budget.effective_mib,
+            core_reserve_mib,
             readers,
             jobs,
             cache_mib,
+            cache_start_mib,
             memtables_mib,
             reserve_mib,
             page_cache_floor_mib,
@@ -664,26 +688,31 @@ impl MachinePlan {
             max_group_bytes,
             core_par: physical.saturating_sub(1).clamp(1, 8) as u64,
             core_rpcthreads: physical.clamp(4, 16) as u64,
-            core_dbcache_mib: (ram_mib / 8).clamp(450, 4096),
+            core_dbcache_mib,
             prune_timeout_seconds: 120,
         }
     }
 
     pub fn describe(&self) -> String {
         format!(
-            "cpu {}C/{}T (eff {}, {}{}) | mem {} MiB (cgroup {}, reserve {}, page floor {}) | \
+            "cpu {}C/{}T (eff {}, {}{}) | mem total {} avail {} effective {} MiB \
+             (cgroup {}, core reserve {}, reserve {}, page floor {}) | \
              data disk {} ({}, same={}) | core par={} rpcthreads={} dbcache={} | \
-             index readers={} jobs={} cache={} memtables={} commit={}ms batch={} txs={} bytes={}MiB",
+             index readers={} jobs={} cache {}..{} memtables={} commit={}ms batch={} txs={} \
+             bytes={}MiB",
             self.cpu.physical,
             self.cpu.logical,
             self.cpu.effective,
             self.cpu.source,
             if self.cpu.smt { ", smt" } else { "" },
             self.mem.total_mib.unwrap_or(0),
+            self.mem.available_mib,
+            self.effective_mib,
             self.mem
                 .cgroup_limit_mib
                 .map(|v| v.to_string())
                 .unwrap_or_else(|| "none".to_string()),
+            self.core_reserve_mib,
             self.reserve_mib,
             self.page_cache_floor_mib,
             self.data_disk.kind.name(),
@@ -694,6 +723,7 @@ impl MachinePlan {
             self.core_dbcache_mib,
             self.readers,
             self.jobs,
+            self.cache_start_mib,
             self.cache_mib,
             self.memtables_mib,
             self.commit_ms,
@@ -717,6 +747,8 @@ impl MachinePlan {
             "memory": {
                 "total_mib": self.mem.total_mib,
                 "available_mib": self.mem.available_mib,
+                "effective_mib": self.effective_mib,
+                "core_reserve_mib": self.core_reserve_mib,
                 "cgroup_limit_mib": self.mem.cgroup_limit_mib,
                 "cgroup_used_mib": self.mem.cgroup_used_mib,
                 "reserve_mib": self.reserve_mib,
@@ -727,6 +759,8 @@ impl MachinePlan {
                     "kind": self.data_disk.kind.name(),
                     "mount": self.data_disk.mount,
                     "device": self.data_disk.device,
+                    "dev": self.data_disk.dev,
+                    "mount_source": self.data_disk.mount_source,
                     "fstype": self.data_disk.fstype,
                     "free_bytes": self.data_disk.free_bytes,
                     "total_bytes": self.data_disk.total_bytes,
@@ -736,6 +770,8 @@ impl MachinePlan {
                     "kind": self.core_disk.kind.name(),
                     "mount": self.core_disk.mount,
                     "device": self.core_disk.device,
+                    "dev": self.core_disk.dev,
+                    "mount_source": self.core_disk.mount_source,
                     "fstype": self.core_disk.fstype,
                     "free_bytes": self.core_disk.free_bytes,
                     "total_bytes": self.core_disk.total_bytes,
@@ -747,6 +783,7 @@ impl MachinePlan {
                 "readers": self.readers,
                 "jobs": self.jobs,
                 "cache_mib": self.cache_mib,
+                "cache_start_mib": self.cache_start_mib,
                 "memtables_mib": self.memtables_mib,
                 "commit_ms": self.commit_ms,
                 "batch_blocks": self.batch_blocks,
@@ -798,11 +835,16 @@ pub struct Tunables {
 
     // Memory split computed at startup.
     total_mib: u64,
+    startup_available_mib: u64,
+    effective_mib: u64,
+    core_reserve_mib: u64,
     reserve_mib: u64,
     ceiling_mib: u64,
     memtables_mib: u64,
     runtime_mib: u64,
     mem_streak: Mutex<(i8, u32)>,
+    /// Last cache direction change: prevents grow/shrink flapping.
+    last_cache_change: Mutex<Option<(Instant, i8)>>,
     resume_shrunk: AtomicBool,
 
     // Exportable performance signals.
@@ -901,14 +943,14 @@ impl Tunables {
                 2usize,
                 45_000u64,
                 512u32,
-                (ram_mib / 16).clamp(512, 2048),
+                (ram_mib / 8).clamp(512, 4096),
                 2usize,
             ),
             Profile::Ssd => (
                 cpus.clamp(2, 4),
                 30_000,
                 512,
-                (ram_mib / 8).clamp(1024, 4096),
+                (ram_mib / 4).clamp(1024, 8192),
                 (cpus / 2).clamp(2, 4),
             ),
             Profile::Nvme => (
@@ -929,7 +971,7 @@ impl Tunables {
                 if cfg.index.cache_mib > 0 {
                     cfg.index.cache_mib
                 } else {
-                    (ram_mib / 8).clamp(1024, 4096)
+                    (ram_mib / 4).clamp(1024, 8192)
                 },
                 cpus.min(4),
             ),
@@ -962,31 +1004,32 @@ impl Tunables {
         } else {
             default_batch
         };
-        let cache_mib = if cfg.index.cache_mib > 0 {
-            cfg.index.cache_mib
-        } else {
-            default_cache
-        };
-
         let mem_now = memory_info();
+        let core_reserve = plan.map(|p| p.core_reserve_mib).unwrap_or_else(|| {
+            if cfg.core.manage == crate::config::CoreManage::External {
+                0
+            } else {
+                fitted_dbcache_mib(ram_mib, mem_now.available_mib)
+            }
+        });
         let budget = budget_with(
             cfg,
             ram_mib,
             mem_now.available_mib,
             mem_now.cached_mib,
-            plan.map(|p| p.reserve_mib),
-            plan.map(|p| p.memtables_mib),
+            None,
+            None,
+            core_reserve,
         );
-        // Do not let the adaptive cache swallow the whole memory ceiling: a
-        // stable quarter of RAM keeps the recent UTXO working set cached while
-        // leaving room for Core and the page cache during IBD.
-        // `budget_from` already fits cache+memtables+runtime inside the
-        // ceiling; do not apply a second ceiling that could break the fit.
+        // The startup cache is fitted to what the OS can give now; the
+        // profile only caps how far the hot controller may grow.
         let max_cache_mib = budget.cache_max_mib.min(default_cache.max(8)).max(8);
-        // Working-set floor: large enough to keep prevout lookups useful, but
-        // never equal to the maximum, so the cache can still shrink under
-        // pressure instead of becoming a fixed allocation.
-        let cache_floor_mib = (ram_mib / 8).clamp(512, 2048).min(max_cache_mib);
+        let cache_floor_mib = budget.cache_floor_mib.min(max_cache_mib).max(8);
+        let cache_mib = if cfg.index.cache_mib > 0 {
+            cfg.index.cache_mib.min(max_cache_mib)
+        } else {
+            budget.cache_start_mib.min(max_cache_mib)
+        };
         if budget.over_budget {
             eprintln!(
                 "[e-lite] WARNING: memory plan ({} MiB) exceeds the {} MiB ceiling; using \
@@ -1020,7 +1063,7 @@ impl Tunables {
         // 64 MiB, and that must degrade instead of aborting the process.
         let cache_mib = cache_mib.min(max_cache_mib).max(8.min(max_cache_mib));
         let commit_ms = commit_ms.clamp(500, 60_000);
-        let batch_blocks = batch_blocks.clamp(16, 4096);
+        let batch_blocks = batch_blocks.clamp(16, 512);
         let max_group_txs = plan
             .map(|p| p.max_group_txs)
             .unwrap_or(if profile == Profile::Hdd {
@@ -1060,13 +1103,20 @@ impl Tunables {
             cache_floor_mib,
             page_cache_floor_mib: budget.page_cache_floor_mib,
             min_batch: 16,
-            max_batch: 4096,
+            // The catch-up checkpoint commits every 512 blocks. A larger
+            // batch can never be filled and only makes the controller look
+            // like it is tuning something it cannot control.
+            max_batch: 512,
             total_mib: ram_mib,
+            startup_available_mib: mem_now.available_mib,
+            effective_mib: budget.effective_mib,
+            core_reserve_mib: budget.core_reserve_mib,
             reserve_mib: budget.reserve_mib,
             ceiling_mib: budget.ceiling_mib,
             memtables_mib: budget.memtables_mib,
             runtime_mib: budget.runtime_mib,
             mem_streak: Mutex::new((0, 0)),
+            last_cache_change: Mutex::new(None),
             reader_streak: Mutex::new((0, 0)),
             resume_shrunk: AtomicBool::new(false),
             read_ms: AtomicU64::new(0),
@@ -1342,7 +1392,7 @@ impl Tunables {
     }
     pub fn record_block_bytes(&self, bytes: usize) {
         if bytes > 0 {
-            ewma(&self.avg_block_bytes, bytes as u64);
+            ewma_long(&self.avg_block_bytes, bytes as u64);
         }
     }
     pub fn avg_block_bytes(&self) -> u64 {
@@ -1546,20 +1596,37 @@ impl Tunables {
                         share * 100.0
                     ));
                 } else if share < 0.5 && last.ms > 500 && self.commit_ms() < self.max_commit_ms {
-                    let v = (self.commit_ms() * 3 / 2).min(self.max_commit_ms);
-                    self.commit_ms.store(v, Ordering::Relaxed);
-                    let b = if batch_locked {
-                        self.batch_blocks()
-                    } else {
-                        let b = (self.batch_blocks() * 3 / 2).min(self.max_batch);
-                        self.batch_blocks.store(b, Ordering::Relaxed);
-                        b
-                    };
-                    action = Some(format!(
-                        "commit {}ms ({:.0}% of cycle): interval -> {v}ms, batch -> {b}",
-                        last.ms,
-                        share * 100.0
-                    ));
+                    // Only the block limit benefits from a larger batch. A
+                    // Time-limited group can use a longer interval, but a
+                    // Txs/Bytes-limited one gains nothing: do not grow a knob
+                    // that is not the binding constraint.
+                    let grow_interval =
+                        matches!(last.reason, CommitReason::Blocks | CommitReason::Time);
+                    let grow_batch = last.reason == CommitReason::Blocks && !batch_locked;
+                    if grow_interval || grow_batch {
+                        let old_interval = self.commit_ms();
+                        let v = if grow_interval {
+                            let v = (old_interval * 3 / 2).min(self.max_commit_ms);
+                            self.commit_ms.store(v, Ordering::Relaxed);
+                            v
+                        } else {
+                            old_interval
+                        };
+                        let b = if grow_batch {
+                            let b = (self.batch_blocks() * 3 / 2).min(self.max_batch);
+                            self.batch_blocks.store(b, Ordering::Relaxed);
+                            b
+                        } else {
+                            self.batch_blocks()
+                        };
+                        action = Some(format!(
+                            "commit {}ms ({:.0}% of cycle, reason {:?}): interval -> {v}ms, \
+                             batch -> {b}",
+                            last.ms,
+                            share * 100.0,
+                            last.reason
+                        ));
+                    }
                 }
                 evaluated = true;
             }
@@ -1635,18 +1702,42 @@ impl Tunables {
     /// Hot memory policy: grow the block cache in small steps while page cache
     /// and available RAM stay healthy, and shrink under pressure. Manual
     /// `cache_mib` is treated as a maximum, not as an immutable value.
+    /// Hot cache ceiling: `available + current e-lite footprint` is the
+    /// effective budget; reserve, memtables and runtime are subtracted. The
+    /// profile/explicit maximum is still a hard cap. This is what makes the
+    /// cache follow the OS allowance instead of installed RAM.
+    fn dynamic_cache_max(&self, mem: &MemoryInfo) -> (u64, u64, u64) {
+        let current = self
+            .cache_mib()
+            .saturating_add(self.memtables_mib)
+            .saturating_add(self.runtime_mib);
+        let effective = self
+            .total_mib
+            .min(mem.available_mib.saturating_add(current))
+            .max(128);
+        let room = effective
+            .saturating_sub(self.reserve_mib)
+            .saturating_sub(self.memtables_mib)
+            .saturating_sub(self.runtime_mib);
+        let max = room
+            .min(self.max_cache_mib)
+            .max(self.min_cache_mib.min(self.max_cache_mib));
+        let margin = (effective / 8).clamp(256, 2048);
+        (max, margin, effective)
+    }
+
     fn memory_step(&self, store: &Store, stats: Option<&Stats>) -> Option<String> {
         let mem = memory_info();
         // Growing the cache only because RAM is free is not evidence that it
         // helps. Require measured UTXO-prefetch pressure; the prefetch EWMA is
         // the closest signal we have to "the block cache would avoid I/O".
+        let (max_cache, grow_margin, effective) = self.dynamic_cache_max(&mem);
         let action = cache_action(
             mem.available_mib,
-            mem.cached_mib,
             self.reserve_mib,
-            self.page_cache_floor_mib,
             self.cache_mib(),
-            self.max_cache_mib,
+            max_cache,
+            grow_margin,
             self.prefetch_ms(),
         );
         let dir = match action {
@@ -1660,36 +1751,56 @@ impl Tunables {
             }
             return None;
         }
-        {
-            let Ok(mut streak) = self.mem_streak.lock() else {
-                return None;
-            };
-            if streak.0 == dir {
-                streak.1 = streak.1.saturating_add(1);
-            } else {
-                *streak = (dir, 1);
+        let critical = mem.available_mib < 256;
+        let pressure = mem.available_mib < 1024;
+        let safety = self.cache_mib() > max_cache || mem.available_mib < self.reserve_mib;
+        if !pressure && !safety {
+            {
+                let Ok(mut streak) = self.mem_streak.lock() else {
+                    return None;
+                };
+                if streak.0 == dir {
+                    streak.1 = streak.1.saturating_add(1);
+                } else {
+                    *streak = (dir, 1);
+                }
+                if streak.1 < 2 {
+                    return None;
+                }
+                *streak = (0, 0);
             }
-            if streak.1 < 2 {
-                return None;
+            // Do not reverse the cache within five minutes unless memory is
+            // already critical: grow/shrink flapping evicts the UTXO set.
+            if let Ok(last) = self.last_cache_change.lock() {
+                if let Some((at, previous)) = *last {
+                    if previous != dir && at.elapsed() < Duration::from_secs(300) {
+                        return None;
+                    }
+                }
             }
-            *streak = (0, 0);
         }
         let old = self.cache_mib();
-        let critical = mem.available_mib < 256;
         let new = match action {
-            CacheAction::Grow => (old + 256).min(self.max_cache_mib),
+            CacheAction::Grow => (old + 256).min(max_cache),
             CacheAction::Shrink => {
-                // Keep a working set for prevout lookups; collapsing to a few
-                // hundred MiB turns every block into random disk reads. Under
-                // real pressure the floor must not block returning memory.
-                let floor = if critical {
-                    self.min_cache_mib
+                if old > max_cache {
+                    max_cache.max(self.min_cache_mib)
                 } else {
-                    self.cache_floor_mib.min(old.max(1))
-                };
-                // Small steps avoid the 8 GiB -> 4.5 GiB oscillation that
-                // starves the page cache and then grows back.
-                (old * 7 / 8).max(floor.min(old))
+                    // Keep a working set for prevout lookups; collapsing to a
+                    // few hundred MiB turns every block into random disk
+                    // reads. Under real pressure the floor must not block
+                    // returning memory.
+                    let floor = if critical {
+                        self.min_cache_mib
+                    } else {
+                        self.cache_floor_mib.min(old.max(1))
+                    };
+                    // Small steps avoid the 8 GiB -> 4.5 GiB oscillation that
+                    // starves the page cache and then grows back.
+                    (old * 7 / 8)
+                        .max(floor.min(old))
+                        .min(max_cache.max(self.min_cache_mib))
+                }
             }
             CacheAction::Hold => old,
         };
@@ -1708,15 +1819,22 @@ impl Tunables {
         if new != old {
             self.cache_mib.store(new, Ordering::Relaxed);
             store.set_cache_bytes(new as usize * 1024 * 1024);
+            if let Ok(mut last) = self.last_cache_change.lock() {
+                *last = Some((Instant::now(), dir));
+            }
         }
         eprintln!(
-            "[e-lite] memory: available {} MiB, buff/cache {} MiB, reserve {} MiB: \
-             cache {} -> {} MiB (max {}, memtables {} MiB, readers {})",
+            "[e-lite] memory: available {} MiB, buff/cache {} MiB, effective {} MiB, \
+             reserve {} MiB, page floor {} MiB: cache {} -> {} MiB (max {} dynamic, profile {}, \
+             memtables {} MiB, readers {})",
             mem.available_mib,
             mem.cached_mib,
+            effective,
             self.reserve_mib,
+            self.page_cache_floor_mib,
             old,
             new,
+            max_cache,
             self.max_cache_mib,
             self.memtables_mib,
             readers
@@ -1735,11 +1853,18 @@ impl Tunables {
         if self.resume_shrunk.swap(true, Ordering::SeqCst) {
             return;
         }
-        let live = (self.total_mib / 4)
-            .max(1024)
+        let mem = memory_info();
+        let old = self.cache_mib();
+        // Only give memory back when the OS is actually short. Shrinking
+        // unconditionally before Core resumes reduces the cache exactly when
+        // the index is about to compete for random reads.
+        if mem.available_mib >= self.reserve_mib.saturating_add(old / 4) {
+            return;
+        }
+        let live = (old * 3 / 4)
+            .max(self.cache_floor_mib)
             .min(self.max_cache_mib)
             .max(self.min_cache_mib);
-        let old = self.cache_mib();
         if old <= live {
             return;
         }
@@ -1747,11 +1872,8 @@ impl Tunables {
         store.set_cache_bytes(live as usize * 1024 * 1024);
         eprintln!(
             "[e-lite] memory: Core is about to resume; cache {} -> {} MiB \
-             (available {}, buff/cache {})",
-            old,
-            live,
-            memory_info().available_mib,
-            memory_info().cached_mib
+             (available {}, buff/cache {}, reserve {})",
+            old, live, mem.available_mib, mem.cached_mib, self.reserve_mib
         );
     }
 
@@ -1760,9 +1882,12 @@ impl Tunables {
         self.resume_shrunk.store(false, Ordering::SeqCst);
     }
 
-    pub fn memory_numbers(&self) -> (u64, u64, u64, u64, u64) {
+    pub fn memory_numbers(&self) -> (u64, u64, u64, u64, u64, u64, u64, u64) {
         (
             self.total_mib,
+            self.startup_available_mib,
+            self.effective_mib,
+            self.core_reserve_mib,
             self.reserve_mib,
             self.ceiling_mib,
             self.memtables_mib,
@@ -1916,6 +2041,22 @@ fn ewma(slot: &AtomicU64, sample: u64) {
         sample
     } else {
         (old.saturating_mul(7).saturating_add(sample)) / 8
+    };
+    slot.store(next, Ordering::Relaxed);
+}
+
+/// Slow average for the block-size watermark. A 1/8 EWMA reacts to a handful
+/// of large blocks and made the byte backlog jump by 3-4x between pause and
+/// resume; 1/1024 spans ~1000 blocks, enough to follow a real size trend
+/// without chasing a burst.
+fn ewma_long(slot: &AtomicU64, sample: u64) {
+    let old = slot.load(Ordering::Relaxed);
+    let next = if old == 0 {
+        sample
+    } else {
+        old.saturating_mul(1023)
+            .saturating_add(sample)
+            .saturating_div(1024)
     };
     slot.store(next, Ordering::Relaxed);
 }
@@ -2342,6 +2483,12 @@ pub fn check_minimum_ram(cfg: &Config, chain: Chain) -> Result<(), String> {
 pub struct MemoryBudget {
     pub total_mib: u64,
     pub available_mib: u64,
+    /// Budget actually used: `min(total, available - core_reserve)`. The
+    /// machine's total RAM is only a ceiling; e-lite plans from what the OS
+    /// can give it now.
+    pub effective_mib: u64,
+    /// Memory reserved for a Core that e-lite is about to start.
+    pub core_reserve_mib: u64,
     pub cached_mib: u64,
     pub reserve_mib: u64,
     pub ceiling_mib: u64,
@@ -2349,6 +2496,7 @@ pub struct MemoryBudget {
     pub runtime_mib: u64,
     pub cache_max_mib: u64,
     pub cache_start_mib: u64,
+    pub cache_floor_mib: u64,
     /// Page cache the block cache must not evict under normal pressure.
     pub page_cache_floor_mib: u64,
     /// Sum of the components the controller plans to keep resident.
@@ -2370,23 +2518,47 @@ fn auto_reserve_mib(total_mib: u64) -> u64 {
     }
 }
 
+/// Core's `-dbcache` from what the OS can give it, not from the installed RAM.
+/// 8 GiB boxes get ~1 GiB, 16 GiB ~2 GiB and 32 GiB 4 GiB, but a machine with
+/// little free memory gets a smaller cache instead of swapping.
+pub fn fitted_dbcache_mib(total_mib: u64, available_mib: u64) -> u64 {
+    let total = total_mib.max(512);
+    let available = if available_mib == 0 {
+        total
+    } else {
+        available_mib
+    };
+    let total_cap = (total / 8).clamp(450, 4096).min((total / 3).max(300));
+    total_cap.min((available / 2).max(300))
+}
+
 pub fn memory_budget(cfg: &Config) -> MemoryBudget {
     let mem = memory_info();
-    budget_from(
+    let total = mem.total_mib.unwrap_or(1024);
+    let core_reserve = if cfg.core.manage == crate::config::CoreManage::External {
+        0
+    } else {
+        fitted_dbcache_mib(total, mem.available_mib)
+    };
+    budget_with(
         cfg,
-        mem.total_mib.unwrap_or(1024),
+        total,
         mem.available_mib,
         mem.cached_mib,
+        None,
+        None,
+        core_reserve,
     )
 }
 
+#[allow(dead_code)]
 pub fn budget_from(
     cfg: &Config,
     total_mib: u64,
     available_mib: u64,
     cached_mib: u64,
 ) -> MemoryBudget {
-    budget_with(cfg, total_mib, available_mib, cached_mib, None, None)
+    budget_with(cfg, total_mib, available_mib, cached_mib, None, None, 0)
 }
 
 pub fn budget_with(
@@ -2396,26 +2568,41 @@ pub fn budget_with(
     cached_mib: u64,
     reserve_override: Option<u64>,
     memtables_override: Option<u64>,
+    core_reserve_mib: u64,
 ) -> MemoryBudget {
+    let total_mib = total_mib.max(128);
+    // `MemAvailable` is the OS's own estimate of what can be allocated
+    // without swapping. Plan from it, not from installed RAM: an 8 GiB box
+    // running other services may only have 4 GiB to give.
+    let available_mib = if available_mib == 0 {
+        total_mib
+    } else {
+        available_mib
+    };
+    let core_reserve_mib = core_reserve_mib.min(available_mib.saturating_sub(128));
+    let effective_mib = total_mib
+        .min(available_mib.saturating_sub(core_reserve_mib))
+        .max(128);
+
     let reserve_mib = reserve_override.unwrap_or_else(|| {
         if cfg.index.memory_reserve_mib > 0 {
             cfg.index.memory_reserve_mib
         } else {
-            auto_reserve_mib(total_mib)
+            auto_reserve_mib(effective_mib)
         }
     });
-    let usable = total_mib.saturating_sub(reserve_mib).max(128);
+    let usable = effective_mib.saturating_sub(reserve_mib).max(128);
     // An explicit fraction is a hard request: never raised to satisfy floors.
     let fraction = if cfg.index.memory_fraction > 0.0 {
         cfg.index.memory_fraction.clamp(0.1, 1.0)
     } else {
         0.75
     };
-    let ceiling_mib = ((total_mib as f64 * fraction) as u64)
+    let ceiling_mib = ((effective_mib as f64 * fraction) as u64)
         .min(usable)
         .max((MIN_RUNTIME_MIB + MIN_CACHE_MIB).min(usable));
 
-    let runtime_mib = (total_mib / 32)
+    let runtime_mib = (effective_mib / 32)
         .clamp(MIN_RUNTIME_MIB, 1024)
         .min((ceiling_mib / 4).max(MIN_RUNTIME_MIB));
 
@@ -2423,7 +2610,7 @@ pub fn budget_with(
         if cfg.index.write_buffer_mib > 0 {
             cfg.index.write_buffer_mib
         } else {
-            (total_mib / 16).clamp(512, 2048)
+            (effective_mib / 16).clamp(512, 2048)
         }
     });
     // Leave at least a small cache before honouring the memtable size.
@@ -2437,6 +2624,9 @@ pub fn budget_with(
         .saturating_sub(runtime_mib)
         .saturating_sub(memtables_mib);
 
+    // The profile cap is a ceiling, not an allocation: at 8 GiB the cache may
+    // reach 2 GiB, at 16 GiB 4 GiB and at 32 GiB 8 GiB, but only when the OS
+    // actually has that memory available.
     let auto_cap = (total_mib / 4).max(1024);
     let cache_max_mib = if cfg.index.cache_mib > 0 {
         cfg.index.cache_mib.min(room)
@@ -2446,15 +2636,18 @@ pub fn budget_with(
     let cache_start_mib = if cfg.index.cache_mib > 0 {
         cache_max_mib
     } else {
-        (total_mib / 4).min(cache_max_mib)
+        (effective_mib / 4).min(cache_max_mib)
     };
+    let cache_floor_mib = (effective_mib / 8).clamp(512, 2048).min(cache_max_mib);
+    let page_cache_floor_mib = (effective_mib / 16).clamp(512, 4096);
     let planned_mib = runtime_mib
         .saturating_add(memtables_mib)
         .saturating_add(cache_start_mib);
-    let page_cache_floor_mib = (total_mib / 16).clamp(1024, 4096);
     MemoryBudget {
         total_mib,
         available_mib,
+        effective_mib,
+        core_reserve_mib,
         cached_mib,
         reserve_mib,
         ceiling_mib,
@@ -2462,9 +2655,11 @@ pub fn budget_with(
         runtime_mib,
         cache_max_mib,
         cache_start_mib,
+        cache_floor_mib,
         page_cache_floor_mib,
         planned_mib,
-        over_budget: planned_mib > ceiling_mib,
+        over_budget: planned_mib > ceiling_mib
+            || planned_mib.saturating_add(reserve_mib) > effective_mib,
     }
 }
 
@@ -2487,27 +2682,28 @@ pub enum CacheAction {
 /// RocksDB cache evicts it, so it is the guard that keeps block reads fast.
 pub fn cache_action(
     available_mib: u64,
-    _cached_mib: u64,
     reserve_mib: u64,
-    page_cache_floor_mib: u64,
     cache_mib: u64,
     cache_max_mib: u64,
+    grow_margin_mib: u64,
     prefetch_ms: u64,
 ) -> CacheAction {
     // `MemAvailable` already accounts for reclaimable page cache, so it is the
-    // right signal. A low page-cache number is expected while the RocksDB
-    // block cache holds the UTXO working set; shrinking because of it caused
-    // cache oscillation (6 GiB -> 256 MiB) and random-read stalls. The floor
-    // makes the guard explicit instead of relying on a single reserve number.
-    let floor = reserve_mib.saturating_add(page_cache_floor_mib);
-    if available_mib < floor {
+    // right signal. The reserve is the only policy floor: adding the
+    // page-cache floor on top double-counted it and caused the 2048<->3997
+    // oscillation seen on a 32 GiB mainnet host.
+    if cache_mib > cache_max_mib || available_mib < reserve_mib {
         CacheAction::Shrink
-    } else if available_mib >= floor.saturating_add(cache_mib / 4)
-        && cache_mib < cache_max_mib
+    } else if cache_mib < cache_max_mib
+        && available_mib
+            >= reserve_mib
+                .saturating_add(cache_mib)
+                .saturating_add(grow_margin_mib)
         && prefetch_ms >= 50
     {
-        // Only grow when prevout lookups are actually slow: free RAM alone is
-        // not a reason to enlarge the cache.
+        // Only grow when prevout lookups are actually slow and the OS has
+        // room for the next step plus a margin; free RAM alone is not a
+        // reason to enlarge the cache.
         CacheAction::Grow
     } else {
         CacheAction::Hold
@@ -2569,6 +2765,22 @@ mod tests {
         assert_eq!(slot.load(Ordering::Relaxed), 100);
         ewma(&slot, 200);
         assert_eq!(slot.load(Ordering::Relaxed), 112);
+    }
+
+    #[test]
+    fn long_block_average_ignores_a_short_burst() {
+        let slot = AtomicU64::new(700_000);
+        for _ in 0..8 {
+            ewma_long(&slot, 4_000_000);
+        }
+        let after = slot.load(Ordering::Relaxed);
+        // Eight huge blocks move the watermark by <1 %, so a burst cannot
+        // pause Core months early by itself.
+        assert!(after < 730_000, "average jumped to {after}");
+        for _ in 0..4096 {
+            ewma_long(&slot, 700_000);
+        }
+        assert!(slot.load(Ordering::Relaxed) < 710_000);
     }
 
     #[test]
@@ -2640,12 +2852,36 @@ mod tests {
         assert_eq!(p.core_par, 3);
         assert_eq!(p.core_rpcthreads, 4);
         assert_eq!(p.core_dbcache_mib, 4096);
-        assert_eq!(p.cache_mib, 4096);
+        assert_eq!(p.cache_mib, 8064);
+        assert_eq!(p.cache_start_mib, 3072);
         assert_eq!(p.commit_ms, 30_000);
-        assert_eq!(p.reserve_mib, 4096);
-        assert_eq!(p.page_cache_floor_mib, 2048);
+        assert_eq!(p.reserve_mib, 2048);
+        assert_eq!(p.page_cache_floor_mib, 768);
+        assert_eq!(p.effective_mib, 12_288);
         assert_eq!(p.max_group_bytes, 256 * 1024 * 1024);
         assert!(p.same_device);
+    }
+
+    #[test]
+    fn memory_budget_fits_typical_8_and_16_gib_machines() {
+        let cfg = Config::default();
+        // 8 GiB box, 6 GiB available, 1 GiB reserved for the Core e-lite starts.
+        let b = budget_with(&cfg, 8192, 6144, 2708, None, None, 1024);
+        assert_eq!(b.effective_mib, 5120);
+        assert_eq!(b.reserve_mib, 2048);
+        assert_eq!(b.memtables_mib, 512);
+        assert_eq!(b.cache_max_mib, 2048);
+        assert_eq!(b.cache_start_mib, 1280);
+        assert!(b.planned_mib.saturating_add(b.reserve_mib) <= b.effective_mib);
+        assert!(!b.over_budget);
+
+        // 16 GiB box, 12 GiB available, 2 GiB for Core.
+        let b = budget_with(&cfg, 16384, 12288, 4096, None, None, 2048);
+        assert_eq!(b.effective_mib, 10240);
+        assert_eq!(b.memtables_mib, 640);
+        assert_eq!(b.cache_max_mib, 4096);
+        assert_eq!(b.cache_start_mib, 2560);
+        assert!(b.planned_mib <= b.ceiling_mib);
     }
 
     #[test]
@@ -2657,29 +2893,31 @@ mod tests {
         assert!(p.cache_mib >= 8);
         assert!(p.commit_ms >= 500);
         assert!(p.batch_blocks >= 16);
-        assert!(p.page_cache_floor_mib >= 1024);
+        assert!(p.page_cache_floor_mib >= 256);
         assert!(p.core_par >= 1);
         assert!(!p.describe().is_empty());
     }
 
     #[test]
-    fn memory_budget_scales_with_ram_and_respects_overrides() {
+    fn memory_budget_scales_with_available_ram_and_respects_overrides() {
         let mut cfg = Config::default();
         let b = budget_from(&cfg, 7941, 2583, 2708);
-        // 8 GiB class: leave 2 GiB for OS/Core/page cache; memtables are
-        // RAM/16 (512 MiB), not the old RAM/8.
+        // 8 GiB class with only 2.5 GiB available: the plan fits that, not the
+        // installed 7.9 GiB.
+        assert_eq!(b.effective_mib, 2583);
         assert_eq!(b.reserve_mib, 2048);
-        assert_eq!(b.ceiling_mib, 5893);
-        assert_eq!(b.memtables_mib, 512);
-        assert_eq!(b.page_cache_floor_mib, 1024);
+        assert_eq!(b.ceiling_mib, 535);
+        assert!(b.memtables_mib <= 512);
+        assert!(b.page_cache_floor_mib >= 256);
         assert!(b.cache_max_mib >= b.cache_start_mib);
 
         cfg.index.memory_fraction = 0.5;
         cfg.index.memory_reserve_mib = 2048;
         cfg.index.write_buffer_mib = 512;
         let b = budget_from(&cfg, 8192, 3000, 1000);
+        assert_eq!(b.effective_mib, 3000);
         assert_eq!(b.reserve_mib, 2048);
-        assert_eq!(b.ceiling_mib, 4096);
+        assert_eq!(b.ceiling_mib, 952);
         assert_eq!(b.memtables_mib, 512);
 
         // Manual cache is a maximum, not a fixed value.
@@ -2706,12 +2944,12 @@ mod tests {
                 assert!(!b.over_budget);
             }
         }
-        // The exact case from the report: 20% of 7907 MiB is a hard request
-        // and must not be raised to fit 988 MiB of memtables.
+        // The exact case from the report: 20% of the *effective* 4000 MiB is
+        // a hard request and must not be raised to fit memtables.
         cfg.index.memory_fraction = 0.20;
         let b = budget_from(&cfg, 7907, 4000, 2000);
-        assert_eq!(b.ceiling_mib, 1581);
-        assert!(b.planned_mib <= 1581, "planned {}", b.planned_mib);
+        assert_eq!(b.ceiling_mib, 800);
+        assert!(b.planned_mib <= 800, "planned {}", b.planned_mib);
     }
 
     #[test]
@@ -2737,36 +2975,36 @@ mod tests {
     }
 
     #[test]
-    fn cache_action_grows_and_shrinks_with_hysteresis_inputs() {
-        // Healthy, 2 GiB page-cache floor and slow prefetch: grow.
+    fn cache_action_follows_available_and_stays_stable() {
+        // Slow prefetch and room above reserve + cache + margin: grow.
         assert_eq!(
-            cache_action(5000, 2708, 1024, 2048, 1985, 4000, 300),
+            cache_action(5000, 1024, 512, 2000, 512, 300),
             CacheAction::Grow
         );
         // Free RAM alone is not a reason to grow.
         assert_eq!(
-            cache_action(5000, 2708, 1024, 2048, 1985, 4000, 5),
+            cache_action(5000, 1024, 512, 2000, 512, 5),
             CacheAction::Hold
         );
-        // Below reserve + page-cache floor: shrink.
+        // Below the OS reserve: shrink even if the cache is at its floor.
         assert_eq!(
-            cache_action(2000, 2708, 1024, 2048, 2000, 4000, 300),
+            cache_action(500, 1024, 512, 2000, 512, 300),
             CacheAction::Shrink
         );
-        // No room above the ceiling: hold.
+        // A dynamic ceiling below the current cache forces a shrink.
         assert_eq!(
-            cache_action(5000, 2708, 1024, 2048, 4000, 4000, 300),
+            cache_action(5000, 1024, 2048, 1500, 512, 300),
+            CacheAction::Shrink
+        );
+        // At the cap: hold.
+        assert_eq!(
+            cache_action(5000, 1024, 2000, 2000, 512, 300),
             CacheAction::Hold
         );
-        // Low page cache alone must not shrink the RocksDB cache: MemAvailable
-        // already accounts for reclaimable memory.
+        // Between the reserve and the growth headroom: hold instead of
+        // oscillating.
         assert_eq!(
-            cache_action(4000, 400, 1024, 2048, 2000, 4000, 300),
-            CacheAction::Grow
-        );
-        // Between the floor and the growth headroom: hold.
-        assert_eq!(
-            cache_action(3200, 2000, 1024, 2048, 2000, 4000, 300),
+            cache_action(2000, 1024, 512, 2000, 1024, 300),
             CacheAction::Hold
         );
     }
@@ -2824,6 +3062,7 @@ mod tests {
         assert!(t.readers() >= 1);
         assert!(t.commit_ms() >= 500);
         assert!(t.cache_mib() <= t.max_cache_mib);
+        assert!(t.batch_blocks() <= 512);
     }
 
     #[test]
