@@ -132,6 +132,18 @@ pub const CF_NAMES: [&str; 7] = [
     "undo",
 ];
 
+/// Relative write pressure of each family. `utxo` and `history` dominate an
+/// IBD; giving them a larger memtable avoids frequent flushes and commit
+/// stalls. The total is still bounded by the shared WriteBufferManager.
+const CF_WEIGHTS: [u32; 7] = [1, 2, 1, 4, 6, 4, 1];
+
+fn weighted_write_buffer(total_bytes: usize, name: &str, max_buffers: usize) -> usize {
+    let idx = CF_NAMES.iter().position(|n| *n == name).unwrap_or(0);
+    let sum: u32 = CF_WEIGHTS.iter().sum();
+    let budget = total_bytes / max_buffers.max(1);
+    (budget.saturating_mul(CF_WEIGHTS[idx] as usize) / sum as usize).clamp(1, 64 * 1024 * 1024)
+}
+
 #[derive(Debug)]
 pub struct StoreError(pub String);
 
@@ -296,7 +308,11 @@ impl Store {
         for name in CF_NAMES {
             let mut cf_opts = Options::default();
             cf_opts.set_compression_type(DBCompressionType::Lz4);
-            cf_opts.set_write_buffer_size(per_cf_write);
+            cf_opts.set_write_buffer_size(weighted_write_buffer(
+                store_opts.write_buffer_total_bytes,
+                name,
+                max_buffers,
+            ));
             cf_opts.set_max_write_buffer_number(max_buffers as i32);
             cf_opts.set_write_buffer_manager(&write_buffer_manager);
             // Bulky sequential ingest: read compaction input in large chunks and
@@ -982,6 +998,37 @@ impl Store {
         self.sum_cf_property("rocksdb.estimate-table-readers-mem").0
     }
 
+    /// Per-column-family pressure for `/status`. The sum hides which family is
+    /// causing write stalls; this returns pending compaction, memtable, SST and
+    /// table-reader bytes plus a "all properties were read" flag for each CF.
+    pub fn cf_stats(&self) -> Vec<(&'static str, u64, u64, u64, u64, bool)> {
+        let mut out = Vec::with_capacity(CF_NAMES.len());
+        for name in CF_NAMES {
+            let mut ok = true;
+            let mut read = |prop: &str| -> u64 {
+                match self.cf(name) {
+                    Ok(cf) => match self.db.property_int_value_cf(cf, prop) {
+                        Ok(Some(v)) => v,
+                        Ok(None) | Err(_) => {
+                            ok = false;
+                            0
+                        }
+                    },
+                    Err(_) => {
+                        ok = false;
+                        0
+                    }
+                }
+            };
+            let pending = read("rocksdb.estimate-pending-compaction-bytes");
+            let memtable = read("rocksdb.cur-size-all-mem-tables");
+            let sst = read("rocksdb.total-sst-files-size");
+            let readers = read("rocksdb.estimate-table-readers-mem");
+            out.push((name, pending, memtable, sst, readers, ok));
+        }
+        out
+    }
+
     /// Live memtables as accounted by the shared WriteBufferManager.
     pub fn memtable_budget_usage(&self) -> usize {
         self.write_buffer_manager.get_usage()
@@ -1062,6 +1109,20 @@ mod tests {
     }
 
     #[test]
+    fn weighted_memtables_favor_hot_families() {
+        let total = 1024 * 1024 * 1024usize;
+        let max_buffers = 3;
+        let utxo = weighted_write_buffer(total, "utxo", max_buffers);
+        let meta = weighted_write_buffer(total, "meta", max_buffers);
+        assert!(utxo > meta, "utxo={utxo} meta={meta}");
+        let sum: usize = CF_NAMES
+            .iter()
+            .map(|n| weighted_write_buffer(total, n, max_buffers))
+            .sum();
+        assert!(sum <= total / max_buffers + CF_NAMES.len());
+    }
+
+    #[test]
     fn write_buffer_budget_is_split_across_column_families() {
         // 1 GiB total over 7 CFs and 3 memtables = ~48 MiB per CF.
         let per_cf = per_cf_write_buffer_bytes(1024 * 1024 * 1024, 7, 3);
@@ -1132,6 +1193,9 @@ mod tests {
         // Every per-CF property must be supported; otherwise a zero would be
         // indistinguishable from an empty database.
         assert!(stats.properties_ok, "{stats:?}");
+        let cf = s.cf_stats();
+        assert_eq!(cf.len(), CF_NAMES.len());
+        assert!(cf.iter().all(|row| row.5), "{cf:?}");
     }
 
     #[test]

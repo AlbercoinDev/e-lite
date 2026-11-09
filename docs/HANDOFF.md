@@ -1,9 +1,9 @@
 # Session handoff
 
-**Updated:** 2026-11-08
-**Latest published release:** `0.1.0-alpha.29.6.0`
-**Release:** https://github.com/AlbercoinDev/e-lite/releases/tag/v0.1.0-alpha.29.6.0
-**Main commit at handoff:** tag `v0.1.0-alpha.29.6.0`
+**Updated:** 2026-11-09
+**Latest published release:** `0.1.0-alpha.29.7.0`
+**Release:** https://github.com/AlbercoinDev/e-lite/releases/tag/v0.1.0-alpha.29.7.0
+**Main commit at handoff:** tag `v0.1.0-alpha.29.7.0`
 
 This file is the short “where we are” for a new session. The invariants live in
 [`AGENTS.md`](../AGENTS.md) and [`PROJECT_MEMORY.md`](PROJECT_MEMORY.md); the
@@ -73,10 +73,11 @@ no repitas contexto ni rehagas decisiones ya documentadas.
   `auto|hdd|ssd|nvme|manual`, readers capped at 4/8/16, cgroup memory aware,
   explicit readers/commit overrides locked. Every knob is also available via CLI
   and `--set` (see `docs/CLI.md`).
-- Memory: reserve `max(1024 MiB, RAM/8)`, ceiling 75 % of RAM, memtables `RAM/8`,
-  page-cache floor; the cache grows in 256 MiB steps only while prevout prefetch
-  is measurably slow (not merely because RAM is free) and shrinks 25 % under
-  pressure; `cache_mib` is a maximum. Background jobs are capped by the CPU count.
+- Memory: reserve `clamp(RAM/8, 2-4 GiB)`, page-cache floor
+  `clamp(RAM/16, 1-4 GiB)`, ceiling 75 % of RAM, memtables `RAM/16` (weighted
+  per CF); the cache grows only while prevout prefetch is measurably slow and
+  shrinks 12.5 % under pressure; `cache_mib` is a maximum. Readers/jobs come
+  from physical cores and the disk class.
 - `run` waits for Core RPC before starting P2P/mempool/listeners; `serve` is the
   offline mode. Shutdown joins background threads and stops managed Tor before
   stopping Core.
@@ -84,6 +85,35 @@ no repitas contexto ni rehagas decisiones ya documentadas.
   the onion setup, reset and security.
 - `docs/ROADMAP.md` contains future features/improvements. Do not present them as
   available.
+
+## Last change (alpha.29.7.0)
+
+Machine-aware plan and commit/prune policy.
+
+- **CPU** uses physical cores and cgroup quota, not logical SMT: a 4C/8T
+  i7-6700T gets `readers=4`, `jobs=2`, Core `par=3`, `rpcthreads=4` instead of
+  8/8/7/8.
+- **Disk** is classified (NVMe/SATA/HDD/virtual/network) from mountinfo+sysfs;
+  data/Core sharing a device is detected. The class sets reader concurrency,
+  cache cap, jobs and bulk commit interval.
+- **Memory** adds a page-cache floor (`clamp(RAM/16, 1-4 GiB)`) and a larger
+  reserve (`clamp(RAM/8, 2-4 GiB)`); cache shrinks in 12.5 % steps.
+- **Commits** in bulk are bounded by tx (250k), blocks (512) and time
+  (20-60 s by disk), with a minimum of 8 blocks/60 s. Live is 1.5 s. Safety is
+  unchanged because the prune gate uses the committed tip.
+- **Memtables** are weighted per CF; `/status.rocksdb.cf` exposes per-family
+  pending compaction/memtable/SST/table readers.
+- **Prune** runs in `el-prune` after the WAL barrier, with a 120 s timeout; the
+  30 s EAGAIN stalls are gone. `/status.machine` shows the detected plan.
+
+### Not yet verified in 29.7.0
+
+- Regtest e2e passed (regtest, recovery, multi_instance, pruned_ibd). No
+  mainnet A/B of the machine plan or the 20-60 s commit intervals.
+- The disk classifier is host-tested on ext4/NVMe and tmpfs; LVM/overlay uses
+  the virtual profile.
+- Real power loss and true ENOSPC remain untested; the recovery e2e simulates
+  SIGKILL, reorg and a file-size limit.
 
 ## Last change (alpha.29.6.0)
 

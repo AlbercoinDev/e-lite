@@ -1,5 +1,56 @@
 # Changelog
 
+## 0.1.0-alpha.29.7.0 — 2026-11-09
+
+### Machine-aware plan, fewer commits and no prune stalls
+
+This release turns the runtime knobs into a function of the machine, and stops
+paying for commits/prunes that safety does not require.
+
+**CPU detection uses physical cores.** `/proc/cpuinfo` is parsed for unique
+`(physical id, core id)` pairs; affinity and the cgroup CPU quota are applied
+afterwards. A 4C/8T i7-6700T now gets `-par=3`, `-rpcthreads=4`, `readers=4`
+and `background_jobs=2` instead of 7/8/8/8. The previous defaults counted
+logical SMT threads as cores and oversubscribed the machine.
+
+**Disk detection.** Each relevant path (`data_dir`, `core_datadir`,
+`blocks_dir`) is resolved through `/proc/self/mountinfo` and `/sys/dev/block`
+to its parent device and classified as NVMe, SATA SSD, HDD, virtual (dm/md/
+loop), network or unknown. The classification sets the point-read concurrency,
+block-cache cap, RocksDB background jobs and the bulk commit interval. Data and
+Core on the same device share the I/O budget; a separate device allows more
+concurrency.
+
+**RAM plan with a page-cache floor.** The reserve is `clamp(RAM/8, 2048, 4096)`
+and a separate `page_cache_floor` of `clamp(RAM/16, 1024, 4096)` prevents the
+block cache from evicting the page cache. Cache shrinks are now 12.5 % steps,
+not 25 %, and growth still requires measured prefetch pressure. On 32 GiB the
+plan is: reserve 4 GiB, page floor 2 GiB, memtables 2 GiB, cache 4 GiB on SATA
+(8 GiB on NVMe).
+
+**Fewer, safer commits.** Bulk commits are triggered by transactions (250k),
+blocks (512) or time (20 s NVMe, 30 s SATA/virtual, 45 s HDD, 60 s network).
+A time trigger with fewer than 8 blocks waits until 60 s, so 1-block commits
+disappear. Live mode switches to 1.5 s. This is safe because the prune gate
+uses the committed tip: Core never prunes blocks that an uncommitted batch
+would need to replay. The commit barrier before pruning is unchanged.
+
+**Weighted memtables.** `utxo` (weight 6), `history` and `utxo_by_script`
+(weight 4) get larger memtables than `meta`/`undo`; the shared
+`WriteBufferManager` still enforces the total. `/status.rocksdb.cf` now shows
+pending compaction, memtable, SST and table-reader bytes per family, so the CF
+causing a write stall is visible instead of hidden by the sum.
+
+**Prune no longer blocks the index.** `pruneblockchain` runs in its own thread
+after the WAL barrier; the apply thread continues. The RPC timeout for prune is
+at least 120 s, so the 30 s read timeout that surfaced as
+`Resource temporarily unavailable (os error 11)` no longer aborts a prune.
+`/status.machine` exposes the whole detected plan.
+
+Tests: workspace fmt/clippy/tests; e2e regtest, recovery (SIGKILL/reorg/write
+failure), multi-instance and pruned-IBD with prune + SIGKILL + restart. The
+pruned test also checks pipeline discarded work and the asynchronous prune.
+
 ## 0.1.0-alpha.29.6.0 — 2026-11-08
 
 ### IBD throughput, safe pruning and Core/Tor coordination

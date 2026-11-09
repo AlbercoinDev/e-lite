@@ -177,6 +177,10 @@ pub struct Stats {
     pub pipeline_prepared: AtomicU64,
     pub pipeline_applied: AtomicU64,
     pub pipeline_discarded: AtomicU64,
+    /// Machine plan detected at startup (CPU/RAM/disk -> knobs).
+    pub plan: Mutex<serde_json::Value>,
+    /// Per-column-family RocksDB pressure, published at commit time.
+    pub rocksdb_cf: Mutex<serde_json::Value>,
     pub started: Instant,
 }
 
@@ -262,6 +266,8 @@ impl Default for Stats {
             pipeline_prepared: AtomicU64::new(0),
             pipeline_applied: AtomicU64::new(0),
             pipeline_discarded: AtomicU64::new(0),
+            plan: Mutex::new(serde_json::json!({})),
+            rocksdb_cf: Mutex::new(serde_json::json!({})),
             started: Instant::now(),
         }
     }
@@ -1005,9 +1011,22 @@ impl Shared {
         let mem_unresolved = mem.as_ref().map(|m| m.unresolved_inputs()).unwrap_or(0);
         let mem_buckets = mem.as_ref().map(|m| m.fee_histogram().len()).unwrap_or(0);
         drop(mem);
+        let machine = self
+            .stats
+            .plan
+            .lock()
+            .map(|v| v.clone())
+            .unwrap_or_else(|_| json!({}));
+        let rocksdb_cf = self
+            .stats
+            .rocksdb_cf
+            .lock()
+            .map(|v| v.clone())
+            .unwrap_or_else(|_| json!({}));
         json!({
             "version": VERSION,
             "network": id.chain.name(),
+            "machine": machine,
             "genesis": id.genesis.to_hex(),
             "state": state::name(self.get_state()),
             "indexed_height": height,
@@ -1061,6 +1080,7 @@ impl Shared {
                 "sst_bytes": self.stats.rocksdb_sst_bytes.load(Ordering::Relaxed),
                 "table_readers_bytes": self.stats.rocksdb_table_readers_bytes.load(Ordering::Relaxed),
                 "properties_ok": self.stats.rocksdb_properties_ok.load(Ordering::Relaxed),
+                "cf": rocksdb_cf,
             },
             "file_descriptors": {
                 "soft_limit": self.stats.fd_soft_limit.load(Ordering::Relaxed),

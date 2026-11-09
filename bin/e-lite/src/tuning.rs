@@ -10,6 +10,8 @@ use crate::config::Config;
 use el_model::Chain;
 use el_serve::Stats;
 use el_store::Store;
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -77,6 +79,581 @@ pub enum Mode {
     Live,
 }
 
+// ------------------------------------------------------- machine detection
+
+/// CPU budget derived from physical cores, affinity and the cgroup quota.
+/// Logical SMT threads are not treated as independent cores: a 4C/8T laptop
+/// CPU must not get `-par=7` and eight index readers.
+#[derive(Debug, Clone)]
+pub struct CpuInfo {
+    pub physical: usize,
+    pub logical: usize,
+    /// Logical CPUs after affinity and cgroup quota.
+    pub effective: usize,
+    /// Physical cores after the quota, never more than `effective`.
+    pub physical_effective: usize,
+    pub smt: bool,
+    pub quota_cpus: Option<f64>,
+    pub source: String,
+}
+
+fn physical_core_pairs() -> HashSet<(String, String)> {
+    let Ok(text) = std::fs::read_to_string("/proc/cpuinfo") else {
+        return HashSet::new();
+    };
+    let mut pairs = HashSet::new();
+    let mut phys: Option<String> = None;
+    let mut core: Option<String> = None;
+    for line in text.lines() {
+        if line.trim().is_empty() {
+            if let (Some(p), Some(c)) = (phys.take(), core.take()) {
+                pairs.insert((p, c));
+            }
+            continue;
+        }
+        if let Some((k, v)) = line.split_once(':') {
+            match k.trim() {
+                "physical id" => phys = Some(v.trim().to_string()),
+                "core id" => core = Some(v.trim().to_string()),
+                _ => {}
+            }
+        }
+    }
+    if let (Some(p), Some(c)) = (phys, core) {
+        pairs.insert((p, c));
+    }
+    pairs
+}
+
+fn parse_cpu_max(text: &str) -> Option<f64> {
+    let mut it = text.split_whitespace();
+    let quota = it.next()?;
+    if quota == "max" {
+        return None;
+    }
+    let quota: f64 = quota.parse().ok()?;
+    let period: f64 = it.next()?.parse().ok()?;
+    if quota <= 0.0 || period <= 0.0 {
+        return None;
+    }
+    Some(quota / period)
+}
+
+fn cpu_quota_cpus() -> Option<f64> {
+    let text = std::fs::read_to_string("/proc/self/cgroup").ok()?;
+    let mut best: Option<f64> = None;
+    let mut consider = |v: f64| {
+        best = Some(best.map_or(v, |b| b.min(v)));
+    };
+    // cgroup v2: one unified hierarchy.
+    if let Some(path) = text.lines().find_map(|l| l.strip_prefix("0::")) {
+        let rel = path.trim_start_matches('/');
+        let mut cur = PathBuf::from("/sys/fs/cgroup").join(rel);
+        loop {
+            if let Ok(s) = std::fs::read_to_string(cur.join("cpu.max")) {
+                if let Some(v) = parse_cpu_max(&s) {
+                    consider(v);
+                }
+            }
+            if cur == Path::new("/sys/fs/cgroup") || !cur.pop() {
+                break;
+            }
+        }
+    }
+    // cgroup v1: cpu controller mounted under /sys/fs/cgroup/cpu.
+    for line in text.lines() {
+        let mut it = line.splitn(3, ':');
+        let _ = it.next();
+        let controller = it.next().unwrap_or("");
+        let path = it.next().unwrap_or("");
+        if !controller.split(',').any(|c| c == "cpu") {
+            continue;
+        }
+        let mut cur = PathBuf::from("/sys/fs/cgroup/cpu").join(path.trim_start_matches('/'));
+        loop {
+            let quota = std::fs::read_to_string(cur.join("cpu.cfs_quota_us"))
+                .ok()
+                .and_then(|s| s.trim().parse::<i64>().ok());
+            let period = std::fs::read_to_string(cur.join("cpu.cfs_period_us"))
+                .ok()
+                .and_then(|s| s.trim().parse::<i64>().ok());
+            if let (Some(q), Some(p)) = (quota, period) {
+                if q > 0 && p > 0 {
+                    consider(q as f64 / p as f64);
+                }
+            }
+            if cur == Path::new("/sys/fs/cgroup/cpu") || !cur.pop() {
+                break;
+            }
+        }
+    }
+    best
+}
+
+impl CpuInfo {
+    pub fn detect() -> Self {
+        let logical = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1)
+            .max(1);
+        let pairs = physical_core_pairs();
+        let physical = if pairs.is_empty() {
+            logical
+        } else {
+            pairs.len()
+        };
+        let quota = cpu_quota_cpus();
+        let effective = quota
+            .map(|q| (q.floor() as usize).max(1))
+            .unwrap_or(logical)
+            .min(logical)
+            .max(1);
+        let physical_effective = physical.min(effective).max(1);
+        let source = match (pairs.is_empty(), quota.is_some()) {
+            (false, true) => "cpuinfo+cgroup",
+            (false, false) => "cpuinfo",
+            (true, true) => "logical+cgroup",
+            (true, false) => "logical",
+        };
+        Self {
+            physical,
+            logical,
+            effective,
+            physical_effective,
+            smt: logical > physical,
+            quota_cpus: quota,
+            source: source.to_string(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiskKind {
+    Nvme,
+    SataSsd,
+    Hdd,
+    Virtual,
+    Network,
+    Unknown,
+}
+
+impl DiskKind {
+    pub fn name(self) -> &'static str {
+        match self {
+            DiskKind::Nvme => "nvme",
+            DiskKind::SataSsd => "sata-ssd",
+            DiskKind::Hdd => "hdd",
+            DiskKind::Virtual => "virtual",
+            DiskKind::Network => "network",
+            DiskKind::Unknown => "unknown",
+        }
+    }
+    /// Point-read concurrency for prevout prefetch.
+    pub fn reader_cap(self) -> usize {
+        match self {
+            DiskKind::Nvme => 8,
+            DiskKind::SataSsd => 4,
+            DiskKind::Hdd => 2,
+            DiskKind::Virtual | DiskKind::Unknown => 4,
+            DiskKind::Network => 2,
+        }
+    }
+    pub fn jobs_cap(self) -> usize {
+        match self {
+            DiskKind::Hdd | DiskKind::Network => 2,
+            _ => 4,
+        }
+    }
+    /// Block cache maximum for a machine with `ram_mib`. The page-cache floor
+    /// is reserved separately; this is only the upper bound.
+    pub fn cache_cap_mib(self, ram_mib: u64) -> u64 {
+        match self {
+            DiskKind::Nvme => (ram_mib / 4).clamp(1024, 8192),
+            DiskKind::SataSsd => (ram_mib / 8).clamp(1024, 4096),
+            DiskKind::Hdd => (ram_mib / 16).clamp(512, 2048),
+            DiskKind::Virtual | DiskKind::Unknown => (ram_mib / 8).clamp(1024, 4096),
+            DiskKind::Network => (ram_mib / 16).clamp(512, 2048),
+        }
+    }
+    /// Bulk commit interval. Fewer, larger groups amortise fsync and locks;
+    /// live mode uses a short interval set by the controller.
+    pub fn bulk_commit_ms(self) -> u64 {
+        match self {
+            DiskKind::Hdd => 45_000,
+            DiskKind::Network => 60_000,
+            DiskKind::SataSsd => 30_000,
+            DiskKind::Nvme => 20_000,
+            DiskKind::Virtual | DiskKind::Unknown => 30_000,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct DiskInfo {
+    pub kind: DiskKind,
+    pub device: Option<String>,
+    pub mount: String,
+    pub fstype: String,
+    pub free_bytes: u64,
+    pub total_bytes: u64,
+    pub source: String,
+}
+
+fn unescape_mount(s: &str) -> String {
+    s.replace("\\040", " ")
+        .replace("\\011", "\t")
+        .replace("\\012", "\n")
+        .replace("\\134", "\\")
+}
+
+fn mount_for(path: &Path) -> Option<(String, String, String)> {
+    let canon = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    let text = std::fs::read_to_string("/proc/self/mountinfo").ok()?;
+    let mut best: Option<(usize, String, String, String)> = None;
+    for line in text.lines() {
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        if fields.len() < 5 {
+            continue;
+        }
+        let mount = unescape_mount(fields[4]);
+        if !canon.starts_with(&mount) {
+            continue;
+        }
+        let fstype = fields
+            .iter()
+            .position(|f| *f == "-")
+            .and_then(|i| fields.get(i + 1))
+            .copied()
+            .unwrap_or("");
+        let len = mount.len();
+        if best.as_ref().map(|b| len >= b.0).unwrap_or(true) {
+            best = Some((len, fields[2].to_string(), mount, fstype.to_string()));
+        }
+    }
+    best.map(|(_, majmin, mount, fstype)| (majmin, mount, fstype))
+}
+
+fn strip_partition(name: &str) -> String {
+    if name.starts_with("nvme") {
+        if let Some(pos) = name.rfind('p') {
+            if name[pos + 1..].chars().all(|c| c.is_ascii_digit()) {
+                return name[..pos].to_string();
+            }
+        }
+        return name.to_string();
+    }
+    if name.starts_with("mmcblk") {
+        if let Some(pos) = name.rfind('p') {
+            return name[..pos].to_string();
+        }
+        return name.to_string();
+    }
+    if (name.starts_with("sd")
+        || name.starts_with("vd")
+        || name.starts_with("hd")
+        || name.starts_with("xvd"))
+        && name.ends_with(|c: char| c.is_ascii_digit())
+    {
+        return name
+            .trim_end_matches(|c: char| c.is_ascii_digit())
+            .to_string();
+    }
+    name.to_string()
+}
+
+fn device_base(majmin: &str, depth: u8) -> Option<String> {
+    if depth > 4 {
+        return None;
+    }
+    let link = std::fs::read_link(format!("/sys/dev/block/{majmin}")).ok()?;
+    let name = link.file_name()?.to_string_lossy().to_string();
+    if name.starts_with("dm-") || name.starts_with("md") || name.starts_with("loop") {
+        let slaves = std::fs::read_dir(format!("/sys/block/{name}/slaves")).ok()?;
+        for entry in slaves.flatten() {
+            let child = entry.file_name().to_string_lossy().to_string();
+            let child_majmin = std::fs::read_to_string(format!("/sys/block/{child}/dev")).ok()?;
+            if let Some(base) = device_base(child_majmin.trim(), depth + 1) {
+                return Some(base);
+            }
+        }
+        return Some(name);
+    }
+    Some(strip_partition(&name))
+}
+
+fn disk_kind_for(base: &str, fstype: &str) -> (DiskKind, bool) {
+    if matches!(
+        fstype,
+        "nfs" | "nfs4" | "cifs" | "smb3" | "fuse" | "fuse.sshfs"
+    ) {
+        return (DiskKind::Network, false);
+    }
+    if base.starts_with("dm-") || base.starts_with("md") || base.starts_with("loop") {
+        return (DiskKind::Virtual, false);
+    }
+    let rotational = std::fs::read_to_string(format!("/sys/block/{base}/queue/rotational"))
+        .ok()
+        .map(|s| s.trim() == "1")
+        .unwrap_or(false);
+    if base.starts_with("nvme") {
+        (DiskKind::Nvme, false)
+    } else if rotational {
+        (DiskKind::Hdd, true)
+    } else {
+        (DiskKind::SataSsd, false)
+    }
+}
+
+fn statvfs_bytes(path: &Path) -> Option<(u64, u64)> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+    let c = CString::new(path.as_os_str().as_bytes()).ok()?;
+    let mut s: libc::statvfs = unsafe { std::mem::zeroed() };
+    if unsafe { libc::statvfs(c.as_ptr(), &mut s) } != 0 {
+        return None;
+    }
+    let total = (s.f_blocks as u64).saturating_mul(s.f_frsize as u64);
+    let free = (s.f_bavail as u64).saturating_mul(s.f_frsize as u64);
+    Some((free, total))
+}
+
+impl DiskInfo {
+    pub fn detect(path: &Path) -> Self {
+        let (kind, device, mount, fstype, source) = match mount_for(path) {
+            Some((majmin, mount, fstype)) => {
+                let base = device_base(&majmin, 0);
+                let (kind, _) = base
+                    .as_deref()
+                    .map(|b| disk_kind_for(b, &fstype))
+                    .unwrap_or((DiskKind::Unknown, false));
+                (kind, base, mount, fstype, "mountinfo+sysfs".to_string())
+            }
+            None => (
+                DiskKind::Unknown,
+                None,
+                path.display().to_string(),
+                String::new(),
+                "fallback".to_string(),
+            ),
+        };
+        let (free_bytes, total_bytes) = statvfs_bytes(path).unwrap_or((0, 0));
+        Self {
+            kind,
+            device,
+            mount,
+            fstype,
+            free_bytes,
+            total_bytes,
+            source,
+        }
+    }
+}
+
+/// Startup plan derived from CPU, cgroup, RAM and the data/Core disks.
+#[derive(Debug, Clone)]
+pub struct MachinePlan {
+    pub cpu: CpuInfo,
+    pub mem: MemoryInfo,
+    pub data_disk: DiskInfo,
+    pub core_disk: DiskInfo,
+    pub same_device: bool,
+    pub readers: usize,
+    pub jobs: usize,
+    pub cache_mib: u64,
+    pub memtables_mib: u64,
+    pub reserve_mib: u64,
+    pub page_cache_floor_mib: u64,
+    pub commit_ms: u64,
+    pub batch_blocks: u32,
+    pub max_group_txs: usize,
+    pub core_par: u64,
+    pub core_rpcthreads: u64,
+    pub core_dbcache_mib: u64,
+    pub prune_timeout_seconds: u64,
+}
+
+impl MachinePlan {
+    pub fn detect(cfg: &Config, chain: Chain) -> Self {
+        let cpu = CpuInfo::detect();
+        let mem = memory_info();
+        let data_disk = DiskInfo::detect(&cfg.data_dir(chain));
+        let core_disk = DiskInfo::detect(&cfg.core_datadir(chain));
+        Self::from_parts(cpu, mem, data_disk, core_disk, cfg)
+    }
+
+    /// Pure mapping from detected parts to knobs, testable with a synthetic
+    /// 4C/8T machine.
+    pub fn from_parts(
+        cpu: CpuInfo,
+        mem: MemoryInfo,
+        data_disk: DiskInfo,
+        core_disk: DiskInfo,
+        cfg: &Config,
+    ) -> Self {
+        let same_device = match (&data_disk.device, &core_disk.device) {
+            (Some(a), Some(b)) => a == b,
+            _ => false,
+        };
+        let ram_mib = mem.total_mib.unwrap_or(1024).max(256);
+        let physical = cpu.physical_effective.max(1);
+
+        let readers = if cfg.index.readers > 0 {
+            cfg.index.readers
+        } else {
+            physical.clamp(2, data_disk.kind.reader_cap())
+        };
+        let jobs = if cfg.index.background_jobs > 0 {
+            cfg.index.background_jobs
+        } else {
+            (physical / 2).clamp(2, data_disk.kind.jobs_cap())
+        };
+        let cache_mib = if cfg.index.cache_mib > 0 {
+            cfg.index.cache_mib
+        } else {
+            data_disk
+                .kind
+                .cache_cap_mib(ram_mib)
+                .min((ram_mib / 4).max(64))
+        };
+        let commit_ms = if cfg.index.commit_interval_ms > 0 {
+            cfg.index.commit_interval_ms
+        } else {
+            data_disk.kind.bulk_commit_ms()
+        };
+        let batch_blocks = if cfg.index.batch_blocks > 0 && cfg.index.batch_blocks != 256 {
+            cfg.index.batch_blocks
+        } else {
+            512
+        };
+        let reserve_mib = if cfg.index.memory_reserve_mib > 0 {
+            cfg.index.memory_reserve_mib
+        } else {
+            auto_reserve_mib(ram_mib)
+        };
+        let page_cache_floor_mib = (ram_mib / 16).clamp(1024, 4096);
+        let memtables_mib = if cfg.index.write_buffer_mib > 0 {
+            cfg.index.write_buffer_mib
+        } else {
+            (ram_mib / 16).clamp(512, 2048)
+        };
+        let max_group_txs = if data_disk.kind == DiskKind::Hdd {
+            500_000
+        } else {
+            250_000
+        };
+
+        Self {
+            cpu,
+            mem,
+            data_disk,
+            core_disk,
+            same_device,
+            readers,
+            jobs,
+            cache_mib,
+            memtables_mib,
+            reserve_mib,
+            page_cache_floor_mib,
+            commit_ms,
+            batch_blocks,
+            max_group_txs,
+            core_par: physical.saturating_sub(1).clamp(1, 8) as u64,
+            core_rpcthreads: physical.clamp(4, 16) as u64,
+            core_dbcache_mib: (ram_mib / 8).clamp(450, 4096),
+            prune_timeout_seconds: 120,
+        }
+    }
+
+    pub fn describe(&self) -> String {
+        format!(
+            "cpu {}C/{}T (eff {}, {}{}) | mem {} MiB (cgroup {}, reserve {}, page floor {}) | \
+             data disk {} ({}, same={}) | core par={} rpcthreads={} dbcache={} | \
+             index readers={} jobs={} cache={} memtables={} commit={}ms batch={} txs={}",
+            self.cpu.physical,
+            self.cpu.logical,
+            self.cpu.effective,
+            self.cpu.source,
+            if self.cpu.smt { ", smt" } else { "" },
+            self.mem.total_mib.unwrap_or(0),
+            self.mem
+                .cgroup_limit_mib
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| "none".to_string()),
+            self.reserve_mib,
+            self.page_cache_floor_mib,
+            self.data_disk.kind.name(),
+            self.data_disk.mount,
+            self.same_device,
+            self.core_par,
+            self.core_rpcthreads,
+            self.core_dbcache_mib,
+            self.readers,
+            self.jobs,
+            self.cache_mib,
+            self.memtables_mib,
+            self.commit_ms,
+            self.batch_blocks,
+            self.max_group_txs
+        )
+    }
+
+    pub fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "cpu": {
+                "physical": self.cpu.physical,
+                "logical": self.cpu.logical,
+                "effective": self.cpu.effective,
+                "physical_effective": self.cpu.physical_effective,
+                "smt": self.cpu.smt,
+                "quota_cpus": self.cpu.quota_cpus,
+                "source": self.cpu.source,
+            },
+            "memory": {
+                "total_mib": self.mem.total_mib,
+                "available_mib": self.mem.available_mib,
+                "cgroup_limit_mib": self.mem.cgroup_limit_mib,
+                "cgroup_used_mib": self.mem.cgroup_used_mib,
+                "reserve_mib": self.reserve_mib,
+                "page_cache_floor_mib": self.page_cache_floor_mib,
+            },
+            "disk": {
+                "data": {
+                    "kind": self.data_disk.kind.name(),
+                    "mount": self.data_disk.mount,
+                    "device": self.data_disk.device,
+                    "fstype": self.data_disk.fstype,
+                    "free_bytes": self.data_disk.free_bytes,
+                    "total_bytes": self.data_disk.total_bytes,
+                    "source": self.data_disk.source,
+                },
+                "core": {
+                    "kind": self.core_disk.kind.name(),
+                    "mount": self.core_disk.mount,
+                    "device": self.core_disk.device,
+                    "fstype": self.core_disk.fstype,
+                    "free_bytes": self.core_disk.free_bytes,
+                    "total_bytes": self.core_disk.total_bytes,
+                    "source": self.core_disk.source,
+                },
+                "same_device": self.same_device,
+            },
+            "plan": {
+                "readers": self.readers,
+                "jobs": self.jobs,
+                "cache_mib": self.cache_mib,
+                "memtables_mib": self.memtables_mib,
+                "commit_ms": self.commit_ms,
+                "batch_blocks": self.batch_blocks,
+                "max_group_txs": self.max_group_txs,
+                "core_par": self.core_par,
+                "core_rpcthreads": self.core_rpcthreads,
+                "core_dbcache_mib": self.core_dbcache_mib,
+                "prune_timeout_seconds": self.prune_timeout_seconds,
+            },
+        })
+    }
+}
+
 /// Thread-safe hot knobs. Cold settings (`prune_mib`, block source, schema...)
 /// stay in `Config` and require a restart.
 pub struct Tunables {
@@ -95,11 +672,19 @@ pub struct Tunables {
     background_jobs: AtomicUsize,
 
     min_readers: usize,
+    max_readers_cap: usize,
     min_commit_ms: u64,
     max_commit_ms: u64,
+    /// Bulk and live commit intervals. The controller switches between them
+    /// when the mode changes; a bulk commit every 20-60 s is enough for
+    /// prune/undo safety and avoids the tiny-commit tax.
+    bulk_commit_ms: AtomicU64,
+    live_commit_ms: u64,
+    commit_min_blocks: u32,
     min_cache_mib: u64,
     max_cache_mib: u64,
     cache_floor_mib: u64,
+    page_cache_floor_mib: u64,
     min_batch: u32,
     max_batch: u32,
 
@@ -158,7 +743,14 @@ pub struct Tunables {
 }
 
 impl Tunables {
+    #[allow(dead_code)]
     pub fn new(cfg: &Config, rotational: bool) -> Self {
+        Self::new_with_plan(cfg, rotational, None)
+    }
+
+    /// Build the runtime knobs from a detected machine plan. Explicit config
+    /// values still win; the plan is the machine-derived default.
+    pub fn new_with_plan(cfg: &Config, rotational: bool, plan: Option<&MachinePlan>) -> Self {
         let requested = Profile::parse(&cfg.index.profile).unwrap_or_else(|| {
             eprintln!(
                 "[e-lite] unknown [index] profile {:?}; using auto",
@@ -166,33 +758,69 @@ impl Tunables {
             );
             Profile::Auto
         });
-        let profile = requested.resolve(rotational);
-        let ram_mib = total_ram_mib().unwrap_or(1024);
-        let cpus = std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(4);
+        let cpu = plan.map(|p| p.cpu.clone()).unwrap_or_else(CpuInfo::detect);
+        let cpus = cpu.effective.max(1);
+        let disk_rotational = plan
+            .map(|p| p.data_disk.kind == DiskKind::Hdd)
+            .unwrap_or(rotational);
+        let profile = requested.resolve(disk_rotational);
+        let ram_mib = plan
+            .and_then(|p| p.mem.total_mib)
+            .or_else(total_ram_mib)
+            .unwrap_or(1024)
+            .max(256);
 
-        let (mut readers, default_commit, default_batch, default_cache, profile_jobs) =
-            match profile {
-                Profile::Hdd => (2usize, 5_000u64, 512u32, (ram_mib / 4).min(4096), 4usize),
-                Profile::Ssd => (8, 2_000, 256, (ram_mib / 4).min(8192), cpus.min(8)),
-                Profile::Nvme => (16, 2_000, 256, (ram_mib / 3).min(16_384), cpus.min(12)),
-                Profile::Manual | Profile::Auto => (
-                    if cfg.index.readers > 0 {
-                        cfg.index.readers
-                    } else {
-                        cpus.min(8)
-                    },
-                    2_000,
-                    256,
-                    if cfg.index.cache_mib > 0 {
-                        cfg.index.cache_mib
-                    } else {
-                        (ram_mib / 4).clamp(64, 2048)
-                    },
-                    cpus.min(4),
-                ),
-            };
+        let (
+            mut readers,
+            mut default_commit,
+            mut default_batch,
+            mut default_cache,
+            mut profile_jobs,
+        ) = match profile {
+            Profile::Hdd => (
+                2usize,
+                45_000u64,
+                512u32,
+                (ram_mib / 16).clamp(512, 2048),
+                2usize,
+            ),
+            Profile::Ssd => (
+                cpus.clamp(2, 4),
+                30_000,
+                512,
+                (ram_mib / 8).clamp(1024, 4096),
+                (cpus / 2).clamp(2, 4),
+            ),
+            Profile::Nvme => (
+                cpus.clamp(2, 8),
+                20_000,
+                512,
+                (ram_mib / 4).clamp(1024, 8192),
+                (cpus / 2).clamp(2, 4),
+            ),
+            Profile::Manual | Profile::Auto => (
+                if cfg.index.readers > 0 {
+                    cfg.index.readers
+                } else {
+                    cpus.min(8)
+                },
+                30_000,
+                512,
+                if cfg.index.cache_mib > 0 {
+                    cfg.index.cache_mib
+                } else {
+                    (ram_mib / 8).clamp(1024, 4096)
+                },
+                cpus.min(4),
+            ),
+        };
+        if let Some(p) = plan {
+            readers = p.readers;
+            default_commit = p.commit_ms;
+            default_batch = p.batch_blocks;
+            default_cache = p.cache_mib;
+            profile_jobs = p.jobs;
+        }
         let requested_jobs = if cfg.index.background_jobs > 0 {
             cfg.index.background_jobs
         } else {
@@ -220,19 +848,25 @@ impl Tunables {
             default_cache
         };
 
-        let budget = budget_from(
+        let mem_now = memory_info();
+        let budget = budget_with(
             cfg,
             ram_mib,
-            memory_info().available_mib,
-            memory_info().cached_mib,
+            mem_now.available_mib,
+            mem_now.cached_mib,
+            plan.map(|p| p.reserve_mib),
+            plan.map(|p| p.memtables_mib),
         );
         // Do not let the adaptive cache swallow the whole memory ceiling: a
         // stable quarter of RAM keeps the recent UTXO working set cached while
         // leaving room for Core and the page cache during IBD.
         // `budget_from` already fits cache+memtables+runtime inside the
         // ceiling; do not apply a second ceiling that could break the fit.
-        let max_cache_mib = budget.cache_max_mib.max(8);
-        let cache_floor_mib = (ram_mib / 8).clamp(512, 4096).min(max_cache_mib);
+        let max_cache_mib = budget.cache_max_mib.min(default_cache.max(8)).max(8);
+        // Working-set floor: large enough to keep prevout lookups useful, but
+        // never equal to the maximum, so the cache can still shrink under
+        // pressure instead of becoming a fixed allocation.
+        let cache_floor_mib = (ram_mib / 8).clamp(512, 2048).min(max_cache_mib);
         if budget.over_budget {
             eprintln!(
                 "[e-lite] WARNING: memory plan ({} MiB) exceeds the {} MiB ceiling; using \
@@ -242,13 +876,17 @@ impl Tunables {
         }
         // Keep a single hard ceiling; the profile only changes the starting
         // point. The controller never raises readers on a rotational disk.
-        let max_readers = match profile {
-            Profile::Hdd => 4,
-            Profile::Ssd => 8,
-            Profile::Nvme => 16,
-            Profile::Auto | Profile::Manual => 32,
-        };
-        let cpu_reader_cap = cpus.saturating_mul(2).max(2);
+        // The plan's reader count is the cap for both the initial value and
+        // the controller. On a 4C/8T box that is 4, not 8 or 16.
+        let max_readers = plan
+            .map(|p| p.readers.max(1))
+            .unwrap_or_else(|| match profile {
+                Profile::Hdd => 4,
+                Profile::Ssd => 8,
+                Profile::Nvme => 16,
+                Profile::Auto | Profile::Manual => 32,
+            });
+        let cpu_reader_cap = cpus.max(2);
         let readers = if cfg.index.readers > 0 {
             readers.clamp(1, max_readers)
         } else {
@@ -257,18 +895,21 @@ impl Tunables {
         // `clamp` panics when min > max; a tight budget can leave less than
         // 64 MiB, and that must degrade instead of aborting the process.
         let cache_mib = cache_mib.min(max_cache_mib).max(8.min(max_cache_mib));
-        let commit_ms = commit_ms.clamp(500, 30_000);
+        let commit_ms = commit_ms.clamp(500, 60_000);
         let batch_blocks = batch_blocks.clamp(16, 4096);
+        let max_group_txs = plan
+            .map(|p| p.max_group_txs)
+            .unwrap_or(if profile == Profile::Hdd {
+                500_000
+            } else {
+                250_000
+            });
 
         Tunables {
             readers: AtomicUsize::new(readers),
             commit_ms: AtomicU64::new(commit_ms),
             batch_blocks: AtomicU32::new(batch_blocks),
-            max_group_txs: AtomicUsize::new(if profile == Profile::Hdd {
-                500_000
-            } else {
-                250_000
-            }),
+            max_group_txs: AtomicUsize::new(max_group_txs),
             cache_mib: AtomicU64::new(cache_mib),
             // 0 means "auto": the pipeline keeps its default window.
             prefetch_blocks: AtomicUsize::new(cfg.index.prefetch_blocks),
@@ -282,11 +923,16 @@ impl Tunables {
             rotational: AtomicBool::new(rotational),
             background_jobs: AtomicUsize::new(jobs.clamp(1, 32)),
             min_readers: 1,
+            max_readers_cap: max_readers,
             min_commit_ms: 500,
-            max_commit_ms: 30_000,
+            max_commit_ms: 60_000,
+            bulk_commit_ms: AtomicU64::new(commit_ms),
+            live_commit_ms: 1_500,
+            commit_min_blocks: 8,
             min_cache_mib: 8,
             max_cache_mib,
             cache_floor_mib,
+            page_cache_floor_mib: budget.page_cache_floor_mib,
             min_batch: 16,
             max_batch: 4096,
             total_mib: ram_mib,
@@ -337,6 +983,9 @@ impl Tunables {
     pub fn commit_ms(&self) -> u64 {
         self.commit_ms.load(Ordering::Relaxed)
     }
+    pub fn commit_min_blocks(&self) -> u32 {
+        self.commit_min_blocks
+    }
     pub fn batch_blocks(&self) -> u32 {
         self.batch_blocks.load(Ordering::Relaxed)
     }
@@ -382,20 +1031,8 @@ impl Tunables {
         self.rotational.load(Ordering::Relaxed)
     }
 
-    fn profile_ceiling(&self) -> usize {
-        match self.profile() {
-            Profile::Hdd => 4,
-            Profile::Ssd => 8,
-            Profile::Nvme => 16,
-            Profile::Auto | Profile::Manual => 32,
-        }
-    }
-
     fn auto_max_readers(&self) -> usize {
-        let cpus = std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(4);
-        self.profile_ceiling().min(cpus.saturating_mul(2).max(2))
+        self.max_readers_cap.max(1)
     }
 
     fn memory_reader_cap(&self) -> usize {
@@ -514,7 +1151,19 @@ impl Tunables {
         } else if lag <= 500 {
             live = true;
         }
-        self.mode_live.store(live, Ordering::Relaxed);
+        let was_live = self.mode_live.swap(live, Ordering::Relaxed);
+        if live != was_live && !self.commit_locked.load(Ordering::Relaxed) {
+            // Bulk can afford 20-60 s between commits; live must stay short
+            // for wallet latency and strict sync.
+            self.commit_ms.store(
+                if live {
+                    self.live_commit_ms
+                } else {
+                    self.bulk_commit_ms.load(Ordering::Relaxed)
+                },
+                Ordering::Relaxed,
+            );
+        }
         (if live { Mode::Live } else { Mode::Bulk }, lag)
     }
     pub fn record_tx_rate(&self, tx_per_sec: u64) {
@@ -525,37 +1174,37 @@ impl Tunables {
     }
 
     fn apply_profile_defaults(&self, profile: Profile) {
-        let cpus = std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(4);
-        let reader_cap = cpus.saturating_mul(2).max(2);
+        let phys = CpuInfo::detect().physical_effective.max(1);
+        let reader_cap = self.max_readers_cap.max(1);
         match profile {
             Profile::Hdd => {
                 self.readers
                     .store(2usize.min(reader_cap), Ordering::Relaxed);
-                self.commit_ms.store(5_000, Ordering::Relaxed);
+                self.commit_ms.store(45_000, Ordering::Relaxed);
+                self.bulk_commit_ms.store(45_000, Ordering::Relaxed);
                 self.batch_blocks.store(512, Ordering::Relaxed);
                 self.max_group_txs.store(500_000, Ordering::Relaxed);
-                self.background_jobs
-                    .store(4usize.min(cpus.max(1)), Ordering::Relaxed);
+                self.background_jobs.store(2.min(phys), Ordering::Relaxed);
             }
             Profile::Ssd => {
                 self.readers
-                    .store(8usize.min(reader_cap), Ordering::Relaxed);
-                self.commit_ms.store(2_000, Ordering::Relaxed);
-                self.batch_blocks.store(256, Ordering::Relaxed);
+                    .store(phys.clamp(2, 4).min(reader_cap), Ordering::Relaxed);
+                self.commit_ms.store(30_000, Ordering::Relaxed);
+                self.bulk_commit_ms.store(30_000, Ordering::Relaxed);
+                self.batch_blocks.store(512, Ordering::Relaxed);
                 self.max_group_txs.store(250_000, Ordering::Relaxed);
                 self.background_jobs
-                    .store(8usize.min(cpus.max(1)), Ordering::Relaxed);
+                    .store((phys / 2).clamp(2, 4), Ordering::Relaxed);
             }
             Profile::Nvme => {
                 self.readers
-                    .store(16usize.min(reader_cap), Ordering::Relaxed);
-                self.commit_ms.store(2_000, Ordering::Relaxed);
-                self.batch_blocks.store(256, Ordering::Relaxed);
+                    .store(phys.clamp(2, 8).min(reader_cap), Ordering::Relaxed);
+                self.commit_ms.store(20_000, Ordering::Relaxed);
+                self.bulk_commit_ms.store(20_000, Ordering::Relaxed);
+                self.batch_blocks.store(512, Ordering::Relaxed);
                 self.max_group_txs.store(250_000, Ordering::Relaxed);
                 self.background_jobs
-                    .store(12usize.min(cpus.max(1)), Ordering::Relaxed);
+                    .store((phys / 2).clamp(2, 4), Ordering::Relaxed);
             }
             Profile::Auto | Profile::Manual => {}
         }
@@ -594,7 +1243,7 @@ impl Tunables {
             let v = cfg
                 .index
                 .readers
-                .clamp(self.min_readers, self.profile_ceiling());
+                .clamp(self.min_readers, self.max_readers_cap);
             if v != self.readers() {
                 self.readers.store(v, Ordering::Relaxed);
                 changed.push("readers");
@@ -607,10 +1256,11 @@ impl Tunables {
                 .clamp(self.min_commit_ms, self.max_commit_ms);
             if v != self.commit_ms() {
                 self.commit_ms.store(v, Ordering::Relaxed);
+                self.bulk_commit_ms.store(v, Ordering::Relaxed);
                 changed.push("commit_interval_ms");
             }
         }
-        if cfg.index.batch_blocks > 0 {
+        if cfg.index.batch_blocks > 0 && cfg.index.batch_blocks != 256 {
             let v = cfg.index.batch_blocks.clamp(self.min_batch, self.max_batch);
             if v != self.batch_blocks() {
                 self.batch_blocks.store(v, Ordering::Relaxed);
@@ -772,6 +1422,7 @@ impl Tunables {
             mem.available_mib,
             mem.cached_mib,
             self.reserve_mib,
+            self.page_cache_floor_mib,
             self.cache_mib(),
             self.max_cache_mib,
             self.prefetch_ms(),
@@ -814,7 +1465,9 @@ impl Tunables {
                 } else {
                     self.cache_floor_mib.min(old.max(1))
                 };
-                (old * 3 / 4).max(floor.min(old))
+                // Small steps avoid the 8 GiB -> 4.5 GiB oscillation that
+                // starves the page cache and then grows back.
+                (old * 7 / 8).max(floor.min(old))
             }
             CacheAction::Hold => old,
         };
@@ -1448,6 +2101,8 @@ pub struct MemoryBudget {
     pub runtime_mib: u64,
     pub cache_max_mib: u64,
     pub cache_start_mib: u64,
+    /// Page cache the block cache must not evict under normal pressure.
+    pub page_cache_floor_mib: u64,
     /// Sum of the components the controller plans to keep resident.
     pub planned_mib: u64,
     /// True when the floor requirements could not fit inside the ceiling.
@@ -1461,7 +2116,9 @@ fn auto_reserve_mib(total_mib: u64) -> u64 {
     if total_mib <= 2048 {
         (total_mib / 4).max(256)
     } else {
-        (total_mib / 8).clamp(512, 2048)
+        // 32 GiB -> 4 GiB: the page cache must keep room for Core's block
+        // files and the index's SST reads, not just for the OS.
+        (total_mib / 8).clamp(2048, 4096)
     }
 }
 
@@ -1481,11 +2138,24 @@ pub fn budget_from(
     available_mib: u64,
     cached_mib: u64,
 ) -> MemoryBudget {
-    let reserve_mib = if cfg.index.memory_reserve_mib > 0 {
-        cfg.index.memory_reserve_mib
-    } else {
-        auto_reserve_mib(total_mib)
-    };
+    budget_with(cfg, total_mib, available_mib, cached_mib, None, None)
+}
+
+pub fn budget_with(
+    cfg: &Config,
+    total_mib: u64,
+    available_mib: u64,
+    cached_mib: u64,
+    reserve_override: Option<u64>,
+    memtables_override: Option<u64>,
+) -> MemoryBudget {
+    let reserve_mib = reserve_override.unwrap_or_else(|| {
+        if cfg.index.memory_reserve_mib > 0 {
+            cfg.index.memory_reserve_mib
+        } else {
+            auto_reserve_mib(total_mib)
+        }
+    });
     let usable = total_mib.saturating_sub(reserve_mib).max(128);
     // An explicit fraction is a hard request: never raised to satisfy floors.
     let fraction = if cfg.index.memory_fraction > 0.0 {
@@ -1501,11 +2171,13 @@ pub fn budget_from(
         .clamp(MIN_RUNTIME_MIB, 1024)
         .min((ceiling_mib / 4).max(MIN_RUNTIME_MIB));
 
-    let mut memtables_mib = if cfg.index.write_buffer_mib > 0 {
-        cfg.index.write_buffer_mib
-    } else {
-        (total_mib / 8).clamp(128, 2048)
-    };
+    let mut memtables_mib = memtables_override.unwrap_or_else(|| {
+        if cfg.index.write_buffer_mib > 0 {
+            cfg.index.write_buffer_mib
+        } else {
+            (total_mib / 16).clamp(512, 2048)
+        }
+    });
     // Leave at least a small cache before honouring the memtable size.
     let room_for_mem = ceiling_mib
         .saturating_sub(runtime_mib)
@@ -1531,6 +2203,7 @@ pub fn budget_from(
     let planned_mib = runtime_mib
         .saturating_add(memtables_mib)
         .saturating_add(cache_start_mib);
+    let page_cache_floor_mib = (total_mib / 16).clamp(1024, 4096);
     MemoryBudget {
         total_mib,
         available_mib,
@@ -1541,6 +2214,7 @@ pub fn budget_from(
         runtime_mib,
         cache_max_mib,
         cache_start_mib,
+        page_cache_floor_mib,
         planned_mib,
         over_budget: planned_mib > ceiling_mib,
     }
@@ -1567,6 +2241,7 @@ pub fn cache_action(
     available_mib: u64,
     _cached_mib: u64,
     reserve_mib: u64,
+    page_cache_floor_mib: u64,
     cache_mib: u64,
     cache_max_mib: u64,
     prefetch_ms: u64,
@@ -1574,10 +2249,12 @@ pub fn cache_action(
     // `MemAvailable` already accounts for reclaimable page cache, so it is the
     // right signal. A low page-cache number is expected while the RocksDB
     // block cache holds the UTXO working set; shrinking because of it caused
-    // cache oscillation (6 GiB -> 256 MiB) and random-read stalls.
-    if available_mib < reserve_mib {
+    // cache oscillation (6 GiB -> 256 MiB) and random-read stalls. The floor
+    // makes the guard explicit instead of relying on a single reserve number.
+    let floor = reserve_mib.saturating_add(page_cache_floor_mib);
+    if available_mib < floor {
         CacheAction::Shrink
-    } else if available_mib >= reserve_mib + reserve_mib / 2
+    } else if available_mib >= floor.saturating_add(cache_mib / 4)
         && cache_mib < cache_max_mib
         && prefetch_ms >= 50
     {
@@ -1592,6 +2269,7 @@ pub fn cache_action(
 /// `rotational` hint for the device holding `path`. Falls back to false.
 /// Uses mountinfo's major:minor and walks sysfs to the parent block device, so
 /// partitions and device-mapper volumes are handled too.
+#[allow(dead_code)]
 pub fn is_rotational(path: &std::path::Path) -> bool {
     let Ok(info) = std::fs::read_to_string("/proc/self/mountinfo") else {
         return false;
@@ -1655,12 +2333,94 @@ mod tests {
     }
 
     #[test]
+    fn cpu_detection_is_sane() {
+        let c = CpuInfo::detect();
+        assert!(c.logical >= 1);
+        assert!(c.physical >= 1);
+        assert!(c.physical <= c.logical);
+        assert!(c.effective >= 1);
+        assert!(c.physical_effective <= c.effective);
+    }
+
+    #[test]
+    fn disk_detection_returns_a_class_and_size() {
+        let d = DiskInfo::detect(std::path::Path::new("."));
+        assert!(!d.mount.is_empty());
+        assert!(d.total_bytes > 0);
+        assert!(!d.kind.name().is_empty());
+    }
+
+    #[test]
+    fn machine_plan_maps_4c8t_sata_to_bounded_values() {
+        let cpu = CpuInfo {
+            physical: 4,
+            logical: 8,
+            effective: 8,
+            physical_effective: 4,
+            smt: true,
+            quota_cpus: None,
+            source: "test".to_string(),
+        };
+        let mem = MemoryInfo {
+            total_mib: Some(32_768),
+            available_mib: 16_384,
+            host_total_mib: Some(32_768),
+            host_available_mib: 16_384,
+            cgroup_limit_mib: None,
+            cgroup_used_mib: None,
+            reclaimable_mib: None,
+            free_mib: 2048,
+            cached_mib: 8192,
+            source: LimitSource::Host,
+            cgroup_detected: false,
+            cgroup_unlimited: false,
+        };
+        let disk = DiskInfo {
+            kind: DiskKind::SataSsd,
+            device: Some("sda".to_string()),
+            mount: "/".to_string(),
+            fstype: "ext4".to_string(),
+            free_bytes: 100,
+            total_bytes: 200,
+            source: "test".to_string(),
+        };
+        let p = MachinePlan::from_parts(cpu, mem, disk.clone(), disk, &Config::default());
+        assert_eq!(p.readers, 4);
+        assert_eq!(p.jobs, 2);
+        assert_eq!(p.core_par, 3);
+        assert_eq!(p.core_rpcthreads, 4);
+        assert_eq!(p.core_dbcache_mib, 4096);
+        assert_eq!(p.cache_mib, 4096);
+        assert_eq!(p.commit_ms, 30_000);
+        assert_eq!(p.reserve_mib, 4096);
+        assert_eq!(p.page_cache_floor_mib, 2048);
+        assert!(p.same_device);
+    }
+
+    #[test]
+    fn machine_plan_has_bounded_knobs() {
+        let cfg = Config::default();
+        let p = MachinePlan::detect(&cfg, Chain::Regtest);
+        assert!(p.readers >= 1);
+        assert!(p.jobs >= 1);
+        assert!(p.cache_mib >= 8);
+        assert!(p.commit_ms >= 500);
+        assert!(p.batch_blocks >= 16);
+        assert!(p.page_cache_floor_mib >= 1024);
+        assert!(p.core_par >= 1);
+        assert!(!p.describe().is_empty());
+    }
+
+    #[test]
     fn memory_budget_scales_with_ram_and_respects_overrides() {
         let mut cfg = Config::default();
         let b = budget_from(&cfg, 7941, 2583, 2708);
-        assert_eq!(b.reserve_mib, 992);
-        assert_eq!(b.ceiling_mib, 5955);
-        assert_eq!(b.memtables_mib, 992);
+        // 8 GiB class: leave 2 GiB for OS/Core/page cache; memtables are
+        // RAM/16 (512 MiB), not the old RAM/8.
+        assert_eq!(b.reserve_mib, 2048);
+        assert_eq!(b.ceiling_mib, 5893);
+        assert_eq!(b.memtables_mib, 512);
+        assert_eq!(b.page_cache_floor_mib, 1024);
         assert!(b.cache_max_mib >= b.cache_start_mib);
 
         cfg.index.memory_fraction = 0.5;
@@ -1727,35 +2487,35 @@ mod tests {
 
     #[test]
     fn cache_action_grows_and_shrinks_with_hysteresis_inputs() {
-        // Healthy and prevout prefetch is actually slow: grow.
+        // Healthy, 2 GiB page-cache floor and slow prefetch: grow.
         assert_eq!(
-            cache_action(2583, 2708, 1024, 1985, 4000, 300),
+            cache_action(5000, 2708, 1024, 2048, 1985, 4000, 300),
             CacheAction::Grow
         );
         // Free RAM alone is not a reason to grow.
         assert_eq!(
-            cache_action(2583, 2708, 1024, 1985, 4000, 5),
+            cache_action(5000, 2708, 1024, 2048, 1985, 4000, 5),
             CacheAction::Hold
+        );
+        // Below reserve + page-cache floor: shrink.
+        assert_eq!(
+            cache_action(2000, 2708, 1024, 2048, 2000, 4000, 300),
+            CacheAction::Shrink
         );
         // No room above the ceiling: hold.
         assert_eq!(
-            cache_action(2583, 2708, 1024, 4000, 4000, 300),
+            cache_action(5000, 2708, 1024, 2048, 4000, 4000, 300),
             CacheAction::Hold
-        );
-        // Available below reserve: shrink.
-        assert_eq!(
-            cache_action(800, 2708, 1024, 2000, 4000, 300),
-            CacheAction::Shrink
         );
         // Low page cache alone must not shrink the RocksDB cache: MemAvailable
         // already accounts for reclaimable memory.
         assert_eq!(
-            cache_action(4000, 400, 1024, 2000, 4000, 300),
+            cache_action(4000, 400, 1024, 2048, 2000, 4000, 300),
             CacheAction::Grow
         );
-        // Between 1x and 1.5x reserve: hold.
+        // Between the floor and the growth headroom: hold.
         assert_eq!(
-            cache_action(1200, 2000, 1024, 2000, 4000, 300),
+            cache_action(3200, 2000, 1024, 2048, 2000, 4000, 300),
             CacheAction::Hold
         );
     }

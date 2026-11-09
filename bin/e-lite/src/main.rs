@@ -1671,6 +1671,16 @@ fn cmd_doctor(cfg: &Config, chain: Chain) -> R<()> {
         Ok(plan) => println!("core plan: {}", core_plan::describe(&plan)),
         Err(e) => problems.push(format!("core plan: {e}")),
     }
+    let machine = tuning::MachinePlan::detect(cfg, chain);
+    println!("machine: {}", machine.describe());
+    if machine.data_disk.kind == tuning::DiskKind::Unknown
+        || machine.data_disk.kind == tuning::DiskKind::Virtual
+    {
+        println!(
+            "machine note: disk class is {}; using conservative reader/cache values",
+            machine.data_disk.kind.name()
+        );
+    }
     {
         let reserve = (cfg.server.max_clients as u64)
             .saturating_mul(2)
@@ -2006,6 +2016,10 @@ struct Indexer {
     /// Latest Core observation shared by a 1 Hz poller thread. Keeps
     /// `getblockchaininfo` out of the block-application path.
     core_obs: Arc<Mutex<Option<(BlockchainInfo, Instant)>>>,
+    /// `pruneblockchain` runs in its own thread: the WAL barrier is taken on
+    /// the apply thread, but the RPC may spend tens of seconds in Core.
+    prune_rx: Mutex<Option<std::sync::mpsc::Receiver<Result<i64, String>>>>,
+    prune_in_flight: AtomicBool,
 }
 
 impl Drop for Indexer {
@@ -2096,6 +2110,8 @@ impl Indexer {
             lag_policy_drain,
             lag_target_secs,
             core_obs: Arc::new(Mutex::new(None)),
+            prune_rx: Mutex::new(None),
+            prune_in_flight: AtomicBool::new(false),
         }
     }
 
@@ -2529,6 +2545,22 @@ impl Indexer {
             sh.stats
                 .rocksdb_properties_ok
                 .store(c.properties_ok, Ordering::Relaxed);
+            let mut cf_map = serde_json::Map::new();
+            for (name, pending, memtable, sst, readers, ok) in self.store.cf_stats() {
+                cf_map.insert(
+                    name.to_string(),
+                    json!({
+                        "pending_compaction_bytes": pending,
+                        "memtable_bytes": memtable,
+                        "sst_bytes": sst,
+                        "table_readers_bytes": readers,
+                        "properties_ok": ok,
+                    }),
+                );
+            }
+            if let Ok(mut v) = sh.stats.rocksdb_cf.lock() {
+                *v = serde_json::Value::Object(cf_map);
+            }
             let fd = self.store.fd_plan();
             sh.stats
                 .fd_soft_limit
@@ -2764,10 +2796,117 @@ impl Indexer {
         }
     }
 
+    fn prune_in_flight(&self) -> bool {
+        self.prune_in_flight.load(Ordering::SeqCst)
+    }
+
+    /// Launch `pruneblockchain` in a background thread. The caller has already
+    /// taken the WAL durability barrier; the RPC itself does not need the
+    /// apply thread.
+    fn start_prune(&self, height: u32) -> bool {
+        if self.prune_in_flight.swap(true, Ordering::SeqCst) {
+            return false;
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        if let Ok(mut slot) = self.prune_rx.lock() {
+            *slot = Some(rx);
+        } else {
+            self.prune_in_flight.store(false, Ordering::SeqCst);
+            return false;
+        }
+        let core = self.core.clone();
+        match std::thread::Builder::new()
+            .name("el-prune".to_string())
+            .spawn(move || {
+                let result = core
+                    .prune_blockchain(height as u64)
+                    .map_err(|e| e.to_string());
+                let _ = tx.send(result);
+            }) {
+            Ok(_) => true,
+            Err(e) => {
+                eprintln!("[e-lite] cannot start the prune thread: {e}");
+                if let Ok(mut slot) = self.prune_rx.lock() {
+                    *slot = None;
+                }
+                self.prune_in_flight.store(false, Ordering::SeqCst);
+                false
+            }
+        }
+    }
+
+    /// Collect a finished background prune and feed the supervisor state.
+    fn poll_prune(&self, supervisor: &mut el_chain::Supervisor) {
+        let msg = {
+            let Ok(mut guard) = self.prune_rx.lock() else {
+                return;
+            };
+            let Some(rx) = guard.as_ref() else {
+                return;
+            };
+            match rx.try_recv() {
+                Ok(v) => Some(v),
+                Err(std::sync::mpsc::TryRecvError::Empty) => None,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    *guard = None;
+                    Some(Err("prune thread ended without a result".to_string()))
+                }
+            }
+        };
+        let Some(result) = msg else {
+            return;
+        };
+        if let Ok(mut guard) = self.prune_rx.lock() {
+            *guard = None;
+        }
+        self.prune_in_flight.store(false, Ordering::SeqCst);
+        match result {
+            Ok(got) if got > 0 => {
+                let got = got.clamp(0, u32::MAX as i64) as u32;
+                supervisor.on_pruned(got);
+                self.tunables.note_prune();
+                if let Some(bulk) = &self.bulk {
+                    match bulk.forget_missing_files() {
+                        Ok(0) => {}
+                        Ok(n) => eprintln!("[e-lite] dropped {n} block locators for pruned files"),
+                        Err(e) => eprintln!("[e-lite] cannot clean block locators: {e}"),
+                    }
+                }
+                eprintln!(
+                    "[e-lite] pruned Core blocks below {got} (asynchronous request finished)"
+                );
+                if let Some(sh) = &self.shared {
+                    refresh_ready_state(sh);
+                }
+            }
+            Ok(got) => {
+                // Core had no whole block file to remove. Keep the retry state
+                // so the next safe height is attempted, not marked as pruned.
+                supervisor.on_prune_failed();
+                eprintln!(
+                    "[e-lite] prune not possible yet (Core reports {got}); waiting for more blocks"
+                );
+                if let Some(sh) = &self.shared {
+                    sh.stats.prune_failures.fetch_add(1, Ordering::Relaxed);
+                    refresh_ready_state(sh);
+                }
+            }
+            Err(e) => {
+                supervisor.on_prune_failed();
+                eprintln!("[e-lite] prune request failed: {e}");
+                if let Some(sh) = &self.shared {
+                    sh.stats.prune_failures.fetch_add(1, Ordering::Relaxed);
+                    refresh_ready_state(sh);
+                }
+            }
+        }
+    }
+
     /// Run one supervisor step from inside the indexing loop. Keeping the
     /// pipeline alive across these steps is what avoids discarding prepared
     /// blocks every 10 s; the supervisor cadence is unchanged.
     fn supervisor_step(&self, supervisor: &mut el_chain::Supervisor) {
+        self.poll_prune(supervisor);
         match supervisor_tick(
             supervisor,
             &self.core,
@@ -3113,9 +3252,17 @@ impl Indexer {
                 }
             }
             let _ = permit_tx.send(());
+            // Bulk commits are deliberately infrequent: the prune gate uses the
+            // *committed* tip, so a 20-60 s interval cannot lose data that Core
+            // has already pruned. A tiny group is not committed on the timer;
+            // it waits for a useful minimum (or 60 s) to avoid 1-block commits.
+            let commit_elapsed = group_started.elapsed();
             let commit_due = count >= self.tunables.batch_blocks().max(1)
                 || group_txids.len() >= self.tunables.max_group_txs()
-                || (group_started.elapsed() >= self.tunables.commit_interval() && undo_ready);
+                || (commit_elapsed >= self.tunables.commit_interval()
+                    && (count >= self.tunables.commit_min_blocks()
+                        || commit_elapsed >= Duration::from_secs(60))
+                    && undo_ready);
             if commit_due {
                 let current = tip.expect("tip set");
                 let sync =
@@ -3720,52 +3867,57 @@ fn apply_supervisor_actions(
                         continue;
                     }
                 }
-                sup.on_prune_requested(height);
-                if let Some(sh) = shared {
-                    sh.stats.prune_requests.fetch_add(1, Ordering::Relaxed);
-                    sh.set_state(state::PRUNING);
-                }
-                match core.prune_blockchain(height as u64) {
-                    Ok(got) if got > 0 => {
-                        let got = (got as u64).min(u32::MAX as u64) as u32;
-                        sup.on_pruned(got);
-                        if let Some(i) = idx {
-                            i.tunables.note_prune();
-                            if let Some(bulk) = &i.bulk {
-                                match bulk.forget_missing_files() {
-                                    Ok(0) => {}
-                                    Ok(n) => eprintln!(
-                                        "[e-lite] dropped {n} block locators for pruned files"
-                                    ),
-                                    Err(e) => {
-                                        eprintln!("[e-lite] cannot clean block locators: {e}")
-                                    }
-                                }
+                if let Some(i) = idx {
+                    if i.prune_in_flight() {
+                        continue;
+                    }
+                    sup.on_prune_requested(height);
+                    if let Some(sh) = shared {
+                        sh.stats.prune_requests.fetch_add(1, Ordering::Relaxed);
+                        sh.set_state(state::PRUNING);
+                    }
+                    if !i.start_prune(height) {
+                        sup.on_prune_failed();
+                        if let Some(sh) = shared {
+                            sh.stats.prune_failures.fetch_add(1, Ordering::Relaxed);
+                            refresh_ready_state(sh);
+                        }
+                    }
+                } else {
+                    // Defensive fallback: no Indexer to own the thread.
+                    sup.on_prune_requested(height);
+                    if let Some(sh) = shared {
+                        sh.stats.prune_requests.fetch_add(1, Ordering::Relaxed);
+                        sh.set_state(state::PRUNING);
+                    }
+                    match core.prune_blockchain(height as u64) {
+                        Ok(got) if got > 0 => {
+                            let got = (got as u64).min(u32::MAX as u64) as u32;
+                            sup.on_pruned(got);
+                            eprintln!(
+                                "[e-lite] pruned Core blocks below {got} (requested {height})"
+                            );
+                        }
+                        Ok(got) => {
+                            sup.on_prune_failed();
+                            eprintln!(
+                                "[e-lite] prune at {height} not possible yet (Core reports {got}); waiting for more blocks"
+                            );
+                            if let Some(sh) = shared {
+                                sh.stats.prune_failures.fetch_add(1, Ordering::Relaxed);
                             }
                         }
-                        eprintln!("[e-lite] pruned Core blocks below {got} (requested {height})");
-                    }
-                    Ok(got) => {
-                        // Core had no whole block file to remove. Cooldown until
-                        // the safe height advances.
-                        sup.on_prune_failed();
-                        eprintln!(
-                            "[e-lite] prune at {height} not possible yet (Core reports {got}); waiting for more blocks"
-                        );
-                        if let Some(sh) = shared {
-                            sh.stats.prune_failures.fetch_add(1, Ordering::Relaxed);
+                        Err(e) => {
+                            sup.on_prune_failed();
+                            eprintln!("[e-lite] prune request failed: {e}");
+                            if let Some(sh) = shared {
+                                sh.stats.prune_failures.fetch_add(1, Ordering::Relaxed);
+                            }
                         }
                     }
-                    Err(e) => {
-                        sup.on_prune_failed();
-                        eprintln!("[e-lite] prune request failed: {e}");
-                        if let Some(sh) = shared {
-                            sh.stats.prune_failures.fetch_add(1, Ordering::Relaxed);
-                        }
+                    if let Some(sh) = shared {
+                        refresh_ready_state(sh);
                     }
-                }
-                if let Some(sh) = shared {
-                    refresh_ready_state(sh);
                 }
             }
         }
@@ -3784,12 +3936,29 @@ fn preflight(cfg: &Config, chain: Chain, require_min_ram: bool) -> R<()> {
     if !plan.args.is_empty() {
         eprintln!("[e-lite] core plan: {}", core_plan::describe(&plan));
     }
-    let b = tuning::memory_budget(cfg);
+    let mplan = tuning::MachinePlan::detect(cfg, chain);
+    let mem = tuning::memory_info();
+    let mut b = tuning::budget_with(
+        cfg,
+        mem.total_mib.unwrap_or(1024),
+        mem.available_mib,
+        mem.cached_mib,
+        Some(mplan.reserve_mib),
+        Some(mplan.memtables_mib),
+    );
+    b.cache_max_mib = b.cache_max_mib.min(mplan.cache_mib).max(8);
+    b.cache_start_mib = b.cache_start_mib.min(b.cache_max_mib);
+    b.planned_mib = b
+        .runtime_mib
+        .saturating_add(b.memtables_mib)
+        .saturating_add(b.cache_start_mib);
+    b.over_budget = b.planned_mib > b.ceiling_mib;
     eprintln!(
-        "[e-lite] memory plan: total {} MiB, reserve {} MiB, ceiling {} MiB -> \
+        "[e-lite] memory plan: total {} MiB, reserve {} MiB, page floor {} MiB, ceiling {} MiB -> \
          cache {}..{} MiB, memtables {} MiB, runtime {} MiB (planned {} MiB)",
         b.total_mib,
         b.reserve_mib,
+        b.page_cache_floor_mib,
         b.ceiling_mib,
         b.cache_start_mib,
         b.cache_max_mib,
@@ -3859,8 +4028,10 @@ fn cmd_index(cfg: &Config, chain: Chain) -> R<()> {
     preflight(cfg, chain, true)?;
     let started_at = SystemTime::now();
     let started = Instant::now();
-    let rotational = tuning::is_rotational(&cfg.data_dir(chain));
-    let tunables = Arc::new(Tunables::new(cfg, rotational));
+    let plan = tuning::MachinePlan::detect(cfg, chain);
+    eprintln!("[e-lite] machine plan: {}", plan.describe());
+    let rotational = plan.data_disk.kind == tuning::DiskKind::Hdd;
+    let tunables = Arc::new(Tunables::new_with_plan(cfg, rotational, Some(&plan)));
     let store = open_store_with(cfg, chain, tunables.cache_mib(), tunables.background_jobs())?;
     tunables.apply_store(&store);
     warn_if_disk_low(cfg, chain);
@@ -4384,6 +4555,7 @@ fn index_loop(
             // free space; without this the system cannot recover on its own.
             // Check every second, not every poll, because the disk is critical.
             if last_tick.elapsed() >= Duration::from_secs(1) {
+                idx.poll_prune(&mut supervisor);
                 match supervisor_tick(
                     &mut supervisor,
                     &idx.core,
@@ -4411,6 +4583,7 @@ fn index_loop(
         } else if last_tick.elapsed() >= poll
             || (idx.downloads_paused() && last_tick.elapsed() >= Duration::from_secs(1))
         {
+            idx.poll_prune(&mut supervisor);
             match supervisor_tick(
                 &mut supervisor,
                 &idx.core,
@@ -4861,6 +5034,12 @@ fn cmd_serve(cfg: &Config, chain: Chain) -> R<()> {
         return Ok(());
     };
     let shared = build_shared(cfg, chain, Arc::clone(&store), identity)?;
+    {
+        let plan = tuning::MachinePlan::detect(cfg, chain);
+        if let Ok(mut p) = shared.stats.plan.lock() {
+            *p = plan.to_json();
+        }
+    }
     let mut tor_runtime = match tor::spawn(cfg, chain, Some(Arc::clone(&shared)), auto_cert) {
         Ok(v) => v,
         Err(e) => {
@@ -5005,8 +5184,10 @@ fn cmd_run(cfg: &Config, chain: Chain) -> R<()> {
         eprintln!("[e-lite] WARNING: managed Tor unavailable: {e}");
     }
     let cfg = &prepared;
-    let rotational = tuning::is_rotational(&cfg.data_dir(chain));
-    let tunables = Arc::new(Tunables::new(cfg, rotational));
+    let plan = tuning::MachinePlan::detect(cfg, chain);
+    eprintln!("[e-lite] machine plan: {}", plan.describe());
+    let rotational = plan.data_disk.kind == tuning::DiskKind::Hdd;
+    let tunables = Arc::new(Tunables::new_with_plan(cfg, rotational, Some(&plan)));
     let store = open_store_with(cfg, chain, tunables.cache_mib(), tunables.background_jobs())?;
     tunables.apply_store(&store);
     warn_if_disk_low(cfg, chain);
@@ -5051,6 +5232,9 @@ fn cmd_run(cfg: &Config, chain: Chain) -> R<()> {
         return Ok(());
     };
     let shared = build_shared(cfg, chain, Arc::clone(&store), live)?;
+    if let Ok(mut p) = shared.stats.plan.lock() {
+        *p = plan.to_json();
+    }
     let mut tor_runtime = match tor::spawn(cfg, chain, Some(Arc::clone(&shared)), auto_cert) {
         Ok(v) => v,
         Err(e) => {

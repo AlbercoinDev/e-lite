@@ -79,6 +79,10 @@ pub struct CoreClient {
     auth: std::sync::Arc<std::sync::Mutex<String>>,
     cookie_path: Option<PathBuf>,
     timeout: Duration,
+    /// `pruneblockchain` can spend tens of seconds flushing/deleting files
+    /// under Core IBD; a 30 s read timeout produced EAGAIN stalls. This stays
+    /// separate from the short timeout used by ordinary calls.
+    prune_timeout: Duration,
 }
 
 impl CoreClient {
@@ -103,6 +107,7 @@ impl CoreClient {
             auth: std::sync::Arc::new(std::sync::Mutex::new(auth)),
             cookie_path,
             timeout: cfg.timeout,
+            prune_timeout: cfg.timeout.max(Duration::from_secs(120)),
         })
     }
 
@@ -112,15 +117,19 @@ impl CoreClient {
     }
 
     fn post(&self, body: &str) -> Result<(u16, Vec<u8>)> {
+        self.post_with_timeout(body, self.timeout)
+    }
+
+    fn post_with_timeout(&self, body: &str, timeout: Duration) -> Result<(u16, Vec<u8>)> {
         let addr = format!("{}:{}", self.host, self.port);
         let sockaddr = addr
             .to_socket_addrs()?
             .next()
             .ok_or_else(|| CoreError(format!("cannot resolve {addr}")))?;
-        let mut stream = TcpStream::connect_timeout(&sockaddr, self.timeout)?;
+        let mut stream = TcpStream::connect_timeout(&sockaddr, timeout)?;
         stream.set_nodelay(true)?;
-        stream.set_read_timeout(Some(self.timeout))?;
-        stream.set_write_timeout(Some(self.timeout))?;
+        stream.set_read_timeout(Some(timeout))?;
+        stream.set_write_timeout(Some(timeout))?;
 
         let mut auth = self
             .auth
@@ -167,6 +176,15 @@ impl CoreClient {
     }
 
     fn call<T: DeserializeOwned>(&self, method: &str, params: serde_json::Value) -> Result<T> {
+        self.call_with_timeout(method, params, self.timeout)
+    }
+
+    fn call_with_timeout<T: DeserializeOwned>(
+        &self,
+        method: &str,
+        params: serde_json::Value,
+        timeout: Duration,
+    ) -> Result<T> {
         let body = serde_json::json!({
             "jsonrpc": "1.0",
             "id": "e-lite",
@@ -174,10 +192,10 @@ impl CoreClient {
             "params": params,
         })
         .to_string();
-        let (mut status, mut bytes) = self.post(&body)?;
+        let (mut status, mut bytes) = self.post_with_timeout(&body, timeout)?;
         if status == 401 {
             self.refresh_auth()?;
-            let retry = self.post(&body)?;
+            let retry = self.post_with_timeout(&body, timeout)?;
             status = retry.0;
             bytes = retry.1;
         }
@@ -386,7 +404,11 @@ impl CoreClient {
     /// Ask Core to prune block files up to (not including) `height`.
     /// Returns the height Core actually pruned to.
     pub fn prune_blockchain(&self, height: u64) -> Result<i64> {
-        self.call("pruneblockchain", serde_json::json!([height]))
+        self.call_with_timeout(
+            "pruneblockchain",
+            serde_json::json!([height]),
+            self.prune_timeout,
+        )
     }
 
     pub fn set_network_active(&self, active: bool) -> Result<bool> {

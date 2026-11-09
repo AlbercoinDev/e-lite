@@ -130,6 +130,11 @@ Additional checks performed:
 | AUD-094 | P2 | Metrics/control | `property_int_value` reads the default CF for per-CF properties; `commit_share` divided by the configured interval; two `maybe_adapt` call sites could pass the 30 s gate concurrently; cache grew on free RAM alone. | Per-CF sums and DB-wide reads classified; `commit_cycle_ms` is the denominator; one caller plus `adapt_gate`; cache growth requires prefetch pressure; Bulk/Live hysteresis. `/status.rocksdb.properties_ok` marks unknown values. |
 | AUD-095 | P3 | Tor noise | A managed Core kept `-listenonion=1 -torcontrol=127.0.0.1:9051` although the managed `torrc` has no `ControlPort`, logging connection errors forever. | Managed Core gets `-listenonion=0` unless the operator overrides it; `/status.tor` exposes the effective SOCKS port and `control_port: 0`; `doctor` explains/warns. Core's own onion is documented as not managed. |
 
+| AUD-096 | P1 | CPU oversubscription | `tuning.rs`/`core_plan.rs` used `available_parallelism()` (logical SMT) for `-par`, readers and RocksDB jobs. A 4C/8T i7-6700T got `par=7`, `readers=8`, `jobs=8` plus e-lite's apply/commit threads. | `MachinePlan` counts physical `(physical id, core id)` pairs and applies cgroup CPU quota. 4C/8T now gets `par=3`, `rpcthreads=4`, `readers=4`, `jobs=2`. `/status.machine` and `doctor` print the plan. |
+| AUD-097 | P1 | Commit overhead | Bulk commits were driven by a short timer/small batch (40-75 blocks, 2.4-8.2 s, 30-40 % of wall in 29.6.0). | Bulk bounds are 250k tx / 512 blocks / 20-60 s by disk, with a minimum of 8 blocks or 60 s; live is 1.5 s. Safe because the prune gate uses the committed tip. |
+| AUD-098 | P2 | Prune stalls | `pruneblockchain` used the 30 s RPC read timeout; a slow prune returned `EAGAIN` (os error 11) and blocked the apply thread for 35-75 s. | Dedicated 120 s prune timeout + `el-prune` background thread. The WAL barrier still runs before the request; the supervisor collects the result at the next tick. |
+| AUD-099 | P2 | Write stalls | Memtables were split evenly across seven CFs and `/status` only showed the sum, hiding which family caused compaction stalls. | Weighted memtables (`utxo` 6, `history`/`utxo_by_script` 4) under the shared WBM; `/status.rocksdb.cf` exposes per-family pending compaction/memtable/SST/table readers. |
+
 ## Reviewed and considered correct
 
 - Commit ordering: `txids.dat` fsync happens before the RocksDB batch that
@@ -146,7 +151,9 @@ Additional checks performed:
   requirement.
 - Adaptive tuning: one change per 30 s under a single `adapt_gate`, memory/disk
   guards take precedence, explicit knobs are locked, and cache growth requires
-  measured prefetch pressure.
+  measured prefetch pressure. The machine plan sets physical-core and disk
+  defaults; the cache shrinks in 12.5 % steps with an explicit page-cache
+  floor.
 - `unsafe`: only `statvfs` and `kill` wrappers in `el-chain`/`core_supervisor`,
   with checked return values.
 

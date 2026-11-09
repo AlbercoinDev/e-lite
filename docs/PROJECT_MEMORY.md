@@ -48,11 +48,21 @@ the per-client rate limiter are implemented; client authentication is not.
   limiter delays requests instead of rejecting them, so it is a throttle, not
   access control.
 - Core RPC is HTTP; use SSH/VPN for LAN/WAN.
-- RocksDB memtables use a global `RAM/8` budget inside a memory ceiling of 75 %
-  of total RAM, with `max(1024, RAM/8)` reserved for the OS/Core/page cache; the
-  block cache grows/shrinks in 256 MiB steps and `cache_mib` is a maximum; growth
-  requires measured prefetch pressure, not merely free RAM. Every knob can be
-  overridden from the CLI or `--set`.
+- CPU and disk defaults come from the detected machine: physical cores (not
+  logical SMT), cgroup CPU quota, and the data/Core disk class
+  (NVMe/SATA/HDD/virtual/network). A 4C/8T box gets `readers=4`, `jobs=2`,
+  Core `par=3`, `rpcthreads=4`. Explicit config wins.
+- RocksDB memtables use a global `RAM/16` budget (weighted per CF: `utxo` 6,
+  `history`/`utxo_by_script` 4) inside a memory ceiling of 75 % of total RAM,
+  with `clamp(RAM/8, 2-4 GiB)` reserved for the OS/Core/page cache plus a
+  `clamp(RAM/16, 1-4 GiB)` page-cache floor. The block cache shrinks in 12.5 %
+  steps and `cache_mib` is a maximum; growth requires measured prefetch
+  pressure, not merely free RAM. Every knob can be overridden from the CLI or
+  `--set`.
+- Bulk commits are bounded by 250k transactions, 512 blocks or 20-60 s by disk
+  class (minimum 8 blocks/60 s); live mode commits every 1.5 s. The prune gate
+  uses the committed tip, so this does not risk pruned-block loss. Prune RPCs
+  run in the background with a 120 s timeout.
 - `run`/`index`/`serve` keep an application log at `<data-dir>/e-lite.log` with
   the same lines as the console.
 - Ready state is `READY` at Core's validated tip and `FULLY SYNCED` at the

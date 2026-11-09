@@ -86,11 +86,13 @@ pub fn plan_core(cfg: &Config, chain: Chain) -> Result<CorePlan, String> {
     validate_extra_args(cfg)?;
 
     let total = tuning::memory_info().total_mib.unwrap_or(0).max(512);
-    let cpus = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(4) as u64;
+    // Core's `-par` is a thread count; using logical SMT threads on a 4C/8T
+    // machine oversubscribes the CPU and starves the index. Count physical
+    // cores (after affinity/cgroup quota) instead.
+    let cpu = tuning::CpuInfo::detect();
+    let cpus = cpu.physical_effective.max(1) as u64;
 
-    let dbcache = (total / 4).clamp(450, 2048).min((total / 3).max(300));
+    let dbcache = (total / 8).clamp(450, 4096).min((total / 3).max(300));
     let par = cpus.saturating_sub(1).clamp(1, 8);
     let rpcthreads = cpus.clamp(4, 16);
 
@@ -136,9 +138,11 @@ pub fn plan_core(cfg: &Config, chain: Chain) -> Result<CorePlan, String> {
     plan.args.push(format!("-prune={}", cfg.core.prune_mib));
 
     plan.notes.push(format!(
-        "{} MiB total RAM, {} CPUs -> dbcache {} MiB, par {}, rpcthreads {} ({} network)",
+        "{} MiB total RAM, {} physical cores ({} logical) -> dbcache {} MiB, par {}, \
+         rpcthreads {} ({} network)",
         total,
-        cpus,
+        cpu.physical_effective,
+        cpu.logical,
         plan.dbcache_mib,
         plan.par,
         plan.rpcthreads,

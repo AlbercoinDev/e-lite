@@ -30,23 +30,63 @@ enforce the minimum: it only answers queries from an existing index.
 database, any memory plan that does not fit or any Core argument that e-lite
 must own (see below).
 
+## Machine plan (CPU, RAM, disk)
+
+At startup e-lite detects the machine and derives the defaults:
+
+- **CPU**: unique `(physical id, core id)` pairs from `/proc/cpuinfo`, then
+  affinity and the cgroup CPU quota (`cpu.max` v2, `cpu.cfs_quota_us` v1).
+  Logical SMT threads are not counted as cores.
+- **RAM**: `/proc/meminfo` plus the cgroup v1/v2 hierarchy, with a separate
+  reserve and page-cache floor.
+- **Disk**: `/proc/self/mountinfo` + `/sys/dev/block` classify the data and Core
+  paths as NVMe, SATA SSD, HDD, virtual, network or unknown; it also records
+  whether both live on the same device.
+
+Example on a 4C/8T i7-6700T with 32 GiB and a SATA SSD:
+
+```text
+cpu 4C/8T (eff 8, cpuinfo, smt) | mem 32 GiB (reserve 4 GiB, page floor 2 GiB)
+data disk sata-ssd (same=yes) | core par=3 rpcthreads=4 dbcache=4096
+index readers=4 jobs=2 cache=4096 memtables=2048 commit=30000ms batch=512
+```
+
+The same line is printed at startup and stored in `/status.machine`. Explicit
+settings in `[index]`/`[core]` still win; the plan is the automatic default.
+
+| Machine | readers | jobs | core par | core rpcthreads | cache (32 GiB) |
+|---|---:|---:|---:|---:|---:|
+| 4C/8T SATA SSD | 4 | 2 | 3 | 4 | 4 GiB |
+| 4C/8T NVMe | 4 | 2 | 3 | 4 | 8 GiB |
+| 8C/16T NVMe | 8 | 4 | 7 | 8 | 8 GiB |
+| 2C/4T HDD | 2 | 2 | 1 | 4 | 2 GiB |
+
+Virtual/unknown devices use the SATA values and a warning. Network filesystems
+are treated as the slowest class.
+
 ## Memory budget
 
 One accounting, three consumers. e-lite never plans more than its ceiling:
 
 ```
-reserve   = memory_reserve_mib, else clamp(RAM/8, 512 MiB, 2048 MiB)
-                        (RAM/4 for machines of 2 GiB or less)
-usable    = RAM_total - reserve
-ceiling   = min(RAM_total * memory_fraction, usable)   # 0 -> 0.75, never raised
-runtime   = clamp(RAM_total/32, 96 MiB, 1024 MiB)      # block buffers, overlay,
+reserve    = memory_reserve_mib, else clamp(RAM/8, 2048 MiB, 4096 MiB)
+                         (RAM/4 for machines of 2 GiB or less)
+page_floor = clamp(RAM/16, 1024 MiB, 4096 MiB)   # page cache the block cache
+                                                  # must not evict
+usable     = RAM_total - reserve
+ceiling    = min(RAM_total * memory_fraction, usable)   # 0 -> 0.75, never raised
+runtime    = clamp(RAM_total/32, 96 MiB, 1024 MiB)      # block buffers, overlay,
                                                         # mempool, queries, Tor
-memtables = write_buffer_mib, else clamp(RAM_total/8, 128 MiB, 2048 MiB)
-            shrunk so that memtables + runtime + 64 MiB <= ceiling
-cache_max = ceiling - runtime - memtables
-            (also capped at max(RAM/4, 1024 MiB) when automatic)
-cache_start = cache_max for an explicit cache_mib, else min(RAM/4, cache_max)
+memtables  = write_buffer_mib, else clamp(RAM_total/16, 512 MiB, 2048 MiB)
+             shrunk so that memtables + runtime + 64 MiB <= ceiling
+cache_max  = min(ceiling - runtime - memtables, disk cap)
+cache_start = cache_mib or the machine plan, capped by cache_max
 ```
+
+The cache shrinks when `MemAvailable < reserve + page_floor` and grows only
+when prevout prefetch is slow and there is room for another quarter of the
+cache. Shrinks are 12.5 % steps, not 25 %, to avoid the 8 GiB ↔ 4.5 GiB
+oscillation that starved the page cache.
 
 `planned = runtime + memtables + cache_start` is always `<= ceiling`. An
 explicit `memory_fraction` is a hard request: if the components do not fit, the
@@ -124,9 +164,9 @@ When e-lite starts Core (`manage = "auto"` with no running node, or
 
 | Argument | Rule |
 |---|---|
-| `-dbcache` | `clamp(RAM/4, 450, 2048)` MiB, at most `RAM/3` |
-| `-par` | `cpus - 1`, clamped to 1..8 (leaves a core for the index) |
-| `-rpcthreads` | `clamp(cpus, 4, 16)` |
+| `-dbcache` | `clamp(RAM/8, 450, 4096)` MiB, at most `RAM/3` |
+| `-par` | physical cores - 1, clamped to 1..8 (leaves a core for the index) |
+| `-rpcthreads` | `clamp(physical cores, 4, 16)` |
 | `-listenonion` | `0`: e-lite publishes its own Electrum onion and does not create a Tor control port |
 | `-prune` | always explicit, from `[core] prune_mib` (including `-prune=0`) |
 
@@ -196,7 +236,21 @@ and the controller treats it as one system:
   `estimate-table-readers-mem` are per-CF and are summed; `num-running-
   compactions` and `block-cache-usage` are DB-wide and are read once.
   `/status.rocksdb.properties_ok` distinguishes an unknown value from zero.
+  `/status.rocksdb.cf` shows the same breakdown per family.
+- Memtables are weighted by write pressure: `utxo` 6, `history` and
+  `utxo_by_script` 4, `blocks`/`tx_occurrences` 2, `meta`/`undo` 1. The shared
+  `WriteBufferManager` still enforces the total.
 - Prevout lookup uses `batched_multi_get_cf` over deduplicated, sorted keys.
+- **Commits in bulk are deliberately infrequent**: transactions (250k), blocks
+  (512) or time (20 s NVMe, 30 s SATA/virtual, 45 s HDD, 60 s network). A time
+  trigger with fewer than 8 blocks waits until 60 s, so tiny commits disappear.
+  Live mode switches to 1.5 s. This is safe because the prune gate never prunes
+  above the committed tip; a crash loses at most the current group and the
+  blocks are still in Core.
+- **Prune is asynchronous**: the WAL barrier runs on the apply thread, then
+  `pruneblockchain` runs in `el-prune` with a 120 s timeout. The index keeps
+  applying blocks while Core deletes files; the supervisor collects the result
+  at the next commit/tick.
 
 `commit_sync` and the WAL ordering are unchanged: `txids.dat` is fsynced before
 the tip advances. Before Core deletes blocks, e-lite now calls `SyncWAL(true)`

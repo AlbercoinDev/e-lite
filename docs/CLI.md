@@ -280,9 +280,14 @@ These are escape hatches for measurements, not normal configuration:
 - `tor.managed/socks_port/control_port`: effective SOCKS address for external
   requests. `control_port` is always `0`; e-lite does not create one.
 - `rocksdb.properties_ok`: `false` means a zero in that block is unknown, not
-  empty.
+  empty. `rocksdb.cf` breaks pending compaction, memtables, SST and table
+  readers down by column family.
+- `machine`: the detected CPU (physical/logical/effective/SMT/quota), memory
+  (reserve, page-cache floor), disk class and the resulting knobs. Explicit
+  config values are reflected in `plan`.
 - `tuning.commit_cycle_ms`: real start-to-start commit interval used by
-  `commit_share`.
+  `commit_share`. In bulk the interval follows the disk class (20-60 s); live
+  mode switches to 1.5 s.
 - `commit_breakdown_us.txids_append_fsync` and `rocksdb_write`: separate the
   flat-file fsync from the RocksDB write.
 

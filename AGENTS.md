@@ -108,7 +108,21 @@ Never treat a version number in this file as authoritative over the code/tag.
 - The pre-prune durability barrier is `SyncWAL(true)`, not `flush_all`: a
   single `WriteBatch` is atomic across CFs and `txids.dat` is fsynced first.
   Never prune if the barrier fails. `tests/e2e_pruned_ibd.sh` covers
-  prune + SIGKILL + restart.
+  prune + SIGKILL + restart. `pruneblockchain` then runs in `el-prune` with a
+  120 s RPC timeout; the apply thread continues.
+- Machine defaults come from `MachinePlan` (`tuning.rs`): physical cores
+  (not logical SMT), cgroup CPU quota, data/Core disk class and the memory
+  hierarchy. A 4C/8T machine gets `readers=4`, `jobs=2`, Core `par=3`,
+  `rpcthreads=4`. Explicit config still wins. `/status.machine` and `doctor`
+  print the plan; unknown/virtual disks use the SATA profile.
+- Bulk commits are bounded by transactions (250k), blocks (512) and time
+  (20 s NVMe, 30 s SATA/virtual, 45 s HDD, 60 s network), with a minimum of 8
+  blocks unless 60 s elapsed. Live mode commits every 1.5 s. This is safe
+  because the prune gate uses the committed tip. Do not turn the bulk interval
+  into a per-second timer; it was 30-40 % of wall time in the 29.6.0 log.
+- RocksDB memtables are weighted per CF (`utxo` 6, `history`/`utxo_by_script`
+  4) under the shared `WriteBufferManager`; `/status.rocksdb.cf` exposes the
+  per-family pressure used to tune them.
 - Electrum binds per-network defaults: plain/TLS/metrics are
   `55011/55022/55084` (mainnet), `55111/55122/55184` (testnet4),
   `55211/55222/55284` (signet) and `55311/55322/55384` (regtest), on `0.0.0.0`
@@ -198,9 +212,10 @@ Never treat a version number in this file as authoritative over the code/tag.
   `RLIM_INFINITY`, never pads back above the limit, and is shown with the soft
   limit in `doctor`/`/status.file_descriptors`; a cap below 2048 warns and a
   limit leaving RocksDB < 20 descriptors is a startup error.
-- A Core started by e-lite gets a fitted `-dbcache` (`clamp(RAM/4, 450, 2048)`,
-  <= `RAM/3`), `-par` (`cpus-1`, 1..8), `-rpcthreads` (4..16),
-  `-listenonion=0` and an explicit `-prune` (including `-prune=0`). Core's own
+- A Core started by e-lite gets a fitted `-dbcache` (`clamp(RAM/8, 450, 4096)`,
+  <= `RAM/3`), `-par` (physical cores - 1, 1..8), `-rpcthreads` (physical
+  cores, 4..16), `-listenonion=0` and an explicit `-prune` (including
+  `-prune=0`). Core's own
   onion is disabled because the managed `torrc` has no `ControlPort`; only the
   Electrum onion is published. Operator values win for `-dbcache`, `-par`,
   `-rpcthreads` and `-listenonion`; `-datadir/-chain/-server/-daemon/
