@@ -71,8 +71,9 @@ The installed RAM is a ceiling, not the allocation basis. e-lite plans from
 what the OS can give it now:
 
 ```
-core_reserve = fitted -dbcache if e-lite will start Core (0 for external or
-               already-running Core, whose memory is already in MemAvailable)
+core_reserve = fitted or operator -dbcache if e-lite will start Core
+               (0 for external, already-running Core or `serve`, whose memory is
+               already in MemAvailable)
 effective    = min(total, MemAvailable - core_reserve)
 reserve      = memory_reserve_mib, else clamp(effective/8, 2048 MiB, 4096 MiB)
                          (effective/4 for machines of 2 GiB or less)
@@ -145,7 +146,8 @@ cache_ceiling = min(profile_cap,
 ```
 
 - **grow +256 MiB** only when `MemAvailable >= reserve + cache + margin` and
-  prevout prefetch is slow. `margin = clamp(effective/8, 256 MiB, 2 GiB)`.
+  **p95 prefetch** is slow. `margin = clamp(effective/8, 256 MiB, 2 GiB)`.
+  A single 10-15 s block cannot drive growth by itself.
 - **shrink** when `cache > cache_ceiling` or `MemAvailable < reserve`.
 - **critical**: below 1 GiB available, act on one sample; below 256 MiB reduce
   readers and allow the cache to fall to 8 MiB.
@@ -157,7 +159,11 @@ already includes reclaimable page cache. Adding it double-counted and caused
 the 2048 ↔ 3997 MiB oscillation in the 32 GiB log.
 
 Cache decisions use `MemAvailable` only. A low page-cache number is expected
-while the RocksDB cache holds the UTXO working set.
+while the RocksDB cache holds the UTXO working set. `/status.tuning` exposes
+`prefetch_p50/p95/max` and `wait_p50/p95`; the progress line prints them. A
+byte pause/resume requires 10 s at the watermark (`reader_pressure` pauses
+immediately). The memory line prints SReclaimable, Shmem, ZFS ARC when
+available and the process RSS.
 
 ## Controller cadence
 
@@ -279,7 +285,9 @@ bound raw block bytes, so a group of large-but-transaction-light blocks cannot
 inflate the `WriteBatch`.
 - Memtables are weighted by write pressure: `utxo` 6, `history` and
   `utxo_by_script` 4, `blocks`/`tx_occurrences` 2, `meta`/`undo` 1. The shared
-  `WriteBufferManager` still enforces the total.
+  `WriteBufferManager` still enforces the total. The budget is fixed at
+  startup; under critical memory (`MemAvailable < 256 MiB`) it is halved as a
+  one-way safety valve, which can force a flush and is logged.
 - Prevout lookup uses `batched_multi_get_cf` over deduplicated, sorted keys.
 - **Commits in bulk are deliberately infrequent**: transactions (250k), blocks
   (512), raw bytes (`clamp(RAM/128, 64-256 MiB)`) or time (20 s NVMe, 30 s

@@ -308,9 +308,15 @@ These are escape hatches for measurements, not normal configuration:
 - `commit_breakdown_us.txids_append_fsync` and `rocksdb_write`: separate the
   flat-file fsync from the RocksDB write.
 - `scheduler`: `mode` (`overlap`/`alternate`), `index_paused`,
-  `backlog_bytes` (`lag × EWMA(raw block size)`), `high_bytes` and `low_bytes`.
-  In `alternate`, `index_paused = true` means Core is downloading and e-lite is
-  serving but not indexing.
+  `backlog_bytes` (`lag × average raw block size`), `avg_block_bytes`,
+  `high_bytes`, `low_bytes`, `phase` (`indexing`/`draining`/`core`),
+  `phase_blocks` and `phase_elapsed_ms`. In `alternate`, `index_paused = true`
+  means Core is downloading and e-lite is serving but not indexing. If the
+  configured mode is `alternate` but Core cannot be paused, the effective mode
+  is `overlap` and a warning is logged.
+- `tuning.prefetch_p50_ms`, `prefetch_p95_ms`, `prefetch_max_ms`,
+  `wait_p50_ms` and `wait_p95_ms`: the cache controller uses p95, not the
+  tail-dominated EWMA.
 
 ## Logging
 

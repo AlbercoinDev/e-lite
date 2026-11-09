@@ -130,6 +130,19 @@ impl CoreClient {
         is_loopback_host(&self.host)
     }
 
+    /// Quick TCP probe. Used before startup to decide whether Core is already
+    /// running and its `-dbcache` is already accounted for in `MemAvailable`.
+    /// A short timeout keeps a down/remote Core from delaying startup.
+    pub fn tcp_reachable(&self) -> bool {
+        let addr = format!("{}:{}", self.host, self.port);
+        let Ok(addrs) = addr.to_socket_addrs() else {
+            return false;
+        };
+        addrs
+            .into_iter()
+            .any(|a| TcpStream::connect_timeout(&a, Duration::from_millis(300)).is_ok())
+    }
+
     fn post(&self, body: &str) -> Result<(u16, Vec<u8>)> {
         self.post_with_timeout(body, self.timeout)
     }

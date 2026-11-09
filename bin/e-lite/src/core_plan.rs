@@ -67,6 +67,15 @@ fn operator_sets(cfg: &Config, name: &str) -> bool {
     cfg.core.extra_args.iter().any(|a| arg_name(a) == name)
 }
 
+/// Operator-supplied `-dbcache` in MiB, used by the e-lite memory budget even
+/// when e-lite does not add the flag itself.
+pub fn operator_dbcache_mib(cfg: &Config) -> Option<u64> {
+    cfg.core.extra_args.iter().find_map(|a| {
+        a.strip_prefix("-dbcache=")
+            .and_then(|v| v.trim().parse::<u64>().ok())
+    })
+}
+
 /// Choose Core's memory/CPU knobs for the detected machine.
 ///
 /// `dbcache` is a quarter of total RAM capped at 2 GiB: enough to keep the
@@ -197,6 +206,7 @@ mod tests {
         assert!(!plan.args.iter().any(|a| a.starts_with("-dbcache=")));
         assert_eq!(plan.dbcache_mib, 0);
         assert!(plan.args.iter().any(|a| a.starts_with("-par=")));
+        assert_eq!(operator_dbcache_mib(&c), Some(3000));
     }
 
     #[test]

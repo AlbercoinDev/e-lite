@@ -115,7 +115,9 @@ Never treat a version number in this file as authoritative over the code/tag.
   indexing is paused, then Core is paused and e-lite drains the byte backlog.
   Serving continues while paused; `alternate` requires `prune_mib = 1` and
   `pause_core_during_bulk = true`. Do not make it the default without a
-  measured Core-solo rate above the ~6.7 blocks/s break-even.
+  measured Core-solo rate above the ~6.7 blocks/s break-even. If the configured
+  mode is `alternate` but e-lite cannot pause Core (external/already running),
+  it warns and keeps `overlap` instead of advertising an inactive mode.
 - The commit controller reads only the last **full** group
   (`/status.tuning.commit_last_*`). Boundary/shutdown partial commits do not
   update the EWMA or the cycle. A `Txs`-limited group must not shrink the
@@ -225,16 +227,28 @@ Never treat a version number in this file as authoritative over the code/tag.
   allocation.
   An explicit fraction is **never raised** to satisfy floors:
   `planned_mib + reserve <= effective_mib` is a regression test. Memtables use
-  one shared `WriteBufferManager`; they are fixed at startup (hot resize can
-  force flushes). `cache_mib` is a maximum, not a lock. The hot ceiling is
+  one shared `WriteBufferManager`; they are normally fixed at startup, with a
+  critical-memory one-way shrink (halve, minimum 256 MiB) when
+  `MemAvailable < 256 MiB`. Routine hot resize can force flushes and is not
+  automatic. `cache_mib` is a maximum, not a lock. The hot ceiling is
   `min(profile, MemAvailable + current - reserve - memtables - runtime)`; the
   cache shrinks when `cache > ceiling` or `MemAvailable < reserve`, grows in
   256 MiB steps only with a `clamp(effective/8, 256 MiB, 2 GiB)` margin and
-  slow prefetch, and needs two samples plus a 5-minute reversal dwell. Below
-  1 GiB it acts immediately; below 256 MiB readers are reduced and the cache
-  may reach 8 MiB. The page-cache floor is reported but not added to the
+  **p95 prefetch**, and needs two samples plus a 5-minute reversal dwell.
+  Below 1 GiB it acts immediately; below 256 MiB readers are reduced and the
+  cache may reach 8 MiB. The page-cache floor is reported but not added to the
   shrink floor (`MemAvailable` already includes reclaimable cache). The
   pre-Core-resume shrink only acts if `MemAvailable < reserve + cache/4`.
+  `core_reserve` is the fitted or operator `-dbcache` only when e-lite will
+  start Core; `run`/`index` probe the RPC port first, an already-running or
+  external Core is already in `MemAvailable`, and `serve` reserves nothing.
+- The byte pause/resume watermark must persist for 10 s before changing the
+  Core state (`reader_pressure` may pause immediately). The block-size average
+  is 1/1024, not 1/8.
+- `IbdLock` must be acquired **before** the first `catch_up_limited` call when
+  Core is in IBD or the lag exceeds 5,000 blocks; a first 512-block call can
+  otherwise run for minutes without the intensive-sync slot. The lock is
+  released when the lag falls below 1,000 blocks.
 - Minimum RAM (`run`/`index`): mainnet 7500 MiB, other networks 3800 MiB, from
   the effective total after cgroup limits (8 GB / 4 GB classes). The minimum is
   checked against total/cgroup, not current `MemAvailable`, so a temporary

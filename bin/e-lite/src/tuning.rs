@@ -10,7 +10,7 @@ use crate::config::Config;
 use el_model::Chain;
 use el_serve::Stats;
 use el_store::Store;
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::Mutex;
@@ -104,6 +104,16 @@ impl CommitReason {
             CommitReason::Time => 4,
             CommitReason::Boundary => 5,
             CommitReason::Shutdown => 6,
+        }
+    }
+    pub fn name(self) -> &'static str {
+        match self {
+            CommitReason::Blocks => "blocks",
+            CommitReason::Txs => "txs",
+            CommitReason::Bytes => "bytes",
+            CommitReason::Time => "time",
+            CommitReason::Boundary => "boundary",
+            CommitReason::Shutdown => "shutdown",
         }
     }
 }
@@ -591,21 +601,53 @@ pub struct MachinePlan {
 
 impl MachinePlan {
     pub fn detect(cfg: &Config, chain: Chain) -> Self {
+        let mem = memory_info();
+        let core_reserve = if cfg.core.manage == crate::config::CoreManage::External {
+            0
+        } else {
+            fitted_dbcache_mib(mem.total_mib.unwrap_or(1024), mem.available_mib)
+        };
+        Self::detect_with_core_reserve(cfg, chain, core_reserve)
+    }
+
+    /// Detect the machine while telling the budget whether e-lite will start
+    /// Core. Pass 0 when Core is external or already running: its `-dbcache`
+    /// is already reflected in `MemAvailable`.
+    pub fn detect_with_core_reserve(cfg: &Config, chain: Chain, core_reserve_mib: u64) -> Self {
         let cpu = CpuInfo::detect();
         let mem = memory_info();
         let data_disk = DiskInfo::detect(&cfg.data_dir(chain));
         let core_disk = DiskInfo::detect(&cfg.core_datadir(chain));
-        Self::from_parts(cpu, mem, data_disk, core_disk, cfg)
+        Self::from_parts_with_core_reserve(cpu, mem, data_disk, core_disk, cfg, core_reserve_mib)
     }
 
     /// Pure mapping from detected parts to knobs, testable with a synthetic
-    /// 4C/8T machine.
+    /// 4C/8T machine. Conservative: reserves the fitted Core cache when e-lite
+    /// manages Core; callers that know Core is already running use
+    /// `from_parts_with_core_reserve`.
+    #[allow(dead_code)]
     pub fn from_parts(
         cpu: CpuInfo,
         mem: MemoryInfo,
         data_disk: DiskInfo,
         core_disk: DiskInfo,
         cfg: &Config,
+    ) -> Self {
+        let core_reserve = if cfg.core.manage == crate::config::CoreManage::External {
+            0
+        } else {
+            fitted_dbcache_mib(mem.total_mib.unwrap_or(1024), mem.available_mib)
+        };
+        Self::from_parts_with_core_reserve(cpu, mem, data_disk, core_disk, cfg, core_reserve)
+    }
+
+    pub fn from_parts_with_core_reserve(
+        cpu: CpuInfo,
+        mem: MemoryInfo,
+        data_disk: DiskInfo,
+        core_disk: DiskInfo,
+        cfg: &Config,
+        core_reserve_mib: u64,
     ) -> Self {
         let same_device = disk_same(&data_disk, &core_disk);
         let ram_mib = mem.total_mib.unwrap_or(1024).max(256);
@@ -622,11 +664,7 @@ impl MachinePlan {
             (physical / 2).clamp(2, data_disk.kind.jobs_cap())
         };
         let core_dbcache_mib = fitted_dbcache_mib(ram_mib, mem.available_mib);
-        let core_reserve_mib = if cfg.core.manage == crate::config::CoreManage::External {
-            0
-        } else {
-            core_dbcache_mib
-        };
+        let core_reserve_mib = core_reserve_mib.min(mem.available_mib.saturating_sub(128));
         // The startup budget is fitted to what the OS can give now, minus the
         // Core cache if e-lite is about to start Core. Installed RAM only caps
         // the result; it is not the allocation basis.
@@ -697,9 +735,9 @@ impl MachinePlan {
         format!(
             "cpu {}C/{}T (eff {}, {}{}) | mem total {} avail {} effective {} MiB \
              (cgroup {}, core reserve {}, reserve {}, page floor {}) | \
-             data disk {} ({}, same={}) | core par={} rpcthreads={} dbcache={} | \
-             index readers={} jobs={} cache {}..{} memtables={} commit={}ms batch={} txs={} \
-             bytes={}MiB",
+             data disk {} ({}, fstype {}, source {}, dev {}, same={}) | core par={} rpcthreads={} \
+             dbcache={} | index readers={} jobs={} cache {}..{} memtables={} commit={}ms batch={} \
+             txs={} bytes={}MiB",
             self.cpu.physical,
             self.cpu.logical,
             self.cpu.effective,
@@ -717,6 +755,13 @@ impl MachinePlan {
             self.page_cache_floor_mib,
             self.data_disk.kind.name(),
             self.data_disk.mount,
+            self.data_disk.fstype,
+            self.data_disk.source,
+            self.data_disk
+                .device
+                .clone()
+                .or_else(|| self.data_disk.dev.clone())
+                .unwrap_or_else(|| "-".to_string()),
             self.same_device,
             self.core_par,
             self.core_rpcthreads,
@@ -753,6 +798,9 @@ impl MachinePlan {
                 "cgroup_used_mib": self.mem.cgroup_used_mib,
                 "reserve_mib": self.reserve_mib,
                 "page_cache_floor_mib": self.page_cache_floor_mib,
+                "sreclaimable_mib": self.mem.sreclaimable_mib,
+                "shmem_mib": self.mem.shmem_mib,
+                "arc_mib": self.mem.arc_mib,
             },
             "disk": {
                 "data": {
@@ -840,7 +888,7 @@ pub struct Tunables {
     core_reserve_mib: u64,
     reserve_mib: u64,
     ceiling_mib: u64,
-    memtables_mib: u64,
+    memtables_mib: AtomicU64,
     runtime_mib: u64,
     mem_streak: Mutex<(i8, u32)>,
     /// Last cache direction change: prevents grow/shrink flapping.
@@ -853,6 +901,10 @@ pub struct Tunables {
     pub decode_ms: AtomicU64,
     pub wait_ms: AtomicU64,
     pub prefetch_ms: AtomicU64,
+    /// Recent per-block samples for p50/p95/max; the EWMA above is dominated
+    /// by a single slow block and must not drive cache growth.
+    prefetch_samples: Mutex<VecDeque<u64>>,
+    wait_samples: Mutex<VecDeque<u64>>,
     pub commit_ewma: AtomicU64,
     pub tx_per_sec: AtomicU64,
     pub blocks_per_sec: AtomicU64,
@@ -1113,7 +1165,7 @@ impl Tunables {
             core_reserve_mib: budget.core_reserve_mib,
             reserve_mib: budget.reserve_mib,
             ceiling_mib: budget.ceiling_mib,
-            memtables_mib: budget.memtables_mib,
+            memtables_mib: AtomicU64::new(budget.memtables_mib),
             runtime_mib: budget.runtime_mib,
             mem_streak: Mutex::new((0, 0)),
             last_cache_change: Mutex::new(None),
@@ -1124,6 +1176,8 @@ impl Tunables {
             decode_ms: AtomicU64::new(0),
             wait_ms: AtomicU64::new(0),
             prefetch_ms: AtomicU64::new(0),
+            prefetch_samples: Mutex::new(VecDeque::with_capacity(256)),
+            wait_samples: Mutex::new(VecDeque::with_capacity(256)),
             commit_ewma: AtomicU64::new(0),
             tx_per_sec: AtomicU64::new(0),
             blocks_per_sec: AtomicU64::new(0),
@@ -1191,6 +1245,13 @@ impl Tunables {
     pub fn prefetch_ms(&self) -> u64 {
         self.prefetch_ms.load(Ordering::Relaxed)
     }
+    pub fn prefetch_percentiles(&self) -> (u64, u64, u64) {
+        percentiles_ms(&self.prefetch_samples)
+    }
+    pub fn wait_percentiles(&self) -> (u64, u64) {
+        let (p50, p95, _) = percentiles_ms(&self.wait_samples);
+        (p50, p95)
+    }
 
     /// Apply cache capacity and mutable RocksDB options to an open store.
     pub fn apply_store(&self, store: &Store) {
@@ -1244,11 +1305,13 @@ impl Tunables {
     pub fn record_wait(&self, d: Duration) {
         let us = d.as_micros() as u64;
         ewma(&self.wait_ms, d.as_millis() as u64);
+        push_sample(&self.wait_samples, us);
         self.total_wait_us.fetch_add(us, Ordering::Relaxed);
     }
     pub fn record_prefetch(&self, d: Duration) {
         let us = d.as_micros() as u64;
         ewma(&self.prefetch_ms, d.as_millis() as u64);
+        push_sample(&self.prefetch_samples, us);
         self.total_prefetch_us.fetch_add(us, Ordering::Relaxed);
     }
     pub fn record_commit(&self, d: Duration) {
@@ -1709,7 +1772,7 @@ impl Tunables {
     fn dynamic_cache_max(&self, mem: &MemoryInfo) -> (u64, u64, u64) {
         let current = self
             .cache_mib()
-            .saturating_add(self.memtables_mib)
+            .saturating_add(self.memtables_mib.load(Ordering::Relaxed))
             .saturating_add(self.runtime_mib);
         let effective = self
             .total_mib
@@ -1717,7 +1780,7 @@ impl Tunables {
             .max(128);
         let room = effective
             .saturating_sub(self.reserve_mib)
-            .saturating_sub(self.memtables_mib)
+            .saturating_sub(self.memtables_mib.load(Ordering::Relaxed))
             .saturating_sub(self.runtime_mib);
         let max = room
             .min(self.max_cache_mib)
@@ -1732,13 +1795,19 @@ impl Tunables {
         // helps. Require measured UTXO-prefetch pressure; the prefetch EWMA is
         // the closest signal we have to "the block cache would avoid I/O".
         let (max_cache, grow_margin, effective) = self.dynamic_cache_max(&mem);
+        let (_, prefetch_p95, _) = self.prefetch_percentiles();
+        let prefetch_signal = if prefetch_p95 > 0 {
+            prefetch_p95
+        } else {
+            self.prefetch_ms()
+        };
         let action = cache_action(
             mem.available_mib,
             self.reserve_mib,
             self.cache_mib(),
             max_cache,
             grow_margin,
-            self.prefetch_ms(),
+            prefetch_signal,
         );
         let dir = match action {
             CacheAction::Grow => 1i8,
@@ -1809,7 +1878,19 @@ impl Tunables {
             readers = (readers * 3 / 4).max(self.min_readers);
             self.readers.store(readers, Ordering::Relaxed);
         }
-        if new == old && readers == self.readers() {
+        let mut memtables_shrunk = false;
+        let memtables_now = self.memtables_mib.load(Ordering::Relaxed);
+        if critical && memtables_now > 512 {
+            let target = (memtables_now / 2).max(256);
+            self.memtables_mib.store(target, Ordering::Relaxed);
+            store.set_write_buffer_bytes(target as usize * 1024 * 1024);
+            memtables_shrunk = true;
+            eprintln!(
+                "[e-lite] memory: critical available {} MiB; memtable budget {} -> {} MiB",
+                mem.available_mib, memtables_now, target
+            );
+        }
+        if new == old && readers == self.readers() && !memtables_shrunk {
             // Nothing changed; keep the streak so the next sample can act.
             if let Ok(mut streak) = self.mem_streak.lock() {
                 *streak = (dir, 1);
@@ -1824,11 +1905,16 @@ impl Tunables {
             }
         }
         eprintln!(
-            "[e-lite] memory: available {} MiB, buff/cache {} MiB, effective {} MiB, \
-             reserve {} MiB, page floor {} MiB: cache {} -> {} MiB (max {} dynamic, profile {}, \
-             memtables {} MiB, readers {})",
+            "[e-lite] memory: available {} MiB, buff/cache {} MiB (sreclaim {}), \
+             arc {}, rss {}, effective {} MiB, reserve {} MiB, page floor {} MiB: \
+             cache {} -> {} MiB (max {} dynamic, profile {}, memtables {} MiB, readers {})",
             mem.available_mib,
             mem.cached_mib,
+            mem.sreclaimable_mib,
+            mem.arc_mib
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| "none".to_string()),
+            process_rss_mib(),
             effective,
             self.reserve_mib,
             self.page_cache_floor_mib,
@@ -1836,7 +1922,7 @@ impl Tunables {
             new,
             max_cache,
             self.max_cache_mib,
-            self.memtables_mib,
+            self.memtables_mib.load(Ordering::Relaxed),
             readers
         );
         if let Some(stats) = stats {
@@ -1890,7 +1976,7 @@ impl Tunables {
             self.core_reserve_mib,
             self.reserve_mib,
             self.ceiling_mib,
-            self.memtables_mib,
+            self.memtables_mib.load(Ordering::Relaxed),
             self.runtime_mib,
         )
     }
@@ -1921,6 +2007,19 @@ impl Tunables {
         stats
             .tuning_wait_ms
             .store(self.wait_ms.load(Ordering::Relaxed), Ordering::Relaxed);
+        let (prefetch_p50, prefetch_p95, prefetch_max) = self.prefetch_percentiles();
+        stats
+            .tuning_prefetch_p50_ms
+            .store(prefetch_p50, Ordering::Relaxed);
+        stats
+            .tuning_prefetch_p95_ms
+            .store(prefetch_p95, Ordering::Relaxed);
+        stats
+            .tuning_prefetch_max_ms
+            .store(prefetch_max, Ordering::Relaxed);
+        let (wait_p50, wait_p95) = self.wait_percentiles();
+        stats.tuning_wait_p50_ms.store(wait_p50, Ordering::Relaxed);
+        stats.tuning_wait_p95_ms.store(wait_p95, Ordering::Relaxed);
         stats
             .tuning_commit_ms_ewma
             .store(self.commit_ewma.load(Ordering::Relaxed), Ordering::Relaxed);
@@ -2023,9 +2122,10 @@ impl Tunables {
         stats
             .mem_cache_max_mib
             .store(self.max_cache_mib, Ordering::Relaxed);
-        stats
-            .mem_memtables_mib
-            .store(self.memtables_mib, Ordering::Relaxed);
+        stats.mem_memtables_mib.store(
+            self.memtables_mib.load(Ordering::Relaxed),
+            Ordering::Relaxed,
+        );
         stats
             .mem_reserve_mib
             .store(self.reserve_mib, Ordering::Relaxed);
@@ -2061,6 +2161,30 @@ fn ewma_long(slot: &AtomicU64, sample: u64) {
     slot.store(next, Ordering::Relaxed);
 }
 
+fn push_sample(slot: &Mutex<VecDeque<u64>>, sample_us: u64) {
+    if let Ok(mut samples) = slot.lock() {
+        if samples.len() >= 256 {
+            samples.pop_front();
+        }
+        samples.push_back(sample_us);
+    }
+}
+
+fn percentiles_ms(slot: &Mutex<VecDeque<u64>>) -> (u64, u64, u64) {
+    let Ok(samples) = slot.lock() else {
+        return (0, 0, 0);
+    };
+    if samples.is_empty() {
+        return (0, 0, 0);
+    }
+    let mut v: Vec<u64> = samples.iter().copied().collect();
+    v.sort_unstable();
+    let p50 = v[((v.len() * 50).div_ceil(100)).saturating_sub(1)];
+    let p95 = v[((v.len() * 95).div_ceil(100)).saturating_sub(1)];
+    let max = *v.last().unwrap_or(&0);
+    (p50 / 1000, p95 / 1000, max / 1000)
+}
+
 /// Where the effective memory limit came from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum LimitSource {
@@ -2090,8 +2214,13 @@ pub struct MemoryInfo {
     pub reclaimable_mib: Option<u64>,
     /// `MemFree`, useful for diagnostics.
     pub free_mib: u64,
-    /// `Buffers + Cached`: page cache that a growing anonymous cache evicts.
+    /// `Buffers + Cached + SReclaimable`: page cache that a growing anonymous
+    /// cache evicts.
     pub cached_mib: u64,
+    pub sreclaimable_mib: u64,
+    pub shmem_mib: u64,
+    /// ZFS ARC size, when `/proc/spl/kstat/zfs/arcstats` is available.
+    pub arc_mib: Option<u64>,
     pub source: LimitSource,
     /// True when a memory controller was found and read successfully.
     pub cgroup_detected: bool,
@@ -2124,9 +2253,13 @@ pub fn memory_info() -> MemoryInfo {
         None => host_available,
     };
     let free = meminfo_mib("MemFree").unwrap_or(0);
+    let sreclaimable = meminfo_mib("SReclaimable").unwrap_or(0);
+    let shmem = meminfo_mib("Shmem").unwrap_or(0);
     let cached = meminfo_mib("Buffers")
         .unwrap_or(0)
-        .saturating_add(meminfo_mib("Cached").unwrap_or(0));
+        .saturating_add(meminfo_mib("Cached").unwrap_or(0))
+        .saturating_add(sreclaimable);
+    let arc_mib = zfs_arc_mib();
     let source = if cg.source == LimitSource::None && host_total.is_some() {
         LimitSource::Host
     } else {
@@ -2142,10 +2275,46 @@ pub fn memory_info() -> MemoryInfo {
         reclaimable_mib: cg.reclaimable_mib,
         free_mib: free,
         cached_mib: cached,
+        sreclaimable_mib: sreclaimable,
+        shmem_mib: shmem,
+        arc_mib,
         source,
         cgroup_detected: cg.detected,
         cgroup_unlimited: cg.detected && cg.limit_mib.is_none(),
     }
+}
+
+/// ZFS ARC `size` in MiB from the kstat file, when present. On ZFS this is
+/// memory that `/proc/meminfo` does not show as `Cached`, which is why a low
+/// buff/cache on a 32 GiB host can still mean "ARC is using the RAM".
+fn zfs_arc_mib() -> Option<u64> {
+    let text = std::fs::read_to_string("/proc/spl/kstat/zfs/arcstats").ok()?;
+    for line in text.lines() {
+        let mut fields = line.split_whitespace();
+        if fields.next() != Some("size") {
+            continue;
+        }
+        let bytes = fields.next()?.parse::<u64>().ok()?;
+        return Some(bytes / 1024 / 1024);
+    }
+    None
+}
+
+pub fn process_rss_mib() -> u64 {
+    let Ok(text) = std::fs::read_to_string("/proc/self/status") else {
+        return 0;
+    };
+    for line in text.lines() {
+        if let Some(rest) = line.strip_prefix("VmRSS:") {
+            return rest
+                .split_whitespace()
+                .next()
+                .and_then(|v| v.parse::<u64>().ok())
+                .map(|kb| kb / 1024)
+                .unwrap_or(0);
+        }
+    }
+    0
 }
 
 /// Parse a `/proc/meminfo` line such as `MemAvailable:    7677888 kB`.
@@ -2784,6 +2953,18 @@ mod tests {
     }
 
     #[test]
+    fn percentiles_are_taken_from_recent_samples() {
+        let slot = Mutex::new(VecDeque::new());
+        for v in 1..=100 {
+            push_sample(&slot, v * 1_000);
+        }
+        let (p50, p95, max) = percentiles_ms(&slot);
+        assert_eq!(p50, 50);
+        assert_eq!(p95, 95);
+        assert_eq!(max, 100);
+    }
+
+    #[test]
     fn meminfo_parser_reads_free_and_page_cache() {
         let text =
             "MemTotal: 8131584 kB\nMemFree: 163840 kB\nBuffers: 10240 kB\nCached: 2772992 kB\n";
@@ -2831,6 +3012,9 @@ mod tests {
             reclaimable_mib: None,
             free_mib: 2048,
             cached_mib: 8192,
+            sreclaimable_mib: 512,
+            shmem_mib: 128,
+            arc_mib: None,
             source: LimitSource::Host,
             cgroup_detected: false,
             cgroup_unlimited: false,
@@ -2872,6 +3056,12 @@ mod tests {
         assert_eq!(b.memtables_mib, 512);
         assert_eq!(b.cache_max_mib, 2048);
         assert_eq!(b.cache_start_mib, 1280);
+        assert!(b.planned_mib.saturating_add(b.reserve_mib) <= b.effective_mib);
+        assert!(!b.over_budget);
+
+        // 4 GiB-class network: 3.5 GiB available, 512 MiB for Core.
+        let b = budget_with(&cfg, 4096, 3584, 1024, None, None, 512);
+        assert_eq!(b.effective_mib, 3072);
         assert!(b.planned_mib.saturating_add(b.reserve_mib) <= b.effective_mib);
         assert!(!b.over_budget);
 

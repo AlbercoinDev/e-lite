@@ -1,5 +1,66 @@
 # Changelog
 
+## 0.1.0-alpha.29.8.2 — 2026-11-10
+
+### Coherence pass: Core reservation, hot cache signals and diagnostics
+
+No schema, protocol or consensus change. Follow-up to 29.8.1; 29.8.1 remains
+the memory-policy release.
+
+**Core reservation is real.** `run`/`index` probe the RPC port before the
+memory plan. If Core is already running (or external), its `-dbcache` is already
+inside `MemAvailable` and is **not** subtracted again. `serve` never reserves a
+future Core cache. An operator `-dbcache=...` in `core.extra_args` is parsed and
+used for the reservation instead of the fitted value.
+
+**Cache growth uses p95, not a tail EWMA.** The tuner keeps the last 256
+`prefetch`/`wait` samples and publishes p50/p95/max in `/status.tuning` and the
+progress line. `memory_step` grows the cache only when p95 (not the 1/8 EWMA)
+says prefetch is slow.
+
+**Byte pause/resume dwell.** A byte watermark must persist for 10 s before
+pausing or resuming Core; a single large-block burst cannot flip the phase.
+Reader pressure still pauses immediately.
+
+**Observability.**
+- `machine plan` prints `fstype`, `source`, device and `same_device`.
+- The memory line prints SReclaimable, Shmem, ZFS ARC (when present) and
+  process RSS; `memory plan` already prints total/available/effective/core
+  reserve.
+- `/status.scheduler` adds `avg_block_bytes`, `phase`, `phase_blocks` and
+  `phase_elapsed_ms`.
+- `/status.tuning` adds `prefetch_p50/p95/max` and `wait_p50/p95`.
+- The progress line prints phase name/rate, average block size, prefetch
+  p50/p95/max, wait p50/p95, commit group size and reason.
+- A `rocksdb:` line every 10 minutes reports pending compaction, running
+  compactions, memtable/block-cache/SST/table-reader bytes and
+  `properties_ok`.
+- An unknown data-disk class prints a ZFS/overlay warning with the detected
+  fstype/source.
+
+**Intensive-sync lock.** `index_loop` acquires `IbdLock` **before** the first
+512-block call when Core is in IBD or the lag exceeds 5,000 blocks. Previously
+the first call could run for ~9 minutes without the slot; the log showed
+`intensive-sync slot acquired` only at 0h09m.
+
+**Alternate scheduler guard.** If `scheduler = "alternate"` is configured with
+a Core e-lite cannot pause (external/already running), e-lite warns and keeps
+`overlap`; `/status` no longer advertises an inactive mode.
+
+**Tests:** fmt, clippy, workspace (224 tests). New tests cover p50/p95
+percentiles, the 4 GiB network budget and the existing 8/16 GiB matrix. The
+memory plan keeps `planned + reserve <= effective`.
+
+### Not yet done
+
+- Memtables are normally fixed at startup. Under critical memory
+  (`MemAvailable < 256 MiB`) the shared `WriteBufferManager` is halved (never
+  below 256 MiB) and the flush is logged; routine hot grow/shrink remains
+  future opt-in work because it can stall commits.
+- `ionice`/cgroup I/O priority and prefetch deadlines are not implemented.
+- `alternate` remains opt-in; no scheduler default change.
+- No mainnet/Umbrel measurement of the 29.8.2 diagnostics yet.
+
 ## 0.1.0-alpha.29.8.1 — 2026-11-09
 
 ### RAM budget follows available memory, not installed RAM

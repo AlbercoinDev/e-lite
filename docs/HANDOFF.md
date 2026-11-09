@@ -1,9 +1,9 @@
 # Session handoff
 
-**Updated:** 2026-11-09
-**Latest published release:** `0.1.0-alpha.29.8.1`
-**Release:** https://github.com/AlbercoinDev/e-lite/releases/tag/v0.1.0-alpha.29.8.1
-**Main commit at handoff:** tag `v0.1.0-alpha.29.8.1`
+**Updated:** 2026-11-10
+**Latest published release:** `0.1.0-alpha.29.8.2`
+**Release:** https://github.com/AlbercoinDev/e-lite/releases/tag/v0.1.0-alpha.29.8.2
+**Main commit at handoff:** tag `v0.1.0-alpha.29.8.2`
 
 This file is the short “where we are” for a new session. The invariants live in
 [`AGENTS.md`](../AGENTS.md) and [`PROJECT_MEMORY.md`](PROJECT_MEMORY.md); the
@@ -86,6 +86,36 @@ no repitas contexto ni rehagas decisiones ya documentadas.
   the onion setup, reset and security.
 - `docs/ROADMAP.md` contains future features/improvements. Do not present them as
   available.
+
+## Last change (alpha.29.8.2)
+
+Coherence pass over the 29.8.1 memory policy.
+
+- **Core reserve is real**: `run`/`index` probe the RPC port first; an
+  already-running or external Core is not subtracted again. `serve` reserves
+  nothing. Operator `-dbcache=...` is parsed and used.
+- **Cache growth uses p95**, not the tail-dominated EWMA. `/status.tuning`
+  exposes p50/p95/max prefetch/wait.
+- **Byte pause/resume dwell**: 10 s at the watermark; reader pressure still
+  pauses immediately.
+- **Diagnostics**: machine plan prints fstype/source/device; memory prints
+  SReclaimable/Shmem/ARC/RSS; `/status.scheduler` has avg block bytes, phase and
+  phase rate; progress prints phase rate, p50/p95/max, commit group/reason;
+  `rocksdb:` summary every 10 min. Unknown disk class warns with fstype/source.
+- **IbdLock** is acquired before the first 512-block call when Core is in IBD or
+  lag > 5,000.
+- **Alternate** with a Core e-lite cannot pause warns and keeps overlap.
+- **Critical memtables**: below 256 MiB available the shared
+  `WriteBufferManager` is halved (minimum 256 MiB) as a last-resort safety
+  valve; routine hot resizing remains future work.
+- Tests: fmt, clippy, workspace (224), p50/p95 and 4 GiB budget tests.
+
+### Not yet done in 29.8.2
+
+- Routine hot memtable resizing remains future work; memtables are sized at
+  startup, with the critical one-way shrink above.
+- `ionice`/cgroup I/O priority and prefetch deadlines are not implemented.
+- No mainnet/Umbrel measurement of the new diagnostics yet.
 
 ## Last change (alpha.29.8.1)
 

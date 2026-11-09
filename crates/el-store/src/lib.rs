@@ -368,6 +368,13 @@ impl Store {
         cache.set_capacity(bytes.max(8 * 1024 * 1024));
     }
 
+    /// Emergency/hot memtable budget. Shrinking can force flush of current
+    /// memtables; callers use it only when the OS is already critical.
+    pub fn set_write_buffer_bytes(&self, bytes: usize) {
+        self.write_buffer_manager
+            .set_buffer_size(bytes.max(8 * 1024 * 1024));
+    }
+
     /// Change mutable DB options at runtime. RocksDB rejects options it
     /// considers immutable; the caller logs and keeps the old value.
     pub fn set_db_option(&self, name: &str, value: &str) -> Result<()> {

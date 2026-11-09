@@ -2043,9 +2043,16 @@ struct Indexer {
     /// `true` when `[pruning] scheduler = "alternate"`: Core downloads and
     /// e-lite indexes in alternating phases. `false` keeps the overlap.
     scheduler_alternate: bool,
+    /// Byte watermark confirmation: a pause/resume must persist before acting.
+    high_since: Mutex<Option<Instant>>,
+    low_since: Mutex<Option<Instant>>,
     /// The alternate scheduler has paused indexing (Core is downloading).
     /// Serving (Electrum, Tor, status) continues.
     index_paused: AtomicBool,
+    /// 0 = overlap/indexing, 1 = Core paused/e-lite draining, 2 = Core phase.
+    phase: AtomicU64,
+    phase_state: Mutex<Option<(Instant, u64)>>,
+    last_rocksdb_log: Mutex<Instant>,
     /// Latest Core observation shared by a 1 Hz poller thread. Keeps
     /// `getblockchaininfo` out of the block-application path.
     core_obs: Arc<Mutex<Option<(BlockchainInfo, Instant)>>>,
@@ -2108,7 +2115,14 @@ impl Indexer {
             .and_then(|v| v.parse::<u64>().ok())
             .unwrap_or(1_800)
             .clamp(120, 6 * 3_600);
-        let scheduler_alternate = cfg.pruning.scheduler.eq_ignore_ascii_case("alternate");
+        let requested_alternate = cfg.pruning.scheduler.eq_ignore_ascii_case("alternate");
+        let scheduler_alternate = requested_alternate && can_control_core;
+        if requested_alternate && !can_control_core {
+            eprintln!(
+                "[e-lite] WARNING: scheduler = \"alternate\" needs a Core that e-lite can pause; \
+                 this Core is external/already running. Keeping overlap."
+            );
+        }
         if let Some(sh) = &shared {
             sh.stats
                 .scheduler_alternate
@@ -2165,7 +2179,12 @@ impl Indexer {
             lag_policy_drain,
             lag_target_secs,
             scheduler_alternate,
+            high_since: Mutex::new(None),
+            low_since: Mutex::new(None),
             index_paused: AtomicBool::new(false),
+            phase: AtomicU64::new(0),
+            phase_state: Mutex::new(None),
+            last_rocksdb_log: Mutex::new(Instant::now()),
             core_obs: Arc::new(Mutex::new(None)),
             prune_rx: Mutex::new(None),
             prune_in_flight: AtomicBool::new(false),
@@ -2644,6 +2663,54 @@ impl Indexer {
 
     /// Pause/resume e-lite indexing for the `alternate` scheduler. Serving
     /// (Electrum, Tor, metrics) continues; only block application stops.
+    fn dwell_reached(&self, slot: &Mutex<Option<Instant>>, active: bool, secs: u64) -> bool {
+        let Ok(mut state) = slot.lock() else {
+            return false;
+        };
+        if !active {
+            *state = None;
+            return false;
+        }
+        let now = Instant::now();
+        match *state {
+            None => {
+                *state = Some(now);
+                false
+            }
+            Some(started) => now.duration_since(started) >= Duration::from_secs(secs),
+        }
+    }
+
+    /// Track the current scheduler phase and its rate. `phase`: 0 overlap,
+    /// 1 Core paused/e-lite draining, 2 Core downloading/e-lite paused.
+    fn update_phase(&self, phase: u64, committed: u64) {
+        let changed = self.phase.swap(phase, Ordering::Relaxed) != phase;
+        let (blocks, elapsed_ms) = if let Ok(mut state) = self.phase_state.lock() {
+            if changed || state.is_none() {
+                *state = Some((Instant::now(), committed));
+            }
+            if let Some((started, start_height)) = *state {
+                (
+                    committed.saturating_sub(start_height),
+                    started.elapsed().as_millis() as u64,
+                )
+            } else {
+                (0, 0)
+            }
+        } else {
+            (0, 0)
+        };
+        if let Some(sh) = &self.shared {
+            sh.stats.scheduler_phase.store(phase, Ordering::Relaxed);
+            sh.stats
+                .scheduler_phase_blocks
+                .store(blocks, Ordering::Relaxed);
+            sh.stats
+                .scheduler_phase_elapsed_ms
+                .store(elapsed_ms, Ordering::Relaxed);
+        }
+    }
+
     fn set_index_paused(&self, paused: bool) {
         if !self.scheduler_alternate {
             if self.index_paused.swap(false, Ordering::SeqCst) {
@@ -2716,6 +2783,9 @@ impl Indexer {
             sh.stats
                 .scheduler_low_bytes
                 .store(low_bytes.unwrap_or(0), Ordering::Relaxed);
+            sh.stats
+                .scheduler_avg_block_bytes
+                .store(avg, Ordering::Relaxed);
         }
         let reader_pressure = self
             .readers
@@ -2768,7 +2838,6 @@ impl Indexer {
             if let (Some(high), Some(low)) = (high_bytes, low_bytes) {
                 let high_blocks = (high / avg.max(1)).max(1);
                 let low_blocks = (low / avg.max(1)).max(1);
-                let (pause_bytes, resume_bytes) = byte_window(backlog, high, low, reader_pressure);
                 if self.cfg.pruning.pause_core_during_bulk {
                     let first = !self.bulk_started.swap(true, Ordering::SeqCst);
                     if first && backlog >= high {
@@ -2781,8 +2850,16 @@ impl Indexer {
                 bulk_full = self.bulk_full_pause.load(Ordering::SeqCst);
                 limit = high_blocks;
                 resume = low_blocks;
-                pause_due = pause_bytes;
-                resume_due = resume_bytes;
+                let (raw_pause, raw_resume) = byte_window(backlog, high, low, reader_pressure);
+                pause_due = if reader_pressure {
+                    true
+                } else {
+                    self.dwell_reached(&self.high_since, raw_pause, 10)
+                };
+                resume_due = self.dwell_reached(&self.low_since, raw_resume, 10);
+                if pause_due {
+                    let _ = self.dwell_reached(&self.low_since, false, 10);
+                }
             } else {
                 let ahead = self.cfg.pruning.core_resume_ahead_blocks as u64;
                 if self.cfg.pruning.pause_core_during_bulk {
@@ -3215,6 +3292,14 @@ impl Indexer {
         // fall too far behind, stop new downloads while the backlog is drained.
         let committed = committed_height;
         self.lag_guard(&info, committed);
+        let phase = if self.lag_paused.load(Ordering::Relaxed) {
+            1
+        } else if self.index_paused.load(Ordering::SeqCst) {
+            2
+        } else {
+            0
+        };
+        self.update_phase(phase, committed);
         if self.index_paused.load(Ordering::SeqCst) {
             // Alternate scheduler: Core is downloading. Keep serving the
             // current index; the next call re-checks the backlog.
@@ -3729,17 +3814,46 @@ impl Indexer {
         };
         let read_ms = self.tunables.read_ms.load(Ordering::Relaxed);
         let decode_ms = self.tunables.decode_ms();
-        let prefetch_ms = self.tunables.prefetch_ms();
-        let wait_ms = self.tunables.wait_ms();
+        let (prefetch_p50, prefetch_p95, prefetch_max) = self.tunables.prefetch_percentiles();
+        let (wait_p50, wait_p95) = self.tunables.wait_percentiles();
         let apply_ms = self.tunables.apply_ms.load(Ordering::Relaxed);
         let commit_ms = self.tunables.commit_ewma.load(Ordering::Relaxed);
         // Measured from the blocks actually committed: dividing by the
         // configured batch understated the cost of small groups by 10x.
         let commit_per_block = self.tunables.commit_per_block_ms.load(Ordering::Relaxed);
+        let (commit_group, commit_reason) = self
+            .tunables
+            .last_commit()
+            .map(|c| (c.blocks, c.reason.name()))
+            .unwrap_or((0, "none"));
+        let (phase_blocks, phase_ms) = self
+            .phase_state
+            .lock()
+            .ok()
+            .and_then(|s| *s)
+            .map(|(started, height)| {
+                let tip = tip.height as u64;
+                (
+                    tip.saturating_sub(height),
+                    started.elapsed().as_millis() as u64,
+                )
+            })
+            .unwrap_or((0, 0));
+        let phase_rate = if phase_ms > 0 {
+            phase_blocks as f64 * 1000.0 / phase_ms as f64
+        } else {
+            0.0
+        };
+        let phase_name = match self.phase.load(Ordering::Relaxed) {
+            1 => "draining",
+            2 => "core",
+            _ => "indexing",
+        };
         eprintln!(
             "[e-lite] height {} ({})  txnum {}  core {}/{} ({})  prune {}  lag {}  \
-             {:.1} blocks/s  {:.0} tx/s  elapsed {}  read {}ms decode {}ms prefetch {}ms wait {}ms \
-             apply {}ms commit {}ms commit/blk {}ms{}",
+             {:.1} blocks/s  {:.0} tx/s  elapsed {}  phase {} {:.1} b/s avgblk {}KiB  \
+             read {}ms decode {}ms prefetch p50/p95/max {}/{}/{}ms wait p50/p95 {}/{}ms \
+             apply {}ms commit {}ms commit/blk {}ms group {} reason {}{}",
             tip.height,
             pct(tip.height as u64, core_headers),
             tip.txnum,
@@ -3751,24 +3865,51 @@ impl Indexer {
             blocks / secs,
             txs / secs,
             format_uptime(self.progress_started.elapsed()),
+            phase_name,
+            phase_rate,
+            self.tunables.avg_block_bytes() / 1024,
             read_ms,
             decode_ms,
-            prefetch_ms,
-            wait_ms,
+            prefetch_p50,
+            prefetch_p95,
+            prefetch_max,
+            wait_p50,
+            wait_p95,
             apply_ms,
             commit_ms,
             commit_per_block,
+            commit_group,
+            commit_reason,
             if ibd {
                 format!("  (core in IBD, verify {:.1}%)", verification * 100.0)
             } else {
                 String::new()
             }
         );
+        if let Some(sh) = &self.shared {
+            if let Ok(mut last) = self.last_rocksdb_log.lock() {
+                if last.elapsed() >= Duration::from_secs(600) {
+                    eprintln!(
+                        "[e-lite] rocksdb: pending_compaction {} MiB, running {}, \
+                         memtable {} MiB, block_cache {} MiB, sst {} MiB, table_readers {} MiB, \
+                         properties_ok {}",
+                        sh.stats
+                            .rocksdb_pending_compaction_bytes
+                            .load(Ordering::Relaxed)
+                            / (1024 * 1024),
+                        sh.stats.rocksdb_running_compactions.load(Ordering::Relaxed),
+                        sh.stats.rocksdb_memtable_bytes.load(Ordering::Relaxed) / (1024 * 1024),
+                        sh.stats.rocksdb_block_cache_bytes.load(Ordering::Relaxed) / (1024 * 1024),
+                        sh.stats.rocksdb_sst_bytes.load(Ordering::Relaxed) / (1024 * 1024),
+                        sh.stats.rocksdb_table_readers_bytes.load(Ordering::Relaxed)
+                            / (1024 * 1024),
+                        sh.stats.rocksdb_properties_ok.load(Ordering::Relaxed),
+                    );
+                    *last = Instant::now();
+                }
+            }
+        }
     }
-
-    /// One line every N blocks or N seconds, whichever happens first. Disk
-    /// sizes are walked in a background thread so a huge Core datadir does not
-    /// stall the indexer.
     fn maybe_milestone(&self, tip: &IndexedTip) {
         let Some((from_height, from_txnum, elapsed)) = (|| {
             let mut state = match self.milestone.lock() {
@@ -4177,11 +4318,24 @@ fn apply_supervisor_actions(
     }
 }
 
+/// Fitted Core `-dbcache` that e-lite must leave out of its own budget. Zero
+/// when Core is external or already answering RPC: its cache is already
+/// reflected in `MemAvailable`.
+fn core_reserve_mib(cfg: &Config, core_running: bool) -> u64 {
+    if core_running || cfg.core.manage == CoreManage::External {
+        return 0;
+    }
+    core_plan::operator_dbcache_mib(cfg).unwrap_or_else(|| {
+        let mem = tuning::memory_info();
+        tuning::fitted_dbcache_mib(mem.total_mib.unwrap_or(1024), mem.available_mib)
+    })
+}
+
 /// Everything that must be decided before e-lite creates certificates, opens
 /// the database or starts Core: memory class, resource plan and Core
 /// parameters. It has no side effects, so a rejected configuration leaves the
 /// data directory untouched.
-fn preflight(cfg: &Config, chain: Chain, require_min_ram: bool) -> R<()> {
+fn preflight(cfg: &Config, chain: Chain, require_min_ram: bool, core_running: bool) -> R<()> {
     if require_min_ram {
         tuning::check_minimum_ram(cfg, chain)?;
     }
@@ -4189,7 +4343,15 @@ fn preflight(cfg: &Config, chain: Chain, require_min_ram: bool) -> R<()> {
     if !plan.args.is_empty() {
         eprintln!("[e-lite] core plan: {}", core_plan::describe(&plan));
     }
-    let mplan = tuning::MachinePlan::detect(cfg, chain);
+    let core_reserve = core_reserve_mib(cfg, core_running);
+    let mplan = tuning::MachinePlan::detect_with_core_reserve(cfg, chain, core_reserve);
+    if mplan.data_disk.kind == tuning::DiskKind::Unknown {
+        eprintln!(
+            "[e-lite] WARNING: data disk at {} could not be classified (fstype {:?}, source {}); \
+             using the SATA profile. If it is ZFS, cap the ARC or set [index] profile explicitly.",
+            mplan.data_disk.mount, mplan.data_disk.fstype, mplan.data_disk.source
+        );
+    }
     let mem = tuning::memory_info();
     let mut b = tuning::budget_with(
         cfg,
@@ -4285,10 +4447,15 @@ fn spawn_controller(
 }
 
 fn cmd_index(cfg: &Config, chain: Chain) -> R<()> {
-    preflight(cfg, chain, true)?;
+    let core_running = core_client(cfg, chain)?.tcp_reachable();
+    preflight(cfg, chain, true, core_running)?;
     let started_at = SystemTime::now();
     let started = Instant::now();
-    let plan = tuning::MachinePlan::detect(cfg, chain);
+    let plan = tuning::MachinePlan::detect_with_core_reserve(
+        cfg,
+        chain,
+        core_reserve_mib(cfg, core_running),
+    );
     eprintln!("[e-lite] machine plan: {}", plan.describe());
     let rotational = plan.data_disk.kind == tuning::DiskKind::Hdd;
     let tunables = Arc::new(Tunables::new_with_plan(cfg, rotational, Some(&plan)));
@@ -4650,7 +4817,7 @@ fn index_loop(
     );
     let (
         mem_total,
-        mem_available,
+        _mem_available,
         mem_effective,
         mem_core_reserve,
         mem_reserve,
@@ -4661,13 +4828,22 @@ fn index_loop(
     let mem_now = tuning::memory_info();
     eprintln!(
         "[e-lite] memory: total {} MiB, available {} MiB, effective {} MiB \
-         (core reserve {}), buff/cache {} MiB, reserve {} MiB, ceiling {} MiB -> \
-         cache {} MiB, memtables {} MiB, runtime {} MiB",
+         (core reserve {}), free {} MiB, buff/cache {} MiB (sreclaim {}, shmem {}), \
+         arc {}, rss {}, reserve {} MiB, ceiling {} MiB -> cache {} MiB, \
+         memtables {} MiB, runtime {} MiB",
         mem_total,
-        mem_now.available_mib.max(mem_available),
+        mem_now.available_mib,
         mem_effective,
         mem_core_reserve,
+        mem_now.free_mib,
         mem_now.cached_mib,
+        mem_now.sreclaimable_mib,
+        mem_now.shmem_mib,
+        mem_now
+            .arc_mib
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| "none".to_string()),
+        tuning::process_rss_mib(),
         mem_reserve,
         mem_ceiling,
         idx.tunables.cache_mib(),
@@ -4684,6 +4860,28 @@ fn index_loop(
     spawn_core_observer(&idx, Arc::clone(&flag));
     if let Some(sh) = &shared {
         idx.tunables.publish(&sh.stats);
+    }
+
+    // Acquire the intensive-sync slot *before* the first 512-block call. The
+    // old loop checked only after a call returned; at 1-2 blocks/s that left a
+    // ~5-9 minute window where a second instance could index concurrently.
+    if ibd_lock.is_none() && ibd_lock::IbdLock::enabled() && idx.core.tcp_reachable() {
+        if let Ok(info) = idx.core.blockchain_info() {
+            let committed = idx
+                .store
+                .committed_tip()
+                .ok()
+                .flatten()
+                .map(|t| t.height as u64)
+                .unwrap_or(0);
+            let lag = info.blocks.saturating_sub(committed);
+            if info.initialblockdownload || lag > 5_000 {
+                ibd_lock = ibd_lock::IbdLock::acquire_waiting(&flag, chain);
+                if flag.load(Ordering::SeqCst) {
+                    return Ok(());
+                }
+            }
+        }
     }
 
     loop {
@@ -5293,7 +5491,8 @@ fn start_transports(shared: &Arc<Shared>, cfg: &Config) -> R<Transports> {
 }
 
 fn cmd_serve(cfg: &Config, chain: Chain) -> R<()> {
-    preflight(cfg, chain, false)?;
+    // `serve` never starts Core: do not reserve a future `-dbcache`.
+    preflight(cfg, chain, false, true)?;
     let started_at = SystemTime::now();
     let started = Instant::now();
     let mut prepared = cfg.clone();
@@ -5327,7 +5526,7 @@ fn cmd_serve(cfg: &Config, chain: Chain) -> R<()> {
     };
     let shared = build_shared(cfg, chain, Arc::clone(&store), identity)?;
     {
-        let plan = tuning::MachinePlan::detect(cfg, chain);
+        let plan = tuning::MachinePlan::detect_with_core_reserve(cfg, chain, 0);
         if let Ok(mut p) = shared.stats.plan.lock() {
             *p = plan.to_json();
         }
@@ -5465,7 +5664,8 @@ fn cmd_serve(cfg: &Config, chain: Chain) -> R<()> {
 }
 
 fn cmd_run(cfg: &Config, chain: Chain) -> R<()> {
-    preflight(cfg, chain, true)?;
+    let core_running = core_client(cfg, chain)?.tcp_reachable();
+    preflight(cfg, chain, true, core_running)?;
     let started_at = SystemTime::now();
     let started = Instant::now();
     let mut prepared = cfg.clone();
@@ -5476,7 +5676,11 @@ fn cmd_run(cfg: &Config, chain: Chain) -> R<()> {
         eprintln!("[e-lite] WARNING: managed Tor unavailable: {e}");
     }
     let cfg = &prepared;
-    let plan = tuning::MachinePlan::detect(cfg, chain);
+    let plan = tuning::MachinePlan::detect_with_core_reserve(
+        cfg,
+        chain,
+        core_reserve_mib(cfg, core_running),
+    );
     eprintln!("[e-lite] machine plan: {}", plan.describe());
     let rotational = plan.data_disk.kind == tuning::DiskKind::Hdd;
     let tunables = Arc::new(Tunables::new_with_plan(cfg, rotational, Some(&plan)));
