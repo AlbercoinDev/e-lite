@@ -68,6 +68,8 @@ version          print version
 | `--commit-interval-ms <n>` | `index.commit_interval_ms` | `0` (profile; 500..30000) |
 | `--commit-sync <mode>` | `index.commit_sync` | `auto` (`txids` in bulk, `always` live) |
 | `--prefetch-blocks <n>` | `index.prefetch_blocks` | `0` (auto; >0 caps the window) |
+| `--prefetch-deadline-ms <n>` | `index.prefetch_deadline_ms` | `0` (off; 50..60000) |
+| `--adaptive-memtables` / `--no-adaptive-memtables` | `index.adaptive_memtables` | `false` |
 | `--batch <n>` | `index.batch_blocks` | `256`/profile, capped at 512 |
 | `--reorg-window <n>` | `index.reorg_window` | `288` |
 | `--milestone-blocks <n>` | `index.milestone_blocks` | `10000` |
@@ -136,6 +138,7 @@ e-lite run --network mainnet --allow-mainnet \
 | `--repair-max-gap-blocks <n>` | `pruning.repair_max_gap_blocks` | `2048` |
 | `--allow-auto-prune` | `pruning.allow_auto_prune` | `false` |
 | `--core-arg <arg>` | `core.extra_args` (appended) | none |
+| `--core-io-priority <0-7>` | `core.io_priority` | unset (opt-in ionice) |
 | `--stop-on-exit` / `--no-stop-on-exit` | `core.stop_on_exit` | `true` |
 | `--restart` / `--no-restart` | `core.restart` | `true` |
 

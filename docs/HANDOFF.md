@@ -1,9 +1,9 @@
 # Session handoff
 
 **Updated:** 2026-11-10
-**Latest published release:** `0.1.0-alpha.29.8.2`
-**Release:** https://github.com/AlbercoinDev/e-lite/releases/tag/v0.1.0-alpha.29.8.2
-**Main commit at handoff:** tag `v0.1.0-alpha.29.8.2`
+**Latest published release:** `0.1.0-alpha.29.8.3`
+**Release:** https://github.com/AlbercoinDev/e-lite/releases/tag/v0.1.0-alpha.29.8.3
+**Main commit at handoff:** tag `v0.1.0-alpha.29.8.3`
 
 This file is the short “where we are” for a new session. The invariants live in
 [`AGENTS.md`](../AGENTS.md) and [`PROJECT_MEMORY.md`](PROJECT_MEMORY.md); the
@@ -86,6 +86,26 @@ no repitas contexto ni rehagas decisiones ya documentadas.
   the onion setup, reset and security.
 - `docs/ROADMAP.md` contains future features/improvements. Do not present them as
   available.
+
+## Last change (alpha.29.8.3)
+
+Opt-in hot memtables, prefetch deadline, ionice and explicit ZFS/overlay.
+
+- **`adaptive_memtables`**: live `effective/16` target, 512 MiB..2 GiB, WBM +
+  per-CF `write_buffer_size`; 10 min persistence and 10 min between changes;
+  cache changes have priority; explicit `write_buffer_mib` disables it.
+  Critical-memory halving remains.
+- **`prefetch_deadline_ms`**: 512-key chunks, stop at deadline, apply falls
+  back; opt-in.
+- **`core.io_priority`**: best-effort `ionice` for managed/adopted Core;
+  warning if unavailable/ignored; off by default.
+- **Disk**: `zfs`/`overlay` classes, warning with fstype/source, ARC in memory.
+- Tests: fmt, clippy, workspace (228), real RocksDB hot resize test.
+
+### Not defaulted in 29.8.3
+
+- The new memtable/prefetch/ionice knobs are opt-in.
+- Prune deferral, readers/cache and `alternate` A/B need mainnet measurements.
 
 ## Last change (alpha.29.8.2)
 

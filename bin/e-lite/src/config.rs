@@ -128,6 +128,10 @@ pub struct CoreCfg {
     /// Extra arguments passed to bitcoind when e-lite launches it.
     #[serde(default)]
     pub extra_args: Vec<String>,
+    /// Best-effort Linux I/O priority (0-7, lower is higher priority) applied
+    /// to a Core launched/adopted by e-lite. None leaves the priority alone.
+    #[serde(default)]
+    pub io_priority: Option<u8>,
     /// Restart a Core process launched by e-lite if it exits unexpectedly.
     #[serde(default = "d_true")]
     pub restart: bool,
@@ -158,6 +162,7 @@ impl Default for CoreCfg {
             timeout_seconds: d_timeout(),
             prune_mib: d_prune_mib(),
             extra_args: Vec::new(),
+            io_priority: None,
             restart: true,
             stop_on_exit: true,
             log_file: None,
@@ -201,6 +206,14 @@ pub struct IndexCfg {
     /// RocksDB write-buffer budget in MiB across all column families. 0 = auto.
     #[serde(default)]
     pub write_buffer_mib: u64,
+    /// Let the controller resize the shared memtable budget at runtime. Off by
+    /// default: shrinking can force a flush and stall commits.
+    #[serde(default)]
+    pub adaptive_memtables: bool,
+    /// Optional per-block prefetch deadline in ms. 0 = no deadline; the apply
+    /// path falls back to point lookups for prevouts not prefetched in time.
+    #[serde(default)]
+    pub prefetch_deadline_ms: u64,
     /// RAM left for the OS, Core and page cache, in MiB. 0 = auto
     /// (`max(1024, RAM/8)`).
     #[serde(default)]
@@ -239,6 +252,8 @@ impl Default for IndexCfg {
             commit_interval_ms: 0,
             prefetch_blocks: 0,
             write_buffer_mib: 0,
+            adaptive_memtables: false,
+            prefetch_deadline_ms: 0,
             memory_reserve_mib: 0,
             memory_fraction: 0.0,
             allow_low_memory: false,
@@ -981,6 +996,16 @@ impl Config {
         if !matches!(self.index.commit_sync.as_str(), "auto" | "always" | "txids") {
             return Err("[index] commit_sync must be auto, always or txids".to_string());
         }
+        if self.index.prefetch_deadline_ms != 0
+            && !(50..=60_000).contains(&self.index.prefetch_deadline_ms)
+        {
+            return Err("[index] prefetch_deadline_ms must be 0 or 50..60000".to_string());
+        }
+        if let Some(prio) = self.core.io_priority {
+            if prio > 7 {
+                return Err("[core] io_priority must be 0..7".to_string());
+            }
+        }
         if !matches!(self.pruning.scheduler.as_str(), "overlap" | "alternate") {
             return Err("[pruning] scheduler must be overlap or alternate".to_string());
         }
@@ -1369,5 +1394,22 @@ mod tests {
         inverted.pruning.max_bulk_lag_gib = 10;
         inverted.pruning.core_resume_ahead_gib = 10;
         assert!(inverted.validate().is_err());
+    }
+
+    #[test]
+    fn adaptive_memtables_and_prefetch_deadline_are_opt_in() {
+        let cfg = Config::default();
+        assert!(!cfg.index.adaptive_memtables);
+        assert_eq!(cfg.index.prefetch_deadline_ms, 0);
+        let mut bad = Config::default();
+        bad.index.prefetch_deadline_ms = 10;
+        assert!(bad.validate().is_err());
+        bad.index.prefetch_deadline_ms = 500;
+        assert!(bad.validate().is_ok());
+        let mut prio = Config::default();
+        prio.core.io_priority = Some(8);
+        assert!(prio.validate().is_err());
+        prio.core.io_priority = Some(7);
+        assert!(prio.validate().is_ok());
     }
 }

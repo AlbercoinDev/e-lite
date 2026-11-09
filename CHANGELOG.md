@@ -1,5 +1,45 @@
 # Changelog
 
+## 0.1.0-alpha.29.8.3 — 2026-11-10
+
+### Adaptive memtables, prefetch deadline, ionice and explicit ZFS/overlay
+
+No schema, protocol or consensus change.
+
+**Opt-in hot memtable resize.** `[index] adaptive_memtables = true` (CLI
+`--adaptive-memtables`) lets the controller resize the shared
+`WriteBufferManager` **and** every CF's `write_buffer_size` from the live
+`effective/16` target (512 MiB..2 GiB). A target must persist for 10 minutes,
+changes are at least 10 minutes apart, cache growth/shrink has priority, and
+the explicit `write_buffer_mib` disables it. The growth condition requires
+room for cache + target + margin; shrink runs when the cache is at its floor
+and available memory is below reserve + 512 MiB. The critical-memory one-way
+halving remains.
+
+**Prefetch deadline.** `[index] prefetch_deadline_ms` (50..60000, 0 = off)
+splits a block's prevout prefetch into 512-key chunks and stops after the
+deadline; apply already falls back to point lookups for missing entries.
+Opt-in because it trades a slow reader for more apply work.
+
+**Core I/O priority.** `[core] io_priority = 0..7` (CLI
+`--core-io-priority`) applies best-effort `ionice -c2 -n<prio>` to a Core that
+e-lite launches or adopts. Failure or a scheduler that ignores it (NVMe
+`none`) is a warning, not fatal. Off by default.
+
+**Disk classes.** `DiskKind` now distinguishes `zfs` and `overlay` explicitly;
+`preflight` warns with fstype/source and the startup plan prints them. Both use
+the local-SSD cache/reader profile, and ARC is visible in the memory line.
+
+**Tests:** fmt, clippy, workspace (228), including the hot memtable resize
+against a real RocksDB and the prefetch deadline path.
+
+### Not defaulted
+
+- `adaptive_memtables`, `prefetch_deadline_ms` and `io_priority` are opt-in;
+  no default changes.
+- Prune deferral and `max_bulk_lag_gib`/readers/cache A/B still require
+  mainnet measurements.
+
 ## 0.1.0-alpha.29.8.2 — 2026-11-10
 
 ### Coherence pass: Core reservation, hot cache signals and diagnostics

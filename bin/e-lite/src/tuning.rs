@@ -287,6 +287,8 @@ pub enum DiskKind {
     Hdd,
     Virtual,
     Network,
+    Zfs,
+    Overlay,
     Unknown,
 }
 
@@ -298,6 +300,8 @@ impl DiskKind {
             DiskKind::Hdd => "hdd",
             DiskKind::Virtual => "virtual",
             DiskKind::Network => "network",
+            DiskKind::Zfs => "zfs",
+            DiskKind::Overlay => "overlay",
             DiskKind::Unknown => "unknown",
         }
     }
@@ -307,7 +311,7 @@ impl DiskKind {
             DiskKind::Nvme => 8,
             DiskKind::SataSsd => 4,
             DiskKind::Hdd => 2,
-            DiskKind::Virtual | DiskKind::Unknown => 4,
+            DiskKind::Virtual | DiskKind::Unknown | DiskKind::Zfs | DiskKind::Overlay => 4,
             DiskKind::Network => 2,
         }
     }
@@ -325,9 +329,10 @@ impl DiskKind {
             // Local SATA/unknown/virtual: a quarter of RAM is a safe ceiling
             // when the budget is fitted to MemAvailable. 8 GiB -> 2 GiB,
             // 16 GiB -> 4 GiB, 32 GiB -> 8 GiB.
-            DiskKind::SataSsd | DiskKind::Virtual | DiskKind::Unknown => {
+            DiskKind::SataSsd | DiskKind::Virtual | DiskKind::Unknown | DiskKind::Overlay => {
                 (ram_mib / 4).clamp(1024, 8192)
             }
+            DiskKind::Zfs => (ram_mib / 4).clamp(1024, 8192),
             DiskKind::Hdd => (ram_mib / 8).clamp(512, 4096),
             DiskKind::Network => (ram_mib / 8).clamp(512, 2048),
         }
@@ -340,7 +345,7 @@ impl DiskKind {
             DiskKind::Network => 60_000,
             DiskKind::SataSsd => 30_000,
             DiskKind::Nvme => 20_000,
-            DiskKind::Virtual | DiskKind::Unknown => 30_000,
+            DiskKind::Virtual | DiskKind::Unknown | DiskKind::Zfs | DiskKind::Overlay => 30_000,
         }
     }
 }
@@ -470,6 +475,12 @@ fn device_base(majmin: &str, depth: u8) -> Option<String> {
 }
 
 fn disk_kind_for(base: &str, fstype: &str) -> (DiskKind, bool) {
+    if fstype == "zfs" {
+        return (DiskKind::Zfs, false);
+    }
+    if fstype == "overlay" || fstype == "overlay2" {
+        return (DiskKind::Overlay, false);
+    }
     if matches!(
         fstype,
         "nfs" | "nfs4" | "cifs" | "smb3" | "fuse" | "fuse.sshfs"
@@ -510,10 +521,12 @@ impl DiskInfo {
         let (kind, device, dev, mount, fstype, mount_source, source) = match mount_for(path) {
             Some((majmin, mount, fstype, mount_source)) => {
                 let base = device_base(&majmin, 0).or_else(|| source_base(&mount_source));
-                let (kind, _) = base
-                    .as_deref()
-                    .map(|b| disk_kind_for(b, &fstype))
-                    .unwrap_or((DiskKind::Unknown, false));
+                let kind = match base.as_deref() {
+                    Some(b) => disk_kind_for(b, &fstype).0,
+                    None if fstype == "zfs" => DiskKind::Zfs,
+                    None if fstype == "overlay" || fstype == "overlay2" => DiskKind::Overlay,
+                    None => DiskKind::Unknown,
+                };
                 (
                     kind,
                     base,
@@ -893,6 +906,11 @@ pub struct Tunables {
     mem_streak: Mutex<(i8, u32)>,
     /// Last cache direction change: prevents grow/shrink flapping.
     last_cache_change: Mutex<Option<(Instant, i8)>>,
+    /// Opt-in routine memtable resize. The target must persist for 10 min.
+    adaptive_memtables: AtomicBool,
+    memtables_locked: bool,
+    memtable_target_since: Mutex<Option<(u64, Instant)>>,
+    last_memtable_change: Mutex<Option<Instant>>,
     resume_shrunk: AtomicBool,
 
     // Exportable performance signals.
@@ -1169,6 +1187,12 @@ impl Tunables {
             runtime_mib: budget.runtime_mib,
             mem_streak: Mutex::new((0, 0)),
             last_cache_change: Mutex::new(None),
+            adaptive_memtables: AtomicBool::new(
+                cfg.index.adaptive_memtables && cfg.index.write_buffer_mib == 0,
+            ),
+            memtables_locked: cfg.index.write_buffer_mib > 0,
+            memtable_target_since: Mutex::new(None),
+            last_memtable_change: Mutex::new(None),
             reader_streak: Mutex::new((0, 0)),
             resume_shrunk: AtomicBool::new(false),
             read_ms: AtomicU64::new(0),
@@ -1510,6 +1534,10 @@ impl Tunables {
             changed.push("profile");
         }
         self.adaptive.store(cfg.index.adaptive, Ordering::Relaxed);
+        self.adaptive_memtables.store(
+            cfg.index.adaptive_memtables && cfg.index.write_buffer_mib == 0,
+            Ordering::Relaxed,
+        );
         self.readers_locked
             .store(cfg.index.readers > 0, Ordering::Relaxed);
         self.commit_locked
@@ -1789,6 +1817,90 @@ impl Tunables {
         (max, margin, effective)
     }
 
+    fn memtable_step(&self, store: &Store, mem: &MemoryInfo) -> Option<String> {
+        if !self.adaptive_memtables.load(Ordering::Relaxed) || self.memtables_locked {
+            return None;
+        }
+        let current = self
+            .cache_mib()
+            .saturating_add(self.memtables_mib.load(Ordering::Relaxed))
+            .saturating_add(self.runtime_mib);
+        let effective = self
+            .total_mib
+            .min(mem.available_mib.saturating_add(current))
+            .max(128);
+        let target = (effective / 16).clamp(512, 2048);
+        let current_mem = self.memtables_mib.load(Ordering::Relaxed);
+        if target.abs_diff(current_mem) < 128 {
+            if let Ok(mut since) = self.memtable_target_since.lock() {
+                *since = None;
+            }
+            return None;
+        }
+        let grow = target > current_mem;
+        let margin = (effective / 8).clamp(256, 2048);
+        let allowed = if grow {
+            mem.available_mib
+                >= self
+                    .reserve_mib
+                    .saturating_add(self.cache_mib())
+                    .saturating_add(target)
+                    .saturating_add(margin)
+        } else {
+            mem.available_mib < self.reserve_mib.saturating_add(512)
+                || self.cache_mib() <= self.cache_floor_mib
+        };
+        if !allowed {
+            if let Ok(mut since) = self.memtable_target_since.lock() {
+                *since = None;
+            }
+            return None;
+        }
+        {
+            let Ok(mut since) = self.memtable_target_since.lock() else {
+                return None;
+            };
+            match *since {
+                Some((t, at)) if t == target => {
+                    if at.elapsed() < Duration::from_secs(600) {
+                        return None;
+                    }
+                }
+                _ => {
+                    *since = Some((target, Instant::now()));
+                    return None;
+                }
+            }
+        }
+        if let Ok(last) = self.last_memtable_change.lock() {
+            if let Some(at) = *last {
+                if at.elapsed() < Duration::from_secs(600) {
+                    return None;
+                }
+            }
+        }
+        if let Err(e) = store.set_write_buffer_bytes(target as usize * 1024 * 1024) {
+            eprintln!("[e-lite] cannot adjust memtables to {target} MiB: {e}");
+            return None;
+        }
+        self.memtables_mib.store(target, Ordering::Relaxed);
+        if let Ok(mut since) = self.memtable_target_since.lock() {
+            *since = None;
+        }
+        if let Ok(mut last) = self.last_memtable_change.lock() {
+            *last = Some(Instant::now());
+        }
+        let direction = if grow { "up" } else { "down" };
+        eprintln!(
+            "[e-lite] memory: memtable budget {current_mem} -> {target} MiB ({direction}); \
+             available {} MiB, effective {} MiB",
+            mem.available_mib, effective
+        );
+        Some(format!(
+            "memtables {direction}: {current_mem} -> {target} MiB"
+        ))
+    }
+
     fn memory_step(&self, store: &Store, stats: Option<&Stats>) -> Option<String> {
         let mem = memory_info();
         // Growing the cache only because RAM is free is not evidence that it
@@ -1817,6 +1929,12 @@ impl Tunables {
         if dir == 0 {
             if let Ok(mut streak) = self.mem_streak.lock() {
                 *streak = (0, 0);
+            }
+            if let Some(reason) = self.memtable_step(store, &mem) {
+                if let Some(stats) = stats {
+                    self.publish(stats);
+                }
+                return Some(reason);
             }
             return None;
         }
@@ -1883,7 +2001,9 @@ impl Tunables {
         if critical && memtables_now > 512 {
             let target = (memtables_now / 2).max(256);
             self.memtables_mib.store(target, Ordering::Relaxed);
-            store.set_write_buffer_bytes(target as usize * 1024 * 1024);
+            if let Err(e) = store.set_write_buffer_bytes(target as usize * 1024 * 1024) {
+                eprintln!("[e-lite] cannot shrink memtables: {e}");
+            }
             memtables_shrunk = true;
             eprintln!(
                 "[e-lite] memory: critical available {} MiB; memtable budget {} -> {} MiB",
@@ -3344,6 +3464,16 @@ mod tests {
         assert!(!t.reader_streak_ok(-1));
         assert!(t.reader_streak_ok(-1));
         assert!(!t.reader_streak_ok(1), "direction change resets the streak");
+    }
+
+    #[test]
+    fn zfs_and_overlay_are_classified_explicitly() {
+        assert_eq!(disk_kind_for("sda", "zfs").0, DiskKind::Zfs);
+        assert_eq!(disk_kind_for("sda", "overlay").0, DiskKind::Overlay);
+        assert_eq!(
+            disk_kind_for("e-lite-no-such-device", "ext4").0,
+            DiskKind::SataSsd
+        );
     }
 
     #[test]

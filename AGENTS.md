@@ -227,10 +227,13 @@ Never treat a version number in this file as authoritative over the code/tag.
   allocation.
   An explicit fraction is **never raised** to satisfy floors:
   `planned_mib + reserve <= effective_mib` is a regression test. Memtables use
-  one shared `WriteBufferManager`; they are normally fixed at startup, with a
-  critical-memory one-way shrink (halve, minimum 256 MiB) when
-  `MemAvailable < 256 MiB`. Routine hot resize can force flushes and is not
-  automatic. `cache_mib` is a maximum, not a lock. The hot ceiling is
+  one shared `WriteBufferManager`; they are normally fixed at startup. With
+  `adaptive_memtables` the controller re-fits WBM + per-CF `write_buffer_size`
+  to `effective/16` after a 10-minute persistent target and a 10-minute
+  cooldown; cache changes have priority and explicit `write_buffer_mib`
+  disables it. A critical-memory one-way shrink (halve, minimum 256 MiB) runs
+  when `MemAvailable < 256 MiB`. `cache_mib` is a maximum, not a lock. The hot
+  ceiling is
   `min(profile, MemAvailable + current - reserve - memtables - runtime)`; the
   cache shrinks when `cache > ceiling` or `MemAvailable < reserve`, grows in
   256 MiB steps only with a `clamp(effective/8, 256 MiB, 2 GiB)` margin and
@@ -244,7 +247,10 @@ Never treat a version number in this file as authoritative over the code/tag.
   external Core is already in `MemAvailable`, and `serve` reserves nothing.
 - The byte pause/resume watermark must persist for 10 s before changing the
   Core state (`reader_pressure` may pause immediately). The block-size average
-  is 1/1024, not 1/8.
+  is 1/1024, not 1/8. An opt-in `prefetch_deadline_ms` stops chunked prefetch
+  after the deadline and leaves missing prevouts to the apply fallback.
+- `[core] io_priority` is best-effort `ionice` for a Core e-lite owns; failure
+  or an unsupported scheduler is a warning, never fatal.
 - `IbdLock` must be acquired **before** the first `catch_up_limited` call when
   Core is in IBD or the lag exceeds 5,000 blocks; a first 512-block call can
   otherwise run for minutes without the intensive-sync slot. The lock is

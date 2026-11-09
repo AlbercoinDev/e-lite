@@ -14,6 +14,29 @@ use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
+/// Best-effort `ionice -c2 -n<prio> -p <pid>`. ionice may be unavailable or
+/// the kernel scheduler may ignore it (NVMe `none`), so failure is a warning.
+fn apply_io_priority(pid: u32, priority: Option<u8>) {
+    let Some(prio) = priority else {
+        return;
+    };
+    let prio = prio.min(7).to_string();
+    match Command::new("ionice")
+        .args(["-c", "2", "-n", prio.as_str(), "-p", &pid.to_string()])
+        .status()
+    {
+        Ok(status) if status.success() => {
+            eprintln!("[e-lite] Core pid {pid}: ionice best-effort {prio}");
+        }
+        Ok(status) => {
+            eprintln!("[e-lite] WARNING: ionice exited {status} for Core pid {pid}");
+        }
+        Err(e) => {
+            eprintln!("[e-lite] WARNING: cannot run ionice for Core pid {pid}: {e}");
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CoreStartOutcome {
     /// `manage = external`: e-lite never starts Core.
@@ -36,6 +59,7 @@ pub struct CoreSupervisor {
     rpc_port: u16,
     prune_mib: u64,
     extra_args: Vec<String>,
+    io_priority: Option<u8>,
     /// Parameters derived from the machine's resources (dbcache/par/...).
     plan_args: Vec<String>,
     restart: bool,
@@ -59,6 +83,7 @@ impl CoreSupervisor {
             rpc_port: rpc_port_from_url(&cfg.rpc_url(chain), chain.default_rpc_port()),
             prune_mib: cfg.core.prune_mib,
             extra_args: cfg.core.extra_args.clone(),
+            io_priority: cfg.core.io_priority,
             plan_args: match core_plan::plan_core(cfg, chain) {
                 Ok(plan) => plan.args,
                 Err(e) => {
@@ -128,6 +153,7 @@ impl CoreSupervisor {
                         "[e-lite] adopted Core pid {pid} from {}",
                         self.pid_file.display()
                     );
+                    apply_io_priority(pid, self.io_priority);
                     return Ok(CoreStartOutcome::Adopted);
                 }
                 let _ = fs::remove_file(&self.pid_file);
@@ -224,6 +250,7 @@ impl CoreSupervisor {
         self.last_start = Some(Instant::now());
         self.backoff = 1;
         self.last_error = None;
+        apply_io_priority(pid, self.io_priority);
         let token = process_start_token(pid);
         if let Err(e) = fs::write(&self.pid_file, format!("{pid} {token}")) {
             eprintln!(

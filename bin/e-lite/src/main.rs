@@ -13,8 +13,8 @@ use config::{Config, CoreManage};
 use core_supervisor::{CoreStartOutcome, CoreSupervisor};
 use el_chain::ReaderTracker;
 use el_index::{
-    apply_prepared_with_prefetch, prefetch_prevouts, prepare_block_bytes, prune_undo, rewind_to,
-    GroupOverlay,
+    apply_prepared_with_prefetch, prefetch_prevouts, prefetch_prevouts_with_deadline,
+    prepare_block_bytes, prune_undo, rewind_to, GroupOverlay,
 };
 use el_mempool::Mempool;
 use el_model::{Chain, Hash32, IndexedTip, NetworkIdentity, ScriptHash};
@@ -225,6 +225,8 @@ struct Args {
     commit_sync: Option<String>,
     prefetch_blocks: Option<usize>,
     write_buffer_mib: Option<u64>,
+    adaptive_memtables: Option<bool>,
+    prefetch_deadline_ms: Option<u64>,
     memory_reserve_mib: Option<u64>,
     memory_fraction: Option<f64>,
     allow_low_memory: bool,
@@ -247,6 +249,7 @@ struct Args {
     max_clients: Option<usize>,
     banner_file: Option<String>,
     core_args: Vec<String>,
+    core_io_priority: Option<u8>,
     p2p_peers: Option<String>,
     no_p2p: bool,
     no_esplora: bool,
@@ -330,6 +333,11 @@ fn parse_args() -> R<Args> {
             "--write-buffer-mib" => {
                 args.write_buffer_mib = Some(value("--write-buffer-mib")?.parse()?)
             }
+            "--adaptive-memtables" => args.adaptive_memtables = Some(true),
+            "--no-adaptive-memtables" => args.adaptive_memtables = Some(false),
+            "--prefetch-deadline-ms" => {
+                args.prefetch_deadline_ms = Some(value("--prefetch-deadline-ms")?.parse()?)
+            }
             "--memory-reserve-mib" => {
                 args.memory_reserve_mib = Some(value("--memory-reserve-mib")?.parse()?)
             }
@@ -383,6 +391,9 @@ fn parse_args() -> R<Args> {
             "--max-clients" => args.max_clients = Some(value("--max-clients")?.parse()?),
             "--banner-file" => args.banner_file = Some(value("--banner-file")?),
             "--core-arg" => args.core_args.push(value("--core-arg")?),
+            "--core-io-priority" => {
+                args.core_io_priority = Some(value("--core-io-priority")?.parse()?)
+            }
             "--p2p-peers" => args.p2p_peers = Some(value("--p2p-peers")?),
             "--decoys" => args.decoys = Some(value("--decoys")?.parse()?),
             "--rawtx-cache-mib" => {
@@ -569,6 +580,12 @@ fn effective_config(args: &Args) -> R<(Config, Chain)> {
     if let Some(v) = args.write_buffer_mib {
         cfg.index.write_buffer_mib = v;
     }
+    if let Some(v) = args.adaptive_memtables {
+        cfg.index.adaptive_memtables = v;
+    }
+    if let Some(v) = args.prefetch_deadline_ms {
+        cfg.index.prefetch_deadline_ms = v;
+    }
     if let Some(v) = args.memory_reserve_mib {
         cfg.index.memory_reserve_mib = v;
     }
@@ -634,6 +651,9 @@ fn effective_config(args: &Args) -> R<(Config, Chain)> {
     }
     if !args.core_args.is_empty() {
         cfg.core.extra_args.extend(args.core_args.iter().cloned());
+    }
+    if let Some(v) = args.core_io_priority {
+        cfg.core.io_priority = Some(v);
     }
     if let Some(v) = &args.p2p_peers {
         cfg.rawtx.p2p_peers = v
@@ -1234,7 +1254,10 @@ TUNING (all networks):
     --background-jobs <n>   RocksDB jobs (0 = profile, capped by CPUs)
     --commit-interval-ms <n> commit/fsync interval (0 = profile; 500..30000)
     --commit-sync <mode>    auto | always | txids (bulk durability tradeoff)
-    --prefetch-blocks <n>   UTXO prefetch depth (reserved; 0 = default)
+    --prefetch-blocks <n>   prepared-block window cap (0 = auto; >0 caps)
+    --prefetch-deadline-ms <n> stop prefetching a block after n ms (0 = off)
+    --adaptive-memtables    let the controller resize memtables at runtime
+    --no-adaptive-memtables keep the startup memtable budget (default)
     --milestone-blocks <n>  progress report every N blocks (0 = off)
     --milestone-seconds <n> progress report every N seconds (0 = off)
 
@@ -1255,6 +1278,7 @@ PRUNING AND CORE:
     --critical-free-gib <n>     pause indexing below this free space
     --allow-auto-prune          opt in to prune_mib >= 550 (automatic pruning)
     --core-arg <arg>            extra bitcoind argument (repeatable)
+    --core-io-priority <0-7>    best-effort ionice for managed Core (opt-in)
     --stop-on-exit / --no-stop-on-exit
     --restart / --no-restart
 
@@ -3344,6 +3368,7 @@ impl Indexer {
         }
         let permit_rx = Arc::new(Mutex::new(permit_rx));
         let stop = Arc::new(AtomicBool::new(false));
+        let prefetch_deadline_ms = self.cfg.index.prefetch_deadline_ms;
         let mut readers = Vec::with_capacity(workers);
         for _ in 0..workers {
             let core = self.core.clone();
@@ -3395,7 +3420,15 @@ impl Indexer {
                             // overlay/point lookup during apply.
                             Ok(p) => {
                                 let prefetch_started = Instant::now();
-                                let prevouts = prefetch_prevouts(&store, &p);
+                                let prevouts = if prefetch_deadline_ms > 0 {
+                                    prefetch_prevouts_with_deadline(
+                                        &store,
+                                        &p,
+                                        Duration::from_millis(prefetch_deadline_ms),
+                                    )
+                                } else {
+                                    prefetch_prevouts(&store, &p)
+                                };
                                 tunables.record_prefetch(prefetch_started.elapsed());
                                 prevouts.map(|m| (height, p, m)).map_err(|e| e.to_string())
                             }
@@ -4345,11 +4378,17 @@ fn preflight(cfg: &Config, chain: Chain, require_min_ram: bool, core_running: bo
     }
     let core_reserve = core_reserve_mib(cfg, core_running);
     let mplan = tuning::MachinePlan::detect_with_core_reserve(cfg, chain, core_reserve);
-    if mplan.data_disk.kind == tuning::DiskKind::Unknown {
+    if matches!(
+        mplan.data_disk.kind,
+        tuning::DiskKind::Unknown | tuning::DiskKind::Zfs | tuning::DiskKind::Overlay
+    ) {
         eprintln!(
-            "[e-lite] WARNING: data disk at {} could not be classified (fstype {:?}, source {}); \
-             using the SATA profile. If it is ZFS, cap the ARC or set [index] profile explicitly.",
-            mplan.data_disk.mount, mplan.data_disk.fstype, mplan.data_disk.source
+            "[e-lite] WARNING: data disk at {} is {} (fstype {:?}, source {}); using the local-SSD \
+             profile. If it is ZFS, cap the ARC; if it is an overlay, set [index] profile explicitly.",
+            mplan.data_disk.mount,
+            mplan.data_disk.kind.name(),
+            mplan.data_disk.fstype,
+            mplan.data_disk.source
         );
     }
     let mem = tuning::memory_info();

@@ -11,6 +11,7 @@ use el_store::{Store, StoreError};
 use rocksdb::WriteBatch;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
+use std::time::{Duration, Instant};
 
 #[derive(Debug)]
 pub enum IndexError {
@@ -191,7 +192,7 @@ pub type PrefetchedPrevouts = HashMap<Outpoint, UtxoValue>;
 /// a reader thread while another block is being applied: it reads committed
 /// state only, and misses are resolved from the overlay during apply. Skipping
 /// outputs created by the same block is what makes the speculation sound.
-pub fn prefetch_prevouts(store: &Store, prepared: &PreparedBlock) -> Result<PrefetchedPrevouts> {
+fn prevouts_needed(prepared: &PreparedBlock) -> Result<Vec<Outpoint>> {
     let created_txids: HashSet<Hash32> = prepared.txids.iter().copied().collect();
     let mut needed: HashSet<Outpoint> = HashSet::with_capacity(prepared.txids.len());
     for tx in &prepared.block.txdata {
@@ -209,8 +210,32 @@ pub fn prefetch_prevouts(store: &Store, prepared: &PreparedBlock) -> Result<Pref
             needed.insert(op);
         }
     }
-    let needed: Vec<Outpoint> = needed.into_iter().collect();
+    Ok(needed.into_iter().collect())
+}
+
+pub fn prefetch_prevouts(store: &Store, prepared: &PreparedBlock) -> Result<PrefetchedPrevouts> {
+    let needed = prevouts_needed(prepared)?;
     Ok(store.get_utxos(&needed)?)
+}
+
+/// Chunked prefetch with a soft deadline. A single `batched_multi_get` cannot
+/// be interrupted, so the deadline is checked between 512-key chunks; the
+/// apply path already falls back to point lookups for anything missing.
+pub fn prefetch_prevouts_with_deadline(
+    store: &Store,
+    prepared: &PreparedBlock,
+    deadline: Duration,
+) -> Result<PrefetchedPrevouts> {
+    let needed = prevouts_needed(prepared)?;
+    let started = Instant::now();
+    let mut out = HashMap::with_capacity(needed.len());
+    for chunk in needed.chunks(512) {
+        out.extend(store.get_utxos(chunk)?);
+        if started.elapsed() >= deadline {
+            break;
+        }
+    }
+    Ok(out)
 }
 
 fn compute_out_script_hashes(block: &bitcoin::Block) -> Vec<Vec<ScriptHash>> {
@@ -732,6 +757,24 @@ mod tests {
         let raw = bitcoin::consensus::serialize(&block);
         let prepared = prepare_block_bytes(&raw, &block.block_hash().to_string(), 0).unwrap();
         assert_eq!(prepared.raw_size(), raw.len());
+    }
+
+    #[test]
+    fn prefetch_deadline_returns_partial_without_panicking() {
+        let dir = tmp("prefetch-deadline");
+        let store = Store::open(&dir).unwrap();
+        let gen = ChainGen::new(ChainSpec {
+            seed: 17,
+            tx_per_block: 3,
+            script_pool: 4,
+        });
+        let block = gen.take(1).next().unwrap();
+        let raw = bitcoin::consensus::serialize(&block);
+        let prepared = prepare_block_bytes(&raw, &block.block_hash().to_string(), 0).unwrap();
+        let got = prefetch_prevouts_with_deadline(&store, &prepared, Duration::ZERO).unwrap();
+        // No UTXOs in this store; the important part is that a zero deadline
+        // stops safely and leaves the apply fallback to resolve anything.
+        assert!(got.is_empty());
     }
 
     #[test]

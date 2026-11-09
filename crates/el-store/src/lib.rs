@@ -141,7 +141,10 @@ fn weighted_write_buffer(total_bytes: usize, name: &str, max_buffers: usize) -> 
     let idx = CF_NAMES.iter().position(|n| *n == name).unwrap_or(0);
     let sum: u32 = CF_WEIGHTS.iter().sum();
     let budget = total_bytes / max_buffers.max(1);
-    (budget.saturating_mul(CF_WEIGHTS[idx] as usize) / sum as usize).clamp(1, 64 * 1024 * 1024)
+    // The shared WriteBufferManager is the real total cap; per-CF sizes are
+    // flush thresholds. The old 64 MiB clamp made `memtables_mib` a promise
+    // the store could not keep (7 CFs x 64 MiB < 2 GiB).
+    (budget.saturating_mul(CF_WEIGHTS[idx] as usize) / sum as usize).max(1)
 }
 
 #[derive(Debug)]
@@ -194,6 +197,8 @@ pub struct Store {
     txids: File,
     /// Keeps the memtable budget alive for the lifetime of the DB.
     write_buffer_manager: WriteBufferManager,
+    /// Memtables per CF, used to recompute per-CF write_buffer_size on resize.
+    max_write_buffers: usize,
     fd_plan: FdPlan,
     /// Paths that `disk_usage_bytes` must skip (for example a Core datadir
     /// nested inside the data directory).
@@ -250,9 +255,9 @@ pub fn per_cf_write_buffer_bytes(
         .max(1)
         .saturating_mul(max_write_buffer_number.max(1));
     let ideal = (total_bytes / slots).max(1);
-    // The old 8 MiB floor made a 64 MiB budget configure 168 MiB of buffers.
-    // Cap instead of padding: a smaller memtable is slower, not unsafe.
-    ideal.min(64 * 1024 * 1024)
+    // The shared WriteBufferManager enforces the total; a per-CF cap here
+    // would make the configured budget unreachable.
+    ideal.max(1)
 }
 
 impl Store {
@@ -348,6 +353,7 @@ impl Store {
             txids_path,
             txids,
             write_buffer_manager,
+            max_write_buffers: max_buffers,
             fd_plan: plan,
             exclude: store_opts.exclude_paths.clone(),
             commit_txids_us: AtomicU64::new(0),
@@ -369,10 +375,19 @@ impl Store {
     }
 
     /// Emergency/hot memtable budget. Shrinking can force flush of current
-    /// memtables; callers use it only when the OS is already critical.
-    pub fn set_write_buffer_bytes(&self, bytes: usize) {
-        self.write_buffer_manager
-            .set_buffer_size(bytes.max(8 * 1024 * 1024));
+    /// memtables; callers use it only when the OS is already critical or with
+    /// an explicit adaptive-memtables opt-in.
+    pub fn set_write_buffer_bytes(&self, bytes: usize) -> Result<()> {
+        let total = bytes.max(8 * 1024 * 1024);
+        self.write_buffer_manager.set_buffer_size(total);
+        for name in CF_NAMES {
+            let per = weighted_write_buffer(total, name, self.max_write_buffers);
+            let value = per.to_string();
+            let cf = self.cf(name)?;
+            self.db
+                .set_options_cf(&cf, &[("write_buffer_size", value.as_str())])?;
+        }
+        Ok(())
     }
 
     /// Change mutable DB options at runtime. RocksDB rejects options it
@@ -1139,10 +1154,11 @@ mod tests {
         let small = per_cf_write_buffer_bytes(64 * 1024 * 1024, 7, 3);
         assert_eq!(small, 64 * 1024 * 1024 / 21);
         assert!(small * 21 <= 64 * 1024 * 1024);
-        // Large budgets are capped at 64 MiB per CF.
+        // The shared WriteBufferManager is the real cap; large per-CF
+        // thresholds are allowed so the configured total is reachable.
         assert_eq!(
             per_cf_write_buffer_bytes(64 * 1024 * 1024 * 1024, 7, 3),
-            64 * 1024 * 1024
+            64 * 1024 * 1024 * 1024 / 21
         );
     }
 
@@ -1189,6 +1205,16 @@ mod tests {
 
     fn identity() -> NetworkIdentity {
         NetworkIdentity::new(Chain::Regtest, Chain::Regtest.known_genesis().unwrap())
+    }
+
+    #[test]
+    fn hot_memtable_resize_is_applied() {
+        let _guard = serial();
+        let dir = tmp("memtable-resize");
+        let s = Store::open(&dir).unwrap();
+        s.set_write_buffer_bytes(512 * 1024 * 1024).unwrap();
+        s.set_write_buffer_bytes(256 * 1024 * 1024).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

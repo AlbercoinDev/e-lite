@@ -40,8 +40,8 @@ At startup e-lite detects the machine and derives the defaults:
 - **RAM**: `/proc/meminfo` plus the cgroup v1/v2 hierarchy, with a separate
   reserve and page-cache floor.
 - **Disk**: `/proc/self/mountinfo` + `/sys/dev/block` classify the data and Core
-  paths as NVMe, SATA SSD, HDD, virtual, network or unknown; it also records
-  whether both live on the same device.
+  paths as NVMe, SATA SSD, HDD, virtual, network, ZFS, overlay or unknown; it
+  also records whether both live on the same device.
 
 Example on a 4C/8T i7-6700T with 32 GiB, 18 GiB available and a SATA SSD:
 
@@ -62,8 +62,8 @@ settings in `[index]`/`[core]` still win; the plan is the automatic default.
 | 8C/16T NVMe | 8 | 4 | 7 | 8 | 8 GiB |
 | 2C/4T HDD | 2 | 2 | 1 | 4 | 4 GiB |
 
-Virtual/unknown devices use the SATA values and a warning. Network filesystems
-are treated as the slowest class.
+Virtual/unknown/ZFS/overlay devices use the SATA values and a warning. Network
+filesystems are treated as the slowest class.
 
 ## Memory budget (fitted to available RAM)
 
@@ -285,9 +285,19 @@ bound raw block bytes, so a group of large-but-transaction-light blocks cannot
 inflate the `WriteBatch`.
 - Memtables are weighted by write pressure: `utxo` 6, `history` and
   `utxo_by_script` 4, `blocks`/`tx_occurrences` 2, `meta`/`undo` 1. The shared
-  `WriteBufferManager` still enforces the total. The budget is fixed at
-  startup; under critical memory (`MemAvailable < 256 MiB`) it is halved as a
-  one-way safety valve, which can force a flush and is logged.
+  `WriteBufferManager` still enforces the total. By default the budget is fixed
+  at startup; under critical memory (`MemAvailable < 256 MiB`) it is halved as
+  a one-way safety valve, which can force a flush and is logged. With
+  `[index] adaptive_memtables = true` the controller re-fits the WBM and every
+  CF's `write_buffer_size` to `effective/16` (512 MiB..2 GiB) after a
+  10-minute persistent target and a 10-minute cooldown; cache changes have
+  priority and an explicit `write_buffer_mib` disables the feature.
+- `[index] prefetch_deadline_ms` (50..60000, 0 = off) splits prevout prefetch
+  into 512-key chunks and stops after the deadline; apply falls back to point
+  lookups. It trades a tail reader for more apply work.
+- `[core] io_priority = 0..7` applies best-effort `ionice` to a Core launched
+  or adopted by e-lite. It is a no-op/warning if `ionice` is unavailable or the
+  kernel scheduler ignores priorities (NVMe `none`).
 - Prevout lookup uses `batched_multi_get_cf` over deduplicated, sorted keys.
 - **Commits in bulk are deliberately infrequent**: transactions (250k), blocks
   (512), raw bytes (`clamp(RAM/128, 64-256 MiB)`) or time (20 s NVMe, 30 s
