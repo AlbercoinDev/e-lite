@@ -1,5 +1,32 @@
 # Changelog
 
+## 0.1.0-alpha.29.7.1 — 2026-11-09
+
+### Complete the machine-plan safety pieces
+
+Follow-up to 29.7.0; no schema, protocol or consensus change.
+
+**RPC retry on timeout/EAGAIN.** A read timeout on a busy Core surfaces as
+`EAGAIN` (`os error 11`). `post_with_timeout` now retries the same request once
+after 150 ms when the error is a socket timeout/reset/broken pipe. The RPCs
+e-lite uses are idempotent (reads, `setnetworkactive`, `pruneblockchain`,
+`sendrawtransaction`), so a duplicate is harmless. HTTP/RPC errors are not
+retried. A unit test covers the classification.
+
+**Bulk commits have a byte bound.** The group is committed when the raw block
+bytes reach `clamp(RAM/128, 64 MiB, 256 MiB)` (256 MiB on 32 GiB) in addition
+to 250k transactions, 512 blocks or 20-60 s. This keeps the `WriteBatch` and
+overlay memory bounded on blocks that are large but transaction-light.
+
+**Prune is deferred until after the commit barrier.** The supervisor only runs
+at commit boundaries; the WAL barrier is taken there, then the prune is queued.
+`el-prune` starts at the top of the next apply iteration, after the commit, and
+logs `deferred prune at N: commit barrier applied`. The RPC never starts while
+an uncommitted group exists.
+
+Tests: fmt, clippy, workspace; e2e regtest, recovery and pruned-IBD (prune +
+SIGKILL + restart). The machine-plan test asserts the 256 MiB byte bound.
+
 ## 0.1.0-alpha.29.7.0 — 2026-11-09
 
 ### Machine-aware plan, fewer commits and no prune stalls

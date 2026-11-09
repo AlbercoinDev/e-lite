@@ -1,9 +1,9 @@
 # Session handoff
 
 **Updated:** 2026-11-09
-**Latest published release:** `0.1.0-alpha.29.7.0`
-**Release:** https://github.com/AlbercoinDev/e-lite/releases/tag/v0.1.0-alpha.29.7.0
-**Main commit at handoff:** tag `v0.1.0-alpha.29.7.0`
+**Latest published release:** `0.1.0-alpha.29.7.1`
+**Release:** https://github.com/AlbercoinDev/e-lite/releases/tag/v0.1.0-alpha.29.7.1
+**Main commit at handoff:** tag `v0.1.0-alpha.29.7.1`
 
 This file is the short “where we are” for a new session. The invariants live in
 [`AGENTS.md`](../AGENTS.md) and [`PROJECT_MEMORY.md`](PROJECT_MEMORY.md); the
@@ -85,6 +85,26 @@ no repitas contexto ni rehagas decisiones ya documentadas.
   the onion setup, reset and security.
 - `docs/ROADMAP.md` contains future features/improvements. Do not present them as
   available.
+
+## Last change (alpha.29.7.1)
+
+Completes the 29.7.0 safety pieces.
+
+- **RPC retry**: one 150 ms retry for socket timeout/EAGAIN/reset/truncated
+  responses; HTTP/RPC errors are not retried. The RPCs used are idempotent.
+- **Byte bound**: bulk commits also trigger at
+  `clamp(RAM/128, 64-256 MiB)` of raw block bytes.
+- **Deferred prune**: the WAL barrier is taken at the commit boundary; the
+  `el-prune` RPC starts at the top of the next apply iteration, never in the
+  middle of an uncommitted group. Logs `deferred prune at N: commit barrier
+  applied`.
+- Tests: fmt, clippy, workspace, regtest/recovery/pruned e2e.
+
+### Not yet verified in 29.7.1
+
+- No mainnet A/B of the byte bound or the RPC retry; regtest/recovery cover the
+  mechanics.
+- Real power loss and true ENOSPC remain untested.
 
 ## Last change (alpha.29.7.0)
 

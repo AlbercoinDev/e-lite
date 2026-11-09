@@ -2020,6 +2020,10 @@ struct Indexer {
     /// the apply thread, but the RPC may spend tens of seconds in Core.
     prune_rx: Mutex<Option<std::sync::mpsc::Receiver<Result<i64, String>>>>,
     prune_in_flight: AtomicBool,
+    /// A prune requested by the supervisor. It is started only at a commit
+    /// boundary, after the current group has been committed and the WAL
+    /// barrier has advanced the durable watermark.
+    deferred_prune: Mutex<Option<u32>>,
 }
 
 impl Drop for Indexer {
@@ -2112,6 +2116,7 @@ impl Indexer {
             core_obs: Arc::new(Mutex::new(None)),
             prune_rx: Mutex::new(None),
             prune_in_flight: AtomicBool::new(false),
+            deferred_prune: Mutex::new(None),
         }
     }
 
@@ -2800,6 +2805,41 @@ impl Indexer {
         self.prune_in_flight.load(Ordering::SeqCst)
     }
 
+    fn defer_prune(&self, height: u32) {
+        if let Ok(mut slot) = self.deferred_prune.lock() {
+            *slot = Some(slot.map_or(height, |h| h.max(height)));
+        }
+    }
+
+    fn take_deferred_prune(&self) -> Option<u32> {
+        self.deferred_prune
+            .lock()
+            .ok()
+            .and_then(|mut slot| slot.take())
+    }
+
+    /// Start a previously deferred prune. This is called at the top of the
+    /// apply loop (after a commit) or from the supervisor tick, so the tip that
+    /// the WAL barrier made durable is the tip the prune was evaluated
+    /// against. The RPC itself runs in `el-prune`.
+    fn run_deferred_prune(&self, supervisor: &mut el_chain::Supervisor) {
+        let Some(height) = self.take_deferred_prune() else {
+            return;
+        };
+        if self.prune_in_flight() {
+            self.defer_prune(height);
+            return;
+        }
+        eprintln!("[e-lite] deferred prune at {height}: commit barrier applied; starting el-prune");
+        if !self.start_prune(height) {
+            supervisor.on_prune_failed();
+            if let Some(sh) = &self.shared {
+                sh.stats.prune_failures.fetch_add(1, Ordering::Relaxed);
+                refresh_ready_state(sh);
+            }
+        }
+    }
+
     /// Launch `pruneblockchain` in a background thread. The caller has already
     /// taken the WAL durability barrier; the RPC itself does not need the
     /// apply thread.
@@ -2907,6 +2947,7 @@ impl Indexer {
     /// blocks every 10 s; the supervisor cadence is unchanged.
     fn supervisor_step(&self, supervisor: &mut el_chain::Supervisor) {
         self.poll_prune(supervisor);
+        self.run_deferred_prune(supervisor);
         match supervisor_tick(
             supervisor,
             &self.core,
@@ -3124,6 +3165,7 @@ impl Indexer {
             std::collections::HashSet::new();
         let mut count = 0u32;
         let mut applied_total = 0u64;
+        let mut group_bytes = 0usize;
         let mut last_ms = 0u64;
         let mut group_undo_heights: Vec<u32> = Vec::new();
         let mut result: R<()> = Ok(());
@@ -3138,6 +3180,10 @@ impl Indexer {
         let mut pending: PendingMap = PendingMap::new();
         let mut next_apply = 0usize;
         while next_apply < hashes_len {
+            // A prune requested at the previous commit boundary starts here,
+            // after the commit and its WAL barrier. It never runs in the middle
+            // of an uncommitted group.
+            self.run_deferred_prune(supervisor);
             let wait_started = Instant::now();
             while !pending.contains_key(&next_apply) {
                 match rx.recv() {
@@ -3193,6 +3239,7 @@ impl Indexer {
                     tip = Some(out.tip);
                     count += 1;
                     applied_total += 1;
+                    group_bytes = group_bytes.saturating_add(prepared.raw_size());
                     last_ms = t0.elapsed().as_millis() as u64;
                     self.tunables.record_apply(t0.elapsed());
                     if (self.cfg.core.prune_mib >= 550
@@ -3259,6 +3306,7 @@ impl Indexer {
             let commit_elapsed = group_started.elapsed();
             let commit_due = count >= self.tunables.batch_blocks().max(1)
                 || group_txids.len() >= self.tunables.max_group_txs()
+                || group_bytes >= self.tunables.max_group_bytes()
                 || (commit_elapsed >= self.tunables.commit_interval()
                     && (count >= self.tunables.commit_min_blocks()
                         || commit_elapsed >= Duration::from_secs(60))
@@ -3314,6 +3362,7 @@ impl Indexer {
                 group_txids.clear();
                 overlay.clear();
                 count = 0;
+                group_bytes = 0;
                 group_started = Instant::now();
                 if last_tick.elapsed() >= supervisor_poll {
                     self.supervisor_step(supervisor);
@@ -3876,13 +3925,10 @@ fn apply_supervisor_actions(
                         sh.stats.prune_requests.fetch_add(1, Ordering::Relaxed);
                         sh.set_state(state::PRUNING);
                     }
-                    if !i.start_prune(height) {
-                        sup.on_prune_failed();
-                        if let Some(sh) = shared {
-                            sh.stats.prune_failures.fetch_add(1, Ordering::Relaxed);
-                            refresh_ready_state(sh);
-                        }
-                    }
+                    // Defer the RPC to the next commit boundary. The WAL
+                    // barrier above already covers the committed tip, and the
+                    // apply thread keeps working while `el-prune` calls Core.
+                    i.defer_prune(height);
                 } else {
                     // Defensive fallback: no Indexer to own the thread.
                     sup.on_prune_requested(height);
@@ -4556,6 +4602,7 @@ fn index_loop(
             // Check every second, not every poll, because the disk is critical.
             if last_tick.elapsed() >= Duration::from_secs(1) {
                 idx.poll_prune(&mut supervisor);
+                idx.run_deferred_prune(&mut supervisor);
                 match supervisor_tick(
                     &mut supervisor,
                     &idx.core,
@@ -4584,6 +4631,7 @@ fn index_loop(
             || (idx.downloads_paused() && last_tick.elapsed() >= Duration::from_secs(1))
         {
             idx.poll_prune(&mut supervisor);
+            idx.run_deferred_prune(&mut supervisor);
             match supervisor_tick(
                 &mut supervisor,
                 &idx.core,

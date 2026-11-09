@@ -284,7 +284,8 @@ These are escape hatches for measurements, not normal configuration:
   readers down by column family.
 - `machine`: the detected CPU (physical/logical/effective/SMT/quota), memory
   (reserve, page-cache floor), disk class and the resulting knobs. Explicit
-  config values are reflected in `plan`.
+  config values are reflected in `plan`. `plan.max_group_bytes` is the raw-byte
+  bound for a bulk commit group.
 - `tuning.commit_cycle_ms`: real start-to-start commit interval used by
   `commit_share`. In bulk the interval follows the disk class (20-60 s); live
   mode switches to 1.5 s.

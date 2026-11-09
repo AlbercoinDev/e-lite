@@ -16,6 +16,20 @@ use std::time::Duration;
 #[derive(Debug)]
 pub struct CoreError(pub String);
 
+/// Socket-level failures worth retrying once. HTTP/RPC errors ("method not
+/// found", "pruneblockchain failed", ...) are not included.
+fn is_transient_rpc_error(e: &CoreError) -> bool {
+    let m = &e.0;
+    m.contains("os error 11")
+        || m.contains("os error 110")
+        || m.contains("Resource temporarily unavailable")
+        || m.contains("timed out")
+        || m.contains("Connection reset")
+        || m.contains("Broken pipe")
+        || m.contains("UnexpectedEof")
+        || m.contains("truncated")
+}
+
 impl fmt::Display for CoreError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "core error: {}", self.0)
@@ -121,6 +135,22 @@ impl CoreClient {
     }
 
     fn post_with_timeout(&self, body: &str, timeout: Duration) -> Result<(u16, Vec<u8>)> {
+        // One retry for transient socket failures. A read timeout on a busy
+        // Core surfaces as EAGAIN (`os error 11`); retrying the same request
+        // avoids tearing down the index pipeline. The RPCs e-lite uses are
+        // idempotent (reads, setnetworkactive, pruneblockchain,
+        // sendrawtransaction), so a duplicate is harmless.
+        match self.post_once_with_timeout(body, timeout) {
+            Ok(v) => Ok(v),
+            Err(e) if is_transient_rpc_error(&e) => {
+                std::thread::sleep(Duration::from_millis(150));
+                self.post_once_with_timeout(body, timeout)
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    fn post_once_with_timeout(&self, body: &str, timeout: Duration) -> Result<(u16, Vec<u8>)> {
         let addr = format!("{}:{}", self.host, self.port);
         let sockaddr = addr
             .to_socket_addrs()?
@@ -769,6 +799,19 @@ mod tests {
                 .unwrap();
         assert_eq!(hex.services & 1, 1, "NODE_NETWORK bit");
         assert_eq!(hex.services & (1 << 3), 1 << 3, "NODE_WITNESS bit");
+    }
+
+    #[test]
+    fn transient_rpc_errors_are_retried_only_for_sockets() {
+        assert!(is_transient_rpc_error(&CoreError(
+            "io: Resource temporarily unavailable (os error 11)".into()
+        )));
+        assert!(is_transient_rpc_error(&CoreError(
+            "io: Connection reset by peer".into()
+        )));
+        assert!(!is_transient_rpc_error(&CoreError(
+            "pruneblockchain failed: bad height (code -8)".into()
+        )));
     }
 
     #[test]

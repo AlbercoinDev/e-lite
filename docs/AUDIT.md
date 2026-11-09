@@ -135,6 +135,8 @@ Additional checks performed:
 | AUD-098 | P2 | Prune stalls | `pruneblockchain` used the 30 s RPC read timeout; a slow prune returned `EAGAIN` (os error 11) and blocked the apply thread for 35-75 s. | Dedicated 120 s prune timeout + `el-prune` background thread. The WAL barrier still runs before the request; the supervisor collects the result at the next tick. |
 | AUD-099 | P2 | Write stalls | Memtables were split evenly across seven CFs and `/status` only showed the sum, hiding which family caused compaction stalls. | Weighted memtables (`utxo` 6, `history`/`utxo_by_script` 4) under the shared WBM; `/status.rocksdb.cf` exposes per-family pending compaction/memtable/SST/table readers. |
 
+| AUD-100 | P2 | RPC/commit/prune completion | 29.7.0 had a 120 s prune timeout but no retry on transient EAGAIN; bulk commits had tx/block/time bounds but no byte bound; the prune RPC could start without an explicit commit-boundary guarantee. | One 150 ms retry for socket timeout/EAGAIN/reset; raw-byte group bound `clamp(RAM/128, 64-256 MiB)`; `run_deferred_prune` starts only at the top of an apply iteration after the commit/WAL barrier. Unit tests + prune/recovery e2e. |
+
 ## Reviewed and considered correct
 
 - Commit ordering: `txids.dat` fsync happens before the RocksDB batch that

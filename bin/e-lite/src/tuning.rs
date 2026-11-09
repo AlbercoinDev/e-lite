@@ -466,6 +466,8 @@ pub struct MachinePlan {
     pub commit_ms: u64,
     pub batch_blocks: u32,
     pub max_group_txs: usize,
+    /// Raw-block byte bound for one commit group. Scales down on small RAM.
+    pub max_group_bytes: usize,
     pub core_par: u64,
     pub core_rpcthreads: u64,
     pub core_dbcache_mib: u64,
@@ -541,6 +543,8 @@ impl MachinePlan {
         } else {
             250_000
         };
+        let max_group_bytes =
+            (((ram_mib / 128) as usize) * 1024 * 1024).clamp(64 * 1024 * 1024, 256 * 1024 * 1024);
 
         Self {
             cpu,
@@ -557,6 +561,7 @@ impl MachinePlan {
             commit_ms,
             batch_blocks,
             max_group_txs,
+            max_group_bytes,
             core_par: physical.saturating_sub(1).clamp(1, 8) as u64,
             core_rpcthreads: physical.clamp(4, 16) as u64,
             core_dbcache_mib: (ram_mib / 8).clamp(450, 4096),
@@ -568,7 +573,7 @@ impl MachinePlan {
         format!(
             "cpu {}C/{}T (eff {}, {}{}) | mem {} MiB (cgroup {}, reserve {}, page floor {}) | \
              data disk {} ({}, same={}) | core par={} rpcthreads={} dbcache={} | \
-             index readers={} jobs={} cache={} memtables={} commit={}ms batch={} txs={}",
+             index readers={} jobs={} cache={} memtables={} commit={}ms batch={} txs={} bytes={}MiB",
             self.cpu.physical,
             self.cpu.logical,
             self.cpu.effective,
@@ -593,7 +598,8 @@ impl MachinePlan {
             self.memtables_mib,
             self.commit_ms,
             self.batch_blocks,
-            self.max_group_txs
+            self.max_group_txs,
+            self.max_group_bytes / (1024 * 1024)
         )
     }
 
@@ -645,6 +651,7 @@ impl MachinePlan {
                 "commit_ms": self.commit_ms,
                 "batch_blocks": self.batch_blocks,
                 "max_group_txs": self.max_group_txs,
+                "max_group_bytes": self.max_group_bytes,
                 "core_par": self.core_par,
                 "core_rpcthreads": self.core_rpcthreads,
                 "core_dbcache_mib": self.core_dbcache_mib,
@@ -661,6 +668,7 @@ pub struct Tunables {
     commit_ms: AtomicU64,
     batch_blocks: AtomicU32,
     max_group_txs: AtomicUsize,
+    max_group_bytes: usize,
     cache_mib: AtomicU64,
     prefetch_blocks: AtomicUsize,
     adaptive: AtomicBool,
@@ -904,12 +912,14 @@ impl Tunables {
             } else {
                 250_000
             });
+        let max_group_bytes = plan.map(|p| p.max_group_bytes).unwrap_or(256 * 1024 * 1024);
 
         Tunables {
             readers: AtomicUsize::new(readers),
             commit_ms: AtomicU64::new(commit_ms),
             batch_blocks: AtomicU32::new(batch_blocks),
             max_group_txs: AtomicUsize::new(max_group_txs),
+            max_group_bytes,
             cache_mib: AtomicU64::new(cache_mib),
             // 0 means "auto": the pipeline keeps its default window.
             prefetch_blocks: AtomicUsize::new(cfg.index.prefetch_blocks),
@@ -991,6 +1001,9 @@ impl Tunables {
     }
     pub fn max_group_txs(&self) -> usize {
         self.max_group_txs.load(Ordering::Relaxed)
+    }
+    pub fn max_group_bytes(&self) -> usize {
+        self.max_group_bytes
     }
     pub fn cache_mib(&self) -> u64 {
         self.cache_mib.load(Ordering::Relaxed)
@@ -2394,6 +2407,7 @@ mod tests {
         assert_eq!(p.commit_ms, 30_000);
         assert_eq!(p.reserve_mib, 4096);
         assert_eq!(p.page_cache_floor_mib, 2048);
+        assert_eq!(p.max_group_bytes, 256 * 1024 * 1024);
         assert!(p.same_device);
     }
 

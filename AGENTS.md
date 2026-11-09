@@ -115,11 +115,15 @@ Never treat a version number in this file as authoritative over the code/tag.
   hierarchy. A 4C/8T machine gets `readers=4`, `jobs=2`, Core `par=3`,
   `rpcthreads=4`. Explicit config still wins. `/status.machine` and `doctor`
   print the plan; unknown/virtual disks use the SATA profile.
-- Bulk commits are bounded by transactions (250k), blocks (512) and time
-  (20 s NVMe, 30 s SATA/virtual, 45 s HDD, 60 s network), with a minimum of 8
-  blocks unless 60 s elapsed. Live mode commits every 1.5 s. This is safe
-  because the prune gate uses the committed tip. Do not turn the bulk interval
-  into a per-second timer; it was 30-40 % of wall time in the 29.6.0 log.
+- Bulk commits are bounded by transactions (250k), blocks (512), raw bytes
+  (`clamp(RAM/128, 64-256 MiB)`) and time (20 s NVMe, 30 s SATA/virtual, 45 s
+  HDD, 60 s network), with a minimum of 8 blocks unless 60 s elapsed. Live
+  mode commits every 1.5 s. This is safe because the prune gate uses the
+  committed tip. Do not turn the bulk interval into a per-second timer; it was
+  30-40 % of wall time in the 29.6.0 log.
+- A prune request is deferred to the top of the next apply iteration after the
+  commit/WAL barrier; it never starts with an uncommitted group. RPC socket
+  timeout/EAGAIN/reset is retried once (150 ms), not HTTP/RPC errors.
 - RocksDB memtables are weighted per CF (`utxo` 6, `history`/`utxo_by_script`
   4) under the shared `WriteBufferManager`; `/status.rocksdb.cf` exposes the
   per-family pressure used to tune them.

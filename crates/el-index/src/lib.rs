@@ -178,6 +178,8 @@ pub struct PreparedBlock {
     block_hash: Hash32,
     txids: Vec<Hash32>,
     out_script_hashes: Vec<Vec<ScriptHash>>,
+    /// Raw serialized block size, used to bound a commit group by bytes.
+    raw_size: usize,
 }
 
 /// Prevouts resolved from the committed UTXO set before apply. A speculative
@@ -273,7 +275,15 @@ pub fn prepare_block_bytes(
         block_hash,
         txids,
         out_script_hashes,
+        raw_size: bytes.len(),
     })
+}
+
+impl PreparedBlock {
+    /// Serialized size of the block that produced this prepared unit.
+    pub fn raw_size(&self) -> usize {
+        self.raw_size
+    }
 }
 
 /// Apply one block into `batch`, updating the overlay. The caller commits the
@@ -709,6 +719,19 @@ mod tests {
         }
         store.commit(batch, &tip.unwrap(), &all_txids)?;
         Ok(())
+    }
+
+    #[test]
+    fn prepared_block_exposes_its_raw_byte_size() {
+        let gen = ChainGen::new(ChainSpec {
+            seed: 11,
+            tx_per_block: 3,
+            script_pool: 4,
+        });
+        let block = gen.take(1).next().unwrap();
+        let raw = bitcoin::consensus::serialize(&block);
+        let prepared = prepare_block_bytes(&raw, &block.block_hash().to_string(), 0).unwrap();
+        assert_eq!(prepared.raw_size(), raw.len());
     }
 
     #[test]

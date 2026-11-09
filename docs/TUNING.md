@@ -236,21 +236,28 @@ and the controller treats it as one system:
   `estimate-table-readers-mem` are per-CF and are summed; `num-running-
   compactions` and `block-cache-usage` are DB-wide and are read once.
   `/status.rocksdb.properties_ok` distinguishes an unknown value from zero.
-  `/status.rocksdb.cf` shows the same breakdown per family.
+  `/status.rocksdb.cf` shows the same breakdown per family. Bulk commits also
+bound raw block bytes, so a group of large-but-transaction-light blocks cannot
+inflate the `WriteBatch`.
 - Memtables are weighted by write pressure: `utxo` 6, `history` and
   `utxo_by_script` 4, `blocks`/`tx_occurrences` 2, `meta`/`undo` 1. The shared
   `WriteBufferManager` still enforces the total.
 - Prevout lookup uses `batched_multi_get_cf` over deduplicated, sorted keys.
 - **Commits in bulk are deliberately infrequent**: transactions (250k), blocks
-  (512) or time (20 s NVMe, 30 s SATA/virtual, 45 s HDD, 60 s network). A time
-  trigger with fewer than 8 blocks waits until 60 s, so tiny commits disappear.
-  Live mode switches to 1.5 s. This is safe because the prune gate never prunes
-  above the committed tip; a crash loses at most the current group and the
-  blocks are still in Core.
-- **Prune is asynchronous**: the WAL barrier runs on the apply thread, then
-  `pruneblockchain` runs in `el-prune` with a 120 s timeout. The index keeps
-  applying blocks while Core deletes files; the supervisor collects the result
-  at the next commit/tick.
+  (512), raw bytes (`clamp(RAM/128, 64-256 MiB)`) or time (20 s NVMe, 30 s
+  SATA/virtual, 45 s HDD, 60 s network). A time trigger with fewer than 8
+  blocks waits until 60 s, so tiny commits disappear. Live mode switches to
+  1.5 s. This is safe because the prune gate never prunes above the committed
+  tip; a crash loses at most the current group and the blocks are still in
+  Core.
+- **Prune is asynchronous and deferred**: the WAL barrier runs at the commit
+  boundary, then the request waits for the top of the next apply iteration
+  (never in the middle of an uncommitted group). `el-prune` calls
+  `pruneblockchain` with a 120 s timeout; the index keeps applying while Core
+  deletes files. The supervisor collects the result at the next commit/tick.
+- **RPC retry**: a socket timeout/EAGAIN/reset is retried once after 150 ms;
+  HTTP and RPC errors are not. This prevents a busy Core from tearing down the
+  pipeline.
 
 `commit_sync` and the WAL ordering are unchanged: `txids.dat` is fsynced before
 the tip advances. Before Core deletes blocks, e-lite now calls `SyncWAL(true)`
