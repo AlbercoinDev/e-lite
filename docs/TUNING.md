@@ -364,7 +364,9 @@ kill -CONT "$PID"
 ```
 
 The blocking `setnetworkactive` switch and peer reconnect make short phases
-expensive; use 40–60 GiB phases if you test `alternate`, not 7–30 GiB.
+expensive; use 40–60 GiB phases if you test `alternate`, not 7–30 GiB. The
+`SIGSTOP` test also pauses Electrum/Tor for those 5 minutes; that is acceptable
+for a one-off measurement but not during wallet use.
 
 ### Commit controller
 
