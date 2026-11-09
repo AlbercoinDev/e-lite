@@ -227,8 +227,10 @@ and the controller treats it as one system:
 - The lag window no longer rewrites its baseline on every resume. The old code
   did `baseline = lag` when Core resumed, which raised the next pause threshold
   by `max_bulk_lag_blocks/2` per cycle (14,884 → 24,858 → 34,858 in a real
-  29.5.0 log). The default keeps a fixed window. `E_LITE_LAG_POLICY=drain`
-  opts into a time-based watermark: pause when the index would need more than
+  29.5.0 log). The default is now an absolute byte window
+  (`max_bulk_lag_gib`/`core_resume_ahead_gib`); the legacy block window is used
+  only when the GiB value is 0. `E_LITE_LAG_POLICY=drain` opts into a
+  time-based watermark: pause when the index would need more than
   `E_LITE_LAG_TARGET_SECONDS` (default 1800) to drain the backlog at the last
   commit cycle's rate, resume at half. It is opt-in until a mainnet A/B.
 - RocksDB properties are classified correctly: `estimate-pending-compaction-
@@ -319,9 +321,69 @@ verified here. When packaging e-lite for UmbrelOS/Docker, keep in mind:
 
 With `prune_mib = 1` (manual pruning), Core can download faster than e-lite
 indexes. By default e-lite pauses Core during the long bulk catch-up and resumes
-it `core_resume_ahead_blocks` (5,000) before the tip, so peers reconnect while
-e-lite finishes. After that, `max_bulk_lag_blocks` (20,000) bounds additional
-growth relative to the lowest lag seen and resumes at half.
+it at `core_resume_ahead_gib` (7 GiB) of unindexed backlog, so peers reconnect
+while e-lite finishes. After that, `max_bulk_lag_gib` (30 GiB) pauses Core
+again.
+
+### Backlog in bytes, not blocks
+
+A 20,000-block lag is ~10 GiB at height 100k and ~30 GiB at height 800k, so the
+watermark is `lag_blocks × avg_block_bytes`. The average is an EWMA of the raw
+serialized blocks applied (`/status.scheduler.backlog_bytes`). To keep the old
+block window, set `max_bulk_lag_gib = 0`; then
+`max_bulk_lag_blocks`/`core_resume_ahead_blocks` apply with their historical
+growth-relative semantics.
+
+### `scheduler = "overlap" | "alternate"`
+
+- `overlap` (default): Core downloads while e-lite keeps indexing. This is the
+  historical behaviour and usually wins because the index still advances during
+  the Core phase.
+- `alternate` (opt-in): while Core downloads, e-lite stops indexing (serving
+  continues); when the backlog reaches `max_bulk_lag_gib`, Core stops and
+  e-lite drains it to `core_resume_ahead_gib`, then the cycle repeats. This
+  removes I/O contention at the cost of the overlap. It requires
+  `prune_mib = 1` and `pause_core_during_bulk = true`.
+
+Strict alternation only wins if Core alone is faster than roughly
+
+```text
+v_core_solo > v_overlap / (1 - v_overlap / v_index_solo)
+```
+
+With the measured 29.7.1 mainnet rates (1.36 blocks/s overlapping, 5.6–6
+blocks/s index-only), the break-even is ~6.7 blocks/s. Measure Core alone with a
+5-minute `SIGSTOP` of e-lite before changing the default:
+
+```bash
+PID=$(pgrep -f 'e-lite run' | head -1)
+bitcoin-cli -datadir=<core-datadir> getblockcount
+kill -STOP "$PID"; sleep 300
+bitcoin-cli -datadir=<core-datadir> getblockcount
+kill -CONT "$PID"
+```
+
+The blocking `setnetworkactive` switch and peer reconnect make short phases
+expensive; use 40–60 GiB phases if you test `alternate`, not 7–30 GiB.
+
+### Commit controller
+
+The commit controller now uses the last **full** commit group, with its own
+cycle (`commit_last_cycle_ms`) and cost split (`txids` vs RocksDB). Boundary
+commits (the 512-block checkpoint, shutdown) and tx-limited groups are
+deliberately excluded:
+
+- a `Txs`-limited group means the batch is not the binding limit, so the batch
+  is left alone;
+- an I/O-bound group (`db_us > 2 × txids_us`) is not shrunk: smaller groups
+  only add commits without reducing per-block compaction;
+- a high commit share only shrinks the batch when the block limit was the
+  reason (`reason = Blocks`).
+
+Readers also need two consecutive samples and pipeline starvation (`wait_ms`)
+before more concurrency is added; a high `read_ms` alone no longer reduces the
+pool, because it can be the block source rather than the pool. Reader changes
+never go below `min_readers` (half the physical cores, at least 2).
 
 ### Measured on a real mainnet IBD with defaults (2026-11-08)
 

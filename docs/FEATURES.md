@@ -20,7 +20,8 @@ available**.
 | Commit sync policy | experimental | `auto` (txids in bulk, strict live), `always`, `txids` |
 | Per-network defaults | experimental | plain/TLS/metrics ports and `<data-dir>/bitcoin` per chain; multiple instances |
 | Prune cadence and deferral | experimental | every 1k safe blocks; no free-space deferral by default |
-| Core bulk pause + peer warm-up | experimental | pause during bulk; resume 5k blocks early |
+| Core bulk pause + peer warm-up | experimental | pause above 30 GiB backlog; resume at 7 GiB; legacy 5k-block fallback |
+| Overlap/alternate scheduler | experimental | `overlap` default; `alternate` opt-in (Core and e-lite take turns) |
 | Disk guard with download/index split | experimental | cgroup/LXC aware |
 | Adaptive profiles and hot reload | experimental | `auto/hdd/ssd/nvme/manual`, `SIGUSR1` |
 | Global RocksDB memory budget | experimental | `RAM/8` memtables inside a 75 % ceiling; adaptive cache; CPU-capped jobs |

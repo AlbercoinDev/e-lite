@@ -62,9 +62,15 @@ min_free_gib = 10                   # pause Core downloads below this; indexing 
 critical_free_gib = 1               # also pause indexing below this hard floor (0 = never)
 max_core_lag_blocks = 192           # automatic pruning only; hard-capped at 224
 allow_auto_prune = false            # required for prune_mib >= 550; not for from-zero
-max_bulk_lag_blocks = 20000         # relative growth window after the bulk pause
+max_bulk_lag_blocks = 20000         # legacy block growth window (used only if max_bulk_lag_gib = 0)
+max_bulk_lag_gib = 30               # preferred: pause Core above this unindexed backlog
 pause_core_during_bulk = true       # pause Core during a long catch-up
-core_resume_ahead_blocks = 5000     # resume early so peers reconnect
+core_resume_ahead_blocks = 5000     # legacy resume margin (used only if core_resume_ahead_gib = 0)
+core_resume_ahead_gib = 7           # resume Core when the backlog falls to this
+scheduler = "overlap"               # overlap (e-lite indexes while Core downloads)
+                                    # | alternate (take turns; opt-in, needs
+                                    # prune_mib = 1 and
+                                    # pause_core_during_bulk = true)
 prune_defer_free_gib = 0            # 0 = prune whenever the safe height allows
 min_gain_blocks = 1000               # evaluate/execute prune every ~1k safe blocks
 prune_interval_seconds = 30         # minimum time between prune requests (low disk bypasses)

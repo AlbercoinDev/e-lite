@@ -59,10 +59,15 @@ the per-client rate limiter are implemented; client authentication is not.
   steps and `cache_mib` is a maximum; growth requires measured prefetch
   pressure, not merely free RAM. Every knob can be overridden from the CLI or
   `--set`.
-- Bulk commits are bounded by 250k transactions, 512 blocks or 20-60 s by disk
-  class (minimum 8 blocks/60 s); live mode commits every 1.5 s. The prune gate
-  uses the committed tip, so this does not risk pruned-block loss. Prune RPCs
-  run in the background with a 120 s timeout.
+- Bulk commits are bounded by 250k transactions, 512 blocks, raw bytes
+  (`clamp(RAM/128, 64-256 MiB)`) or 20-60 s by disk class (minimum 8 blocks/60 s);
+  live mode commits every 1.5 s. The prune gate uses the committed tip, so this
+  does not risk pruned-block loss. Prune RPCs run in the background with a 120 s
+  timeout.
+- Core is paused above `max_bulk_lag_gib` (30) of unindexed data and resumed at
+  `core_resume_ahead_gib` (7). `scheduler = "overlap"` (default) keeps e-lite
+  indexing during Core downloads; `alternate` is opt-in and requires
+  `prune_mib = 1` plus `pause_core_during_bulk = true`.
 - `run`/`index`/`serve` keep an application log at `<data-dir>/e-lite.log` with
   the same lines as the console.
 - Ready state is `READY` at Core's validated tip and `FULLY SYNCED` at the

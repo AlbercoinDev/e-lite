@@ -79,6 +79,49 @@ pub enum Mode {
     Live,
 }
 
+/// Why the current group was committed. The controller must not shrink the
+/// batch when the transaction limit (or a call-boundary partial commit) is the
+/// reason: the batch is not the binding constraint.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommitReason {
+    Blocks,
+    Txs,
+    Bytes,
+    Time,
+    Boundary,
+    Shutdown,
+}
+
+impl CommitReason {
+    pub fn full(self) -> bool {
+        !matches!(self, CommitReason::Boundary | CommitReason::Shutdown)
+    }
+    pub fn code(self) -> u8 {
+        match self {
+            CommitReason::Blocks => 1,
+            CommitReason::Txs => 2,
+            CommitReason::Bytes => 3,
+            CommitReason::Time => 4,
+            CommitReason::Boundary => 5,
+            CommitReason::Shutdown => 6,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct LastCommit {
+    /// Monotonic full-commit id. The controller evaluates each group once.
+    pub seq: u64,
+    pub ms: u64,
+    pub cycle_ms: u64,
+    pub blocks: u64,
+    pub txs: u64,
+    pub bytes: u64,
+    pub reason: CommitReason,
+    pub txids_us: u64,
+    pub db_us: u64,
+}
+
 // ------------------------------------------------------- machine detection
 
 /// CPU budget derived from physical cores, affinity and the cgroup quota.
@@ -292,8 +335,12 @@ impl DiskKind {
 pub struct DiskInfo {
     pub kind: DiskKind,
     pub device: Option<String>,
+    /// Raw mountinfo `major:minor`, used for `same_device` when the device
+    /// name cannot be resolved (bind mounts, overlay, btrfs subvolumes).
+    pub dev: Option<String>,
     pub mount: String,
     pub fstype: String,
+    pub mount_source: String,
     pub free_bytes: u64,
     pub total_bytes: u64,
     pub source: String,
@@ -306,10 +353,10 @@ fn unescape_mount(s: &str) -> String {
         .replace("\\134", "\\")
 }
 
-fn mount_for(path: &Path) -> Option<(String, String, String)> {
+fn mount_for(path: &Path) -> Option<(String, String, String, String)> {
     let canon = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
     let text = std::fs::read_to_string("/proc/self/mountinfo").ok()?;
-    let mut best: Option<(usize, String, String, String)> = None;
+    let mut best: Option<(usize, String, String, String, String)> = None;
     for line in text.lines() {
         let fields: Vec<&str> = line.split_whitespace().collect();
         if fields.len() < 5 {
@@ -319,18 +366,45 @@ fn mount_for(path: &Path) -> Option<(String, String, String)> {
         if !canon.starts_with(&mount) {
             continue;
         }
-        let fstype = fields
-            .iter()
-            .position(|f| *f == "-")
+        let sep = fields.iter().position(|f| *f == "-");
+        let fstype = sep
             .and_then(|i| fields.get(i + 1))
             .copied()
-            .unwrap_or("");
+            .unwrap_or("")
+            .to_string();
+        let mount_source = sep
+            .and_then(|i| fields.get(i + 2))
+            .copied()
+            .unwrap_or("")
+            .to_string();
         let len = mount.len();
         if best.as_ref().map(|b| len >= b.0).unwrap_or(true) {
-            best = Some((len, fields[2].to_string(), mount, fstype.to_string()));
+            best = Some((len, fields[2].to_string(), mount, fstype, mount_source));
         }
     }
-    best.map(|(_, majmin, mount, fstype)| (majmin, mount, fstype))
+    best.map(|(_, majmin, mount, fstype, source)| (majmin, mount, fstype, source))
+}
+
+/// Resolve a mountinfo `source` (`/dev/...`, `UUID=...`, `LABEL=...`) to its
+/// parent block device. Needed when `/sys/dev/block/<major:minor>` is absent
+/// (bind mounts and some virtual filesystems).
+fn source_base(source: &str) -> Option<String> {
+    let path = if let Some(rest) = source.strip_prefix("UUID=") {
+        PathBuf::from("/dev/disk/by-uuid").join(rest)
+    } else if let Some(rest) = source.strip_prefix("LABEL=") {
+        PathBuf::from("/dev/disk/by-label").join(rest)
+    } else if source.starts_with("/dev/") {
+        PathBuf::from(source)
+    } else {
+        return None;
+    };
+    let canon = std::fs::canonicalize(&path).ok()?;
+    let name = canon.file_name()?.to_string_lossy().to_string();
+    if name.starts_with("dm-") || name.starts_with("md") || name.starts_with("loop") {
+        let dev = std::fs::read_to_string(format!("/sys/block/{name}/dev")).ok()?;
+        return device_base(dev.trim(), 0);
+    }
+    Some(strip_partition(&name))
 }
 
 fn strip_partition(name: &str) -> String {
@@ -419,19 +493,29 @@ fn statvfs_bytes(path: &Path) -> Option<(u64, u64)> {
 
 impl DiskInfo {
     pub fn detect(path: &Path) -> Self {
-        let (kind, device, mount, fstype, source) = match mount_for(path) {
-            Some((majmin, mount, fstype)) => {
-                let base = device_base(&majmin, 0);
+        let (kind, device, dev, mount, fstype, mount_source, source) = match mount_for(path) {
+            Some((majmin, mount, fstype, mount_source)) => {
+                let base = device_base(&majmin, 0).or_else(|| source_base(&mount_source));
                 let (kind, _) = base
                     .as_deref()
                     .map(|b| disk_kind_for(b, &fstype))
                     .unwrap_or((DiskKind::Unknown, false));
-                (kind, base, mount, fstype, "mountinfo+sysfs".to_string())
+                (
+                    kind,
+                    base,
+                    Some(majmin),
+                    mount,
+                    fstype,
+                    mount_source,
+                    "mountinfo+sysfs".to_string(),
+                )
             }
             None => (
                 DiskKind::Unknown,
                 None,
+                None,
                 path.display().to_string(),
+                String::new(),
                 String::new(),
                 "fallback".to_string(),
             ),
@@ -440,13 +524,32 @@ impl DiskInfo {
         Self {
             kind,
             device,
+            dev,
             mount,
             fstype,
+            mount_source,
             free_bytes,
             total_bytes,
             source,
         }
     }
+}
+
+/// Decide whether the data and Core disks are the same physical device.
+/// Prefer the resolved parent block device (so two partitions or LVs of one
+/// disk count as shared), then the raw `major:minor` (bind mounts), then the
+/// mount source and mount point.
+fn disk_same(a: &DiskInfo, b: &DiskInfo) -> bool {
+    if let (Some(x), Some(y)) = (&a.device, &b.device) {
+        return x == y;
+    }
+    if let (Some(x), Some(y)) = (&a.dev, &b.dev) {
+        return x == y;
+    }
+    if !a.mount_source.is_empty() && a.mount_source == b.mount_source {
+        return true;
+    }
+    !a.mount.is_empty() && a.mount == b.mount
 }
 
 /// Startup plan derived from CPU, cgroup, RAM and the data/Core disks.
@@ -492,10 +595,7 @@ impl MachinePlan {
         core_disk: DiskInfo,
         cfg: &Config,
     ) -> Self {
-        let same_device = match (&data_disk.device, &core_disk.device) {
-            (Some(a), Some(b)) => a == b,
-            _ => false,
-        };
+        let same_device = disk_same(&data_disk, &core_disk);
         let ram_mib = mem.total_mib.unwrap_or(1024).max(256);
         let physical = cpu.physical_effective.max(1);
 
@@ -714,6 +814,9 @@ pub struct Tunables {
     pub commit_ewma: AtomicU64,
     pub tx_per_sec: AtomicU64,
     pub blocks_per_sec: AtomicU64,
+    /// EWMA of the raw serialized block size. The backlog in bytes is
+    /// `lag_blocks * avg_block_bytes`; it is the height-independent watermark.
+    pub avg_block_bytes: AtomicU64,
     /// Blocks/s over the last commit cycle, used by the drain-time lag policy.
     recent_blocks_per_sec: AtomicU64,
     pub total_read_us: AtomicU64,
@@ -739,6 +842,8 @@ pub struct Tunables {
     mode_live: AtomicBool,
 
     last_change: Mutex<Instant>,
+    /// Two consecutive samples are required before changing the reader pool.
+    reader_streak: Mutex<(i8, u32)>,
     /// Serialises the 30 s rate-limit check with the mutation so two callers
     /// cannot both pass it (the old code checked under one lock and wrote
     /// under another).
@@ -748,6 +853,13 @@ pub struct Tunables {
     /// the prune RPC/WAL barrier inflates the cycle and would otherwise look
     /// like commit pain.
     last_prune: Mutex<Option<Instant>>,
+    /// Last *full* commit group, with its matching cycle and cost breakdown.
+    /// Boundary partial commits are deliberately excluded from adaptation.
+    last_commit: Mutex<Option<LastCommit>>,
+    /// Id of the last full commit already evaluated by the controller.
+    last_commit_eval: AtomicU64,
+    /// Monotonic id assigned to each full commit.
+    commit_seq: AtomicU64,
 }
 
 impl Tunables {
@@ -894,6 +1006,10 @@ impl Tunables {
                 Profile::Nvme => 16,
                 Profile::Auto | Profile::Manual => 32,
             });
+        let min_readers = plan
+            .map(|p| (p.cpu.physical_effective / 2).max(2))
+            .unwrap_or(2)
+            .min(max_readers);
         let cpu_reader_cap = cpus.max(2);
         let readers = if cfg.index.readers > 0 {
             readers.clamp(1, max_readers)
@@ -932,7 +1048,7 @@ impl Tunables {
             profile: AtomicU8::new(profile.code()),
             rotational: AtomicBool::new(rotational),
             background_jobs: AtomicUsize::new(jobs.clamp(1, 32)),
-            min_readers: 1,
+            min_readers,
             max_readers_cap: max_readers,
             min_commit_ms: 500,
             max_commit_ms: 60_000,
@@ -951,6 +1067,7 @@ impl Tunables {
             memtables_mib: budget.memtables_mib,
             runtime_mib: budget.runtime_mib,
             mem_streak: Mutex::new((0, 0)),
+            reader_streak: Mutex::new((0, 0)),
             resume_shrunk: AtomicBool::new(false),
             read_ms: AtomicU64::new(0),
             apply_ms: AtomicU64::new(0),
@@ -960,6 +1077,7 @@ impl Tunables {
             commit_ewma: AtomicU64::new(0),
             tx_per_sec: AtomicU64::new(0),
             blocks_per_sec: AtomicU64::new(0),
+            avg_block_bytes: AtomicU64::new(1_500_000),
             recent_blocks_per_sec: AtomicU64::new(0),
             total_read_us: AtomicU64::new(0),
             total_decode_us: AtomicU64::new(0),
@@ -981,6 +1099,9 @@ impl Tunables {
             adapt_gate: Mutex::new(()),
             last_commit_start: Mutex::new(None),
             last_prune: Mutex::new(None),
+            last_commit: Mutex::new(None),
+            last_commit_eval: AtomicU64::new(0),
+            commit_seq: AtomicU64::new(0),
         }
     }
 
@@ -1089,23 +1210,61 @@ impl Tunables {
     /// Record a commit together with the number of blocks it actually
     /// contained. `commit/blk` must not divide by the configured batch size:
     /// transaction limits and time-based commits produce smaller groups.
-    pub fn record_commit_group(&self, started: Instant, d: Duration, blocks: u64) {
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_commit_group(
+        &self,
+        started: Instant,
+        d: Duration,
+        blocks: u64,
+        txs: u64,
+        bytes: u64,
+        reason: CommitReason,
+        txids_us: u64,
+        db_us: u64,
+    ) {
+        if !reason.full() {
+            // Boundary/partial commits are ignored by the controller: a
+            // 1-block boundary commit used to deflate the EWMA and make the
+            // next share look like 76-118%.
+            return;
+        }
         self.record_commit(d);
         let per_block = (d.as_millis() as u64) / blocks.max(1);
         self.commit_per_block_ms.store(per_block, Ordering::Relaxed);
-        if let Ok(mut last) = self.last_commit_start.lock() {
-            if let Some(prev) = *last {
-                let cycle = started.saturating_duration_since(prev).as_millis() as u64;
-                self.commit_cycle_ms.store(cycle, Ordering::Relaxed);
-                if cycle > 0 {
-                    self.recent_blocks_per_sec.store(
-                        blocks.saturating_mul(1_000).checked_div(cycle).unwrap_or(0),
-                        Ordering::Relaxed,
-                    );
-                }
-            }
+        let cycle = if let Ok(mut last) = self.last_commit_start.lock() {
+            let cycle = last
+                .map(|prev| started.saturating_duration_since(prev).as_millis() as u64)
+                .unwrap_or(0);
             *last = Some(started);
+            cycle
+        } else {
+            0
+        };
+        if cycle > 0 {
+            self.commit_cycle_ms.store(cycle, Ordering::Relaxed);
+            self.recent_blocks_per_sec.store(
+                blocks.saturating_mul(1_000).checked_div(cycle).unwrap_or(0),
+                Ordering::Relaxed,
+            );
         }
+        if let Ok(mut slot) = self.last_commit.lock() {
+            let seq = self.commit_seq.fetch_add(1, Ordering::Relaxed) + 1;
+            *slot = Some(LastCommit {
+                seq,
+                ms: d.as_millis() as u64,
+                cycle_ms: cycle,
+                blocks,
+                txs,
+                bytes,
+                reason,
+                txids_us,
+                db_us,
+            });
+        }
+    }
+
+    pub fn last_commit(&self) -> Option<LastCommit> {
+        self.last_commit.lock().ok().and_then(|slot| *slot)
     }
 
     /// Blocks/s over the last commit cycle; falls back to the since-start
@@ -1118,10 +1277,6 @@ impl Tunables {
         } else {
             self.blocks_per_sec.load(Ordering::Relaxed)
         }
-    }
-
-    pub fn commit_cycle_ms(&self) -> u64 {
-        self.commit_cycle_ms.load(Ordering::Relaxed)
     }
 
     /// Called after a successful prune so the controller ignores the stall.
@@ -1184,6 +1339,14 @@ impl Tunables {
     }
     pub fn record_blocks_rate(&self, blocks_per_sec: u64) {
         ewma(&self.blocks_per_sec, blocks_per_sec);
+    }
+    pub fn record_block_bytes(&self, bytes: usize) {
+        if bytes > 0 {
+            ewma(&self.avg_block_bytes, bytes as u64);
+        }
+    }
+    pub fn avg_block_bytes(&self) -> u64 {
+        self.avg_block_bytes.load(Ordering::Relaxed).max(1)
     }
 
     fn apply_profile_defaults(&self, profile: Profile) {
@@ -1293,6 +1456,22 @@ impl Tunables {
         changed
     }
 
+    fn reader_streak_ok(&self, direction: i8) -> bool {
+        let Ok(mut streak) = self.reader_streak.lock() else {
+            return false;
+        };
+        if streak.0 == direction {
+            streak.1 = streak.1.saturating_add(1);
+        } else {
+            *streak = (direction, 1);
+        }
+        if streak.1 < 2 {
+            return false;
+        }
+        *streak = (0, 0);
+        true
+    }
+
     /// One conservative control step. Returns a human-readable reason when a
     /// knob changed.
     pub fn maybe_adapt(
@@ -1329,49 +1508,68 @@ impl Tunables {
         }
         let mut action = None;
 
-        // Commit/fsync pain: amortise with larger groups on slow storage. Avoid
-        // growing the group when commit already dominates the interval; in that
-        // case shrink the group to reduce the per-commit stall. Use the real
-        // start-to-start cycle, not the configured interval: a time-based
-        // commit or a prune/WAL stall makes the interval lie.
-        let cycle = self.commit_cycle_ms();
-        let cycle_ms = if cycle > 0 { cycle } else { self.commit_ms() }.max(1);
-        let commit_share = commit_ms as f64 / cycle_ms as f64;
+        // Commit decisions use the last *full* group (same cycle, same cost),
+        // never the EWMA against a possibly-partial cycle. A tx-limited group
+        // means the batch is not the binding constraint: leave it alone.
         let prune_recent = self.prune_recent();
         let batch_locked = self.batch_locked.load(Ordering::Relaxed);
-        if !prune_recent
-            && !self.commit_locked.load(Ordering::Relaxed)
-            && commit_ms > 500
-            && commit_share < 0.5
-            && self.commit_ms() < self.max_commit_ms
-        {
-            let v = (self.commit_ms() * 3 / 2).min(self.max_commit_ms);
-            self.commit_ms.store(v, Ordering::Relaxed);
-            let b = if batch_locked {
-                self.batch_blocks()
+        let commit_locked = self.commit_locked.load(Ordering::Relaxed);
+        if let Some(last) = self.last_commit() {
+            let share = if last.cycle_ms > 0 {
+                last.ms as f64 / last.cycle_ms as f64
             } else {
-                let b = (self.batch_blocks() * 3 / 2).min(self.max_batch);
-                self.batch_blocks.store(b, Ordering::Relaxed);
-                b
+                0.0
             };
-            action = Some(format!(
-                "commit {commit_ms}ms ({:.0}% of interval): interval -> {v}ms, batch -> {b}",
-                commit_share * 100.0
-            ));
-        } else if !prune_recent
-            && !self.commit_locked.load(Ordering::Relaxed)
-            && !batch_locked
-            && commit_share > 0.75
-            && self.batch_blocks() > self.min_batch.saturating_mul(4)
-        {
-            let b = (self.batch_blocks() * 3 / 4).max(self.min_batch);
-            self.batch_blocks.store(b, Ordering::Relaxed);
-            action = Some(format!(
-                "commit {commit_ms}ms ({:.0}% of interval): batch -> {b}",
-                commit_share * 100.0
-            ));
-        } else if !prune_recent
-            && !self.commit_locked.load(Ordering::Relaxed)
+            let io_bound = last.db_us > last.txids_us.saturating_mul(2);
+            let tx_bound = last.reason == CommitReason::Txs;
+            let fresh = last.seq > self.last_commit_eval.load(Ordering::Relaxed);
+            let mut evaluated = false;
+            if last.cycle_ms > 0 && fresh && !prune_recent && !commit_locked {
+                if tx_bound {
+                    // The transaction limit committed the group. Changing the
+                    // batch would only move the binding limit; leave it.
+                } else if io_bound {
+                    // RocksDB write/compaction dominates. A smaller batch
+                    // increases the number of commits without reducing the
+                    // per-block cost; keep it and let the operator inspect
+                    // /status.rocksdb.cf. Do not consume the single action.
+                } else if share > 0.75
+                    && last.reason == CommitReason::Blocks
+                    && !batch_locked
+                    && self.batch_blocks() > self.min_batch.saturating_mul(4)
+                {
+                    let b = (self.batch_blocks() * 3 / 4).max(self.min_batch);
+                    self.batch_blocks.store(b, Ordering::Relaxed);
+                    action = Some(format!(
+                        "commit {}ms ({:.0}% of cycle, blocks limit): batch -> {b}",
+                        last.ms,
+                        share * 100.0
+                    ));
+                } else if share < 0.5 && last.ms > 500 && self.commit_ms() < self.max_commit_ms {
+                    let v = (self.commit_ms() * 3 / 2).min(self.max_commit_ms);
+                    self.commit_ms.store(v, Ordering::Relaxed);
+                    let b = if batch_locked {
+                        self.batch_blocks()
+                    } else {
+                        let b = (self.batch_blocks() * 3 / 2).min(self.max_batch);
+                        self.batch_blocks.store(b, Ordering::Relaxed);
+                        b
+                    };
+                    action = Some(format!(
+                        "commit {}ms ({:.0}% of cycle): interval -> {v}ms, batch -> {b}",
+                        last.ms,
+                        share * 100.0
+                    ));
+                }
+                evaluated = true;
+            }
+            if evaluated {
+                self.last_commit_eval.store(last.seq, Ordering::Relaxed);
+            }
+        }
+        if action.is_none()
+            && !prune_recent
+            && !commit_locked
             && mode == Mode::Live
             && commit_ms < 100
             && self.commit_ms() > 1_500
@@ -1385,27 +1583,38 @@ impl Tunables {
         // Only add readers when reads are actually slow; low read latency means
         // the bottleneck is elsewhere (apply/commit/compaction).
         let max_readers = self.auto_max_readers().min(self.memory_reader_cap());
-        if action.is_none()
-            && !self.readers_locked.load(Ordering::Relaxed)
-            && read_ms > 200
-            && apply_ms < read_ms
-        {
-            let v = (self.readers() * 3 / 4).max(self.min_readers);
-            if v != self.readers() {
-                self.readers.store(v, Ordering::Relaxed);
-                action = Some(format!("read latency {read_ms}ms: readers -> {v}"));
+        let wait_ms = self.wait_ms();
+        let prefetch_ms = self.prefetch_ms();
+        if action.is_none() && !self.readers_locked.load(Ordering::Relaxed) {
+            // Pipeline starvation (wait_ms) means more concurrency is needed;
+            // a high block-read latency with no wait is the block source's
+            // limit, and reducing readers there does not help. Require two
+            // consecutive samples before changing the pool.
+            let direction = if wait_ms > 50 && prefetch_ms > 100 && self.readers() < max_readers {
+                1i8
+            } else if read_ms > 200
+                && wait_ms < 50
+                && apply_ms < read_ms
+                && self.readers() > self.min_readers
+            {
+                -1i8
+            } else {
+                0i8
+            };
+            if direction != 0 && self.reader_streak_ok(direction) {
+                let v = if direction > 0 {
+                    (self.readers() + 1).min(max_readers)
+                } else {
+                    (self.readers() * 3 / 4).max(self.min_readers)
+                };
+                if v != self.readers() {
+                    self.readers.store(v, Ordering::Relaxed);
+                    action = Some(format!(
+                        "readers {direction:+}: read {read_ms}ms wait {wait_ms}ms prefetch \
+                         {prefetch_ms}ms -> {v}"
+                    ));
+                }
             }
-        } else if action.is_none()
-            && !self.readers_locked.load(Ordering::Relaxed)
-            && mode == Mode::Bulk
-            && !self.rotational()
-            && read_ms > 120
-            && apply_ms < read_ms
-            && self.readers() < max_readers
-        {
-            let v = (self.readers() + 1).min(max_readers);
-            self.readers.store(v, Ordering::Relaxed);
-            action = Some(format!("read latency {read_ms}ms: readers -> {v}"));
         }
 
         if let Some(reason) = &action {
@@ -1598,6 +1807,32 @@ impl Tunables {
             self.commit_cycle_ms.load(Ordering::Relaxed),
             Ordering::Relaxed,
         );
+        if let Some(last) = self.last_commit() {
+            stats
+                .tuning_commit_last_ms
+                .store(last.ms, Ordering::Relaxed);
+            stats
+                .tuning_commit_last_cycle_ms
+                .store(last.cycle_ms, Ordering::Relaxed);
+            stats
+                .tuning_commit_last_blocks
+                .store(last.blocks, Ordering::Relaxed);
+            stats
+                .tuning_commit_last_txs
+                .store(last.txs, Ordering::Relaxed);
+            stats
+                .tuning_commit_last_bytes
+                .store(last.bytes, Ordering::Relaxed);
+            stats
+                .tuning_commit_last_txids_us
+                .store(last.txids_us, Ordering::Relaxed);
+            stats
+                .tuning_commit_last_db_us
+                .store(last.db_us, Ordering::Relaxed);
+            stats
+                .tuning_commit_last_reason
+                .store(last.reason.code() as u64, Ordering::Relaxed);
+        }
         stats
             .tuning_adapt_steps
             .store(self.adapt_steps.load(Ordering::Relaxed), Ordering::Relaxed);
@@ -2391,8 +2626,10 @@ mod tests {
         let disk = DiskInfo {
             kind: DiskKind::SataSsd,
             device: Some("sda".to_string()),
+            dev: Some("8:0".to_string()),
             mount: "/".to_string(),
             fstype: "ext4".to_string(),
+            mount_source: "/dev/sda1".to_string(),
             free_bytes: 100,
             total_bytes: 200,
             source: "test".to_string(),
@@ -2610,5 +2847,105 @@ mod tests {
         assert_eq!(t.readers(), 6);
         let _ = t.reload(&cfg);
         assert_eq!(t.readers(), 6);
+    }
+
+    #[test]
+    fn boundary_commit_does_not_feed_the_controller() {
+        let t = Tunables::new(&Config::default(), false);
+        let t0 = Instant::now();
+        t.record_commit_group(
+            t0,
+            Duration::from_millis(1_000),
+            100,
+            10_000,
+            100 << 20,
+            CommitReason::Blocks,
+            100_000,
+            800_000,
+        );
+        let ewma = t.commit_ms();
+        let last = t.last_commit().expect("full commit recorded");
+        assert_eq!(last.reason, CommitReason::Blocks);
+        assert_eq!(last.seq, 1);
+        assert_eq!(last.blocks, 100);
+        assert_eq!(last.txs, 10_000);
+        assert_eq!(last.bytes, 100 << 20);
+        assert_eq!(last.cycle_ms, 0, "first full commit has no previous start");
+
+        // A boundary partial commit is 1 ms / 1 block. It must not replace the
+        // full commit nor deflate the EWMA the controller reads.
+        t.record_commit_group(
+            t0 + Duration::from_secs(10),
+            Duration::from_millis(1),
+            1,
+            1,
+            1_000,
+            CommitReason::Boundary,
+            100,
+            100,
+        );
+        assert_eq!(t.commit_ms(), ewma);
+        let last = t.last_commit().expect("full commit still recorded");
+        assert_eq!(last.reason, CommitReason::Blocks);
+        assert_eq!(last.blocks, 100);
+
+        // A tx-limited group is a full commit and is reported as such so the
+        // controller can leave the batch alone.
+        t.record_commit_group(
+            t0 + Duration::from_secs(20),
+            Duration::from_millis(2_000),
+            75,
+            250_000,
+            120 << 20,
+            CommitReason::Txs,
+            100_000,
+            1_900_000,
+        );
+        let last = t.last_commit().expect("tx-limited commit recorded");
+        assert_eq!(last.reason, CommitReason::Txs);
+        assert_eq!(last.seq, 2);
+        assert_eq!(last.cycle_ms, 20_000);
+    }
+
+    #[test]
+    fn reader_changes_require_two_samples() {
+        let t = Tunables::new(&Config::default(), false);
+        assert!(!t.reader_streak_ok(1));
+        assert!(t.reader_streak_ok(1));
+        assert!(!t.reader_streak_ok(-1));
+        assert!(t.reader_streak_ok(-1));
+        assert!(!t.reader_streak_ok(1), "direction change resets the streak");
+    }
+
+    #[test]
+    fn disk_identity_prefers_kernel_device_number() {
+        let mut base = DiskInfo {
+            kind: DiskKind::SataSsd,
+            device: Some("sda".to_string()),
+            dev: Some("8:1".to_string()),
+            mount: "/data".to_string(),
+            fstype: "ext4".to_string(),
+            mount_source: "/dev/sda1".to_string(),
+            free_bytes: 1,
+            total_bytes: 2,
+            source: "test".to_string(),
+        };
+        let mut core = base.clone();
+        core.mount = "/data/core".to_string();
+        core.mount_source = "/dev/sda2".to_string();
+        assert!(disk_same(&base, &core), "same parent device");
+
+        core.dev = Some("8:2".to_string());
+        assert!(
+            disk_same(&base, &core),
+            "two partitions of one physical disk are shared"
+        );
+
+        // Without resolved device names, fall back to raw major:minor.
+        base.device = None;
+        core.device = None;
+        assert!(!disk_same(&base, &core), "different partitions");
+        core.dev = base.dev.clone();
+        assert!(disk_same(&base, &core), "same raw device");
     }
 }

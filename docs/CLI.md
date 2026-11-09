@@ -120,10 +120,13 @@ e-lite run --network mainnet --allow-mainnet \
 | Flag | TOML field | Default |
 |---|---|---|
 | `--max-core-lag-blocks <n>` | `pruning.max_core_lag_blocks` | `192` (auto-prune only) |
-| `--max-bulk-lag-blocks <n>` | `pruning.max_bulk_lag_blocks` | `20000` |
+| `--max-bulk-lag-blocks <n>` | `pruning.max_bulk_lag_blocks` | `20000` (legacy) |
+| `--max-bulk-lag-gib <n>` | `pruning.max_bulk_lag_gib` | `30` |
 | `--pause-core-during-bulk` | `pruning.pause_core_during_bulk` | `true` |
 | `--no-pause-core-during-bulk` | same | disable the full bulk pause |
-| `--core-resume-ahead-blocks <n>` | `pruning.core_resume_ahead_blocks` | `5000` |
+| `--core-resume-ahead-blocks <n>` | `pruning.core_resume_ahead_blocks` | `5000` (legacy) |
+| `--core-resume-ahead-gib <n>` | `pruning.core_resume_ahead_gib` | `7` |
+| `--scheduler <mode>` | `pruning.scheduler` | `overlap` |
 | `--prune-defer-free-gib <n>` | `pruning.prune_defer_free_gib` | `0` |
 | `--min-gain-blocks <n>` | `pruning.min_gain_blocks` | `1000` |
 | `--prune-interval-seconds <n>` | `pruning.prune_interval_seconds` | `30` |
@@ -135,11 +138,20 @@ e-lite run --network mainnet --allow-mainnet \
 | `--restart` / `--no-restart` | `core.restart` | `true` |
 
 By default (`pause_core_during_bulk = true`), a long bulk catch-up pauses
-Core's P2P until `core_resume_ahead_blocks` remain (5,000). It then resumes
-Core early so peers reconnect while e-lite finishes; after that,
-`max_bulk_lag_blocks` (20,000) bounds additional growth relative to the lowest
-lag seen and resumes at half. Use `--no-pause-core-during-bulk` for the relative
-guard only.
+Core's P2P when the unindexed backlog reaches `max_bulk_lag_gib` (30 GiB) and
+resumes it at `core_resume_ahead_gib` (7 GiB). The backlog is
+`lag_blocks × avg_block_bytes`, so the threshold means the same disk footprint
+at 100k and at 800k; blocks are not comparable across heights. The older
+`max_bulk_lag_blocks`/`core_resume_ahead_blocks` pair is still honoured only
+when the corresponding GiB value is `0`.
+
+`scheduler = "overlap"` (default) keeps e-lite indexing while Core downloads.
+`scheduler = "alternate"` pauses e-lite indexing during the Core phase and
+pauses Core during the e-lite phase, so only one of them writes at a time. It
+requires `prune_mib = 1` (manual prune) and `pause_core_during_bulk = true`;
+serving (Electrum, Tor, metrics) continues while indexing is paused. Use it to
+test whether removing I/O contention beats the lost overlap; it is not the
+default.
 
 `commit_sync = auto` relaxes the RocksDB fsync during bulk/IBD (`txids.dat` is
 still fsynced, so a crash only reindexes the last interval) and returns to
@@ -286,11 +298,17 @@ These are escape hatches for measurements, not normal configuration:
   (reserve, page-cache floor), disk class and the resulting knobs. Explicit
   config values are reflected in `plan`. `plan.max_group_bytes` is the raw-byte
   bound for a bulk commit group.
-- `tuning.commit_cycle_ms`: real start-to-start commit interval used by
-  `commit_share`. In bulk the interval follows the disk class (20-60 s); live
-  mode switches to 1.5 s.
+- `tuning.commit_cycle_ms`: real start-to-start commit interval between **full**
+  commit groups. Boundary/shutdown partials are excluded from the EWMA and the
+  cycle. `tuning.commit_last_*` exposes the last full group: `ms`, `cycle_ms`,
+  `blocks`, `txs`, `bytes`, `txids_us`, `db_us` and `reason`
+  (1 blocks, 2 txs, 3 bytes, 4 time, 5 boundary, 6 shutdown).
 - `commit_breakdown_us.txids_append_fsync` and `rocksdb_write`: separate the
   flat-file fsync from the RocksDB write.
+- `scheduler`: `mode` (`overlap`/`alternate`), `index_paused`,
+  `backlog_bytes` (`lag × EWMA(raw block size)`), `high_bytes` and `low_bytes`.
+  In `alternate`, `index_paused = true` means Core is downloading and e-lite is
+  serving but not indexing.
 
 ## Logging
 
@@ -317,7 +335,7 @@ e-lite run --set 'rawtx.p2p_peers=["203.0.113.10:8333","[2001:db8::1]:8333"]'
 e-lite run --set 'core.extra_args=["-dbcache=256","-maxmempool=128"]'
 
 # Pruning and server fields
-e-lite run --set pruning.max_bulk_lag_blocks=20000
+e-lite run --set pruning.max_bulk_lag_gib=40 --set pruning.scheduler=alternate
 e-lite serve --set server.max_clients=64
 ```
 

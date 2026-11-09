@@ -1,9 +1,9 @@
 # Session handoff
 
 **Updated:** 2026-11-09
-**Latest published release:** `0.1.0-alpha.29.7.1`
-**Release:** https://github.com/AlbercoinDev/e-lite/releases/tag/v0.1.0-alpha.29.7.1
-**Main commit at handoff:** tag `v0.1.0-alpha.29.7.1`
+**Latest published release:** `0.1.0-alpha.29.8.0`
+**Release:** https://github.com/AlbercoinDev/e-lite/releases/tag/v0.1.0-alpha.29.8.0
+**Main commit at handoff:** tag `v0.1.0-alpha.29.8.0`
 
 This file is the short “where we are” for a new session. The invariants live in
 [`AGENTS.md`](../AGENTS.md) and [`PROJECT_MEMORY.md`](PROJECT_MEMORY.md); the
@@ -86,25 +86,41 @@ no repitas contexto ni rehagas decisiones ya documentadas.
 - `docs/ROADMAP.md` contains future features/improvements. Do not present them as
   available.
 
-## Last change (alpha.29.7.1)
+## Last change (alpha.29.8.0)
 
-Completes the 29.7.0 safety pieces.
+Byte backlog watermarks, opt-in alternate scheduler, commit/reader fixes.
 
-- **RPC retry**: one 150 ms retry for socket timeout/EAGAIN/reset/truncated
-  responses; HTTP/RPC errors are not retried. The RPCs used are idempotent.
-- **Byte bound**: bulk commits also trigger at
-  `clamp(RAM/128, 64-256 MiB)` of raw block bytes.
-- **Deferred prune**: the WAL barrier is taken at the commit boundary; the
-  `el-prune` RPC starts at the top of the next apply iteration, never in the
-  middle of an uncommitted group. Logs `deferred prune at N: commit barrier
-  applied`.
-- Tests: fmt, clippy, workspace, regtest/recovery/pruned e2e.
+- **Bytes, not blocks**: pause Core at `max_bulk_lag_gib` (30), resume at
+  `core_resume_ahead_gib` (7). The backlog is
+  `lag_blocks × avg_block_bytes` (EWMA of `PreparedBlock::raw_size`).
+  `/status.scheduler` shows mode, backlog and both watermarks. The legacy
+  `*_blocks` fields apply only when the GiB value is 0.
+- **Scheduler**: `overlap` remains the default. `alternate` pauses e-lite
+  indexing while Core downloads and pauses Core while e-lite drains to the low
+  watermark; serving continues. It requires `prune_mib = 1` and
+  `pause_core_during_bulk = true`. Opt-in because the measured break-even is
+  Core alone > ~6.7 blocks/s and phase switches cost peer reconnects.
+- **Commit controller**: full groups only. Boundary/shutdown partials do not
+  update the EWMA/cycle; `Txs`-limited groups no longer shrink the batch;
+  I/O-bound groups (`db_us > 2 × txids_us`) are left alone. New
+  `/status.tuning.commit_last_*` fields expose reason, blocks, txs, bytes,
+  cycle and the txids/db split.
+- **Readers**: growth needs `wait_ms > 50` (starvation) and two consecutive
+  samples; a high `read_ms` alone no longer removes readers when `wait_ms` is
+  high. Floor is half the physical cores (min 2).
+- **Disk identity**: `DiskInfo` keeps `major:minor`/mount source; `same_device`
+  works through bind mounts and `/data` layouts.
+- Tests: fmt, clippy, workspace; new unit tests for byte watermarks at two
+  heights, boundary commit exclusion, tx-limited reason, reader streak and
+  disk identity. Mainnet A/B pending.
 
-### Not yet verified in 29.7.1
+### Not yet verified in 29.8.0
 
-- No mainnet A/B of the byte bound or the RPC retry; regtest/recovery cover the
-  mechanics.
+- No mainnet measurement of `scheduler = "alternate"`; keep `overlap` until the
+  5-minute `SIGSTOP` Core-solo test is available.
 - Real power loss and true ENOSPC remain untested.
+- `/status.rocksdb.cf` and `commit_last_*` during the competition phase are not
+  captured yet, so compaction/memtables are not tuned from that data.
 
 ## Last change (alpha.29.7.0)
 

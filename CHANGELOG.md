@@ -1,5 +1,48 @@
 # Changelog
 
+## 0.1.0-alpha.29.8.0 — 2026-11-09
+
+### Byte backlog watermarks, opt-in alternate scheduler, commit/reader fixes
+
+No schema, protocol or consensus change.
+
+**Backlog is measured in bytes.** The bulk guard now pauses Core at
+`max_bulk_lag_gib` (30) of unindexed data and resumes it at
+`core_resume_ahead_gib` (7), using an EWMA of the raw block size
+(`/status.scheduler.backlog_bytes`). A 20k-block lag is ~10 GiB at 100k and
+~30 GiB at 800k, so the old block window was not a disk bound.
+`max_bulk_lag_blocks`/`core_resume_ahead_blocks` remain as legacy fallbacks
+when the corresponding GiB value is `0`. An existing config that sets only the
+block fields must add `max_bulk_lag_gib = 0` to keep the old window, because the
+new byte default (30 GiB) otherwise wins.
+
+**`scheduler = "overlap" | "alternate"`.** `overlap` stays the default.
+`alternate` (opt-in) stops e-lite indexing while Core downloads and stops Core
+while e-lite drains the byte backlog, so only one writes at a time; serving
+continues. It requires `pause_core_during_bulk = true`. The measured
+break-even is Core alone > ~6.7 blocks/s; short phases lose to the switch cost.
+
+**Commit controller uses full groups only.** The last commit records blocks,
+txs, bytes, reason, cycle and the `txids`/RocksDB split
+(`/status.tuning.commit_last_*`). Boundary and shutdown partial commits no
+longer update the EWMA or the cycle. A `Txs`-limited group no longer shrinks
+the batch, and an I/O-bound group (`db_us > 2 × txids_us`) is left alone
+instead of being shrunk blindly.
+
+**Reader control requires two samples and starvation.** More readers are added
+only when `wait_ms > 50` and prefetch is the constraint; a high `read_ms` alone
+no longer removes readers when `wait_ms` is high. Changes need two consecutive
+samples and never go below half the physical cores (min 2).
+
+**Disk identity.** `DiskInfo` now keeps `major:minor` and the mount source, and
+`same_device` falls back through `major:minor`, parent block device and mount
+source. This fixes `same=false` on bind mounts and paths such as `/data`.
+
+Tests: fmt, clippy, workspace; new unit tests cover byte watermarks at
+different heights, boundary commits not feeding the controller, tx-limited
+reasons, the two-sample reader streak and disk identity. The e2e scripts run
+regtest, recovery, multi-instance and pruned-IBD (prune + SIGKILL + restart).
+
 ## 0.1.0-alpha.29.7.1 — 2026-11-09
 
 ### Complete the machine-plan safety pieces

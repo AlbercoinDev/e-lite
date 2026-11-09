@@ -464,14 +464,29 @@ pub struct PruningCfg {
     /// Core's P2P until the index halves the gap. 0 disables it.
     #[serde(default = "d_max_bulk_lag")]
     pub max_bulk_lag_blocks: u32,
+    /// Absolute unindexed backlog in GiB. This is the preferred unit: a block
+    /// at 800k is several times larger than one at 100k. 0 = use the legacy
+    /// block window above.
+    #[serde(default = "d_max_bulk_lag_gib")]
+    pub max_bulk_lag_gib: u64,
     /// Pause Core during a long bulk catch-up and pre-warm its networking when
     /// the index is close to catching up.
     #[serde(default = "d_true")]
     pub pause_core_during_bulk: bool,
     /// Resume Core's networking this many blocks before the tip so peers can
-    /// reconnect while e-lite finishes the catch-up.
+    /// reconnect while e-lite finishes the catch-up. Used only when
+    /// `core_resume_ahead_gib = 0`.
     #[serde(default = "d_core_resume_ahead")]
     pub core_resume_ahead_blocks: u32,
+    /// Absolute low-water mark in GiB. Core resumes when the unindexed backlog
+    /// falls to this; it is the byte equivalent of `core_resume_ahead_blocks`.
+    #[serde(default = "d_core_resume_ahead_gib")]
+    pub core_resume_ahead_gib: u64,
+    /// `overlap`: e-lite keeps indexing while Core downloads. `alternate`:
+    /// Core and e-lite take turns (Core downloads, then e-lite indexes) to
+    /// avoid I/O contention. `alternate` is opt-in for testing.
+    #[serde(default = "d_scheduler")]
+    pub scheduler: String,
     /// Skip normal pruning while free space is at or above this many GiB.
     #[serde(default = "d_prune_defer_free")]
     pub prune_defer_free_gib: u64,
@@ -499,8 +514,11 @@ impl Default for PruningCfg {
             max_core_lag_blocks: d_max_lag(),
             allow_auto_prune: false,
             max_bulk_lag_blocks: d_max_bulk_lag(),
+            max_bulk_lag_gib: d_max_bulk_lag_gib(),
             pause_core_during_bulk: true,
             core_resume_ahead_blocks: d_core_resume_ahead(),
+            core_resume_ahead_gib: d_core_resume_ahead_gib(),
+            scheduler: d_scheduler(),
             prune_defer_free_gib: d_prune_defer_free(),
             min_gain_blocks: d_min_gain(),
             prune_interval_seconds: d_prune_interval(),
@@ -662,8 +680,19 @@ fn d_min_gain() -> u32 {
 fn d_max_bulk_lag() -> u32 {
     20_000
 }
+fn d_max_bulk_lag_gib() -> u64 {
+    // ~20k mainnet blocks at the 2026 height; the byte value keeps the phase
+    // comparable as blocks grow.
+    30
+}
 fn d_core_resume_ahead() -> u32 {
     5_000
+}
+fn d_core_resume_ahead_gib() -> u64 {
+    7
+}
+fn d_scheduler() -> String {
+    "overlap".to_string()
 }
 
 /// Host part of a `host:port` listener, used to pair the TLS listener with the
@@ -951,6 +980,28 @@ impl Config {
         }
         if !matches!(self.index.commit_sync.as_str(), "auto" | "always" | "txids") {
             return Err("[index] commit_sync must be auto, always or txids".to_string());
+        }
+        if !matches!(self.pruning.scheduler.as_str(), "overlap" | "alternate") {
+            return Err("[pruning] scheduler must be overlap or alternate".to_string());
+        }
+        if self.pruning.scheduler == "alternate" && !self.pruning.pause_core_during_bulk {
+            return Err(
+                "[pruning] scheduler = \"alternate\" requires pause_core_during_bulk = true"
+                    .to_string(),
+            );
+        }
+        if self.pruning.scheduler == "alternate" && self.core.prune_mib != 1 {
+            return Err(
+                "[pruning] scheduler = \"alternate\" requires prune_mib = 1 (manual prune)"
+                    .to_string(),
+            );
+        }
+        if self.pruning.max_bulk_lag_gib > 0
+            && self.pruning.core_resume_ahead_gib >= self.pruning.max_bulk_lag_gib
+        {
+            return Err(
+                "[pruning] core_resume_ahead_gib must be lower than max_bulk_lag_gib".to_string(),
+            );
         }
         if self.index.memory_fraction != 0.0 && !(0.1..=1.0).contains(&self.index.memory_fraction) {
             return Err("[index] memory_fraction must be 0 (auto) or 0.1..1.0".to_string());
@@ -1289,5 +1340,34 @@ mod tests {
     #[test]
     fn set_override_without_equals_is_rejected() {
         assert!(Config::load_with_overrides(None, &["index.profile".to_string()]).is_err());
+    }
+
+    #[test]
+    fn byte_scheduler_defaults_and_validation() {
+        let cfg = Config::default();
+        assert_eq!(cfg.pruning.max_bulk_lag_gib, 30);
+        assert_eq!(cfg.pruning.core_resume_ahead_gib, 7);
+        assert_eq!(cfg.pruning.scheduler, "overlap");
+        assert_eq!(cfg.pruning.max_bulk_lag_blocks, 20_000);
+
+        let mut alt = Config::default();
+        alt.pruning.scheduler = "alternate".to_string();
+        assert!(alt.validate().is_ok());
+        alt.pruning.pause_core_during_bulk = false;
+        assert!(alt.validate().is_err());
+
+        let mut full = Config::default();
+        full.pruning.scheduler = "alternate".to_string();
+        full.core.prune_mib = 0;
+        assert!(full.validate().is_err());
+
+        let mut bad = Config::default();
+        bad.pruning.scheduler = "round-robin".to_string();
+        assert!(bad.validate().is_err());
+
+        let mut inverted = Config::default();
+        inverted.pruning.max_bulk_lag_gib = 10;
+        inverted.pruning.core_resume_ahead_gib = 10;
+        assert!(inverted.validate().is_err());
     }
 }

@@ -29,7 +29,7 @@ use std::net::TcpStream;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::{Duration, Instant, SystemTime};
-use tuning::Tunables;
+use tuning::{CommitReason, Tunables};
 
 type E = Box<dyn std::error::Error + Send + Sync>;
 type R<T> = std::result::Result<T, E>;
@@ -233,8 +233,11 @@ struct Args {
     milestone_seconds: Option<u64>,
     max_core_lag_blocks: Option<u32>,
     max_bulk_lag_blocks: Option<u32>,
+    max_bulk_lag_gib: Option<u64>,
     pause_core_during_bulk: Option<bool>,
     core_resume_ahead_blocks: Option<u32>,
+    core_resume_ahead_gib: Option<u64>,
+    scheduler: Option<String>,
     prune_defer_free_gib: Option<u64>,
     min_gain_blocks: Option<u32>,
     prune_interval_seconds: Option<u64>,
@@ -349,11 +352,18 @@ fn parse_args() -> R<Args> {
             "--max-bulk-lag-blocks" => {
                 args.max_bulk_lag_blocks = Some(value("--max-bulk-lag-blocks")?.parse()?)
             }
+            "--max-bulk-lag-gib" => {
+                args.max_bulk_lag_gib = Some(value("--max-bulk-lag-gib")?.parse()?)
+            }
             "--pause-core-during-bulk" => args.pause_core_during_bulk = Some(true),
             "--no-pause-core-during-bulk" => args.pause_core_during_bulk = Some(false),
             "--core-resume-ahead-blocks" => {
                 args.core_resume_ahead_blocks = Some(value("--core-resume-ahead-blocks")?.parse()?)
             }
+            "--core-resume-ahead-gib" => {
+                args.core_resume_ahead_gib = Some(value("--core-resume-ahead-gib")?.parse()?)
+            }
+            "--scheduler" => args.scheduler = Some(value("--scheduler")?),
             "--prune-defer-free-gib" => {
                 args.prune_defer_free_gib = Some(value("--prune-defer-free-gib")?.parse()?)
             }
@@ -583,11 +593,20 @@ fn effective_config(args: &Args) -> R<(Config, Chain)> {
     if let Some(v) = args.max_bulk_lag_blocks {
         cfg.pruning.max_bulk_lag_blocks = v;
     }
+    if let Some(v) = args.max_bulk_lag_gib {
+        cfg.pruning.max_bulk_lag_gib = v;
+    }
     if let Some(v) = args.pause_core_during_bulk {
         cfg.pruning.pause_core_during_bulk = v;
     }
     if let Some(v) = args.core_resume_ahead_blocks {
         cfg.pruning.core_resume_ahead_blocks = v;
+    }
+    if let Some(v) = args.core_resume_ahead_gib {
+        cfg.pruning.core_resume_ahead_gib = v;
+    }
+    if let Some(v) = args.scheduler.clone() {
+        cfg.pruning.scheduler = v;
     }
     if let Some(v) = args.prune_defer_free_gib {
         cfg.pruning.prune_defer_free_gib = v;
@@ -1221,10 +1240,13 @@ TUNING (all networks):
 
 PRUNING AND CORE:
     --max-core-lag-blocks <n>   auto-prune download limit (0 = off)
-    --max-bulk-lag-blocks <n>   opt-in manual/bulk limit (0 = off)
+    --max-bulk-lag-blocks <n>   legacy block growth limit (used if GiB is 0)
+    --max-bulk-lag-gib <n>      pause Core above this unindexed backlog (0 = off)
     --pause-core-during-bulk    pause Core during a long catch-up (default)
     --no-pause-core-during-bulk disable the full bulk pause
-    --core-resume-ahead-blocks <n> resume Core this early to pre-warm peers
+    --core-resume-ahead-blocks <n> legacy resume margin in blocks
+    --core-resume-ahead-gib <n> resume Core below this backlog (default 7)
+    --scheduler <mode>          overlap (default) | alternate (opt-in test)
     --prune-defer-free-gib <n>  skip normal prune above this free space (default 50)
     --min-gain-blocks <n>       minimum safe-height gain between prunes (default 10000)
     --prune-interval-seconds <n> minimum time between prunes
@@ -1966,6 +1988,7 @@ fn bind_ok(addr: &str) -> bool {
 // ------------------------------------------------------------------- indexing
 
 const CATCH_UP_BLOCKS: u64 = 512;
+const GIB: u64 = 1024 * 1024 * 1024;
 
 type FetchResult =
     std::result::Result<(u64, el_index::PreparedBlock, el_index::PrefetchedPrevouts), String>;
@@ -2013,6 +2036,12 @@ struct Indexer {
     /// keeps the block window with a fixed baseline (no ratchet).
     lag_policy_drain: bool,
     lag_target_secs: u64,
+    /// `true` when `[pruning] scheduler = "alternate"`: Core downloads and
+    /// e-lite indexes in alternating phases. `false` keeps the overlap.
+    scheduler_alternate: bool,
+    /// The alternate scheduler has paused indexing (Core is downloading).
+    /// Serving (Electrum, Tor, status) continues.
+    index_paused: AtomicBool,
     /// Latest Core observation shared by a 1 Hz poller thread. Keeps
     /// `getblockchaininfo` out of the block-application path.
     core_obs: Arc<Mutex<Option<(BlockchainInfo, Instant)>>>,
@@ -2075,6 +2104,24 @@ impl Indexer {
             .and_then(|v| v.parse::<u64>().ok())
             .unwrap_or(1_800)
             .clamp(120, 6 * 3_600);
+        let scheduler_alternate = cfg.pruning.scheduler.eq_ignore_ascii_case("alternate");
+        if let Some(sh) = &shared {
+            sh.stats
+                .scheduler_alternate
+                .store(scheduler_alternate, Ordering::Relaxed);
+            sh.stats.scheduler_high_bytes.store(
+                cfg.pruning
+                    .max_bulk_lag_gib
+                    .saturating_mul(1024 * 1024 * 1024),
+                Ordering::Relaxed,
+            );
+            sh.stats.scheduler_low_bytes.store(
+                cfg.pruning
+                    .core_resume_ahead_gib
+                    .saturating_mul(1024 * 1024 * 1024),
+                Ordering::Relaxed,
+            );
+        }
         Indexer {
             store,
             core,
@@ -2113,6 +2160,8 @@ impl Indexer {
             bulk_full_pause: AtomicBool::new(false),
             lag_policy_drain,
             lag_target_secs,
+            scheduler_alternate,
+            index_paused: AtomicBool::new(false),
             core_obs: Arc::new(Mutex::new(None)),
             prune_rx: Mutex::new(None),
             prune_in_flight: AtomicBool::new(false),
@@ -2478,9 +2527,11 @@ impl Indexer {
         tip: &IndexedTip,
         txids: &[Hash32],
         blocks: u32,
+        bytes: u64,
         last_block_ms: u64,
         undo_heights: &[u32],
         sync: bool,
+        reason: CommitReason,
     ) -> R<()> {
         let mut batch = batch;
         // Undo is written for every applied block so an early commit (time or
@@ -2506,10 +2557,16 @@ impl Indexer {
             let _g = self.lock.write().map_err(|_| "lock poisoned")?;
             let commit_started = Instant::now();
             let result = self.store.commit_with_sync(batch, tip, txids, sync);
+            let (ct, cd) = self.store.last_commit_timings_us();
             self.tunables.record_commit_group(
                 commit_started,
                 commit_started.elapsed(),
                 blocks as u64,
+                txids.len() as u64,
+                bytes,
+                reason,
+                ct,
+                cd,
             );
             if let Err(e) = result {
                 // Whatever happened, keep the flat file aligned with the DB.
@@ -2581,31 +2638,91 @@ impl Indexer {
         Ok(())
     }
 
+    /// Pause/resume e-lite indexing for the `alternate` scheduler. Serving
+    /// (Electrum, Tor, metrics) continues; only block application stops.
+    fn set_index_paused(&self, paused: bool) {
+        if !self.scheduler_alternate {
+            if self.index_paused.swap(false, Ordering::SeqCst) {
+                if let Some(sh) = &self.shared {
+                    sh.stats
+                        .scheduler_index_paused
+                        .store(false, Ordering::Relaxed);
+                }
+            }
+            return;
+        }
+        let previous = self.index_paused.swap(paused, Ordering::SeqCst);
+        if previous == paused {
+            return;
+        }
+        if let Some(sh) = &self.shared {
+            sh.stats
+                .scheduler_index_paused
+                .store(paused, Ordering::Relaxed);
+        }
+        if paused {
+            eprintln!(
+                "[e-lite] scheduler alternate: e-lite indexing paused; Core downloading \
+                 (serving continues)"
+            );
+        } else {
+            eprintln!("[e-lite] scheduler alternate: Core paused; e-lite indexing");
+        }
+    }
+
     /// Pause Core's P2P when automatic pruning would outrun the index, or when
-    /// the opt-in bulk guard is enabled for manual pruning. Core keeps at least
+    /// the bulk guard is enabled for manual pruning. Core keeps at least
     /// `MIN_BLOCKS_TO_KEEP` (288) blocks, so the auto limit is capped below it.
     ///
-    /// Manual pruning (`prune_mib = 1`) does not pause by default: Core cannot
-    /// delete a block on its own and the prune gate keeps the cut below the
-    /// committed index. `max_bulk_lag_blocks` is an explicit opt-in to bound
-    /// the gap (and the disk contention) during a long catch-up.
+    /// For manual pruning the guard uses absolute byte watermarks
+    /// (`max_bulk_lag_gib`/`core_resume_ahead_gib`) over the estimated
+    /// unindexed backlog. The legacy block window is used only when the GiB
+    /// value is 0. In `alternate` mode, e-lite also stops indexing while Core
+    /// downloads and resumes when Core is paused.
     fn lag_guard(&self, info: &BlockchainInfo, committed: u64) {
         if !self.can_control_core {
             return;
         }
         let paused = self.lag_paused.load(Ordering::Relaxed);
         let lag = info.blocks.saturating_sub(committed);
-        let bulk_limit = if self.cfg.core.prune_mib == 1 {
+        let avg = self.tunables.avg_block_bytes();
+        let backlog = backlog_bytes(lag, avg);
+        let bulk_blocks = if self.cfg.core.prune_mib == 1 {
             self.cfg.pruning.max_bulk_lag_blocks as u64
         } else {
             0
         };
+        let bulk_gib = if self.cfg.core.prune_mib == 1 {
+            self.cfg.pruning.max_bulk_lag_gib
+        } else {
+            0
+        };
+        let bulk = self.cfg.core.prune_mib == 1 && (bulk_blocks > 0 || bulk_gib > 0);
         let auto_enabled = self.cfg.core.prune_mib != 1 && self.cfg.pruning.max_core_lag_blocks > 0;
-        let mut is_bulk = false;
-        let mut bulk_resume = None;
+        let high_bytes = (bulk_gib > 0).then(|| bulk_gib.saturating_mul(GIB));
+        let low_bytes =
+            (bulk_gib > 0).then(|| self.cfg.pruning.core_resume_ahead_gib.saturating_mul(GIB));
+        if let Some(sh) = &self.shared {
+            sh.stats
+                .scheduler_backlog_bytes
+                .store(backlog, Ordering::Relaxed);
+            sh.stats
+                .scheduler_high_bytes
+                .store(high_bytes.unwrap_or(0), Ordering::Relaxed);
+            sh.stats
+                .scheduler_low_bytes
+                .store(low_bytes.unwrap_or(0), Ordering::Relaxed);
+        }
+        let reader_pressure = self
+            .readers
+            .as_ref()
+            .and_then(|r| r.earliest())
+            .map(|h| (h as u64) < info.pruneheight.saturating_add(32))
+            .unwrap_or(false);
 
-        if bulk_limit == 0 && !auto_enabled {
+        if !bulk && !auto_enabled {
             self.bulk_lag_baseline.store(u64::MAX, Ordering::Relaxed);
+            self.set_index_paused(false);
             if paused && !self.downloads_paused() && self.core.set_network_active(true).is_ok() {
                 self.lag_paused.store(false, Ordering::Relaxed);
                 self.mark_paused(false);
@@ -2618,11 +2735,20 @@ impl Indexer {
             return;
         }
 
-        let limit = if bulk_limit > 0 {
+        let mut is_bulk = false;
+        let mut bulk_full = false;
+        let pause_due;
+        let resume_due;
+        let limit;
+        let resume;
+
+        if bulk {
+            is_bulk = true;
             if !info.initialblockdownload {
                 self.bulk_lag_baseline.store(u64::MAX, Ordering::Relaxed);
                 self.bulk_started.store(false, Ordering::Relaxed);
                 self.bulk_full_pause.store(false, Ordering::Relaxed);
+                self.set_index_paused(false);
                 if paused && !self.downloads_paused() && self.core.set_network_active(true).is_ok()
                 {
                     self.lag_paused.store(false, Ordering::Relaxed);
@@ -2635,56 +2761,70 @@ impl Indexer {
                 }
                 return;
             }
-            is_bulk = true;
-            let ahead = self.cfg.pruning.core_resume_ahead_blocks as u64;
-            if self.cfg.pruning.pause_core_during_bulk {
-                let first = !self.bulk_started.swap(true, Ordering::SeqCst);
-                if first && lag > ahead {
-                    self.bulk_full_pause.store(true, Ordering::SeqCst);
-                    self.tunables.reset_resume_shrink();
+            if let (Some(high), Some(low)) = (high_bytes, low_bytes) {
+                let high_blocks = (high / avg.max(1)).max(1);
+                let low_blocks = (low / avg.max(1)).max(1);
+                let (pause_bytes, resume_bytes) = byte_window(backlog, high, low, reader_pressure);
+                if self.cfg.pruning.pause_core_during_bulk {
+                    let first = !self.bulk_started.swap(true, Ordering::SeqCst);
+                    if first && backlog >= high {
+                        self.bulk_full_pause.store(true, Ordering::SeqCst);
+                        self.tunables.reset_resume_shrink();
+                    }
+                } else {
+                    self.bulk_started.store(true, Ordering::Relaxed);
                 }
+                bulk_full = self.bulk_full_pause.load(Ordering::SeqCst);
+                limit = high_blocks;
+                resume = low_blocks;
+                pause_due = pause_bytes;
+                resume_due = resume_bytes;
             } else {
-                self.bulk_started.store(true, Ordering::Relaxed);
-            }
-            if self.bulk_full_pause.load(Ordering::SeqCst) {
-                // Full bulk pause: keep Core stopped until the index is
-                // close enough; then the common resume path pre-warms P2P.
-                bulk_resume = Some(ahead);
-                ahead.max(1)
-            } else if self.lag_policy_drain {
-                // Bound the backlog by how long the index would need to drain
-                // it at the recent rate. Stable by construction: the watermark
-                // does not grow with every resume.
-                let rate = self.tunables.recent_blocks_rate();
-                if rate > 0 {
-                    let (pause_at, resume_at) =
-                        bulk_drain_window(rate, self.lag_target_secs, ahead.max(1));
-                    bulk_resume = Some(resume_at);
-                    pause_at
+                let ahead = self.cfg.pruning.core_resume_ahead_blocks as u64;
+                if self.cfg.pruning.pause_core_during_bulk {
+                    let first = !self.bulk_started.swap(true, Ordering::SeqCst);
+                    if first && lag > ahead {
+                        self.bulk_full_pause.store(true, Ordering::SeqCst);
+                        self.tunables.reset_resume_shrink();
+                    }
+                } else {
+                    self.bulk_started.store(true, Ordering::Relaxed);
+                }
+                if self.bulk_full_pause.load(Ordering::SeqCst) {
+                    bulk_full = true;
+                    limit = ahead.max(1);
+                    resume = ahead.max(1);
+                } else if self.lag_policy_drain {
+                    let rate = self.tunables.recent_blocks_rate();
+                    if rate > 0 {
+                        let (pause_at, resume_at) =
+                            bulk_drain_window(rate, self.lag_target_secs, ahead.max(1));
+                        limit = pause_at;
+                        resume = resume_at;
+                    } else {
+                        let baseline = self.bulk_lag_baseline.load(Ordering::Relaxed);
+                        let (new_baseline, pause_at, resume_at) =
+                            bulk_lag_window(lag, baseline, bulk_blocks, paused);
+                        self.bulk_lag_baseline
+                            .store(new_baseline, Ordering::Relaxed);
+                        limit = pause_at;
+                        resume = resume_at;
+                    }
                 } else {
                     let baseline = self.bulk_lag_baseline.load(Ordering::Relaxed);
                     let (new_baseline, pause_at, resume_at) =
-                        bulk_lag_window(lag, baseline, bulk_limit, paused);
+                        bulk_lag_window(lag, baseline, bulk_blocks, paused);
                     self.bulk_lag_baseline
                         .store(new_baseline, Ordering::Relaxed);
-                    bulk_resume = Some(resume_at);
-                    pause_at
+                    limit = pause_at;
+                    resume = resume_at;
                 }
-            } else {
-                // Bound *additional* separation, not the absolute lag. With a
-                // 300k-block backlog, an absolute 20k threshold would freeze Core
-                // for the whole catch-up. The baseline follows the lowest lag seen
-                // while Core is downloading, so Core works in phases.
-                let baseline = self.bulk_lag_baseline.load(Ordering::Relaxed);
-                let (new_baseline, pause_at, resume_at) =
-                    bulk_lag_window(lag, baseline, bulk_limit, paused);
-                self.bulk_lag_baseline
-                    .store(new_baseline, Ordering::Relaxed);
-                bulk_resume = Some(resume_at);
-                pause_at
+                pause_due = lag > limit || reader_pressure;
+                resume_due = lag <= resume && !reader_pressure;
             }
         } else {
             if !info.pruned {
+                self.set_index_paused(false);
                 if paused && !self.downloads_paused() && self.core.set_network_active(true).is_ok()
                 {
                     self.lag_paused.store(false, Ordering::Relaxed);
@@ -2698,6 +2838,7 @@ impl Indexer {
                 return;
             }
             if info.pruneheight == 0 {
+                self.set_index_paused(false);
                 if paused && !self.downloads_paused() && self.core.set_network_active(true).is_ok()
                 {
                     self.lag_paused.store(false, Ordering::Relaxed);
@@ -2710,45 +2851,50 @@ impl Indexer {
                 }
                 return;
             }
-            el_chain::lag_limit(
+            limit = el_chain::lag_limit(
                 info.blocks.min(u32::MAX as u64) as u32,
                 info.pruneheight.min(u32::MAX as u64) as u32,
                 self.cfg.pruning.max_core_lag_blocks,
-            ) as u64
-        };
-        let baseline = self.bulk_lag_baseline.load(Ordering::Relaxed);
-        let resume = if let Some(r) = bulk_resume {
-            r
-        } else {
-            (limit / 2).max(1)
-        };
-        let reader_pressure = self
-            .readers
-            .as_ref()
-            .and_then(|r| r.earliest())
-            .map(|h| (h as u64) < info.pruneheight.saturating_add(32))
-            .unwrap_or(false);
+            ) as u64;
+            resume = (limit / 2).max(1);
+            pause_due = lag > limit || reader_pressure;
+            resume_due = lag <= resume && !reader_pressure;
+        }
 
-        if !paused && (lag > limit || reader_pressure) {
+        let baseline = self.bulk_lag_baseline.load(Ordering::Relaxed);
+        if !paused && pause_due {
             match self.core.set_network_active(false) {
                 Ok(_) => {
                     self.lag_paused.store(true, Ordering::Relaxed);
                     self.mark_paused(true);
+                    self.set_index_paused(false);
                     if let Some(sh) = &self.shared {
                         sh.stats.core_network_active.store(false, Ordering::Relaxed);
                         sh.set_state(state::PAUSE_DOWNLOAD);
                     }
-                    if is_bulk && self.bulk_full_pause.load(Ordering::SeqCst) {
-                        eprintln!(
-                            "[e-lite] bulk: paused Core downloads until {limit} blocks remain \
-                             (lag {lag})"
-                        );
-                    } else if is_bulk {
-                        eprintln!(
-                            "[e-lite] lag {lag} blocks (baseline {baseline}, max growth \
-                             {bulk_limit}, reader {reader_pressure}): paused Core downloads \
-                             until the index catches up"
-                        );
+                    if is_bulk {
+                        if bulk_full {
+                            eprintln!(
+                                "[e-lite] bulk: paused Core downloads until {} blocks remain \
+                                 (lag {lag}, backlog {} GiB)",
+                                resume,
+                                backlog / GIB
+                            );
+                        } else if high_bytes.is_some() {
+                            eprintln!(
+                                "[e-lite] lag {lag} blocks, backlog {} GiB (high {} GiB, low \
+                                 {} GiB, reader {reader_pressure}): paused Core downloads",
+                                backlog / GIB,
+                                high_bytes.unwrap_or(0) / GIB,
+                                low_bytes.unwrap_or(0) / GIB
+                            );
+                        } else {
+                            eprintln!(
+                                "[e-lite] lag {lag} blocks (baseline {baseline}, max growth \
+                                 {bulk_blocks}, reader {reader_pressure}): paused Core downloads \
+                                 until the index catches up"
+                            );
+                        }
                     } else {
                         eprintln!(
                             "[e-lite] lag {lag} blocks (limit {limit}, reader {reader_pressure}): \
@@ -2758,13 +2904,12 @@ impl Indexer {
                 }
                 Err(e) => eprintln!("[e-lite] cannot pause Core downloads: {e}"),
             }
-        } else if paused && lag <= resume && !reader_pressure {
+        } else if paused && resume_due {
             if self.downloads_paused() {
-                // Keep Core paused: disk backpressure still owns the network.
                 self.lag_paused.store(false, Ordering::Relaxed);
+                self.set_index_paused(false);
                 return;
             }
-            // Core is about to grow again: give RAM back before resuming.
             self.tunables.shrink_for_core_resume(&self.store);
             match self.core.set_network_active(true) {
                 Ok(_) => {
@@ -2772,13 +2917,9 @@ impl Indexer {
                     self.mark_paused(false);
                     let prewarm = is_bulk && self.bulk_full_pause.swap(false, Ordering::SeqCst);
                     if is_bulk && prewarm {
-                        // A full pause drains to `ahead`; anchor the next window
-                        // there. A normal window resume must NOT rewrite the
-                        // baseline: doing so raised the pause threshold by
-                        // limit/2 every cycle (the backlog ratchet seen in the
-                        // 29.5.0 mainnet log).
                         self.bulk_lag_baseline.store(lag, Ordering::Relaxed);
                     }
+                    self.set_index_paused(is_bulk && self.scheduler_alternate);
                     if let Some(sh) = &self.shared {
                         sh.stats.core_network_active.store(true, Ordering::Relaxed);
                         refresh_ready_state(sh);
@@ -2786,18 +2927,25 @@ impl Indexer {
                     if prewarm {
                         eprintln!(
                             "[e-lite] pre-warming Core networking at lag {lag} blocks \
-                             (peers reconnect while the index finishes)"
+                             (backlog {} GiB)",
+                            backlog / GIB
                         );
                     } else {
-                        eprintln!("[e-lite] lag down to {lag} blocks: resumed Core downloads");
+                        eprintln!(
+                            "[e-lite] lag down to {lag} blocks (backlog {} GiB): resumed Core \
+                             downloads",
+                            backlog / GIB
+                        );
                     }
                 }
                 Err(e) => eprintln!("[e-lite] cannot resume Core downloads: {e}"),
             }
         } else if paused {
-            // A disk-supervisor resume may have re-enabled P2P behind our back.
             let _ = self.core.set_network_active(false);
             self.mark_paused(true);
+            self.set_index_paused(false);
+        } else {
+            self.set_index_paused(is_bulk && self.scheduler_alternate);
         }
     }
 
@@ -2985,7 +3133,18 @@ impl Indexer {
         if self.disk_guard() {
             return Ok(tip_at_start.map(|t| t.height as u64).unwrap_or(0));
         }
-        let info = self.core.blockchain_info()?;
+        // The alternate scheduler is the only phase that polls while e-lite is
+        // not indexing. Use the 1 Hz observation there to avoid an RPC every
+        // 500 ms; in the indexing phase always ask Core so a new block/reorg is
+        // seen immediately.
+        let info = if self.index_paused.load(Ordering::SeqCst) {
+            match self.observed_core(Duration::from_secs(2)) {
+                Some(info) => info,
+                None => self.core.blockchain_info()?,
+            }
+        } else {
+            self.core.blockchain_info()?
+        };
         let core_tip = info.blocks;
         self.tunables
             .set_core_state(core_tip, info.initialblockdownload);
@@ -3052,6 +3211,11 @@ impl Indexer {
         // fall too far behind, stop new downloads while the backlog is drained.
         let committed = committed_height;
         self.lag_guard(&info, committed);
+        if self.index_paused.load(Ordering::SeqCst) {
+            // Alternate scheduler: Core is downloading. Keep serving the
+            // current index; the next call re-checks the backlog.
+            return Ok(committed_height);
+        }
 
         let start = tip.map(|t| t.height as u64 + 1).unwrap_or(0);
         if start > core_tip || max_blocks == 0 {
@@ -3205,6 +3369,11 @@ impl Indexer {
                 paused_by_disk = true;
                 break;
             }
+            if self.index_paused.load(Ordering::SeqCst) {
+                // Alternate scheduler switched to Core downloading. Commit the
+                // applied prefix below, then return.
+                break;
+            }
             let (height, prepared, prevouts) = match item {
                 Ok(v) => v,
                 Err(e) => {
@@ -3240,6 +3409,7 @@ impl Indexer {
                     count += 1;
                     applied_total += 1;
                     group_bytes = group_bytes.saturating_add(prepared.raw_size());
+                    self.tunables.record_block_bytes(prepared.raw_size());
                     last_ms = t0.elapsed().as_millis() as u64;
                     self.tunables.record_apply(t0.elapsed());
                     if (self.cfg.core.prune_mib >= 550
@@ -3304,14 +3474,22 @@ impl Indexer {
             // has already pruned. A tiny group is not committed on the timer;
             // it waits for a useful minimum (or 60 s) to avoid 1-block commits.
             let commit_elapsed = group_started.elapsed();
-            let commit_due = count >= self.tunables.batch_blocks().max(1)
-                || group_txids.len() >= self.tunables.max_group_txs()
-                || group_bytes >= self.tunables.max_group_bytes()
-                || (commit_elapsed >= self.tunables.commit_interval()
-                    && (count >= self.tunables.commit_min_blocks()
-                        || commit_elapsed >= Duration::from_secs(60))
-                    && undo_ready);
-            if commit_due {
+            let commit_reason = if count >= self.tunables.batch_blocks().max(1) {
+                Some(CommitReason::Blocks)
+            } else if group_txids.len() >= self.tunables.max_group_txs() {
+                Some(CommitReason::Txs)
+            } else if group_bytes >= self.tunables.max_group_bytes() {
+                Some(CommitReason::Bytes)
+            } else if commit_elapsed >= self.tunables.commit_interval()
+                && (count >= self.tunables.commit_min_blocks()
+                    || commit_elapsed >= Duration::from_secs(60))
+                && undo_ready
+            {
+                Some(CommitReason::Time)
+            } else {
+                None
+            };
+            if let Some(reason) = commit_reason {
                 let current = tip.expect("tip set");
                 let sync =
                     self.commit_sync(info.initialblockdownload, current.height as u64, core_tip);
@@ -3320,9 +3498,11 @@ impl Indexer {
                     &current,
                     &group_txids,
                     count,
+                    group_bytes as u64,
                     last_ms,
                     &group_undo_heights,
                     sync,
+                    reason,
                 ) {
                     result = Err(e);
                     break;
@@ -3379,14 +3559,21 @@ impl Indexer {
         if result.is_ok() && count > 0 && !paused_by_disk && !self.disk_guard() {
             let current = tip.expect("tip set");
             let sync = self.commit_sync(info.initialblockdownload, current.height as u64, core_tip);
+            let reason = if self.shutdown.load(Ordering::SeqCst) {
+                CommitReason::Shutdown
+            } else {
+                CommitReason::Boundary
+            };
             self.commit_group(
                 std::mem::take(&mut batch),
                 &current,
                 &group_txids,
                 count,
+                group_bytes as u64,
                 last_ms,
                 &group_undo_heights,
                 sync,
+                reason,
             )?;
             committed_height = current.height as u64;
             let (live_core, live_prune) = self.live_core_and_prune(info.blocks, info.pruneheight);
@@ -3682,6 +3869,22 @@ fn bulk_drain_window(rate: u64, target_secs: u64, min_resume: u64) -> (u64, u64)
 /// follows the lowest lag seen **while Core is downloading**. While paused it
 /// must stay fixed; otherwise every block indexed would lower the resume
 /// threshold and Core would resume immediately.
+/// Unindexed backlog in bytes. Heights are not comparable (a block at 818k is
+/// several times a block at 100k), so the high/low watermarks are bytes.
+fn backlog_bytes(lag_blocks: u64, avg_block_bytes: u64) -> u64 {
+    lag_blocks.saturating_mul(avg_block_bytes.max(1))
+}
+
+/// Byte watermarks for the bulk scheduler. `high` pauses Core, `low` resumes
+/// it. Reader pressure (a reader about to hit Core's prune height) forces the
+/// pause: the block may not exist any more.
+fn byte_window(backlog: u64, high: u64, low: u64, reader_pressure: bool) -> (bool, bool) {
+    (
+        backlog >= high || reader_pressure,
+        backlog <= low && !reader_pressure,
+    )
+}
+
 fn bulk_lag_window(lag: u64, baseline: u64, limit: u64, paused: bool) -> (u64, u64, u64) {
     let base = if paused {
         if baseline == u64::MAX {
@@ -4329,11 +4532,16 @@ fn reload_hot(
                 || new.index.milestone_seconds != old.index.milestone_seconds
                 || new.pruning.max_core_lag_blocks != old.pruning.max_core_lag_blocks
                 || new.pruning.max_bulk_lag_blocks != old.pruning.max_bulk_lag_blocks
+                || new.pruning.max_bulk_lag_gib != old.pruning.max_bulk_lag_gib
+                || new.pruning.core_resume_ahead_blocks != old.pruning.core_resume_ahead_blocks
+                || new.pruning.core_resume_ahead_gib != old.pruning.core_resume_ahead_gib
+                || new.pruning.pause_core_during_bulk != old.pruning.pause_core_during_bulk
+                || new.pruning.scheduler != old.pruning.scheduler
             {
                 eprintln!(
                     "[e-lite] reload: cold fields changed (prune_mib, block_source, \
                      reorg_window, data_dir, server listeners/TLS, write buffers, \
-                     milestones, lag limits); restart required"
+                     milestones, lag limits/scheduler); restart required"
                 );
             }
             eprintln!(
@@ -4854,6 +5062,20 @@ fn build_shared(
             Ordering::Relaxed,
         );
     }
+    // Publish the scheduler configuration even in `serve`, where no Indexer
+    // exists. `index_paused` stays false because nothing is indexing.
+    stats.scheduler_alternate.store(
+        cfg.pruning.scheduler.eq_ignore_ascii_case("alternate"),
+        Ordering::Relaxed,
+    );
+    stats.scheduler_high_bytes.store(
+        cfg.pruning.max_bulk_lag_gib.saturating_mul(GIB),
+        Ordering::Relaxed,
+    );
+    stats.scheduler_low_bytes.store(
+        cfg.pruning.core_resume_ahead_gib.saturating_mul(GIB),
+        Ordering::Relaxed,
+    );
     let shared = Arc::new(Shared {
         store,
         core,
@@ -5808,6 +6030,33 @@ mod tests {
             bulk_lag_window(326_999, 317_000, 20_000, true),
             (317_000, 337_000, 327_000)
         );
+    }
+
+    #[test]
+    fn byte_backlog_is_height_independent() {
+        // 20 GiB is ~41k early blocks (0.5 MB) but only ~13.6k at 818k
+        // (1.5 MB). The byte watermark is the one that bounds the disk.
+        let gib = 1024 * 1024 * 1024u64;
+        let high = 20 * gib;
+        // Same 20 GiB backlog is ~41k blocks at 512 KiB but only ~14.3k at
+        // 1.5 MB: a block-count watermark cannot bound the disk.
+        assert!(backlog_bytes(41_000, 512 * 1024) >= high);
+        assert!(backlog_bytes(40_000, 512 * 1024) < high);
+        assert!(backlog_bytes(14_317, 1_500_000) >= high);
+        assert!(backlog_bytes(14_316, 1_500_000) < high);
+    }
+
+    #[test]
+    fn byte_window_pauses_at_high_and_resumes_at_low() {
+        let gib = 1024 * 1024 * 1024u64;
+        let high = 30 * gib;
+        let low = 7 * gib;
+        assert_eq!(byte_window(29 * gib, high, low, false), (false, false));
+        assert_eq!(byte_window(30 * gib, high, low, false), (true, false));
+        assert_eq!(byte_window(7 * gib, high, low, false), (false, true));
+        assert_eq!(byte_window(6 * gib, high, low, false), (false, true));
+        // A reader at the prune height forces a pause even below the low mark.
+        assert_eq!(byte_window(6 * gib, high, low, true), (true, false));
     }
 
     #[test]

@@ -57,9 +57,10 @@ Never treat a version number in this file as authoritative over the code/tag.
   pruning every 10,000 safe blocks by default (low disk bypasses it).
 - `prune_mib >= 550` requires `[pruning] allow_auto_prune = true`.
 - Snapshots are optional; they are never required by the from-zero flow.
-- Long bulk catch-up pauses Core by default and resumes 5,000 blocks early to
-  pre-warm peers; normal pruning is not deferred by free space by default
-  (`prune_defer_free_gib = 0`), only by the 1k-block gain and 30 s interval.
+- Long bulk catch-up pauses Core by default and resumes at 7 GiB of unindexed
+  backlog (legacy: 5,000 blocks) to pre-warm peers; normal pruning is not
+  deferred by free space by default (`prune_defer_free_gib = 0`), only by the
+  1k-block gain and 30 s interval.
 - Never authorise a Core prune from a tip that is not durable: flush RocksDB/WAL
   first. A failed prune RPC must retry the same safe height after backoff.
 - Undo is generated for **every** applied block and pruned at commit time from
@@ -103,8 +104,25 @@ Never treat a version number in this file as authoritative over the code/tag.
   per block. `/status.pipeline.discarded` is the regression signal.
 - The bulk lag window must not rewrite its baseline on a normal resume. Doing
   so raised the pause threshold by `max_bulk_lag_blocks/2` per cycle. The
-  opt-in `E_LITE_LAG_POLICY=drain` uses the last commit cycle's rate; it stays
-  opt-in until a mainnet A/B.
+  default is now an absolute byte window: pause at `max_bulk_lag_gib` (30),
+  resume at `core_resume_ahead_gib` (7), because a block at 800k is much larger
+  than at 100k. `max_bulk_lag_blocks`/`core_resume_ahead_blocks` are legacy and
+  apply only when the GiB value is 0. The opt-in
+  `E_LITE_LAG_POLICY=drain` uses the last commit cycle's rate; it stays opt-in
+  until a mainnet A/B.
+- `scheduler = "overlap"` is the default: e-lite keeps indexing while Core
+  downloads. `scheduler = "alternate"` is opt-in: Core downloads while e-lite
+  indexing is paused, then Core is paused and e-lite drains the byte backlog.
+  Serving continues while paused; `alternate` requires `prune_mib = 1` and
+  `pause_core_during_bulk = true`. Do not make it the default without a
+  measured Core-solo rate above the ~6.7 blocks/s break-even.
+- The commit controller reads only the last **full** group
+  (`/status.tuning.commit_last_*`). Boundary/shutdown partial commits do not
+  update the EWMA or the cycle. A `Txs`-limited group must not shrink the
+  batch; an I/O-bound group (`db_us > 2 × txids_us`) must not shrink it either.
+  Reader changes require two consecutive samples and are driven by `wait_ms`
+  (starvation), not by `read_ms` alone; `min_readers` is half the physical
+  cores, at least 2.
 - The pre-prune durability barrier is `SyncWAL(true)`, not `flush_all`: a
   single `WriteBatch` is atomic across CFs and `txids.dat` is fsynced first.
   Never prune if the barrier fails. `tests/e2e_pruned_ibd.sh` covers

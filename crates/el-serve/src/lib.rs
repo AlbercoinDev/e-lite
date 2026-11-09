@@ -148,6 +148,15 @@ pub struct Stats {
     /// Wall-clock between the start of consecutive commits. `commit_share`
     /// must divide by this, not by the configured interval.
     pub tuning_commit_cycle_ms: AtomicU64,
+    /// Last full commit group: duration, cycle, blocks, reason and cost split.
+    pub tuning_commit_last_ms: AtomicU64,
+    pub tuning_commit_last_cycle_ms: AtomicU64,
+    pub tuning_commit_last_blocks: AtomicU64,
+    pub tuning_commit_last_txs: AtomicU64,
+    pub tuning_commit_last_bytes: AtomicU64,
+    pub tuning_commit_last_txids_us: AtomicU64,
+    pub tuning_commit_last_db_us: AtomicU64,
+    pub tuning_commit_last_reason: AtomicU64,
     pub tuning_adapt_steps: AtomicU64,
     pub tuning_tx_per_sec: AtomicU64,
     pub tuning_blocks_per_sec: AtomicU64,
@@ -177,6 +186,12 @@ pub struct Stats {
     pub pipeline_prepared: AtomicU64,
     pub pipeline_applied: AtomicU64,
     pub pipeline_discarded: AtomicU64,
+    /// Core/e-lite scheduler: backlog bytes and high/low watermarks.
+    pub scheduler_alternate: AtomicBool,
+    pub scheduler_index_paused: AtomicBool,
+    pub scheduler_backlog_bytes: AtomicU64,
+    pub scheduler_high_bytes: AtomicU64,
+    pub scheduler_low_bytes: AtomicU64,
     /// Machine plan detected at startup (CPU/RAM/disk -> knobs).
     pub plan: Mutex<serde_json::Value>,
     /// Per-column-family RocksDB pressure, published at commit time.
@@ -241,6 +256,14 @@ impl Default for Stats {
             tuning_commit_ms_ewma: AtomicU64::new(0),
             tuning_commit_per_block_ms: AtomicU64::new(0),
             tuning_commit_cycle_ms: AtomicU64::new(0),
+            tuning_commit_last_ms: AtomicU64::new(0),
+            tuning_commit_last_cycle_ms: AtomicU64::new(0),
+            tuning_commit_last_blocks: AtomicU64::new(0),
+            tuning_commit_last_txs: AtomicU64::new(0),
+            tuning_commit_last_bytes: AtomicU64::new(0),
+            tuning_commit_last_txids_us: AtomicU64::new(0),
+            tuning_commit_last_db_us: AtomicU64::new(0),
+            tuning_commit_last_reason: AtomicU64::new(0),
             tuning_adapt_steps: AtomicU64::new(0),
             tuning_tx_per_sec: AtomicU64::new(0),
             tuning_blocks_per_sec: AtomicU64::new(0),
@@ -266,6 +289,11 @@ impl Default for Stats {
             pipeline_prepared: AtomicU64::new(0),
             pipeline_applied: AtomicU64::new(0),
             pipeline_discarded: AtomicU64::new(0),
+            scheduler_alternate: AtomicBool::new(false),
+            scheduler_index_paused: AtomicBool::new(false),
+            scheduler_backlog_bytes: AtomicU64::new(0),
+            scheduler_high_bytes: AtomicU64::new(0),
+            scheduler_low_bytes: AtomicU64::new(0),
             plan: Mutex::new(serde_json::json!({})),
             rocksdb_cf: Mutex::new(serde_json::json!({})),
             started: Instant::now(),
@@ -1120,6 +1148,17 @@ impl Shared {
                 "applied": self.stats.pipeline_applied.load(Ordering::Relaxed),
                 "discarded": self.stats.pipeline_discarded.load(Ordering::Relaxed),
             },
+            "scheduler": {
+                "mode": if self.stats.scheduler_alternate.load(Ordering::Relaxed) {
+                    "alternate"
+                } else {
+                    "overlap"
+                },
+                "index_paused": self.stats.scheduler_index_paused.load(Ordering::Relaxed),
+                "backlog_bytes": self.stats.scheduler_backlog_bytes.load(Ordering::Relaxed),
+                "high_bytes": self.stats.scheduler_high_bytes.load(Ordering::Relaxed),
+                "low_bytes": self.stats.scheduler_low_bytes.load(Ordering::Relaxed),
+            },
             "tls_handshakes": self.stats.tls_handshakes.load(Ordering::Relaxed),
             "tls_handshake_failures": self
                 .stats
@@ -1150,6 +1189,14 @@ impl Shared {
                 "commit_ms_ewma": self.stats.tuning_commit_ms_ewma.load(Ordering::Relaxed),
                 "commit_per_block_ms": self.stats.tuning_commit_per_block_ms.load(Ordering::Relaxed),
                 "commit_cycle_ms": self.stats.tuning_commit_cycle_ms.load(Ordering::Relaxed),
+                "commit_last_ms": self.stats.tuning_commit_last_ms.load(Ordering::Relaxed),
+                "commit_last_cycle_ms": self.stats.tuning_commit_last_cycle_ms.load(Ordering::Relaxed),
+                "commit_last_blocks": self.stats.tuning_commit_last_blocks.load(Ordering::Relaxed),
+                "commit_last_txs": self.stats.tuning_commit_last_txs.load(Ordering::Relaxed),
+                "commit_last_bytes": self.stats.tuning_commit_last_bytes.load(Ordering::Relaxed),
+                "commit_last_txids_us": self.stats.tuning_commit_last_txids_us.load(Ordering::Relaxed),
+                "commit_last_db_us": self.stats.tuning_commit_last_db_us.load(Ordering::Relaxed),
+                "commit_last_reason": self.stats.tuning_commit_last_reason.load(Ordering::Relaxed),
                 "adapt_steps": self.stats.tuning_adapt_steps.load(Ordering::Relaxed),
                 "tx_per_sec": self.stats.tuning_tx_per_sec.load(Ordering::Relaxed),
                 "blocks_per_sec": self.stats.tuning_blocks_per_sec.load(Ordering::Relaxed),
