@@ -1,8 +1,11 @@
-# Mainnet / Umbrel A/B protocol
+# A/B protocol (mainnet and other test machines)
 
 These are the measurements that decide the remaining tuning defaults. e-lite
-does not change them automatically; run one variant at a time on the Umbrel
-and keep the previous CSV.
+does not change them automatically; run one variant at a time on any test
+machine and keep the previous CSV. On a closed box (Umbrel, appliance) the
+protocol is the same: run the variant, then pass the log or CSV to the
+analysis. `tests/ab_umbrel.sh` is the generic sampler despite its historical
+name.
 
 ## 0. Baseline
 
@@ -26,7 +29,7 @@ tests/ab_umbrel.sh baseline 1800
 ```
 
 `E_LITE_STATUS_URL` defaults to `http://127.0.0.1:55084/status` (mainnet
-metrics); set it if your Umbrel maps the port differently. The CSV is written
+metrics); set it if your instance maps the port differently. The CSV is written
 to `/tmp/e-lite-ab-baseline.csv`.
 
 ## 1. Readers
@@ -109,6 +112,35 @@ and watch:
 - `memtables_mib` should move only after a 10-minute persistent target;
 - `prefetch_p95` should fall;
 - `wait_p95` and apply/commit should not regress.
+
+## 6. Compaction (`background_jobs`)
+
+Baseline evidence (mainnet, end of IBD, ~5 blocks/s): `pending_compaction`
+grew 49 → 185 GiB in one hour with `running 1` the whole time, commit/blk went
+from 57-80 ms to 150-210 ms, and one 45.5 s commit was unexplained. With the
+default plan on a 4-core host, `max_background_jobs = 2` means one flush and
+one compaction thread.
+
+```toml
+[index]
+background_jobs = 4    # two flush + two compaction threads (4-core host)
+```
+
+Run for 30-60 min in the same phase as the baseline and compare the 10-minute
+`rocksdb:` lines (and `/status.rocksdb`):
+
+| Signal | Keep 4 if… |
+|---|---|
+| `running` | goes from constant `1` to `2` (compactions in flight) |
+| `pending_compaction` | stops growing at the same block rate, or falls |
+| `l0` | stays bounded instead of climbing between lines |
+| commit/blk | returns to the pre-degradation cost; `commit spike:` lines stop appearing |
+| `memory.available_mib` | does not regress (more compaction threads need CPU/RAM headroom) |
+
+If the debt stops growing but commit spikes remain, capture a
+`[e-lite] commit spike:` line: it now includes running compactions, L0 files,
+memtable, pending compaction and the Core backlog. Changing this default
+requires the same evidence on a slow-disk class before shipping.
 
 ## How to read the CSV
 

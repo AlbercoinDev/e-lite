@@ -1,5 +1,52 @@
 # Changelog
 
+## 0.1.0-alpha.29.8.6 — 2026-11-10
+
+### Compaction diagnostics: real block cache, L0 files and commit-spike context
+
+No schema, protocol or consensus change. Follow-up to the mainnet log at the
+end of IBD (96-99 %, ~5 blocks/s): `pending_compaction` grew monotonically
+49 → 185 GiB in one hour with `running 1` the whole time, commit/blk degraded
+from 57-80 ms to 150-210 ms, and one 45.5 s commit left no diagnostic trail.
+Two of the counters needed to explain it were broken or missing.
+
+**`block_cache` was always 0.** `rocksdb.block-cache-usage` is a per-CF
+property: read through the DB handle it only reports the empty default family,
+so the `rocksdb:` log line and `/status.rocksdb` showed `block_cache 0 MiB`
+while the memory line showed a live cache ceiling. It is now summed across all
+seven column families like the other per-CF properties.
+
+**L0 file count is now visible.** `CompactionStats` gains `level0_files`
+(summed `rocksdb.num-files-at-level0`). A growing L0 with one running
+compaction is the actual flush/compaction stall signal; the
+`estimate-pending-compaction-bytes` sum is an estimate that inflates while
+ingest continues and cannot distinguish that on its own. The 10-minute
+`rocksdb:` log line and `/status.rocksdb` now print:
+
+```text
+[e-lite] rocksdb: pending_compaction {} MiB, running {}, l0 {} files,
+         memtable {} MiB, block_cache {} MiB, sst {} MiB,
+         table_readers {} MiB, properties_ok {}
+```
+
+**Commit spikes explain themselves.** A full commit group that lasts at least
+10 s and either overshoots twice the configured bulk time limit (20-60 s by
+disk class) or costs 5x the previous full group's per-block cost now logs its
+context, sampled at the spike: running compactions, L0 files, real memtables,
+pending compaction and the Core backlog. Normal bulk groups (the full interval
+on HDD/network included) stay silent; boundary commits never trigger it.
+
+```text
+[e-lite] commit spike: 45547 ms for 60 blocks / 154886 txs (92 MiB), reason Txs;
+         rocksdb running 1, l0 23 files, memtable 218 MiB, pending_compaction
+         184896 MiB; lag 10436 blocks; previous per-block cost 67 ms
+```
+
+Nothing about the controller, defaults or memory budget changed. To compare
+compaction throughput, set `[index] background_jobs` (0 = plan: physical/2,
+2..4; 4 turns one flush + one compaction thread into two of each) and watch
+`running`, `l0` and the `pending_compaction` trend in the `rocksdb:` lines.
+
 ## 0.1.0-alpha.29.8.5 — 2026-11-10
 
 ### Dynamic cache ceiling without double-counting resident memory

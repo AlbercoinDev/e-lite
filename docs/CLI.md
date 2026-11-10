@@ -300,8 +300,11 @@ These are escape hatches for measurements, not normal configuration:
 - `tor.managed/socks_port/control_port`: effective SOCKS address for external
   requests. `control_port` is always `0`; e-lite does not create one.
 - `rocksdb.properties_ok`: `false` means a zero in that block is unknown, not
-  empty. `rocksdb.cf` breaks pending compaction, memtables, SST and table
-  readers down by column family.
+  empty. `rocksdb.block_cache_bytes` is the real bytes charged to the shared
+  cache (summed per column family). `rocksdb.level0_files` is the summed
+  level-0 file count: growing `l0` with `running_compactions = 1` is the
+  flush/compaction stall signal. `rocksdb.cf` breaks pending compaction,
+  memtables, SST and table readers down by column family.
 - `machine`: the detected CPU (physical/logical/effective/SMT/quota), memory
   (reserve, page-cache floor), disk class and the resulting knobs. Explicit
   config values are reflected in `plan`. `plan.max_group_bytes` is the raw-byte

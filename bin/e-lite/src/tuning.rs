@@ -1242,6 +1242,12 @@ impl Tunables {
     pub fn commit_ms(&self) -> u64 {
         self.commit_ms.load(Ordering::Relaxed)
     }
+    /// Configured bulk commit time limit (20-60 s per disk class). The
+    /// commit-spike warn uses it to tell a normal full-interval group from a
+    /// real overshoot.
+    pub fn bulk_commit_ms_limit(&self) -> u64 {
+        self.bulk_commit_ms.load(Ordering::Relaxed)
+    }
     pub fn commit_min_blocks(&self) -> u32 {
         self.commit_min_blocks
     }

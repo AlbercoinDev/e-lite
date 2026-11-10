@@ -2623,9 +2623,14 @@ impl Indexer {
             let commit_started = Instant::now();
             let result = self.store.commit_with_sync(batch, tip, txids, sync);
             let (ct, cd) = self.store.last_commit_timings_us();
+            // The spike check compares against the per-block cost of the last
+            // full group *before* this one, so a sustained slowdown cannot be
+            // silently re-normalised into the baseline.
+            let prev_per_block = self.tunables.commit_per_block_ms.load(Ordering::Relaxed);
+            let commit_elapsed = commit_started.elapsed();
             self.tunables.record_commit_group(
                 commit_started,
-                commit_started.elapsed(),
+                commit_elapsed,
                 blocks as u64,
                 txids.len() as u64,
                 bytes,
@@ -2633,6 +2638,17 @@ impl Indexer {
                 ct,
                 cd,
             );
+            if result.is_ok() && reason.full() && blocks > 0 {
+                self.warn_commit_spike(
+                    commit_elapsed,
+                    blocks,
+                    txids.len() as u64,
+                    bytes,
+                    reason,
+                    tip.height as u64,
+                    prev_per_block,
+                );
+            }
             if let Err(e) = result {
                 // Whatever happened, keep the flat file aligned with the DB.
                 if let Ok(Some(t)) = self.store.committed_tip() {
@@ -2670,6 +2686,9 @@ impl Indexer {
                 .rocksdb_table_readers_bytes
                 .store(c.table_readers_bytes, Ordering::Relaxed);
             sh.stats
+                .rocksdb_level0_files
+                .store(c.level0_files, Ordering::Relaxed);
+            sh.stats
                 .rocksdb_properties_ok
                 .store(c.properties_ok, Ordering::Relaxed);
             let mut cf_map = serde_json::Map::new();
@@ -2701,6 +2720,55 @@ impl Indexer {
                 .store(fd.effective as u64, Ordering::Relaxed);
         }
         Ok(())
+    }
+
+    /// Explain a slow commit group from the log alone. Bulk groups
+    /// legitimately run for the full commit interval (20-60 s), so the
+    /// thresholds are well above normal bulk cost: twice the configured time
+    /// limit, or 5x the previous full group's per-block cost once the group
+    /// reaches 10 s. The context — running compactions, L0 files, real
+    /// memtables, pending compaction and the Core backlog — is sampled at the
+    /// spike so a stall like a 45 s commit can be attributed afterwards from
+    /// the log.
+    #[allow(clippy::too_many_arguments)]
+    fn warn_commit_spike(
+        &self,
+        d: Duration,
+        blocks: u32,
+        txs: u64,
+        bytes: u64,
+        reason: CommitReason,
+        tip_height: u64,
+        prev_per_block: u64,
+    ) {
+        let ms = d.as_millis() as u64;
+        if ms < 10_000 {
+            return;
+        }
+        let over_limit = ms >= self.tunables.bulk_commit_ms_limit().saturating_mul(2);
+        let per_block = ms / blocks.max(1) as u64;
+        let over_ewma = per_block >= prev_per_block.max(1_000).saturating_mul(5);
+        if !(over_limit || over_ewma) {
+            return;
+        }
+        let c = self.store.compaction_stats();
+        let lag = self.tunables.core_height().saturating_sub(tip_height);
+        eprintln!(
+            "[e-lite] commit spike: {} ms for {} blocks / {} txs ({} MiB), reason {}; \
+             rocksdb running {}, l0 {} files, memtable {} MiB, pending_compaction {} MiB; \
+             lag {} blocks; previous per-block cost {} ms",
+            ms,
+            blocks,
+            txs,
+            bytes / (1024 * 1024),
+            reason.name(),
+            c.running_compactions,
+            c.level0_files,
+            c.memtable_bytes / (1024 * 1024),
+            c.pending_compaction_bytes / (1024 * 1024),
+            lag,
+            prev_per_block,
+        );
     }
 
     /// Pause/resume e-lite indexing for the `alternate` scheduler. Serving
@@ -3941,7 +4009,7 @@ impl Indexer {
             if let Ok(mut last) = self.last_rocksdb_log.lock() {
                 if last.elapsed() >= Duration::from_secs(600) {
                     eprintln!(
-                        "[e-lite] rocksdb: pending_compaction {} MiB, running {}, \
+                        "[e-lite] rocksdb: pending_compaction {} MiB, running {}, l0 {} files, \
                          memtable {} MiB, block_cache {} MiB, sst {} MiB, table_readers {} MiB, \
                          properties_ok {}",
                         sh.stats
@@ -3949,6 +4017,7 @@ impl Indexer {
                             .load(Ordering::Relaxed)
                             / (1024 * 1024),
                         sh.stats.rocksdb_running_compactions.load(Ordering::Relaxed),
+                        sh.stats.rocksdb_level0_files.load(Ordering::Relaxed),
                         sh.stats.rocksdb_memtable_bytes.load(Ordering::Relaxed) / (1024 * 1024),
                         sh.stats.rocksdb_block_cache_bytes.load(Ordering::Relaxed) / (1024 * 1024),
                         sh.stats.rocksdb_sst_bytes.load(Ordering::Relaxed) / (1024 * 1024),

@@ -1,9 +1,9 @@
 # Session handoff
 
 **Updated:** 2026-11-10
-**Latest published release:** `0.1.0-alpha.29.8.5`
-**Release:** https://github.com/AlbercoinDev/e-lite/releases/tag/v0.1.0-alpha.29.8.5
-**Main commit at handoff:** tag `v0.1.0-alpha.29.8.5`
+**Latest published release:** `0.1.0-alpha.29.8.6`
+**Release:** https://github.com/AlbercoinDev/e-lite/releases/tag/v0.1.0-alpha.29.8.6
+**Main commit at handoff:** tag `v0.1.0-alpha.29.8.6`
 
 This file is the short “where we are” for a new session. The invariants live in
 [`AGENTS.md`](../AGENTS.md) and [`PROJECT_MEMORY.md`](PROJECT_MEMORY.md); the
@@ -86,6 +86,35 @@ no repitas contexto ni rehagas decisiones ya documentadas.
   the onion setup, reset and security.
 - `docs/ROADMAP.md` contains future features/improvements. Do not present them as
   available.
+
+## Last change (alpha.29.8.6)
+
+Compaction diagnostics: real block cache, L0 files and commit-spike context.
+
+- **Bug**: `rocksdb.block-cache-usage` was read through the DB handle, which
+  only reports the empty default family, so `rocksdb:`/`/status.rocksdb`
+  always showed `block_cache 0 MiB`. It is now summed per CF.
+- **Telemetry**: `CompactionStats.level0_files` (summed
+  `num-files-at-level0`) in the 10-minute `rocksdb:` line and
+  `/status.rocksdb`. Growing `l0` with `running 1` is the flush/compaction
+  stall signal; `pending_compaction` is an estimate that inflates during
+  ingest — use its trend.
+- **Commit spikes**: a full group ≥ 10 s costing twice the bulk time limit or
+  5x the previous full group's per-block cost logs `[e-lite] commit spike:`
+  with running compactions, L0 files, memtable, pending compaction and Core
+  backlog, sampled at the spike. Normal bulk groups stay silent.
+- Motivation: mainnet end-of-IBD log showed `pending_compaction` 49 → 185 GiB
+  in one hour with `running 1`, commit/blk 57 → 210 ms and one unexplained
+  45.5 s commit.
+- `[index] background_jobs` (0 = plan: physical/2, 2..4) is the lever to A/B;
+  no default changed. Tests: fmt, clippy, workspace.
+
+### Not decided in 29.8.6
+
+- `background_jobs` default stays the plan value until the A/B shows the
+  compaction debt stops growing with 4.
+- Cache churn (shrink on short `available` dips, 256 MiB grow steps) is
+  untouched; revisit only with evidence.
 
 ## Last change (alpha.29.8.5)
 

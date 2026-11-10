@@ -125,6 +125,9 @@ pub struct Stats {
     pub rocksdb_block_cache_bytes: AtomicU64,
     pub rocksdb_sst_bytes: AtomicU64,
     pub rocksdb_table_readers_bytes: AtomicU64,
+    /// Summed level-0 file count across column families (flush/compaction
+    /// stall signal). Sampled at commit time.
+    pub rocksdb_level0_files: AtomicU64,
     pub rocksdb_properties_ok: AtomicBool,
     /// Descriptor budget: requested/effective max_open_files and the process
     /// soft limit. Zero means "not measured".
@@ -250,6 +253,7 @@ impl Default for Stats {
             rocksdb_block_cache_bytes: AtomicU64::new(0),
             rocksdb_sst_bytes: AtomicU64::new(0),
             rocksdb_table_readers_bytes: AtomicU64::new(0),
+            rocksdb_level0_files: AtomicU64::new(0),
             rocksdb_properties_ok: AtomicBool::new(false),
             fd_soft_limit: AtomicU64::new(0),
             fd_reserve: AtomicU64::new(0),
@@ -1129,6 +1133,7 @@ impl Shared {
             "rocksdb": {
                 "pending_compaction_bytes": self.stats.rocksdb_pending_compaction_bytes.load(Ordering::Relaxed),
                 "running_compactions": self.stats.rocksdb_running_compactions.load(Ordering::Relaxed),
+                "level0_files": self.stats.rocksdb_level0_files.load(Ordering::Relaxed),
                 "memtable_bytes": self.stats.rocksdb_memtable_bytes.load(Ordering::Relaxed),
                 "block_cache_bytes": self.stats.rocksdb_block_cache_bytes.load(Ordering::Relaxed),
                 "sst_bytes": self.stats.rocksdb_sst_bytes.load(Ordering::Relaxed),

@@ -445,6 +445,33 @@ before more concurrency is added; a high `read_ms` alone no longer reduces the
 pool, because it can be the block source rather than the pool. Reader changes
 never go below `min_readers` (half the physical cores, at least 2).
 
+### Compaction debt, L0 files and `background_jobs`
+
+The 10-minute `rocksdb:` log line and `/status.rocksdb` sample the counters
+needed to attribute slow commits:
+
+| Signal | Meaning |
+|---|---|
+| `pending_compaction` | `estimate-pending-compaction-bytes` summed over every family. It is an **estimate** that inflates while ingest continues; use its *trend*, not its absolute value |
+| `l0` | summed level-0 file count. A growing `l0` with `running 1` is the real flush/compaction stall signal |
+| `running` | compactions in flight. `max_background_jobs` splits the pool between flushes and compactions, so the default plan (`physical/2`, 2..4) gives one of each on a 4-core host |
+| `block_cache` | real bytes charged to the shared cache (per-CF sum); the configured ceiling is in the `memory:` line |
+| `memtable` / `table_readers` | actual memtable bytes and index/filter reader memory |
+
+A full commit group that reaches 10 s and either costs twice the configured
+bulk time limit or 5x the previous per-block cost prints a
+`[e-lite] commit spike:` line with that context plus the Core backlog, so an
+outlier can be attributed after the fact. Normal full-interval bulk groups do
+not warn.
+
+RocksDB falls back to slow/stop writes when L0 accumulates faster than a
+single compaction thread can drain it; that shows up as long commits with
+`running 1` and rising `l0`. The lever is `[index] background_jobs`
+(`0` = plan, `physical/2` clamped 2..4; `4` = two flush + two compaction
+threads on a 4-core host). It applies on hot reload; compare the
+`pending_compaction` trend and commit/blk before and after in the same phase
+before changing the default.
+
 ### Measured on a real mainnet IBD with defaults (2026-11-08)
 
 At ~640k height on a 32 GiB machine, default settings:

@@ -45,6 +45,9 @@ pub struct CompactionStats {
     pub block_cache_bytes: u64,
     pub sst_files_bytes: u64,
     pub table_readers_bytes: u64,
+    /// Summed L0 file count across every column family. A growing value with
+    /// one running compaction is the real flush/compaction stall signal.
+    pub level0_files: u64,
     /// False when any per-CF property was unsupported or failed; a zero is
     /// then "unknown", not "empty".
     pub properties_ok: bool,
@@ -957,8 +960,9 @@ impl Store {
     }
 
     /// Sum a property across every column family. Some RocksDB properties are
-    /// per-CF (`estimate-*`, `total-sst-files-size`, memtables); reading them
-    /// through the DB handle only reports the default family.
+    /// per-CF (`estimate-*`, `total-sst-files-size`, memtables, block-cache
+    /// usage, `num-files-at-level0`); reading them through the DB handle only
+    /// reports the default family.
     fn sum_cf_property(&self, name: &str) -> (u64, bool) {
         let mut total = 0u64;
         let mut ok = true;
@@ -978,37 +982,39 @@ impl Store {
     /// `/status`. Property reads are cheap and only sampled at commit time.
     ///
     /// Per-CF properties are summed across all seven families; DB-wide
-    /// properties (`num-running-compactions`, the shared block cache) are read
-    /// once so they are not multiplied by the CF count.
+    /// properties (`num-running-compactions`) are read once so they are not
+    /// multiplied by the CF count. `block-cache-usage` is also per-CF (every
+    /// family charges its blocks to the shared cache), so it is summed too:
+    /// read through the DB handle it only reports the empty default family
+    /// and the log always showed `block_cache 0 MiB`.
     pub fn compaction_stats(&self) -> CompactionStats {
         let (pending, ok_pending) =
             self.sum_cf_property("rocksdb.estimate-pending-compaction-bytes");
         let (memtables, ok_memtables) = self.sum_cf_property("rocksdb.cur-size-all-mem-tables");
         let (sst, ok_sst) = self.sum_cf_property("rocksdb.total-sst-files-size");
         let (readers, ok_readers) = self.sum_cf_property("rocksdb.estimate-table-readers-mem");
+        let (cache, ok_cache) = self.sum_cf_property("rocksdb.block-cache-usage");
+        let (l0, ok_l0) = self.sum_cf_property("rocksdb.num-files-at-level0");
         let running = self
             .db
             .property_int_value("rocksdb.num-running-compactions")
-            .ok()
-            .flatten();
-        let cache = self
-            .db
-            .property_int_value("rocksdb.block-cache-usage")
             .ok()
             .flatten();
         CompactionStats {
             pending_compaction_bytes: pending,
             running_compactions: running.unwrap_or(0),
             memtable_bytes: memtables,
-            block_cache_bytes: cache.unwrap_or(0),
+            block_cache_bytes: cache,
             sst_files_bytes: sst,
             table_readers_bytes: readers,
+            level0_files: l0,
             properties_ok: ok_pending
                 && ok_memtables
                 && ok_sst
                 && ok_readers
-                && running.is_some()
-                && cache.is_some(),
+                && ok_cache
+                && ok_l0
+                && running.is_some(),
         }
     }
 
