@@ -455,7 +455,7 @@ needed to attribute slow commits:
 | `pending_compaction` | `estimate-pending-compaction-bytes` summed over every family. It is an **estimate** that inflates while ingest continues; use its *trend*, not its absolute value |
 | `l0` | summed level-0 file count. A growing `l0` with `running 1` is the real flush/compaction stall signal |
 | `running` | compactions in flight. `max_background_jobs` splits the pool between flushes and compactions, so the default plan (`physical/2`, 2..4) gives one of each on a 4-core host |
-| `block_cache` | real bytes charged to the shared cache (per-CF sum); the configured ceiling is in the `memory:` line |
+| `block_cache` | real bytes charged to the shared cache, read once (with a shared cache every family reports the whole-cache usage, so it is not summed); expected ≈ the configured ceiling in the `memory:` line |
 | `memtable` / `table_readers` | actual memtable bytes and index/filter reader memory |
 
 A full commit group that reaches 10 s and either costs twice the configured

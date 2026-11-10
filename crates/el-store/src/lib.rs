@@ -960,8 +960,8 @@ impl Store {
     }
 
     /// Sum a property across every column family. Some RocksDB properties are
-    /// per-CF (`estimate-*`, `total-sst-files-size`, memtables, block-cache
-    /// usage, `num-files-at-level0`); reading them through the DB handle only
+    /// per-CF (`estimate-*`, `total-sst-files-size`, memtables,
+    /// `num-files-at-level0`); reading them through the DB handle only
     /// reports the default family.
     fn sum_cf_property(&self, name: &str) -> (u64, bool) {
         let mut total = 0u64;
@@ -978,22 +978,46 @@ impl Store {
         (total, ok)
     }
 
+    /// Shared block cache usage. Not summed over the families: with a shared
+    /// cache every family reports the usage of the whole cache, so the sum
+    /// multiplied the real value by seven (the 29.8.6 log showed
+    /// `block_cache 18854 MiB` with a 2705 MiB capacity; 18854/7 = 2693).
+    /// Read once through the first data family that answers; the empty
+    /// default family reports 0, which is why the DB-handle read used to
+    /// return 0 while the memory line showed a live cache.
+    fn whole_cache_usage(&self) -> (u64, bool) {
+        for cf_name in CF_NAMES {
+            if let Ok(cf) = self.cf(cf_name) {
+                if let Ok(Some(v)) = self
+                    .db
+                    .property_int_value_cf(cf, "rocksdb.block-cache-usage")
+                {
+                    return (v, true);
+                }
+            }
+        }
+        (0, false)
+    }
+
     /// RocksDB compaction/memory counters used by the indexing benchmark and
     /// `/status`. Property reads are cheap and only sampled at commit time.
     ///
     /// Per-CF properties are summed across all seven families; DB-wide
     /// properties (`num-running-compactions`) are read once so they are not
-    /// multiplied by the CF count. `block-cache-usage` is also per-CF (every
-    /// family charges its blocks to the shared cache), so it is summed too:
-    /// read through the DB handle it only reports the empty default family
-    /// and the log always showed `block_cache 0 MiB`.
+    /// multiplied by the CF count. `block-cache-usage` is also read once, but
+    /// for the opposite reason: with a shared cache **every** column family
+    /// reports the usage of the whole cache ("the same for every column
+    /// family" in the RocksDB property docs), so summing it multiplied the
+    /// real value by seven. It must be read through a data family: the empty
+    /// default family reports 0, which is why the DB-handle read always
+    /// showed `block_cache 0 MiB` before.
     pub fn compaction_stats(&self) -> CompactionStats {
         let (pending, ok_pending) =
             self.sum_cf_property("rocksdb.estimate-pending-compaction-bytes");
         let (memtables, ok_memtables) = self.sum_cf_property("rocksdb.cur-size-all-mem-tables");
         let (sst, ok_sst) = self.sum_cf_property("rocksdb.total-sst-files-size");
         let (readers, ok_readers) = self.sum_cf_property("rocksdb.estimate-table-readers-mem");
-        let (cache, ok_cache) = self.sum_cf_property("rocksdb.block-cache-usage");
+        let (cache, ok_cache) = self.whole_cache_usage();
         let (l0, ok_l0) = self.sum_cf_property("rocksdb.num-files-at-level0");
         let running = self
             .db

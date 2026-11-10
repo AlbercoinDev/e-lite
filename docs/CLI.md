@@ -301,7 +301,9 @@ These are escape hatches for measurements, not normal configuration:
   requests. `control_port` is always `0`; e-lite does not create one.
 - `rocksdb.properties_ok`: `false` means a zero in that block is unknown, not
   empty. `rocksdb.block_cache_bytes` is the real bytes charged to the shared
-  cache (summed per column family). `rocksdb.level0_files` is the summed
+  cache, read once (with a shared cache every family reports the whole-cache
+  usage, so it is not summed; expected ≈ the memory plan's cache capacity).
+  `rocksdb.level0_files` is the summed
   level-0 file count: growing `l0` with `running_compactions = 1` is the
   flush/compaction stall signal. `rocksdb.cf` breaks pending compaction,
   memtables, SST and table readers down by column family.

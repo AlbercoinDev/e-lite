@@ -2449,11 +2449,19 @@ pub fn memory_info() -> MemoryInfo {
 /// buff/cache on a 32 GiB host can still mean "ARC is using the RAM".
 fn zfs_arc_mib() -> Option<u64> {
     let text = std::fs::read_to_string("/proc/spl/kstat/zfs/arcstats").ok()?;
+    parse_zfs_arc_mib(&text)
+}
+
+/// kstat rows are `name type value`; the second column is the data type
+/// (4 = uint64), the value is the third. Taking the second column made
+/// `arc` print 0 MiB on every ZFS host (4 bytes / 1024 / 1024).
+fn parse_zfs_arc_mib(text: &str) -> Option<u64> {
     for line in text.lines() {
         let mut fields = line.split_whitespace();
         if fields.next() != Some("size") {
             continue;
         }
+        fields.next()?; // kstat type column
         let bytes = fields.next()?.parse::<u64>().ok()?;
         return Some(bytes / 1024 / 1024);
     }
@@ -3094,6 +3102,17 @@ mod tests {
         assert_eq!(Profile::Auto.resolve(true), Profile::Hdd);
         assert_eq!(Profile::Auto.resolve(false), Profile::Ssd);
         assert_eq!(Profile::Nvme.resolve(true), Profile::Nvme);
+    }
+
+    #[test]
+    fn zfs_arc_size_reads_the_value_column() {
+        // Realistic kstat layout: header rows, then `name type value`.
+        let text = "2 3 0x01 93 23200 23200 9223372036854775807 0 2.2.2\n\
+                    name                            type data\n\
+                    hits                            4    12345\n\
+                    size                            4    4294967296\n";
+        assert_eq!(parse_zfs_arc_mib(text), Some(4096));
+        assert_eq!(parse_zfs_arc_mib("no size here\n"), None);
     }
 
     #[test]

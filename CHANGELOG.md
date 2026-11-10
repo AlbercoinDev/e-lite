@@ -1,5 +1,34 @@
 # Changelog
 
+## 0.1.0-alpha.29.8.7 — 2026-11-10
+
+### Two measurement fixes found by the first 29.8.6 mainnet log
+
+No schema, protocol or consensus change. The 29.8.6 diagnostics did their
+job: the first log exposed that two counters printed wrong values.
+
+**`block_cache` was multiplied by seven.** With a shared block cache,
+RocksDB reports the usage of the whole cache for *every* column family
+(documented as "the same for every column family"), so summing
+`rocksdb.block-cache-usage` across the seven families multiplied the real
+value by the CF count. The 29.8.6 log showed `block_cache 18854 MiB` next to
+a 2705 MiB capacity (18854/7 = 2693); the previous DB-handle read returned 0
+because the empty default family reports 0. The value is now read once
+through the first data family that answers; expected reading is the live
+cache usage, ≈ the capacity shown in the `memory:` line.
+
+**ZFS ARC always printed 0.** The `arcstats` kstat rows are `name type
+value`; the reader took the second column (the data type `4`) as the byte
+value, so `arc 0 MiB` on every ZFS host regardless of the real ARC size. It
+now reads the third column. On a ZFS pool this number matters: a capped or
+empty ARC makes cold reads pay the pool directly, which showed up as
+602-4850 ms block-read spikes in the same log. The value is unit-tested
+against a realistic kstat layout.
+
+The `l0` file count stays summed per family (that property really is
+per-CF); `pending_compaction` stays an estimate whose trend is the signal.
+No controller, default or budget change.
+
 ## 0.1.0-alpha.29.8.6 — 2026-11-10
 
 ### Compaction diagnostics: real block cache, L0 files and commit-spike context

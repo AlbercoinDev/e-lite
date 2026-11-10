@@ -1,9 +1,9 @@
 # Session handoff
 
 **Updated:** 2026-11-10
-**Latest published release:** `0.1.0-alpha.29.8.6`
-**Release:** https://github.com/AlbercoinDev/e-lite/releases/tag/v0.1.0-alpha.29.8.6
-**Main commit at handoff:** tag `v0.1.0-alpha.29.8.6`
+**Latest published release:** `0.1.0-alpha.29.8.7`
+**Release:** https://github.com/AlbercoinDev/e-lite/releases/tag/v0.1.0-alpha.29.8.7
+**Main commit at handoff:** tag `v0.1.0-alpha.29.8.7`
 
 This file is the short “where we are” for a new session. The invariants live in
 [`AGENTS.md`](../AGENTS.md) and [`PROJECT_MEMORY.md`](PROJECT_MEMORY.md); the
@@ -86,6 +86,30 @@ no repitas contexto ni rehagas decisiones ya documentadas.
   the onion setup, reset and security.
 - `docs/ROADMAP.md` contains future features/improvements. Do not present them as
   available.
+
+## Last change (alpha.29.8.7)
+
+Two measurement fixes found by the first 29.8.6 mainnet log.
+
+- **Bug (29.8.6)**: `block_cache` was summed over the seven families, but
+  with a shared cache every family reports the whole-cache usage
+  (`18854 MiB` reported next to a `2705 MiB` capacity = 7x). Read once
+  through the first data family now; expected ≈ the memory plan's capacity.
+- **Bug (pre-existing)**: ZFS `arc` parsed the kstat type column, so it
+  always printed 0 MiB; it now reads the value column (unit-tested). On ZFS
+  this matters for read-spike analysis (the same log showed 602-4850 ms
+  block reads).
+- Evidence for the compaction question: `pending_compaction` stayed flat
+  (~170-175 GiB) through 26 min of the indexing phase at `jobs=2`; the
+  decisive test is the draining phase (the 29.8.5 debt grew at drain rate).
+- No controller, default or budget change. Tests: fmt, clippy, workspace
+  (231, incl. the new ARC kstat test).
+
+### Not decided in 29.8.7
+
+- `background_jobs` default stays the plan value until a draining-phase A/B.
+- Whether ARC was actually capped/empty on the ZFS box is only observable
+  after this fix; re-read the `arc` value in the next log.
 
 ## Last change (alpha.29.8.6)
 
