@@ -50,6 +50,7 @@ commit_sync = "auto"                # auto | always | txids (bulk durability tra
 commit_interval_ms = 0              # 0 = plan: 20-60 s bulk by disk, 1.5 s live
 prefetch_blocks = 0                 # prepared-block window cap; 0 = auto (workers*2)
 prefetch_deadline_ms = 0            # stop prefetching a block after n ms (0 = off)
+max_open_files = 0                  # 0 = 8192; 2048/4096 shrinks table readers on 8-16 GB
 write_buffer_mib = 0                # total memtable budget; 0 = effective/16 (512 MB..2 GiB)
 adaptive_memtables = false          # opt-in hot memtable resize (can force flushes)
 memory_reserve_mib = 0              # RAM left for OS/Core/page cache; 0 = clamp(effective/8, 2-4 GiB)

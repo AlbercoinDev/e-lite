@@ -233,15 +233,22 @@ Never treat a version number in this file as authoritative over the code/tag.
   cooldown; cache changes have priority and explicit `write_buffer_mib`
   disables it. A critical-memory one-way shrink (halve, minimum 256 MiB) runs
   when `MemAvailable < 256 MiB`. `cache_mib` is a maximum, not a lock. The hot
-  ceiling is
-  `min(profile, MemAvailable + current - reserve - memtables - runtime)`; the
-  cache shrinks when `cache > ceiling` or `MemAvailable < reserve`, grows in
-  256 MiB steps only with a `clamp(effective/8, 256 MiB, 2 GiB)` margin and
+  ceiling is `min(profile, MemAvailable - reserve_dyn)`; `MemAvailable`
+  already excludes memtables/runtime/table readers, so those budgets must not
+  be subtracted a second time (this double-count starved the cache to 8 MiB).
+  The reserve is dynamic:
+  `reserve_dyn = min(startup_reserve, max(1024 MiB, MemAvailable/2))`. The
+  cache shrinks when `cache > ceiling` or `MemAvailable < reserve_dyn`, grows
+  in 256 MiB steps only with a `clamp(effective/8, 256 MiB, 2 GiB)` margin and
   **p95 prefetch**, and needs two samples plus a 5-minute reversal dwell.
   Below 1 GiB it acts immediately; below 256 MiB readers are reduced and the
   cache may reach 8 MiB. The page-cache floor is reported but not added to the
   shrink floor (`MemAvailable` already includes reclaimable cache). The
-  pre-Core-resume shrink only acts if `MemAvailable < reserve + cache/4`.
+  pre-Core-resume shrink uses `reserve_dyn` and only acts if
+  `MemAvailable < reserve_dyn + cache/4`.
+  `/status.memory` must show planned memtables, **actual** RocksDB memtable
+  bytes and table-reader bytes; table readers live outside the block cache
+  and `[index] max_open_files` exists for 8-16 GiB A/B (default 8192).
   `core_reserve` is the fitted or operator `-dbcache` only when e-lite will
   start Core; `run`/`index` probe the RPC port first, an already-running or
   external Core is already in `MemAvailable`, and `serve` reserves nothing.

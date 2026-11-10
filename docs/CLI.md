@@ -69,6 +69,7 @@ version          print version
 | `--commit-sync <mode>` | `index.commit_sync` | `auto` (`txids` in bulk, `always` live) |
 | `--prefetch-blocks <n>` | `index.prefetch_blocks` | `0` (auto; >0 caps the window) |
 | `--prefetch-deadline-ms <n>` | `index.prefetch_deadline_ms` | `0` (off; 50..60000) |
+| `--max-open-files <n>` | `index.max_open_files` | `0` (8192; 2048/4096 for 8-16 GB) |
 | `--adaptive-memtables` / `--no-adaptive-memtables` | `index.adaptive_memtables` | `false` |
 | `--batch <n>` | `index.batch_blocks` | `256`/profile, capped at 512 |
 | `--reorg-window <n>` | `index.reorg_window` | `288` |

@@ -124,9 +124,10 @@ Two different budgets are reported and must not be confused:
   `table_readers_bytes`) and the process RSS.
 
 Indexes and bloom filters stay outside the data block cache for read speed, so
-their memory (`rocksdb.estimate-table-readers-mem`) is reported separately. The
-plan reserves runtime for them; if they grow past it, raise the reserve or lower
-`max_open_files`.
+their memory (`rocksdb.estimate-table-readers-mem`) is reported separately. On a
+260 GiB index and with `max_open_files = 8192` that block can be 4-6 GiB; it
+must appear in `/status.memory`. Lower it with `[index] max_open_files` when
+memory is tight (2048/4096 on 8/16 GiB) and A/B it against the cache.
 
 `cache_mib` is a **maximum**, not a fixed value. The controller may use less
 under pressure and grow back up to it. `write_buffer_mib` is fixed when the
@@ -136,27 +137,28 @@ can force flushes and stall commits.
 
 ### Hot cache controller
 
-The ceiling is recomputed from current memory:
+The ceiling uses `MemAvailable` directly. That value already excludes
+memtables, runtime and RocksDB table readers, so adding and re-subtracting the
+memtable/runtime budgets counted that memory twice and starved the cache.
 
 ```
-current      = cache + memtables + runtime
-effective    = min(total, MemAvailable + current)
-cache_ceiling = min(profile_cap,
-                    effective - reserve - memtables - runtime)
+reserve_dyn  = min(startup_reserve, max(1024 MiB, MemAvailable/2))
+cache_ceiling = min(profile_cap, MemAvailable - reserve_dyn)
 ```
 
-- **grow +256 MiB** only when `MemAvailable >= reserve + cache + margin` and
+- **grow +256 MiB** only when `MemAvailable >= reserve_dyn + cache + margin` and
   **p95 prefetch** is slow. `margin = clamp(effective/8, 256 MiB, 2 GiB)`.
   A single 10-15 s block cannot drive growth by itself.
-- **shrink** when `cache > cache_ceiling` or `MemAvailable < reserve`.
+- **shrink** when `cache > cache_ceiling` or `MemAvailable < reserve_dyn`.
 - **critical**: below 1 GiB available, act on one sample; below 256 MiB reduce
   readers and allow the cache to fall to 8 MiB.
 - two consecutive samples and a 5-minute reversal dwell prevent the
   grow/shrink flapping that previously evicted the UTXO set.
 
-The page-cache floor is **not** added to the shrink threshold: `MemAvailable`
-already includes reclaimable page cache. Adding it double-counted and caused
-the 2048 ↔ 3997 MiB oscillation in the 32 GiB log.
+`/status.memory` keeps planned memtables and **actual** RocksDB memory apart:
+`memtables_mib` is the budget, `memtable_bytes_mib` is the real memtable, and
+`table_readers_mib` is the index/filter block that lives outside the data
+cache. Lower `[index] max_open_files` when that block is too large on 8-16 GiB.
 
 Cache decisions use `MemAvailable` only. A low page-cache number is expected
 while the RocksDB cache holds the UTXO working set. `/status.tuning` exposes

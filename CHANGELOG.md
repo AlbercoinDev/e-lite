@@ -1,5 +1,49 @@
 # Changelog
 
+## 0.1.0-alpha.29.8.5 — 2026-11-10
+
+### Dynamic cache ceiling without double-counting resident memory
+
+No schema, protocol or consensus change. Follow-up to the 29.8.4 mainnet log:
+the hot cache collapsed to 8-30 MiB while `available` was 2-5 GiB and
+`reserve + memtables + runtime` was sized from a much larger startup value.
+
+**The dynamic cache ledger no longer double-counts resident memory.**
+`MemAvailable` already excludes memtables, runtime and RocksDB table readers.
+The old formula reconstructed `effective` by adding the planned memtable and
+runtime budgets to `MemAvailable`, then subtracted them again from the cache
+ceiling, so those budgets were counted twice and the cache was starved to
+`block_cache = 0`. The ceiling is now:
+
+```text
+reserve_dyn  = min(startup_reserve, max(1024 MiB, MemAvailable/2))
+cache_dyn    = min(profile, MemAvailable - reserve_dyn)
+```
+
+On the 29.8.4 log sample (`available = 2870 MiB`, `reserve = 3066 MiB`) the
+expected cache ceiling goes from 30 MiB to **1435 MiB**. Cache decisions,
+pre-resume shrink and adaptive memtables use the same dynamic reserve.
+
+**Visible, not planned.** `/status.memory` and the hot memory line now expose:
+
+```text
+effective_mib          MemAvailable (post cgroup), used as the cache basis
+dynamic_reserve_mib    reserve_dyn
+memtable_bytes_mib     actual RocksDB memtable memory
+table_readers_mib      actual RocksDB index/filter memory
+```
+
+The hot log line also prints cache/profile cap, planned vs real memtables,
+table readers, pending compaction and the dynamic/startup reserve.
+
+**RocksDB descriptors.** `[index] max_open_files` / `--max-open-files`
+(0 = 8192) lets an 8-16 GiB host lower the table-reader block (2048/4096) and
+A/B it against the data cache.
+
+Tests: fmt, clippy, workspace (230), including the dynamic-reserve test over
+the exact `available = 2870 MiB` sample from the log. The log line and
+`/status.memory` now keep planned and actual memtables apart.
+
 ## 0.1.0-alpha.29.8.4 — 2026-11-10
 
 ### cgroup I/O priority, prune defaults and the A/B harness

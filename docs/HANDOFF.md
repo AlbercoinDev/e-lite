@@ -1,9 +1,9 @@
 # Session handoff
 
 **Updated:** 2026-11-10
-**Latest published release:** `0.1.0-alpha.29.8.4`
-**Release:** https://github.com/AlbercoinDev/e-lite/releases/tag/v0.1.0-alpha.29.8.4
-**Main commit at handoff:** tag `v0.1.0-alpha.29.8.4`
+**Latest published release:** `0.1.0-alpha.29.8.5`
+**Release:** https://github.com/AlbercoinDev/e-lite/releases/tag/v0.1.0-alpha.29.8.5
+**Main commit at handoff:** tag `v0.1.0-alpha.29.8.5`
 
 This file is the short “where we are” for a new session. The invariants live in
 [`AGENTS.md`](../AGENTS.md) and [`PROJECT_MEMORY.md`](PROJECT_MEMORY.md); the
@@ -86,6 +86,28 @@ no repitas contexto ni rehagas decisiones ya documentadas.
   the onion setup, reset and security.
 - `docs/ROADMAP.md` contains future features/improvements. Do not present them as
   available.
+
+## Last change (alpha.29.8.5)
+
+Dynamic cache ceiling without double-counting resident memory.
+
+- **Bug**: 29.8.4 added the planned memtable/runtime budgets to `MemAvailable`
+  and then subtracted them again, so the hot cache collapsed to 8-30 MiB when
+  `available` was 2-5 GiB (`block_cache = 0`, prefetch p95 10-15 s).
+- **Fix**: `cache_dyn = min(profile, MemAvailable - reserve_dyn)`, with
+  `reserve_dyn = min(startup reserve, max(1024 MiB, MemAvailable/2))`.
+  With `available = 2870 MiB` and `reserve = 3066 MiB`, the ceiling is 1435 MiB.
+- **Telemetry**: `/status.memory` and the hot log show dynamic reserve,
+  effective basis, planned memtables, **actual** RocksDB memtable and
+  table-reader bytes.
+- **A/B knob**: `[index] max_open_files` to reduce table readers on 8-16 GiB.
+- Tests: fmt, clippy, workspace (230), dynamic-reserve unit test on the log
+  sample.
+
+### Not decided in 29.8.5
+
+- `max_open_files` default stays 8192; 2048/4096 are A/B knobs.
+- `adaptive_memtables`/`prefetch_deadline_ms`/`io_priority` remain opt-in.
 
 ## Last change (alpha.29.8.4)
 

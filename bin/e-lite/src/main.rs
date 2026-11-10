@@ -227,6 +227,7 @@ struct Args {
     write_buffer_mib: Option<u64>,
     adaptive_memtables: Option<bool>,
     prefetch_deadline_ms: Option<u64>,
+    max_open_files: Option<u32>,
     memory_reserve_mib: Option<u64>,
     memory_fraction: Option<f64>,
     allow_low_memory: bool,
@@ -339,6 +340,7 @@ fn parse_args() -> R<Args> {
             "--prefetch-deadline-ms" => {
                 args.prefetch_deadline_ms = Some(value("--prefetch-deadline-ms")?.parse()?)
             }
+            "--max-open-files" => args.max_open_files = Some(value("--max-open-files")?.parse()?),
             "--memory-reserve-mib" => {
                 args.memory_reserve_mib = Some(value("--memory-reserve-mib")?.parse()?)
             }
@@ -589,6 +591,9 @@ fn effective_config(args: &Args) -> R<(Config, Chain)> {
     }
     if let Some(v) = args.prefetch_deadline_ms {
         cfg.index.prefetch_deadline_ms = v;
+    }
+    if let Some(v) = args.max_open_files {
+        cfg.index.max_open_files = v;
     }
     if let Some(v) = args.memory_reserve_mib {
         cfg.index.memory_reserve_mib = v;
@@ -1031,9 +1036,13 @@ fn open_store_with(
         max_write_buffer_number: max_buffers,
         max_total_wal_bytes: ((write_mib / 2).clamp(64, 1024) as usize) * 1024 * 1024,
         background_jobs: jobs,
+        max_open_files: if cfg.index.max_open_files > 0 {
+            cfg.index.max_open_files as i32
+        } else {
+            el_store::StoreOptions::default().max_open_files
+        },
         fd_reserve,
         exclude_paths: exclude,
-        ..Default::default()
     };
     let store = Arc::new(Store::open_with(dir, opts)?);
     let plan = store.fd_plan();
@@ -1263,6 +1272,7 @@ TUNING (all networks):
     --commit-sync <mode>    auto | always | txids (bulk durability tradeoff)
     --prefetch-blocks <n>   prepared-block window cap (0 = auto; >0 caps)
     --prefetch-deadline-ms <n> stop prefetching a block after n ms (0 = off)
+    --max-open-files <n>        RocksDB fds for table readers (0 = 8192)
     --adaptive-memtables    let the controller resize memtables at runtime
     --no-adaptive-memtables keep the startup memtable budget (default)
     --milestone-blocks <n>  progress report every N blocks (0 = off)
@@ -3651,7 +3661,7 @@ impl Indexer {
                         / rate_secs) as u64,
                 );
                 if let Some(sh) = &self.shared {
-                    self.tunables.publish(&sh.stats);
+                    self.tunables.publish(&self.store, &sh.stats);
                 }
                 self.print_progress(
                     &current,
@@ -3717,7 +3727,7 @@ impl Indexer {
                     / rate_secs) as u64,
             );
             if let Some(sh) = &self.shared {
-                self.tunables.publish(&sh.stats);
+                self.tunables.publish(&self.store, &sh.stats);
             }
             self.print_progress(
                 &current,
@@ -4742,7 +4752,7 @@ fn reload_hot(
             }
             supervisor.update_config(supervisor_config(&new, can_control_core));
             if let Some(sh) = shared {
-                idx.tunables.publish(&sh.stats);
+                idx.tunables.publish(&idx.store, &sh.stats);
             }
             if new.core.prune_mib != old.core.prune_mib
                 || new.index.block_source != old.index.block_source
@@ -4906,7 +4916,7 @@ fn index_loop(
     }
     spawn_core_observer(&idx, Arc::clone(&flag));
     if let Some(sh) = &shared {
-        idx.tunables.publish(&sh.stats);
+        idx.tunables.publish(&idx.store, &sh.stats);
     }
 
     // Acquire the intensive-sync slot *before* the first 512-block call. The

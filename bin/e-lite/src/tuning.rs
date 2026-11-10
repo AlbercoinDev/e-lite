@@ -1782,10 +1782,10 @@ impl Tunables {
             self.adapt_steps.fetch_add(1, Ordering::Relaxed);
             eprintln!("[e-lite] adaptive tuning: {reason}");
             if let Some(stats) = stats {
-                self.publish(stats);
+                self.publish(store, stats);
             }
         } else if let Some(stats) = stats {
-            self.publish(stats);
+            self.publish(store, stats);
         }
         action
     }
@@ -1793,28 +1793,33 @@ impl Tunables {
     /// Hot memory policy: grow the block cache in small steps while page cache
     /// and available RAM stay healthy, and shrink under pressure. Manual
     /// `cache_mib` is treated as a maximum, not as an immutable value.
-    /// Hot cache ceiling: `available + current e-lite footprint` is the
-    /// effective budget; reserve, memtables and runtime are subtracted. The
-    /// profile/explicit maximum is still a hard cap. This is what makes the
-    /// cache follow the OS allowance instead of installed RAM.
-    fn dynamic_cache_max(&self, mem: &MemoryInfo) -> (u64, u64, u64) {
-        let current = self
-            .cache_mib()
-            .saturating_add(self.memtables_mib.load(Ordering::Relaxed))
-            .saturating_add(self.runtime_mib);
+    /// Hot cache ceiling. `available` already excludes e-lite's resident
+    /// memory (memtables, runtime and RocksDB table readers), so subtracting
+    /// the startup memtable/runtime budgets here double-counted them and
+    /// starved the cache. The only subtraction left is a dynamic OS reserve.
+    fn dynamic_reserve_mib(&self, mem: &MemoryInfo) -> u64 {
+        dynamic_reserve_for(self.reserve_mib, mem.available_mib)
+    }
+
+    fn dynamic_cache_max(&self, mem: &MemoryInfo) -> (u64, u64, u64, u64) {
+        let reserve = self.dynamic_reserve_mib(mem);
         let effective = self
             .total_mib
-            .min(mem.available_mib.saturating_add(current))
+            .min(
+                mem.available_mib.saturating_add(
+                    self.cache_mib()
+                        .saturating_add(self.memtables_mib.load(Ordering::Relaxed))
+                        .saturating_add(self.runtime_mib),
+                ),
+            )
             .max(128);
-        let room = effective
-            .saturating_sub(self.reserve_mib)
-            .saturating_sub(self.memtables_mib.load(Ordering::Relaxed))
-            .saturating_sub(self.runtime_mib);
-        let max = room
+        let max = mem
+            .available_mib
+            .saturating_sub(reserve)
             .min(self.max_cache_mib)
             .max(self.min_cache_mib.min(self.max_cache_mib));
-        let margin = (effective / 8).clamp(256, 2048);
-        (max, margin, effective)
+        let margin = (mem.available_mib / 8).clamp(256, 2048);
+        (max, margin, effective, reserve)
     }
 
     fn memtable_step(&self, store: &Store, mem: &MemoryInfo) -> Option<String> {
@@ -1839,15 +1844,15 @@ impl Tunables {
         }
         let grow = target > current_mem;
         let margin = (effective / 8).clamp(256, 2048);
+        let reserve = self.dynamic_reserve_mib(mem);
         let allowed = if grow {
             mem.available_mib
-                >= self
-                    .reserve_mib
+                >= reserve
                     .saturating_add(self.cache_mib())
                     .saturating_add(target)
                     .saturating_add(margin)
         } else {
-            mem.available_mib < self.reserve_mib.saturating_add(512)
+            mem.available_mib < reserve.saturating_add(512)
                 || self.cache_mib() <= self.cache_floor_mib
         };
         if !allowed {
@@ -1906,7 +1911,7 @@ impl Tunables {
         // Growing the cache only because RAM is free is not evidence that it
         // helps. Require measured UTXO-prefetch pressure; the prefetch EWMA is
         // the closest signal we have to "the block cache would avoid I/O".
-        let (max_cache, grow_margin, effective) = self.dynamic_cache_max(&mem);
+        let (max_cache, grow_margin, effective, dynamic_reserve) = self.dynamic_cache_max(&mem);
         let (_, prefetch_p95, _) = self.prefetch_percentiles();
         let prefetch_signal = if prefetch_p95 > 0 {
             prefetch_p95
@@ -1915,7 +1920,7 @@ impl Tunables {
         };
         let action = cache_action(
             mem.available_mib,
-            self.reserve_mib,
+            dynamic_reserve,
             self.cache_mib(),
             max_cache,
             grow_margin,
@@ -1932,7 +1937,7 @@ impl Tunables {
             }
             if let Some(reason) = self.memtable_step(store, &mem) {
                 if let Some(stats) = stats {
-                    self.publish(stats);
+                    self.publish(store, stats);
                 }
                 return Some(reason);
             }
@@ -1940,7 +1945,7 @@ impl Tunables {
         }
         let critical = mem.available_mib < 256;
         let pressure = mem.available_mib < 1024;
-        let safety = self.cache_mib() > max_cache || mem.available_mib < self.reserve_mib;
+        let safety = self.cache_mib() > max_cache || mem.available_mib < dynamic_reserve;
         if !pressure && !safety {
             {
                 let Ok(mut streak) = self.mem_streak.lock() else {
@@ -2024,10 +2029,14 @@ impl Tunables {
                 *last = Some((Instant::now(), dir));
             }
         }
+        let rs = store.compaction_stats();
         eprintln!(
             "[e-lite] memory: available {} MiB, buff/cache {} MiB (sreclaim {}), \
-             arc {}, rss {}, effective {} MiB, reserve {} MiB, page floor {} MiB: \
-             cache {} -> {} MiB (max {} dynamic, profile {}, memtables {} MiB, readers {})",
+             arc {}, rss {}, effective {} MiB, reserve {} MiB (startup {} MiB), \
+             page floor {} MiB, cache {} -> {} MiB (max {} dynamic, profile {}, \
+             memtables {} planned / \
+             {} real MiB, table readers {} MiB, pending compaction {} MiB, \
+             iterative readers {})",
             mem.available_mib,
             mem.cached_mib,
             mem.sreclaimable_mib,
@@ -2036,6 +2045,7 @@ impl Tunables {
                 .unwrap_or_else(|| "none".to_string()),
             process_rss_mib(),
             effective,
+            dynamic_reserve,
             self.reserve_mib,
             self.page_cache_floor_mib,
             old,
@@ -2043,10 +2053,13 @@ impl Tunables {
             max_cache,
             self.max_cache_mib,
             self.memtables_mib.load(Ordering::Relaxed),
+            rs.memtable_bytes / (1024 * 1024),
+            rs.table_readers_bytes / (1024 * 1024),
+            rs.pending_compaction_bytes / (1024 * 1024),
             readers
         );
         if let Some(stats) = stats {
-            self.publish(stats);
+            self.publish(store, stats);
         }
         Some(format!(
             "memory: cache {old} -> {new} MiB, readers {readers}"
@@ -2060,11 +2073,12 @@ impl Tunables {
             return;
         }
         let mem = memory_info();
+        let reserve = self.dynamic_reserve_mib(&mem);
         let old = self.cache_mib();
         // Only give memory back when the OS is actually short. Shrinking
         // unconditionally before Core resumes reduces the cache exactly when
         // the index is about to compete for random reads.
-        if mem.available_mib >= self.reserve_mib.saturating_add(old / 4) {
+        if mem.available_mib >= reserve.saturating_add(old / 4) {
             return;
         }
         let live = (old * 3 / 4)
@@ -2079,7 +2093,7 @@ impl Tunables {
         eprintln!(
             "[e-lite] memory: Core is about to resume; cache {} -> {} MiB \
              (available {}, buff/cache {}, reserve {})",
-            old, live, mem.available_mib, mem.cached_mib, self.reserve_mib
+            old, live, mem.available_mib, mem.cached_mib, reserve
         );
     }
 
@@ -2101,8 +2115,11 @@ impl Tunables {
         )
     }
 
-    /// Export current hot values and metrics to the shared status.
-    pub fn publish(&self, stats: &Stats) {
+    /// Export current hot values and metrics to the shared status. The store
+    /// provides the RocksDB-side memory that does not live in the block cache
+    /// (memtable, table readers); without it the memory plan is not a real
+    /// budget.
+    pub fn publish(&self, store: &Store, stats: &Stats) {
         stats
             .tuning_readers
             .store(self.readers() as u64, Ordering::Relaxed);
@@ -2246,6 +2263,23 @@ impl Tunables {
             self.memtables_mib.load(Ordering::Relaxed),
             Ordering::Relaxed,
         );
+        let rs = store.compaction_stats();
+        // The planned memtable budget and the memory RocksDB actually holds
+        // are not the same value, and table readers live outside the block
+        // cache. Both must be visible or the cache looks over-budgeted.
+        stats
+            .mem_memtable_bytes_mib
+            .store(rs.memtable_bytes / (1024 * 1024), Ordering::Relaxed);
+        stats
+            .mem_table_readers_mib
+            .store(rs.table_readers_bytes / (1024 * 1024), Ordering::Relaxed);
+        let mem = memory_info();
+        stats
+            .mem_effective_mib
+            .store(self.total_mib.min(mem.available_mib), Ordering::Relaxed);
+        stats
+            .mem_dynamic_reserve_mib
+            .store(self.dynamic_reserve_mib(&mem), Ordering::Relaxed);
         stats
             .mem_reserve_mib
             .store(self.reserve_mib, Ordering::Relaxed);
@@ -2807,6 +2841,15 @@ fn auto_reserve_mib(total_mib: u64) -> u64 {
     }
 }
 
+/// Hot reserve for the block cache. `MemAvailable` already excludes e-lite's
+/// resident memory; the reserve is only for the OS/page cache, so it must
+/// shrink with available memory instead of staying at the startup value.
+fn dynamic_reserve_for(startup_reserve_mib: u64, available_mib: u64) -> u64 {
+    (available_mib / 2)
+        .max(1024)
+        .min(startup_reserve_mib.max(1))
+}
+
 /// Core's `-dbcache` from what the OS can give it, not from the installed RAM.
 /// 8 GiB boxes get ~1 GiB, 16 GiB ~2 GiB and 32 GiB 4 GiB, but a machine with
 /// little free memory gets a smaller cache instead of swapping.
@@ -3282,6 +3325,22 @@ mod tests {
         assert_eq!(minimum_ram_mib(Chain::Regtest), 3_800);
         assert_eq!(minimum_ram_mib(Chain::Signet), 3_800);
         assert_eq!(minimum_ram_mib(Chain::Testnet4), 3_800);
+    }
+
+    #[test]
+    fn dynamic_reserve_shrinks_with_available_memory() {
+        // Available 2.87 GiB (the log): reserve falls from 3 GiB to 1.4 GiB.
+        // The reserve floors at 1 GiB, not at 512 MiB: below that the OS and
+        // the page cache need priority.
+        for startup in [3_066u64, 4_096, 999_999] {
+            assert_eq!(dynamic_reserve_for(startup, 2_870), 1_435);
+            assert_eq!(dynamic_reserve_for(startup, 1_000), 1_024);
+            assert_eq!(dynamic_reserve_for(startup, 0), 1_024);
+        }
+        assert_eq!(dynamic_reserve_for(3_066, 6_900), 3_066);
+        assert_eq!(dynamic_reserve_for(4_096, 6_900), 3_450);
+        // An operator reserve can still be lower than available/2.
+        assert_eq!(dynamic_reserve_for(1_024, 6_900), 1_024);
     }
 
     #[test]

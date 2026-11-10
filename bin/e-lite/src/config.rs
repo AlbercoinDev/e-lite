@@ -219,6 +219,11 @@ pub struct IndexCfg {
     /// path falls back to point lookups for prevouts not prefetched in time.
     #[serde(default)]
     pub prefetch_deadline_ms: u64,
+    /// RocksDB `max_open_files` (fds kept for table/index/filter readers).
+    /// 0 = 8192; lowering to 2048/4096 shrinks `table_readers` memory on
+    /// 8-16 GiB hosts, at the cost of reopened table readers.
+    #[serde(default)]
+    pub max_open_files: u32,
     /// RAM left for the OS, Core and page cache, in MiB. 0 = auto
     /// (`max(1024, RAM/8)`).
     #[serde(default)]
@@ -259,6 +264,7 @@ impl Default for IndexCfg {
             write_buffer_mib: 0,
             adaptive_memtables: false,
             prefetch_deadline_ms: 0,
+            max_open_files: 0,
             memory_reserve_mib: 0,
             memory_fraction: 0.0,
             allow_low_memory: false,
@@ -1012,6 +1018,9 @@ impl Config {
                 return Err("[core] io_priority must be 0..7".to_string());
             }
         }
+        if self.index.max_open_files > 0 && self.index.max_open_files < 256 {
+            return Err("[index] max_open_files must be 0 (auto) or >= 256".to_string());
+        }
         if let Some(weight) = self.core.cgroup_io_weight {
             if !(1..=10_000).contains(&weight) {
                 return Err("[core] cgroup_io_weight must be 1..10000".to_string());
@@ -1418,6 +1427,13 @@ mod tests {
         assert!(bad.validate().is_err());
         bad.index.prefetch_deadline_ms = 500;
         assert!(bad.validate().is_ok());
+        let mut fds = Config::default();
+        fds.index.max_open_files = 128;
+        assert!(fds.validate().is_err());
+        fds.index.max_open_files = 0;
+        assert!(fds.validate().is_ok());
+        fds.index.max_open_files = 2048;
+        assert!(fds.validate().is_ok());
         let mut prio = Config::default();
         prio.core.io_priority = Some(8);
         assert!(prio.validate().is_err());
