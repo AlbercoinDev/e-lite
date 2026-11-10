@@ -296,8 +296,10 @@ inflate the `WriteBatch`.
   into 512-key chunks and stops after the deadline; apply falls back to point
   lookups. It trades a tail reader for more apply work.
 - `[core] io_priority = 0..7` applies best-effort `ionice` to a Core launched
-  or adopted by e-lite. It is a no-op/warning if `ionice` is unavailable or the
-  kernel scheduler ignores priorities (NVMe `none`).
+  or adopted by e-lite. `[core] cgroup_io_weight = 1..10000` additionally tries
+  to place Core in `e-lite-core` under the current cgroup v2 and set
+  `io.weight`; it requires a delegated `io` controller. Both are warnings, not
+  fatal, when the kernel/filesystem does not support them (NVMe `none`).
 - Prevout lookup uses `batched_multi_get_cf` over deduplicated, sorted keys.
 - **Commits in bulk are deliberately infrequent**: transactions (250k), blocks
   (512), raw bytes (`clamp(RAM/128, 64-256 MiB)`) or time (20 s NVMe, 30 s
@@ -496,13 +498,13 @@ The bottleneck on this host was the wallet used to mine dense blocks (UTXO
 scan), not e-lite; the synthetic chain is much smaller than mainnet, so these
 numbers compare variants, not real chain throughput.
 
-Normal pruning runs every `min_gain_blocks` safe blocks (default **1,000**) and
-is not deferred by free space by default (`prune_defer_free_gib = 0`). At an
-average mainnet block size of ~1.5 MiB, 1,000 blocks is roughly 1.5 GiB of
-retained tail before Core rounds the cut to whole block files; 10,000 blocks was
-roughly 15 GiB. Increase the gain only if prune I/O is a measured problem.
-Low-disk emergency pruning still runs. `--core-arg` can also reduce Core's
-memory/IO footprint (for example `--core-arg=-dbcache=128`).
+Normal pruning runs every `min_gain_blocks` safe blocks (default **5,000**) and
+keeps a 20 GiB free-space margin by default (`prune_defer_free_gib = 20`). At
+an average mainnet block size of ~1.5 MiB, 5,000 blocks is roughly 7.5 GiB of
+retained tail before Core rounds the cut to whole block files. Increase the
+gain only if prune I/O is a measured problem. Low-disk emergency pruning still
+runs. `--core-arg` can also reduce Core's memory/IO footprint (for example
+`--core-arg=-dbcache=128`).
 
 `commit_sync = auto` (default) uses `txids` durability during bulk/IBD and
 strict `always` when live. `txids` still fsyncs `txids.dat`; a crash can only

@@ -64,6 +64,7 @@ reorg_window = 8
 min_free_gib = 1
 max_core_lag_blocks = 64
 min_gain_blocks = 288
+prune_defer_free_gib = 0
 poll_seconds = 1
 
 [server]

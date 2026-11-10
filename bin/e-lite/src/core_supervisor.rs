@@ -37,6 +37,86 @@ fn apply_io_priority(pid: u32, priority: Option<u8>) {
     }
 }
 
+/// cgroup v2 path of the current process from `/proc/self/cgroup`
+/// (`0::/user.slice/...`).
+fn cgroup_v2_relative(text: &str) -> Option<String> {
+    for line in text.lines() {
+        let mut fields = line.splitn(3, ':');
+        let Some(_id) = fields.next() else { continue };
+        let Some(controllers) = fields.next() else {
+            continue;
+        };
+        let Some(path) = fields.next() else { continue };
+        if controllers.is_empty() {
+            return Some(path.trim_start_matches('/').to_string());
+        }
+    }
+    None
+}
+
+/// cgroup2 mount point from `/proc/self/mountinfo`.
+fn cgroup2_mount_from(text: &str) -> Option<PathBuf> {
+    for line in text.lines() {
+        let Some((pre, post)) = line.split_once(" - ") else {
+            continue;
+        };
+        if !post.starts_with("cgroup2 ") {
+            continue;
+        }
+        let fields: Vec<&str> = pre.split_whitespace().collect();
+        if fields.len() >= 5 {
+            return Some(PathBuf::from(unescape_mount_path(fields[4])));
+        }
+    }
+    None
+}
+
+fn unescape_mount_path(s: &str) -> String {
+    s.replace("\\040", " ")
+        .replace("\\011", "\t")
+        .replace("\\012", "\n")
+        .replace("\\134", "\\")
+}
+
+/// Put Core in a child cgroup and set its `io.weight`. Best effort: cgroup v2
+/// delegation is often unavailable inside containers; the caller logs and
+/// keeps `ionice` as the fallback.
+fn apply_cgroup_io(pid: u32, weight: Option<u64>) -> Result<(), String> {
+    let Some(weight) = weight else {
+        return Ok(());
+    };
+    let cgroup_text = std::fs::read_to_string("/proc/self/cgroup")
+        .map_err(|e| format!("/proc/self/cgroup: {e}"))?;
+    let rel = cgroup_v2_relative(&cgroup_text)
+        .ok_or_else(|| "cgroup v2 hierarchy not detected".to_string())?;
+    let mount_text =
+        std::fs::read_to_string("/proc/self/mountinfo").map_err(|e| format!("mountinfo: {e}"))?;
+    let mount =
+        cgroup2_mount_from(&mount_text).ok_or_else(|| "cgroup2 mount not found".to_string())?;
+    let parent = if rel.is_empty() {
+        mount
+    } else {
+        mount.join(unescape_mount_path(&rel))
+    };
+    let child = parent.join("e-lite-core");
+    std::fs::create_dir_all(&child).map_err(|e| format!("create {}: {e}", child.display()))?;
+    // Enable the io controller for children when the parent allows it. If the
+    // file is absent/read-only, io.weight below will tell us.
+    let _ = std::fs::write(parent.join("cgroup.subtree_control"), "+io\n");
+    let weight_file = child.join("io.weight");
+    if !weight_file.exists() {
+        return Err(format!(
+            "{} is not available (io controller not delegated)",
+            weight_file.display()
+        ));
+    }
+    std::fs::write(&weight_file, format!("default {weight}\n"))
+        .map_err(|e| format!("write {}: {e}", weight_file.display()))?;
+    std::fs::write(child.join("cgroup.procs"), format!("{pid}\n"))
+        .map_err(|e| format!("move pid {pid} to {}: {e}", child.display()))?;
+    Ok(())
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CoreStartOutcome {
     /// `manage = external`: e-lite never starts Core.
@@ -60,6 +140,7 @@ pub struct CoreSupervisor {
     prune_mib: u64,
     extra_args: Vec<String>,
     io_priority: Option<u8>,
+    cgroup_io_weight: Option<u64>,
     /// Parameters derived from the machine's resources (dbcache/par/...).
     plan_args: Vec<String>,
     restart: bool,
@@ -84,6 +165,7 @@ impl CoreSupervisor {
             prune_mib: cfg.core.prune_mib,
             extra_args: cfg.core.extra_args.clone(),
             io_priority: cfg.core.io_priority,
+            cgroup_io_weight: cfg.core.cgroup_io_weight,
             plan_args: match core_plan::plan_core(cfg, chain) {
                 Ok(plan) => plan.args,
                 Err(e) => {
@@ -154,6 +236,11 @@ impl CoreSupervisor {
                         self.pid_file.display()
                     );
                     apply_io_priority(pid, self.io_priority);
+                    if let Err(e) = apply_cgroup_io(pid, self.cgroup_io_weight) {
+                        if self.cgroup_io_weight.is_some() {
+                            eprintln!("[e-lite] WARNING: cgroup I/O priority unavailable: {e}");
+                        }
+                    }
                     return Ok(CoreStartOutcome::Adopted);
                 }
                 let _ = fs::remove_file(&self.pid_file);
@@ -251,6 +338,11 @@ impl CoreSupervisor {
         self.backoff = 1;
         self.last_error = None;
         apply_io_priority(pid, self.io_priority);
+        if let Err(e) = apply_cgroup_io(pid, self.cgroup_io_weight) {
+            if self.cgroup_io_weight.is_some() {
+                eprintln!("[e-lite] WARNING: cgroup I/O priority unavailable: {e}");
+            }
+        }
         let token = process_start_token(pid);
         if let Err(e) = fs::write(&self.pid_file, format!("{pid} {token}")) {
             eprintln!(
@@ -456,6 +548,23 @@ fn kill(_pid: u32) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cgroup_v2_path_and_mount_are_parsed() {
+        assert_eq!(
+            cgroup_v2_relative("0::/user.slice/e-lite.service\n"),
+            Some("user.slice/e-lite.service".to_string())
+        );
+        assert_eq!(
+            cgroup_v2_relative("12:memory:/x\n0::/docker/abc\n"),
+            Some("docker/abc".to_string())
+        );
+        let mount = "30 25 0:26 / /sys/fs/cgroup rw,nosuid - cgroup2 cgroup2 rw\n";
+        assert_eq!(
+            cgroup2_mount_from(mount),
+            Some(PathBuf::from("/sys/fs/cgroup"))
+        );
+    }
 
     #[test]
     fn external_never_starts() {

@@ -1,9 +1,9 @@
 # Session handoff
 
 **Updated:** 2026-11-10
-**Latest published release:** `0.1.0-alpha.29.8.3`
-**Release:** https://github.com/AlbercoinDev/e-lite/releases/tag/v0.1.0-alpha.29.8.3
-**Main commit at handoff:** tag `v0.1.0-alpha.29.8.3`
+**Latest published release:** `0.1.0-alpha.29.8.4`
+**Release:** https://github.com/AlbercoinDev/e-lite/releases/tag/v0.1.0-alpha.29.8.4
+**Main commit at handoff:** tag `v0.1.0-alpha.29.8.4`
 
 This file is the short “where we are” for a new session. The invariants live in
 [`AGENTS.md`](../AGENTS.md) and [`PROJECT_MEMORY.md`](PROJECT_MEMORY.md); the
@@ -86,6 +86,29 @@ no repitas contexto ni rehagas decisiones ya documentadas.
   the onion setup, reset and security.
 - `docs/ROADMAP.md` contains future features/improvements. Do not present them as
   available.
+
+## Last change (alpha.29.8.4)
+
+cgroup v2 I/O priority, prune defaults and the A/B harness.
+
+- **`core.cgroup_io_weight`**: best-effort `e-lite-core` child cgroup with
+  `io.weight` for launched/adopted Core; warning if delegation/`io` is absent,
+  `ionice` remains the fallback.
+- **Prune defaults**: 20 GiB free-space deferral and 5,000-safe-block gain;
+  emergency low-disk pruning bypasses both. The pruned-IBD e2e pins
+  `prune_defer_free_gib = 0` because it must observe the gate.
+- **`tests/ab_umbrel.sh` + `docs/AB_TESTS.md`**: labelled sampling CSV, phase
+  rates and the readers/cache/bulk/alternate matrix. Smoke-tested locally;
+  the mainnet/Umbrel run is the user's measurement.
+- Tests: fmt, clippy, workspace (229), e2e defaults/regtest/pruned/recovery/
+  multi/launch.
+
+### Not decided in 29.8.4
+
+- readers/cache/`max_bulk`/`alternate` defaults require the Umbrel A/B; the
+  harness and thresholds are ready.
+- `adaptive_memtables`, `prefetch_deadline_ms`, `io_priority` and
+  `cgroup_io_weight` remain opt-in.
 
 ## Last change (alpha.29.8.3)
 

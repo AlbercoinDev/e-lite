@@ -131,14 +131,15 @@ e-lite run --network mainnet --allow-mainnet \
 | `--core-resume-ahead-blocks <n>` | `pruning.core_resume_ahead_blocks` | `5000` (legacy) |
 | `--core-resume-ahead-gib <n>` | `pruning.core_resume_ahead_gib` | `7` |
 | `--scheduler <mode>` | `pruning.scheduler` | `overlap` |
-| `--prune-defer-free-gib <n>` | `pruning.prune_defer_free_gib` | `0` |
-| `--min-gain-blocks <n>` | `pruning.min_gain_blocks` | `1000` |
+| `--prune-defer-free-gib <n>` | `pruning.prune_defer_free_gib` | `20` |
+| `--min-gain-blocks <n>` | `pruning.min_gain_blocks` | `5000` |
 | `--prune-interval-seconds <n>` | `pruning.prune_interval_seconds` | `30` |
 | `--poll-seconds <n>` | `pruning.poll_seconds` | `10` |
 | `--repair-max-gap-blocks <n>` | `pruning.repair_max_gap_blocks` | `2048` |
 | `--allow-auto-prune` | `pruning.allow_auto_prune` | `false` |
 | `--core-arg <arg>` | `core.extra_args` (appended) | none |
 | `--core-io-priority <0-7>` | `core.io_priority` | unset (opt-in ionice) |
+| `--core-cgroup-io-weight <n>` | `core.cgroup_io_weight` | unset (opt-in cgroup v2 io.weight) |
 | `--stop-on-exit` / `--no-stop-on-exit` | `core.stop_on_exit` | `true` |
 | `--restart` / `--no-restart` | `core.restart` | `true` |
 
@@ -162,8 +163,9 @@ default.
 still fsynced, so a crash only reindexes the last interval) and returns to
 strict `sync=true` when live. Use `always` or `txids` to force a policy.
 
-Normal pruning is not deferred by free space by default
-(`prune_defer_free_gib = 0`); the 1k-block gain and 30 s interval still apply.
+Normal pruning keeps a 20 GiB free-space margin by default
+(`prune_defer_free_gib = 20`); the 5k-block gain and 30 s interval still apply.
+Low disk bypasses the deferral.
 Set a positive value to defer normal pruning on a large disk.
 
 Low-RAM Core example:

@@ -287,9 +287,9 @@ security model.
 | `>=550` | Core automatic pruning; requires `allow_auto_prune = true` |
 
 Manual mode: the prune gate uses min(`index - 288`, readers, `tip - 288`) and
-throttles requests. By default it evaluates pruning every **10,000** safe blocks
-(`min_gain_blocks`); free-space deferral is off by default
-(`prune_defer_free_gib = 0`). Low disk still triggers an emergency prune.
+throttles requests. By default it evaluates pruning every **5,000** safe blocks
+(`min_gain_blocks`) and keeps a 20 GiB free-space margin
+(`prune_defer_free_gib = 20`). Low disk still triggers an emergency prune.
 Core may return a lower height because it prunes whole files.
 
 During a long bulk catch-up, Core is paused by default

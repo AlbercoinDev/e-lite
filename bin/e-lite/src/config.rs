@@ -132,6 +132,10 @@ pub struct CoreCfg {
     /// to a Core launched/adopted by e-lite. None leaves the priority alone.
     #[serde(default)]
     pub io_priority: Option<u8>,
+    /// Best-effort cgroup v2 `io.weight` (1-10000) for Core. Requires a
+    /// delegated cgroup with the io controller; failure is a warning.
+    #[serde(default)]
+    pub cgroup_io_weight: Option<u64>,
     /// Restart a Core process launched by e-lite if it exits unexpectedly.
     #[serde(default = "d_true")]
     pub restart: bool,
@@ -163,6 +167,7 @@ impl Default for CoreCfg {
             prune_mib: d_prune_mib(),
             extra_args: Vec::new(),
             io_priority: None,
+            cgroup_io_weight: None,
             restart: true,
             stop_on_exit: true,
             log_file: None,
@@ -688,9 +693,9 @@ fn d_max_lag() -> u32 {
     192
 }
 fn d_min_gain() -> u32 {
-    // Core deletes whole block files anyway. 1k safe blocks (~1.5 GiB on
-    // mainnet) keeps the retained tail small without meaningful prune churn.
-    1_000
+    // Core deletes whole block files anyway. 5k safe blocks (~7.5 GiB on
+    // mainnet) reduces prune churn and the commit-boundary barrier frequency.
+    5_000
 }
 fn d_max_bulk_lag() -> u32 {
     20_000
@@ -720,9 +725,10 @@ fn listener_host(addr: &str) -> String {
     }
 }
 fn d_prune_defer_free() -> u64 {
-    // Space-first default: do not defer normal pruning just because the disk
-    // is large. `min_gain_blocks` still suppresses churn.
-    0
+    // Keep a 20 GiB free-space margin before normal pruning; low-space
+    // emergency pruning still bypasses the deferral. On a large disk this
+    // avoids pruning every 1k blocks while Core is writing.
+    20
 }
 fn d_prune_interval() -> u64 {
     30
@@ -1004,6 +1010,11 @@ impl Config {
         if let Some(prio) = self.core.io_priority {
             if prio > 7 {
                 return Err("[core] io_priority must be 0..7".to_string());
+            }
+        }
+        if let Some(weight) = self.core.cgroup_io_weight {
+            if !(1..=10_000).contains(&weight) {
+                return Err("[core] cgroup_io_weight must be 1..10000".to_string());
             }
         }
         if !matches!(self.pruning.scheduler.as_str(), "overlap" | "alternate") {
@@ -1314,8 +1325,9 @@ mod tests {
     }
 
     #[test]
-    fn prune_gain_default_is_one_thousand_blocks() {
-        assert_eq!(Config::default().pruning.min_gain_blocks, 1_000);
+    fn prune_defaults_defer_and_gain_are_bounded() {
+        assert_eq!(Config::default().pruning.min_gain_blocks, 5_000);
+        assert_eq!(Config::default().pruning.prune_defer_free_gib, 20);
     }
 
     #[test]
@@ -1411,5 +1423,10 @@ mod tests {
         assert!(prio.validate().is_err());
         prio.core.io_priority = Some(7);
         assert!(prio.validate().is_ok());
+        let mut cg = Config::default();
+        cg.core.cgroup_io_weight = Some(0);
+        assert!(cg.validate().is_err());
+        cg.core.cgroup_io_weight = Some(100);
+        assert!(cg.validate().is_ok());
     }
 }

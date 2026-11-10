@@ -54,13 +54,13 @@ Never treat a version number in this file as authoritative over the code/tag.
 
 - From-zero pruned IBD uses `prune_mib = 1` (manual pruning). Core never prunes
   on its own; the prune gate keeps the cut below `index - 288` and evaluates
-  pruning every 10,000 safe blocks by default (low disk bypasses it).
+  pruning every 5,000 safe blocks by default (low disk bypasses it).
 - `prune_mib >= 550` requires `[pruning] allow_auto_prune = true`.
 - Snapshots are optional; they are never required by the from-zero flow.
 - Long bulk catch-up pauses Core by default and resumes at 7 GiB of unindexed
-  backlog (legacy: 5,000 blocks) to pre-warm peers; normal pruning is not
-  deferred by free space by default (`prune_defer_free_gib = 0`), only by the
-  1k-block gain and 30 s interval.
+  backlog (legacy: 5,000 blocks) to pre-warm peers; normal pruning keeps a
+  20 GiB free-space margin by default (`prune_defer_free_gib = 20`) and runs
+  every 5k safe blocks / 30 s.
 - Never authorise a Core prune from a tip that is not durable: flush RocksDB/WAL
   first. A failed prune RPC must retry the same safe height after backoff.
 - Undo is generated for **every** applied block and pruned at commit time from
@@ -92,7 +92,7 @@ Never treat a version number in this file as authoritative over the code/tag.
 - Drop locators for deleted `blk*.dat` files (sidecar compaction at open and
   in-memory filtering after prune) and only hold a ReaderTracker guard when the
   block is still at/above Core's prune height; external resolutions must not
-  block pruning. `min_gain_blocks` defaults to 1,000 for the disk-first goal.
+  block pruning. `min_gain_blocks` defaults to 5,000 for the disk-first goal.
 - Pause/resume state must reflect `setnetworkactive` success; never let a lag
   resume override a disk pause. Start indexing before the provider gate so a
   provider outage cannot stop local block progress.
@@ -249,8 +249,10 @@ Never treat a version number in this file as authoritative over the code/tag.
   Core state (`reader_pressure` may pause immediately). The block-size average
   is 1/1024, not 1/8. An opt-in `prefetch_deadline_ms` stops chunked prefetch
   after the deadline and leaves missing prevouts to the apply fallback.
-- `[core] io_priority` is best-effort `ionice` for a Core e-lite owns; failure
-  or an unsupported scheduler is a warning, never fatal.
+- `[core] io_priority` is best-effort `ionice` for a Core e-lite owns;
+  `[core] cgroup_io_weight` additionally tries a cgroup v2 `e-lite-core`
+  child with `io.weight`. Failure or an unsupported scheduler is a warning,
+  never fatal.
 - `IbdLock` must be acquired **before** the first `catch_up_limited` call when
   Core is in IBD or the lag exceeds 5,000 blocks; a first 512-block call can
   otherwise run for minutes without the intensive-sync slot. The lock is

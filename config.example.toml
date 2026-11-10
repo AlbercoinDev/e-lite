@@ -34,6 +34,7 @@ extra_args = []                     # e.g. ["-dbcache=1024"]; e-lite adds a fitt
 restart = true                      # restart a Core launched by e-lite
 stop_on_exit = true                 # stop only a Core launched by e-lite
 # io_priority = 7                   # opt-in best-effort ionice for managed Core (0-7)
+# cgroup_io_weight = 100            # opt-in cgroup v2 io.weight (1-10000; needs delegation)
 # log_file = ""                     # default <data-dir>/bitcoind.log
 
 [index]
@@ -75,8 +76,8 @@ scheduler = "overlap"               # overlap (e-lite indexes while Core downloa
                                     # | alternate (take turns; opt-in, needs
                                     # prune_mib = 1 and
                                     # pause_core_during_bulk = true)
-prune_defer_free_gib = 0            # 0 = prune whenever the safe height allows
-min_gain_blocks = 1000               # evaluate/execute prune every ~1k safe blocks
+prune_defer_free_gib = 20           # keep 20 GiB free before normal pruning (low disk bypasses)
+min_gain_blocks = 5000              # evaluate/execute prune every ~5k safe blocks
 prune_interval_seconds = 30         # minimum time between prune requests (low disk bypasses)
 repair_max_gap_blocks = 2048        # auto-repair a prune gap from verified sources
 poll_seconds = 10

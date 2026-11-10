@@ -250,6 +250,7 @@ struct Args {
     banner_file: Option<String>,
     core_args: Vec<String>,
     core_io_priority: Option<u8>,
+    core_cgroup_io_weight: Option<u64>,
     p2p_peers: Option<String>,
     no_p2p: bool,
     no_esplora: bool,
@@ -393,6 +394,9 @@ fn parse_args() -> R<Args> {
             "--core-arg" => args.core_args.push(value("--core-arg")?),
             "--core-io-priority" => {
                 args.core_io_priority = Some(value("--core-io-priority")?.parse()?)
+            }
+            "--core-cgroup-io-weight" => {
+                args.core_cgroup_io_weight = Some(value("--core-cgroup-io-weight")?.parse()?)
             }
             "--p2p-peers" => args.p2p_peers = Some(value("--p2p-peers")?),
             "--decoys" => args.decoys = Some(value("--decoys")?.parse()?),
@@ -654,6 +658,9 @@ fn effective_config(args: &Args) -> R<(Config, Chain)> {
     }
     if let Some(v) = args.core_io_priority {
         cfg.core.io_priority = Some(v);
+    }
+    if let Some(v) = args.core_cgroup_io_weight {
+        cfg.core.cgroup_io_weight = Some(v);
     }
     if let Some(v) = &args.p2p_peers {
         cfg.rawtx.p2p_peers = v
@@ -1279,6 +1286,7 @@ PRUNING AND CORE:
     --allow-auto-prune          opt in to prune_mib >= 550 (automatic pruning)
     --core-arg <arg>            extra bitcoind argument (repeatable)
     --core-io-priority <0-7>    best-effort ionice for managed Core (opt-in)
+    --core-cgroup-io-weight <n> best-effort cgroup v2 io.weight (opt-in)
     --stop-on-exit / --no-stop-on-exit
     --restart / --no-restart
 

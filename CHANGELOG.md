@@ -1,5 +1,40 @@
 # Changelog
 
+## 0.1.0-alpha.29.8.4 — 2026-11-10
+
+### cgroup I/O priority, prune defaults and the A/B harness
+
+No schema, protocol or consensus change.
+
+**cgroup v2 I/O priority.** `[core] cgroup_io_weight = 1..10000` (CLI
+`--core-cgroup-io-weight`) creates an `e-lite-core` child under the current
+cgroup v2, enables `+io` where permitted, writes `io.weight` and moves a Core
+that e-lite launches or adopts into it. It is best-effort: without delegation
+or the `io` controller it logs a warning; `ionice` remains the fallback.
+
+**Prune deferral defaults.** Normal pruning now keeps a **20 GiB** free-space
+margin (`prune_defer_free_gib = 20`) and advances every **5,000** safe blocks
+(`min_gain_blocks = 5000`). Low-disk emergency pruning still bypasses both.
+`tests/e2e_pruned_ibd.sh` sets `prune_defer_free_gib = 0` explicitly because it
+must observe the gate on a small temporary disk.
+
+**A/B harness.** `tests/ab_umbrel.sh` samples `/status` for a labelled run and
+writes a CSV with phase rate, backlog, cache/memtables, readers, p95, commit
+group/reason and state. `docs/AB_TESTS.md` defines the baseline/readers/cache/
+bulk/alternate matrix and the decision thresholds. The A/B itself must run on
+the Umbrel; this release provides and validates the harness.
+
+Tests: fmt, clippy, workspace (229), e2e defaults/regtest/pruned/recovery/
+multi/launch. The cgroup parser has unit tests; the A/B script was smoke-tested
+against a local regtest `/status`.
+
+### Not done automatically
+
+- The actual mainnet/Umbrel A/B decisions (readers, cache, `max_bulk`,
+  `alternate`) need the user's machine; defaults remain conservative.
+- `adaptive_memtables`, `prefetch_deadline_ms`, `io_priority` and
+  `cgroup_io_weight` are opt-in.
+
 ## 0.1.0-alpha.29.8.3 — 2026-11-10
 
 ### Adaptive memtables, prefetch deadline, ionice and explicit ZFS/overlay

@@ -35,9 +35,9 @@ the per-client rate limiter are implemented; client authentication is not.
 ## Safety defaults
 
 - `prune_mib = 1` for from-zero pruned IBD; `prune_mib >= 550` needs
-  `allow_auto_prune = true`. The prune gate advances in 1,000-safe-block steps
-  with a 30 s minimum interval and no free-space deferral by default; low disk
-  triggers an emergency prune.
+  `allow_auto_prune = true`. The prune gate advances in 5,000-safe-block steps
+  with a 30 s minimum interval and a 20 GiB free-space deferral by default; low
+  disk triggers an emergency prune.
 - Snapshots are optional, never required by the from-zero flow.
 - Electrum binds per-network ports (55011/55022/55084 mainnet, 55111/55122/
   55184 testnet4, 55211/55222/55284 signet, 55311/55322/55384 regtest) on
