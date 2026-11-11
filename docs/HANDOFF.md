@@ -1,9 +1,9 @@
 # Session handoff
 
 **Updated:** 2026-11-11
-**Latest published release:** `0.1.0-alpha.29.8.8`
-**Release:** https://github.com/AlbercoinDev/e-lite/releases/tag/v0.1.0-alpha.29.8.8
-**Main commit at handoff:** tag `v0.1.0-alpha.29.8.8`
+**Latest published release:** `0.1.0-alpha.29.8.9`
+**Release:** https://github.com/AlbercoinDev/e-lite/releases/tag/v0.1.0-alpha.29.8.9
+**Main commit at handoff:** tag `v0.1.0-alpha.29.8.9`
 
 This file is the short “where we are” for a new session. The invariants live in
 [`AGENTS.md`](../AGENTS.md) and [`PROJECT_MEMORY.md`](PROJECT_MEMORY.md); the
@@ -86,6 +86,35 @@ no repitas contexto ni rehagas decisiones ya documentadas.
   the onion setup, reset and security.
 - `docs/ROADMAP.md` contains future features/improvements. Do not present them as
   available.
+
+## Last change (alpha.29.8.9)
+
+The index now reaches the tip: the last-blocks stall and honest READY.
+
+- **Bug**: with fewer blocks left than the commit minimum, each 500 ms
+  catch-up call rebuilt the same 2-block target list and the end-of-call
+  commit could be skipped — Ok without progress, no log line, forever. Seen
+  on mainnet as 85+ min at `lag 2` with no `READY` and "(100.0%)" on screen.
+- **Fixes**: a clean end-of-call always commits the applied prefix (under
+  disk pressure it commits first and logs a `debug:` line); the reader wait
+  is bounded (10 s + `debug:`); readers return their permit at the end of
+  the target list; `debug: pipeline:` traces every call (rate-limited
+  no-progress note at the tail).
+- **READY correctness**: `sync.ready` now requires Core out of IBD (the
+  spurious "READY ... Core still in IBD" lines are gone; the state machine
+  already excluded it). The height line caps at 99.9 % while blocks remain;
+  `FULLY SYNCED` is the real 100 %. READY/FULLY SYNCED lines include the
+  session time.
+- Full-sync timing from the console log: 0 → 975409 took 4 d 9 h 12 min
+  wall (~17 sessions, Core IBD in parallel); the last drain was 23m18s at
+  ~3.4 blocks/s before the tail stall.
+- Tests: fmt, clippy, workspace (232).
+
+### Not decided in 29.8.9
+
+- The exact reader-level root cause of the tail silence: the bounded wait
+  plus the `pipeline:` debug lines will show it in the next occurrence; the
+  symptom (no commits at the tail) is now structurally impossible.
 
 ## Last change (alpha.29.8.8)
 

@@ -58,12 +58,19 @@ fn format_local_time(t: SystemTime) -> String {
     )
 }
 
-fn readiness_line(shared: &Shared, sync: &el_serve::SyncStatus, tls: &str, fully: bool) -> String {
+fn readiness_line(
+    shared: &Shared,
+    sync: &el_serve::SyncStatus,
+    tls: &str,
+    fully: bool,
+    session: &str,
+) -> String {
     let log = shared.log_file.display();
     if fully {
         format!(
-            "[e-lite] FULLY SYNCED: height {}/{}; Electrum {}{}; log {}",
-            sync.height, sync.headers, shared.listen, tls, log
+            "[e-lite] FULLY SYNCED: height {}/{}; session {} (indexing and serving since \
+             the start); Electrum {}{}; log {}",
+            sync.height, sync.headers, session, shared.listen, tls, log
         )
     } else if sync.offline {
         format!(
@@ -81,9 +88,9 @@ fn readiness_line(shared: &Shared, sync: &el_serve::SyncStatus, tls: &str, fully
             "Core caught up".to_string()
         };
         format!(
-            "[e-lite] READY: index caught up to Core at height {} ({} headers; {}); \
+            "[e-lite] READY: index caught up to Core at height {} ({} headers; {}; session {}); \
              Electrum {}{}; log {}",
-            sync.height, sync.headers, note, shared.listen, tls, log
+            sync.height, sync.headers, note, session, shared.listen, tls, log
         )
     }
 }
@@ -2084,6 +2091,8 @@ struct Indexer {
     core_datadir: std::path::PathBuf,
     blocks_dir: std::path::PathBuf,
     last_disk_check: Mutex<Instant>,
+    /// Rate limit for the no-progress pipeline note (10 s).
+    last_pipeline_note: Mutex<Option<Instant>>,
     progress_started: Instant,
     progress_start_height: u64,
     progress_start_txnum: u64,
@@ -2220,6 +2229,7 @@ impl Indexer {
                     .checked_sub(Duration::from_secs(60))
                     .unwrap_or_else(Instant::now),
             ),
+            last_pipeline_note: Mutex::new(None),
             progress_started: now,
             progress_start_height: start_height,
             progress_start_txnum: start_txnum,
@@ -3475,8 +3485,22 @@ impl Indexer {
         let wanted = target - start + 1;
         let hashes = self.core.block_hashes(start, wanted)?;
         if hashes.is_empty() {
+            crate::debug_log!(
+                "pipeline: block_hashes({start}, {wanted}) returned empty; core tip {core_tip}"
+            );
             self.refresh_core_height();
             return Ok(committed_height);
+        }
+        if wanted >= 64 {
+            // Real-work calls only: at the tail the calls repeat every 500 ms
+            // and the end-note (rate-limited) carries the diagnosis.
+            crate::debug_log!(
+                "pipeline: call start {} target {} wanted {} (bulk {})",
+                start,
+                target,
+                wanted,
+                self.bulk.is_some()
+            );
         }
         let hashes_len = hashes.len();
 
@@ -3517,6 +3541,7 @@ impl Indexer {
             let next_index = Arc::clone(&next_index);
             let stop_thread = Arc::clone(&stop);
             let permit_rx = Arc::clone(&permit_rx);
+            let permit_tx = permit_tx.clone();
             let tx = tx.clone();
             readers.push(std::thread::spawn(move || loop {
                 if stop_thread.load(Ordering::Relaxed) {
@@ -3531,6 +3556,9 @@ impl Indexer {
                 }
                 let i = next_index.fetch_add(1, Ordering::Relaxed);
                 if i >= hashes.len() {
+                    // Give the permit back: the apply loop is the only other
+                    // producer and this reader is done.
+                    let _ = permit_tx.send(());
                     break;
                 }
                 let h = start + i as u64;
@@ -3607,12 +3635,26 @@ impl Indexer {
             // of an uncommitted group.
             self.run_deferred_prune(supervisor);
             let wait_started = Instant::now();
+            // Bound the wait: a wedged reader (a panic dies silently, an RPC
+            // can stall) must not block the apply loop forever. The next
+            // call has fresh readers; the timeout only makes the stall loud.
+            let wait_deadline = wait_started + Duration::from_secs(10);
             while !pending.contains_key(&next_apply) {
-                match rx.recv() {
+                let Some(remaining) = wait_deadline.checked_duration_since(Instant::now()) else {
+                    crate::debug_log!(
+                        "pipeline: 10 s without block {} from the readers; \
+                         ending the call (items pending {})",
+                        start + next_apply as u64,
+                        pending.len()
+                    );
+                    break;
+                };
+                match rx.recv_timeout(remaining) {
                     Ok((i, item)) => {
                         pending.insert(i, item);
                     }
-                    Err(_) => break,
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
                 }
             }
             self.tunables.record_wait(wait_started.elapsed());
@@ -3809,12 +3851,20 @@ impl Indexer {
             }
         }
 
-        // Commit a partial group only if it contains undo for its tip. A
-        // supervisor-deadline break can leave the group before its undo zone
-        // (large bulk batches); dropping those applied blocks is cheaper than
-        // committing a tip that cannot be rewound. A clean end-of-call always
-        // covers the tip, so no progress is lost there.
-        if result.is_ok() && count > 0 && !paused_by_disk && !self.disk_guard() {
+        // A clean end-of-call always commits the applied prefix. The batch is
+        // already built and undo is written for every applied block, so the
+        // commit is the cheap step; skipping it made the tail refetch the same
+        // blocks every 500 ms call and stall forever a few blocks behind the
+        // tip (no commits, no READY). The disk guard still stops the *next*
+        // call from fetching more.
+        if result.is_ok() && count > 0 {
+            if paused_by_disk || self.disk_guard() {
+                crate::debug_log!(
+                    "pipeline: committing the applied prefix ({} blocks) under \
+                     disk pressure before pausing",
+                    count
+                );
+            }
             let current = tip.expect("tip set");
             let sync = self.commit_sync(info.initialblockdownload, current.height as u64, core_tip);
             let reason = if self.shutdown.load(Ordering::SeqCst) {
@@ -3892,6 +3942,40 @@ impl Indexer {
             sh.stats
                 .pipeline_discarded
                 .fetch_add(discarded, Ordering::Relaxed);
+        }
+        // Make a no-progress call impossible to miss: this is exactly the tail
+        // signature (calls every 500 ms, wanted 2, applied 0, no commits, no
+        // READY). Rate-limited so a real stall prints ~6 lines per minute.
+        if wanted < 64 && applied_total == 0 {
+            let note_at = self.last_pipeline_note.lock().map(|mut s| {
+                let due = s
+                    .map(|at| at.elapsed() >= Duration::from_secs(10))
+                    .unwrap_or(true);
+                if due {
+                    *s = Some(Instant::now());
+                }
+                due
+            });
+            if note_at.unwrap_or(false) {
+                crate::debug_log!(
+                    "pipeline: no progress: committed {} of target {} (wanted {}, \
+                     applied 0, discarded {}, paused_by_disk {}, disk_guard {})",
+                    committed_height,
+                    target,
+                    wanted,
+                    discarded,
+                    paused_by_disk,
+                    self.disk_guard()
+                );
+            }
+        } else if wanted >= 64 {
+            crate::debug_log!(
+                "pipeline: call end committed {} (wanted {}, applied {}, discarded {})",
+                committed_height,
+                wanted,
+                applied_total,
+                discarded
+            );
         }
         result?;
         self.refresh_core_height();
@@ -3977,8 +4061,13 @@ impl Indexer {
         let pct = |value: u64, total: u64| {
             if total == 0 {
                 "?".to_string()
+            } else if value >= total {
+                "100.0%".to_string()
             } else {
-                format!("{:.1}%", (value as f64 / total as f64 * 100.0).min(100.0))
+                // Never round up to 100% while blocks remain: the tail looked
+                // synced at "(100.0%)" with lag 2 and the catch-up event never
+                // became visible. `FULLY SYNCED` is the real 100%.
+                format!("{:.1}%", (value as f64 / total as f64 * 100.0).min(99.9))
             }
         };
         let read_ms = self.tunables.read_ms.load(Ordering::Relaxed);
@@ -5172,10 +5261,11 @@ fn index_loop(
                         .unwrap_or_default();
                     let print_fully = sync.fully_synced && !was_fully_synced;
                     let print_ready = sync.ready && !was_ready && !print_fully;
+                    let session = format_uptime(idx.progress_started.elapsed());
                     if print_fully {
-                        eprintln!("{}", readiness_line(sh, &sync, &tls, true));
+                        eprintln!("{}", readiness_line(sh, &sync, &tls, true, &session));
                     } else if print_ready {
-                        eprintln!("{}", readiness_line(sh, &sync, &tls, false));
+                        eprintln!("{}", readiness_line(sh, &sync, &tls, false, &session));
                     }
                     if sync.fully_synced {
                         was_fully_synced = true;
@@ -5845,7 +5935,13 @@ fn cmd_serve(cfg: &Config, chain: Chain) -> R<()> {
             .unwrap_or_default();
         eprintln!(
             "{}",
-            readiness_line(&shared, &sync, &tls, sync.fully_synced)
+            readiness_line(
+                &shared,
+                &sync,
+                &tls,
+                sync.fully_synced,
+                &format_uptime(shared.stats.started.elapsed()),
+            )
         );
     }
     println!(

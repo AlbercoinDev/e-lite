@@ -964,7 +964,10 @@ impl Shared {
         let at_core_tip = core_height > 0 && height == core_height;
         let fully_synced =
             !core_ibd && core_height > 0 && height == core_height && headers == core_height;
-        let ready = at_core_tip || (offline && height > 0);
+        // `ready` used to fire while Core was still in IBD whenever the index
+        // briefly matched Core's short tip ("READY ... Core still in IBD").
+        // Wallets are only served with a stable tip when Core itself is done.
+        let ready = (at_core_tip && !core_ibd) || (offline && height > 0);
         let pct = |value: u64, total: u64| {
             if total == 0 {
                 0.0

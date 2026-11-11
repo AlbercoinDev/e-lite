@@ -1,5 +1,54 @@
 # Changelog
 
+## 0.1.0-alpha.29.8.9 — 2026-11-11
+
+### The index now reaches the tip: the last-blocks stall and honest READY
+
+No schema, protocol or consensus change. Found on the mainnet console log of
+a 29.8.7 run: the index drained to 2 blocks behind Core's tip (height 975409,
+`lag 2`, "(100.0%)" on screen) and then stopped for the rest of the session —
+no commits, no `READY`, no `FULLY SYNCED`, only memory lines.
+
+**The tail could stall forever.** With fewer blocks left than the commit
+minimum, every 500 ms catch-up call rebuilt the same 2-block target list and
+the end-of-call commit could be skipped, so the call returned Ok without
+progress and without a single log line. Three fixes together:
+
+1. **A clean end-of-call always commits the applied prefix.** Undo is written
+   for every applied block, so the commit is the cheap step; skipping it made
+   the tail refetch the same blocks forever. Under disk pressure it now
+   commits first (a `debug:` line notes it) and the disk guard still stops
+   the *next* call from fetching more.
+2. **The reader wait is bounded (10 s).** A wedged reader cannot block the
+   apply loop silently anymore; on timeout the call ends with a
+   `debug: pipeline:` line and the next call gets fresh readers.
+3. **Readers that exit at the end of the target list return their permit.**
+
+The `debug:` log (alpha default) now also traces the pipeline so the
+signature is visible in the log alone:
+
+```text
+debug: pipeline: call start 975410 target 975411 wanted 2 ...
+debug: pipeline: no progress: committed 975409 of target 975411 (wanted 2,
+       applied 0, discarded 2, paused_by_disk false, disk_guard false)
+```
+
+(real-work calls log `pipeline: call start/end` with wanted/applied/discarded;
+the no-progress note is rate-limited to one line per 10 s).
+
+**`READY` no longer lies.** `sync.ready` required only an exact tip match, so
+it fired during Core's IBD whenever the index briefly matched Core's short
+tip ("READY ... Core still in IBD"). It now also requires Core to be out of
+IBD, like the state machine already did.
+
+**The percentage cannot fake the finish.** The height line capped at 100.0 %
+by rounding (99.9998 % displayed as `(100.0%)` with lag 2). While blocks
+remain it now caps at 99.9 %; the real 100 % is the `FULLY SYNCED` line.
+
+**The catch-up event is visible.** `READY` / `FULLY SYNCED` include the
+session time (`session 23m 18s`), so the sync duration is in the log at the
+moment it completes.
+
 ## 0.1.0-alpha.29.8.8 — 2026-11-11
 
 ### Log levels, a bolder compaction plan and the ARC warning

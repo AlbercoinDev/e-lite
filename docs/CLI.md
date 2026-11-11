@@ -387,6 +387,18 @@ and TOML arrays are parsed as TOML.
 - a milestone line every `milestone_blocks` or `milestone_seconds` (whichever
   happens first) with interval throughput and disk usage for e-lite and Core.
 
+The percentage never rounds up to 100.0 % while blocks remain (it caps at
+99.9 %); the catch-up completes with two explicit lines, printed once:
+
+```text
+[e-lite] READY: index caught up to Core at height 975411 (975411 headers; Core caught up; session 23m 18s); ...
+[e-lite] FULLY SYNCED: height 975411/975411; session 23m 18s (indexing and serving since the start); ...
+```
+
+`READY` also requires Core to be out of IBD; `FULLY SYNCED` additionally
+requires Core's headers at the same height. `/status.ready` and
+`/status.fully_synced` expose the same flags for the UI.
+
 Start and stop timestamps are printed in local time. `SIGTERM`/`Ctrl+C` stops
 mempool and notification threads before stopping Core, so the shutdown log has
 no connection errors.
