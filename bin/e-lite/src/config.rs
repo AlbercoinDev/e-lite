@@ -238,6 +238,20 @@ pub struct IndexCfg {
     /// RocksDB background jobs. 0 = profile default, capped by CPU count.
     #[serde(default)]
     pub background_jobs: usize,
+    /// Let e-lite manage the ZFS ARC cap dynamically: grow it while Core
+    /// downloads or the index drains (reads are nearly free at a 97-98 % hit
+    /// rate), shrink it to `zfs_arc_min_mib` once the index is fully synced.
+    /// Writes `/sys/module/zfs/parameters/zfs_arc_max`, so it needs root or a
+    /// writable parameter; without permission it falls back to warn-only.
+    #[serde(default = "d_true")]
+    pub zfs_arc_dynamic: bool,
+    /// ARC cap in MiB while Core is in IBD or the index drains. 0 = half of
+    /// total RAM (the ZFS default behaviour).
+    #[serde(default)]
+    pub zfs_arc_max_mib: u64,
+    /// ARC cap in MiB once the index is fully synced. Floor 512.
+    #[serde(default = "d_zfs_arc_min")]
+    pub zfs_arc_min_mib: u64,
     /// Log a progress milestone every N blocks. 0 disables block milestones.
     #[serde(default = "d_milestone_blocks")]
     pub milestone_blocks: u64,
@@ -269,6 +283,9 @@ impl Default for IndexCfg {
             memory_fraction: 0.0,
             allow_low_memory: false,
             background_jobs: 0,
+            zfs_arc_dynamic: true,
+            zfs_arc_max_mib: 0,
+            zfs_arc_min_mib: d_zfs_arc_min(),
             milestone_blocks: d_milestone_blocks(),
             milestone_seconds: d_milestone_seconds(),
             follow: true,
@@ -655,6 +672,9 @@ fn d_prune_mib() -> u64 {
 fn d_batch() -> u32 {
     256
 }
+fn d_zfs_arc_min() -> u64 {
+    1024
+}
 fn d_profile() -> String {
     "auto".to_string()
 }
@@ -1023,6 +1043,19 @@ impl Config {
             return Err(
                 "[logging] level must be info, debug or trace (alpha default: debug)".to_string(),
             );
+        }
+        if self.index.zfs_arc_min_mib < 512 || self.index.zfs_arc_min_mib > 65536 {
+            return Err("[index] zfs_arc_min_mib must be 512..65536".to_string());
+        }
+        if self.index.zfs_arc_max_mib != 0
+            && (self.index.zfs_arc_max_mib < 512 || self.index.zfs_arc_max_mib > 65536)
+        {
+            return Err("[index] zfs_arc_max_mib must be 0 or 512..65536".to_string());
+        }
+        if self.index.zfs_arc_max_mib != 0
+            && self.index.zfs_arc_max_mib < self.index.zfs_arc_min_mib
+        {
+            return Err("[index] zfs_arc_max_mib must be >= zfs_arc_min_mib when set".to_string());
         }
         if self.index.prefetch_deadline_ms != 0
             && !(50..=60_000).contains(&self.index.prefetch_deadline_ms)

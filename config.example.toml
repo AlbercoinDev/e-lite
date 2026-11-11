@@ -58,7 +58,13 @@ memory_fraction = 0                 # hard ceiling over effective RAM; 0 = 0.75.
                                     # raised: cache+memtables+runtime always fit.
 allow_low_memory = false            # skip the minimum-RAM check (unsupported;
                                     # mainnet needs an 8 GB class machine, others 4 GB)
-background_jobs = 0                 # RocksDB jobs; 0 = plan (ssd/nvme: physical cores, 2..8; hdd: 2; virtual: 2..4)
+background_jobs = 0                 # RocksDB jobs; 0 = plan (ssd/nvme: physical cores, 2..8; hdd: 2; virtual/zfs: 2..4)
+# Dynamic ZFS ARC cap: grow while Core downloads or the index drains, shrink
+# to zfs_arc_min_mib once fully synced. Writes zfs_arc_max (needs root or a
+# writable parameter; without permission e-lite keeps the warn-only mode).
+zfs_arc_dynamic = true
+zfs_arc_max_mib = 0                 # ARC cap in MiB during IBD/drain; 0 = half of total RAM
+zfs_arc_min_mib = 1024              # ARC cap in MiB once fully synced (floor 512)
 milestone_blocks = 10000            # progress report every N blocks (0 = off)
 milestone_seconds = 21600           # or every N seconds (0 = off; 6 h default)
 follow = true                       # keep following the tip

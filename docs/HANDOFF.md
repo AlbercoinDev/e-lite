@@ -1,9 +1,9 @@
 # Session handoff
 
 **Updated:** 2026-11-11
-**Latest published release:** `0.1.0-alpha.29.9.0`
-**Release:** https://github.com/AlbercoinDev/e-lite/releases/tag/v0.1.0-alpha.29.9.0
-**Main commit at handoff:** tag `v0.1.0-alpha.29.9.0`
+**Latest published release:** `0.1.0-alpha.29.9.1`
+**Release:** https://github.com/AlbercoinDev/e-lite/releases/tag/v0.1.0-alpha.29.9.1
+**Main commit at handoff:** tag `v0.1.0-alpha.29.9.1`
 
 This file is the short “where we are” for a new session. The invariants live in
 [`AGENTS.md`](../AGENTS.md) and [`PROJECT_MEMORY.md`](PROJECT_MEMORY.md); the
@@ -86,6 +86,32 @@ no repitas contexto ni rehagas decisiones ya documentadas.
   the onion setup, reset and security.
 - `docs/ROADMAP.md` contains future features/improvements. Do not present them as
   available.
+
+## Last change (alpha.29.9.1)
+
+Automatic jobs at startup, honest live re-syncs and the dynamic ZFS ARC.
+
+- **Bug**: the 29.8.8 jobs rule only reached the profile-reload path;
+  `MachinePlan::detect` kept `physical/2`, so an automatic 4-core host still
+  planned `jobs = 2` (29.8.9 mainnet log). Both paths now share the rule,
+  capped by disk kind (SSD/NVMe 8, ZFS/virtual 4, HDD 2).
+- **READY/FULLY SYNCED**: first transition per session logs INFO; later
+  live re-syncs (one block ahead, then caught up) log at `debug:`.
+- **Dynamic ZFS ARC** (`[index] zfs_arc_dynamic = true` default): cap grows
+  to `zfs_arc_max_mib` (0 = half of RAM) while Core is in IBD or the index
+  drains, drops to `zfs_arc_min_mib` (1024) once fully synced. Writes
+  `zfs_arc_max` (bytes, 5 s tick, 5 min dwell) only when e-lite can write
+  it; without permission it stays warn-only. `arc: cap X -> Y MiB (phase)`
+  on every change; the hourly uncapped warning yields to the manager.
+  29.9.0's prune-to-max-at-caught-up pairs with it: at the tip the ARC
+  shrinks, the plan recovers and the prune releases ~140 GiB.
+- Tests: fmt, clippy, workspace (234).
+
+### Not decided in 29.9.1
+
+- The ARC hit-rate line mixes compaction misses with prevout lookups
+  (compaction reads dominated the 29.8.9 log's 4%); separating them is a
+  diagnostics nicety, not a correctness issue.
 
 ## Last change (alpha.29.9.0)
 

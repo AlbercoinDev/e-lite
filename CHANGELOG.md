@@ -1,5 +1,48 @@
 # Changelog
 
+## 0.1.0-alpha.29.9.1 — 2026-11-11
+
+### Automatic jobs at startup, honest live re-syncs and the dynamic ZFS ARC
+
+No schema, protocol or consensus change.
+
+**The startup plan now gives fast disks enough compaction threads.** The
+29.8.8 rule (`background_jobs = physical cores`, 2..8 on SSD/NVMe) was only
+applied on the profile-reload path; `MachinePlan::detect` kept the old
+`physical/2` and an automatic 4-core host still planned `jobs = 2` (visible
+in the 29.8.9 mainnet log). Both paths now use the same rule, capped by disk
+kind: SSD/NVMe 8, ZFS/virtual/unknown 4, HDD/network 2. On the 4-core ZFS
+host the plan is now `jobs = 4` with no explicit config.
+
+**READY / FULLY SYNCED print once per session.** In live mode Core gets
+ahead by a block and the index re-syncs every few minutes, so the two INFO
+lines repeated forever. The first transition of each kind keeps the INFO
+line; later re-syncs log at `debug:` (`scheduler: fully synced again ...`).
+
+**Dynamic ZFS ARC cap (default on).** The ARC is ZFS's RAM cache: at a
+97-98 % hit rate it makes pool reads nearly free, but the kernel does not
+count it in `MemAvailable`, so at ~20 GiB it starved the memory plan. e-lite
+now manages the cap per phase on the 5 s `el-tune` tick (5 min dwell):
+
+```text
+[index]
+zfs_arc_dynamic = true
+zfs_arc_max_mib = 0      # IBD/drain cap; 0 = half of total RAM
+zfs_arc_min_mib = 1024   # fully synced cap (floor 512)
+```
+
+- Core in IBD or the index draining: cap grows to `zfs_arc_max_mib`
+  (or half of RAM) — the read warmth is worth it.
+- Fully synced: cap drops to `zfs_arc_min_mib`, the RAM becomes visible to
+  `MemAvailable` again and the cache/memtable plans recover.
+- Writes go to `/sys/module/zfs/parameters/zfs_arc_max` (bytes) only when
+  e-lite can write it (root or a writable parameter, probed by writing the
+  current value back — a no-op on success). Without permission e-lite logs
+  it once and keeps the warn-only mode. Every change logs
+  `arc: cap X -> Y MiB (phase; ZFS ARC managed dynamically)` and the
+  hourly uncapped-ARC warning yields to the manager.
+- `zfs_arc_dynamic = false` freezes whatever cap is in place.
+
 ## 0.1.0-alpha.29.9.0 — 2026-11-11
 
 ### Prune to the safe maximum once the index is caught up

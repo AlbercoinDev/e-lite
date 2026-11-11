@@ -318,7 +318,11 @@ impl DiskKind {
     pub fn jobs_cap(self) -> usize {
         match self {
             DiskKind::Hdd | DiskKind::Network => 2,
-            _ => 4,
+            // Fast local disks: half the cores can compact in parallel
+            // without starving the single writer. Matches the Ssd/Nvme
+            // profile defaults (8 = 2 flush + 6 compaction threads).
+            DiskKind::Nvme | DiskKind::SataSsd => 8,
+            DiskKind::Virtual | DiskKind::Unknown | DiskKind::Zfs | DiskKind::Overlay => 4,
         }
     }
     /// Block cache maximum for a machine with `ram_mib`. The page-cache floor
@@ -674,7 +678,10 @@ impl MachinePlan {
         let jobs = if cfg.index.background_jobs > 0 {
             cfg.index.background_jobs
         } else {
-            (physical / 2).clamp(2, data_disk.kind.jobs_cap())
+            // Same rule as the profile reload: the pool splits between flush
+            // and compaction, so `physical/2` gave a 4-core host a single
+            // compaction thread and the compaction debt grew at drain rates.
+            physical.clamp(2, data_disk.kind.jobs_cap())
         };
         let core_dbcache_mib = fitted_dbcache_mib(ram_mib, mem.available_mib);
         let core_reserve_mib = core_reserve_mib.min(mem.available_mib.saturating_sub(128));
@@ -910,6 +917,16 @@ pub struct Tunables {
     arc_prev: Mutex<Option<(u64, u64)>>,
     /// Unix seconds of the last uncapped-ARC warning (rate-limited to 1/h).
     arc_warn_at: AtomicU64,
+    /// Let e-lite grow/shrink the ZFS ARC cap with the phase (IBD vs live).
+    zfs_arc_dynamic: AtomicBool,
+    /// ARC cap in MiB during IBD/drain. 0 = half of total RAM.
+    zfs_arc_max_mib: AtomicU64,
+    /// ARC cap in MiB once fully synced.
+    zfs_arc_min_mib: AtomicU64,
+    /// True once the dynamic manager wrote the cap successfully; the
+    /// uncapped-ARC warning yields to the manager from then on.
+    arc_managed: AtomicBool,
+    arc_state: Mutex<ArcManagerState>,
     /// Opt-in routine memtable resize. The target must persist for 10 min.
     adaptive_memtables: AtomicBool,
     memtables_locked: bool,
@@ -1193,6 +1210,11 @@ impl Tunables {
             last_cache_change: Mutex::new(None),
             arc_prev: Mutex::new(None),
             arc_warn_at: AtomicU64::new(0),
+            zfs_arc_dynamic: AtomicBool::new(cfg.index.zfs_arc_dynamic),
+            zfs_arc_max_mib: AtomicU64::new(cfg.index.zfs_arc_max_mib),
+            zfs_arc_min_mib: AtomicU64::new(cfg.index.zfs_arc_min_mib),
+            arc_managed: AtomicBool::new(false),
+            arc_state: Mutex::new(ArcManagerState::default()),
             adaptive_memtables: AtomicBool::new(
                 cfg.index.adaptive_memtables && cfg.index.write_buffer_mib == 0,
             ),
@@ -1573,6 +1595,21 @@ impl Tunables {
                 self.background_jobs.store(v, Ordering::Relaxed);
                 changed.push("background_jobs");
             }
+        }
+        if self.zfs_arc_dynamic.load(Ordering::Relaxed) != cfg.index.zfs_arc_dynamic {
+            self.zfs_arc_dynamic
+                .store(cfg.index.zfs_arc_dynamic, Ordering::Relaxed);
+            changed.push("zfs_arc_dynamic");
+        }
+        if self.zfs_arc_max_mib.load(Ordering::Relaxed) != cfg.index.zfs_arc_max_mib {
+            self.zfs_arc_max_mib
+                .store(cfg.index.zfs_arc_max_mib, Ordering::Relaxed);
+            changed.push("zfs_arc_max_mib");
+        }
+        if self.zfs_arc_min_mib.load(Ordering::Relaxed) != cfg.index.zfs_arc_min_mib {
+            self.zfs_arc_min_mib
+                .store(cfg.index.zfs_arc_min_mib, Ordering::Relaxed);
+            changed.push("zfs_arc_min_mib");
         }
         if cfg.index.readers > 0 {
             let v = cfg
@@ -2143,6 +2180,10 @@ impl Tunables {
     /// RAM the cache controller shrinks on a false signal. Warn with the
     /// recommended cap, rate-limited to once per hour.
     fn maybe_warn_uncapped_arc(&self, mem: &MemoryInfo) {
+        // The dynamic manager owns the cap once it wrote it: no warning.
+        if self.arc_managed.load(Ordering::Relaxed) {
+            return;
+        }
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
@@ -2153,6 +2194,95 @@ impl Tunables {
         }
         if warn_uncapped_arc(mem, "[e-lite] WARNING:") {
             self.arc_warn_at.store(now.max(1), Ordering::Relaxed);
+        }
+    }
+
+    /// Dynamic ZFS ARC manager. While Core downloads or the index drains, a
+    /// big ARC makes pool reads nearly free (97-98 % hit rate); once the
+    /// index is fully synced the working set is tiny and the RAM is better
+    /// left visible to the memory plan. Writes
+    /// `/sys/module/zfs/parameters/zfs_arc_max` only when e-lite can (root or
+    /// a writable parameter); without permission it keeps the warn-only mode.
+    /// Runs on the 5 s `el-tune` tick, with a 5 min dwell per change.
+    pub fn arc_tick(&self, lag: u64) {
+        if !self.zfs_arc_dynamic.load(Ordering::Relaxed) {
+            return;
+        }
+        if zfs_arc_mib().is_none() {
+            return; // no ZFS ARC on this host
+        }
+        let mut state = match self.arc_state.lock() {
+            Ok(state) => state,
+            Err(_) => return,
+        };
+        let Some(current_mib) = std::fs::read_to_string(ARC_PARAM_PATH)
+            .ok()
+            .and_then(|text| text.trim().parse::<u64>().ok())
+            .map(|bytes| bytes / (1024 * 1024))
+        else {
+            return;
+        };
+        if state.writable.is_none() {
+            // Probe by writing the current value back: it changes nothing on
+            // success and fails with EACCES/EPERM without permission.
+            match std::fs::write(ARC_PARAM_PATH, (current_mib * 1024 * 1024).to_string()) {
+                Ok(()) => state.writable = Some(true),
+                Err(e) => {
+                    state.writable = Some(false);
+                    eprintln!(
+                        "[e-lite] arc: dynamic management unavailable (cannot write \
+                         zfs_arc_max: {e}); keep the manual cap from the startup warning"
+                    );
+                    return;
+                }
+            }
+        }
+        if state.writable != Some(true) {
+            return;
+        }
+        let ibd_like = self.core_ibd() || lag > 1000;
+        let mem = memory_info();
+        let target = if ibd_like {
+            let configured = self.zfs_arc_max_mib.load(Ordering::Relaxed);
+            let auto = mem.total_mib.unwrap_or(0) / 2;
+            if configured > 0 {
+                configured
+            } else {
+                auto
+            }
+        } else {
+            self.zfs_arc_min_mib.load(Ordering::Relaxed)
+        }
+        .max(512);
+        // Hysteresis: a phase flip that lasts one block must not flap the cap.
+        if state.last_written_mib == Some(target)
+            || current_mib == target
+            || state
+                .last_change
+                .map(|at| at.elapsed() < Duration::from_secs(300))
+                .unwrap_or(false)
+        {
+            return;
+        }
+        match std::fs::write(ARC_PARAM_PATH, (target * 1024 * 1024).to_string()) {
+            Ok(()) => {
+                self.arc_managed.store(true, Ordering::Relaxed);
+                state.last_written_mib = Some(target);
+                state.last_change = Some(Instant::now());
+                eprintln!(
+                    "[e-lite] arc: cap {current_mib} -> {target} MiB ({phase}; ZFS ARC \
+                     managed dynamically)",
+                    phase = if ibd_like {
+                        "Core IBD or drain"
+                    } else {
+                        "fully synced"
+                    }
+                );
+            }
+            Err(e) => {
+                state.writable = Some(false);
+                eprintln!("[e-lite] arc: cannot write zfs_arc_max anymore: {e}; warn-only");
+            }
         }
     }
 
@@ -2542,6 +2672,19 @@ fn zfs_arc_mib() -> Option<u64> {
 fn parse_zfs_arc_mib(text: &str) -> Option<u64> {
     zfs_arc_field(text, "size").map(|bytes| bytes / 1024 / 1024)
 }
+
+/// Where the dynamic ARC manager stands for this run.
+#[derive(Debug, Default)]
+struct ArcManagerState {
+    /// None = not probed yet. The probe writes the *current* value back, so
+    /// it changes nothing when it succeeds.
+    writable: Option<bool>,
+    /// Cap actually written by this run, so unchanged targets are skipped.
+    last_written_mib: Option<u64>,
+    last_change: Option<Instant>,
+}
+
+const ARC_PARAM_PATH: &str = "/sys/module/zfs/parameters/zfs_arc_max";
 
 /// Read one numeric field from `/proc/spl/kstat/zfs/arcstats` content.
 fn zfs_arc_field(text: &str, field: &str) -> Option<u64> {
@@ -3396,7 +3539,10 @@ mod tests {
         };
         let p = MachinePlan::from_parts(cpu, mem, disk.clone(), disk, &Config::default());
         assert_eq!(p.readers, 4);
-        assert_eq!(p.jobs, 2);
+        // Same rule as the profile reload: fast disks give compaction half
+        // the physical cores; `physical/2` left a 4-core host with one
+        // compaction thread and a growing compaction debt.
+        assert_eq!(p.jobs, 4);
         assert_eq!(p.core_par, 3);
         assert_eq!(p.core_rpcthreads, 4);
         assert_eq!(p.core_dbcache_mib, 4096);

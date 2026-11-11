@@ -4737,6 +4737,9 @@ fn spawn_controller(
             {
                 tunables.apply_store(&store);
             }
+            // The dynamic ZFS ARC cap runs on its own cadence, independent of
+            // the adaptive tuning gate.
+            tunables.arc_tick(lag);
         })
         .unwrap_or_else(|e| {
             eprintln!("[e-lite] cannot start the tuning thread: {e}");
@@ -5108,6 +5111,10 @@ fn index_loop(
     let mut last_height = u64::MAX;
     let mut was_ready = false;
     let mut was_fully_synced = false;
+    // The READY/FULLY SYNCED INFO lines print once per session; later live
+    // re-syncs (Core one block ahead, then caught up again) log at debug.
+    let mut printed_ready_once = false;
+    let mut printed_fully_once = false;
     let mut backoff = 1u64;
     let mut loading_logged = false;
     eprintln!(
@@ -5264,9 +5271,30 @@ fn index_loop(
                     let print_ready = sync.ready && !was_ready && !print_fully;
                     let session = format_uptime(idx.progress_started.elapsed());
                     if print_fully {
-                        eprintln!("{}", readiness_line(sh, &sync, &tls, true, &session));
+                        if !printed_fully_once {
+                            eprintln!("{}", readiness_line(sh, &sync, &tls, true, &session));
+                            printed_fully_once = true;
+                        } else {
+                            // In live mode Core gets ahead by a block and the
+                            // index re-syncs every few minutes; the first
+                            // FULLY SYNCED of the session is the INFO line.
+                            crate::debug_log!(
+                                "scheduler: fully synced again at height {} (core {})",
+                                sync.height,
+                                sync.core_height
+                            );
+                        }
                     } else if print_ready {
-                        eprintln!("{}", readiness_line(sh, &sync, &tls, false, &session));
+                        if !printed_ready_once {
+                            eprintln!("{}", readiness_line(sh, &sync, &tls, false, &session));
+                            printed_ready_once = true;
+                        } else {
+                            crate::debug_log!(
+                                "scheduler: ready again at height {} (core {})",
+                                sync.height,
+                                sync.core_height
+                            );
+                        }
                     }
                     if sync.fully_synced {
                         was_fully_synced = true;

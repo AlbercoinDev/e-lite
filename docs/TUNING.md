@@ -177,6 +177,18 @@ zfs_arc_max` for 8 GiB on a 32 GiB host, persisted in `/etc/modprobe.d/`).
 `/status` and the `debug:` lines report the ARC hit rate, so you can check
 what the cap costs in read warmth.
 
+**Dynamic ARC (default on when e-lite can write it).** `zfs_arc_dynamic`
+lets e-lite manage the cap per phase instead: while Core downloads or the
+index drains, the cap grows to `zfs_arc_max_mib` (0 = half of total RAM —
+the block reads are nearly free at a 97-98 % hit rate); once fully synced
+the cap drops to `zfs_arc_min_mib` (default 1024 MiB) and the RAM becomes
+visible to `MemAvailable` again, so the memory plan and the cache recover.
+Writes go to `/sys/module/zfs/parameters/zfs_arc_max` (bytes) on the 5 s
+`el-tune` tick with a 5 min dwell, logged as `arc: cap X -> Y MiB (phase)`.
+It needs root or a writable parameter: without permission e-lite stays in
+warn-only mode and logs it once. Setting `zfs_arc_dynamic = false` freezes
+whatever cap is in place — remember to raise it again before a long IBD.
+
 ## Controller cadence
 
 The controller is a dedicated thread (`el-tune`), not part of the indexing
