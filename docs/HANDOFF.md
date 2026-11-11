@@ -1,9 +1,9 @@
 # Session handoff
 
 **Updated:** 2026-11-11
-**Latest published release:** `0.1.0-alpha.29.9.1`
-**Release:** https://github.com/AlbercoinDev/e-lite/releases/tag/v0.1.0-alpha.29.9.1
-**Main commit at handoff:** tag `v0.1.0-alpha.29.9.1`
+**Latest published release:** `0.1.0-alpha.29.9.2`
+**Release:** https://github.com/AlbercoinDev/e-lite/releases/tag/v0.1.0-alpha.29.9.2
+**Main commit at handoff:** tag `v0.1.0-alpha.29.9.2`
 
 This file is the short “where we are” for a new session. The invariants live in
 [`AGENTS.md`](../AGENTS.md) and [`PROJECT_MEMORY.md`](PROJECT_MEMORY.md); the
@@ -86,6 +86,30 @@ no repitas contexto ni rehagas decisiones ya documentadas.
   the onion setup, reset and security.
 - `docs/ROADMAP.md` contains future features/improvements. Do not present them as
   available.
+
+## Last change (alpha.29.9.2)
+
+Live-mode prune batching on the day scale.
+
+- **Finding**: `min_gain_blocks = 5,000` is right for IBD/drain (the gain
+  grows thousands of blocks per hour) but wrong at the tip: the safe cut
+  advances ~144 blocks/day at mainnet rates, so live mode would hold ~7.5
+  GiB of dead data for ~35 days.
+- **Fix**: `[pruning] min_gain_live_blocks = 144` (default, 0 = keep the
+  IBD gain) — once caught up, the gate prunes when the safe cut advances
+  144 blocks (~1 day, ~220 MiB). Validation caps it at `min_gain_blocks`.
+  IBD/drain behaviour unchanged; emergency pruning unchanged; durability
+  invariants unchanged.
+- Whole chain at the tip (29.9.0 + 29.9.1): prune to the safe maximum once,
+  keep ~one day of tail, prune daily, ARC shrinks to its minimum, the
+  memory plan recovers.
+- Tests: `caught_up_live_gain_uses_the_live_scale`; workspace 235.
+
+### Not decided in 29.9.2
+
+- Whether the drain phases (Core out of IBD, lag > 0) should also use the
+  live-scale gain: today they keep `min_gain_blocks`, which releases most
+  of the backlog on its own windows. Revisit with a log.
 
 ## Last change (alpha.29.9.1)
 

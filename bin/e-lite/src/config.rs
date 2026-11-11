@@ -548,6 +548,11 @@ pub struct PruningCfg {
     /// prunes whole files, so a small value produces no-op calls and flushes.
     #[serde(default = "d_min_gain")]
     pub min_gain_blocks: u32,
+    /// Once fully synced the safe cut advances ~144 blocks/day at mainnet
+    /// rates; `min_gain_blocks` (5,000) would hold ~7.5 GiB for ~35 days.
+    /// 0 = use `min_gain_blocks` in live mode too.
+    #[serde(default = "d_min_gain_live")]
+    pub min_gain_live_blocks: u32,
     /// Minimum wall-clock interval between prune requests. Low disk bypasses
     /// this with an emergency prune.
     #[serde(default = "d_prune_interval")]
@@ -575,6 +580,7 @@ impl Default for PruningCfg {
             scheduler: d_scheduler(),
             prune_defer_free_gib: d_prune_defer_free(),
             min_gain_blocks: d_min_gain(),
+            min_gain_live_blocks: d_min_gain_live(),
             prune_interval_seconds: d_prune_interval(),
             repair_max_gap_blocks: d_repair_max_gap(),
             poll_seconds: d_poll(),
@@ -733,6 +739,11 @@ fn d_min_gain() -> u32 {
     // Core deletes whole block files anyway. 5k safe blocks (~7.5 GiB on
     // mainnet) reduces prune churn and the commit-boundary barrier frequency.
     5_000
+}
+fn d_min_gain_live() -> u32 {
+    // Fully synced, the safe cut advances ~144 blocks/day at mainnet rates:
+    // prune once a day (~220 MiB) instead of holding ~7.5 GiB for ~35 days.
+    144
 }
 fn d_max_bulk_lag() -> u32 {
     20_000
@@ -1149,6 +1160,9 @@ impl Config {
         }
         if self.pruning.min_gain_blocks == 0 {
             return Err("[pruning] min_gain_blocks must be >= 1".to_string());
+        }
+        if self.pruning.min_gain_live_blocks > self.pruning.min_gain_blocks {
+            return Err("[pruning] min_gain_live_blocks must be <= min_gain_blocks".to_string());
         }
         if self.pruning.prune_interval_seconds == 0 {
             return Err("[pruning] prune_interval_seconds must be >= 1".to_string());

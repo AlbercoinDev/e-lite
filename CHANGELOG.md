@@ -1,5 +1,31 @@
 # Changelog
 
+## 0.1.0-alpha.29.9.2 — 2026-11-11
+
+### Live-mode prune batching on the day scale
+
+No schema, protocol or consensus change. Follow-up to the 29.9.0 caught-up
+prune: `min_gain_blocks = 5,000` is the right batching while Core downloads
+(the gain grows thousands of blocks per hour), but once fully synced the
+safe cut advances **~144 blocks/day** at mainnet rates — the IBD-scale gain
+would hold ~7.5 GiB of dead data for ~35 days before the next prune.
+
+**`[pruning] min_gain_live_blocks = 144`** (new, default): once the index is
+caught up with a Core out of IBD, the prune gate uses this gain instead of
+`min_gain_blocks` — one prune per day (~220 MiB retained), churn negligible.
+`0` uses `min_gain_blocks` in live mode too. Validation caps it at
+`min_gain_blocks`. During IBD/drain nothing changes; the emergency path
+(free space below `prune_defer_free_gib`) still bypasses gain and interval.
+
+Full chain at the tip: prune to the safe maximum once (29.9.0), then keep
+~one day of tail (~220 MiB), prune daily, prune instantly if the disk
+presses. Durability unchanged: durable tip behind the WAL barrier, cut
+capped by `index - 288` and Core's `tip - 288`, retry after backoff.
+
+Tests: `caught_up_live_gain_uses_the_live_scale` (live gain 2 < 3: no prune;
+gain 3: prune, with a 10,000-block IBD gain present); the IBD batching test
+is untouched. Workspace 235.
+
 ## 0.1.0-alpha.29.9.1 — 2026-11-11
 
 ### Automatic jobs at startup, honest live re-syncs and the dynamic ZFS ARC

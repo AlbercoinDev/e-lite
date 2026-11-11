@@ -4370,6 +4370,7 @@ fn supervisor_config(cfg: &Config, can_control_core: bool) -> el_chain::Supervis
         undo_margin: cfg.index.reorg_window,
         core_recent_margin: 288,
         min_gain: cfg.pruning.min_gain_blocks,
+        min_gain_live: cfg.pruning.min_gain_live_blocks,
         prune_interval: Duration::from_secs(cfg.pruning.prune_interval_seconds),
         prune_defer_free_bytes: {
             // 0 means "do not defer": it must not be raised to min_free_gib.

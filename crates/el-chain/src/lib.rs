@@ -120,6 +120,10 @@ pub struct SupervisorConfig {
     pub core_recent_margin: u32,
     /// Do not issue another prune request until the safe height advanced this much.
     pub min_gain: u32,
+    /// Once fully synced the safe cut advances ~144 blocks/day at mainnet
+    /// rates; the IBD-scale gain would hold ~7.5 GiB for ~35 days. 0 = use
+    /// `min_gain` in live mode too.
+    pub min_gain_live: u32,
     /// Minimum wall-clock interval between prune requests. Emergency pruning
     /// on low disk bypasses this.
     pub prune_interval: Duration,
@@ -140,6 +144,7 @@ impl Default for SupervisorConfig {
             undo_margin: 288,
             core_recent_margin: 288,
             min_gain: 288,
+            min_gain_live: 0,
             prune_interval: Duration::from_secs(30),
             prune_defer_free_bytes: None,
         }
@@ -355,8 +360,15 @@ impl Supervisor {
                 && if emergency {
                     emergency_due
                 } else {
-                    (retry_same || safe >= last.saturating_add(self.cfg.min_gain))
-                        && interval_elapsed
+                    // Live mode batches on the day-scale gain: once fully
+                    // synced the safe cut advances ~144 blocks/day, so the
+                    // IBD-scale gain would hold ~7.5 GiB for ~35 days.
+                    let gain = if caught_up && self.cfg.min_gain_live > 0 {
+                        self.cfg.min_gain_live
+                    } else {
+                        self.cfg.min_gain
+                    };
+                    (retry_same || safe >= last.saturating_add(gain)) && interval_elapsed
                 };
             if advanced && safe > 0 {
                 self.state = State::PruneEligible;
@@ -411,6 +423,7 @@ mod tests {
             undo_margin: 10,
             core_recent_margin: 10,
             min_gain: 5,
+            min_gain_live: 0,
             prune_interval: Duration::ZERO,
             prune_defer_free_bytes: None,
         }
@@ -521,6 +534,34 @@ mod tests {
         j.core_pruneheight = 90;
         j.free_bytes = Some(1000);
         assert!(s.tick(&j).is_empty(), "live gain below min_gain: no prune");
+    }
+
+    #[test]
+    fn caught_up_live_gain_uses_the_live_scale() {
+        let mut c = cfg();
+        c.min_gain = 10_000; // IBD scale: irrelevant in live mode
+        c.min_gain_live = 3;
+        let mut s = Supervisor::new(c);
+        // Recorded success at 90; the safe cut is 90 (committed 100 - undo
+        // margin 10). Two blocks later the safe cut is 92: below the live
+        // gain (3), no prune despite the 10_000-block IBD gain remaining.
+        s.on_pruned(90);
+        let mut j = caught_up_input(102, 102);
+        j.core_pruneheight = 90;
+        j.free_bytes = Some(1000);
+        assert!(
+            s.tick(&j).is_empty(),
+            "live gain 2 < min_gain_live 3: no prune"
+        );
+        // One more block reaches the live gain (3): prune to the safe cut.
+        let mut k = caught_up_input(103, 103);
+        k.core_pruneheight = 90;
+        k.free_bytes = Some(1000);
+        assert_eq!(
+            s.tick(&k),
+            vec![Action::Prune(93)],
+            "live gain 3 >= min_gain_live: prune"
+        );
     }
 
     #[test]

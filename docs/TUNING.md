@@ -559,6 +559,11 @@ gain only if prune I/O is a measured problem. Low-disk emergency pruning still
 runs. `--core-arg` can also reduce Core's memory/IO footprint (for example
 `--core-arg=-dbcache=128`).
 
+Once fully synced, `[pruning] min_gain_live_blocks = 144` (default) replaces
+the IBD-scale gain: the safe cut advances ~144 blocks/day, so live mode
+prunes once a day (~220 MiB retained) instead of holding ~7.5 GiB for weeks.
+`0` uses `min_gain_blocks` in live mode too.
+
 **The free-space deferral ends at the tip.** While Core downloads (IBD),
 plenty of free space defers normal pruning — it would be churn. Once Core is
 out of IBD **and** the index matches Core's tip, the deferral is bypassed:
