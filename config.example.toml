@@ -58,7 +58,7 @@ memory_fraction = 0                 # hard ceiling over effective RAM; 0 = 0.75.
                                     # raised: cache+memtables+runtime always fit.
 allow_low_memory = false            # skip the minimum-RAM check (unsupported;
                                     # mainnet needs an 8 GB class machine, others 4 GB)
-background_jobs = 0                 # RocksDB jobs; 0 = plan (physical/2, 2..4)
+background_jobs = 0                 # RocksDB jobs; 0 = plan (ssd/nvme: physical cores, 2..8; hdd: 2; virtual: 2..4)
 milestone_blocks = 10000            # progress report every N blocks (0 = off)
 milestone_seconds = 21600           # or every N seconds (0 = off; 6 h default)
 follow = true                       # keep following the tip
@@ -172,6 +172,10 @@ enabled = false                     # opt-in gate; BIP352 indexer not included y
 [logging]
 # file = "/var/log/e-lite/e-lite.log"  # default <data-dir>/e-lite.log
 max_mib = 16                        # rotate to e-lite.log.1 above this; 0 = never
+# Verbosity of the extra diagnostic lines: `info` = standard lines only;
+# `debug` = adds per-family/levels/statistics/I-O-pressure/controller detail;
+# `trace` = adds one line per commit group. Alpha default: `debug`.
+level = "debug"
 
 [safety]
 allow_mainnet = false               # mainnet requires explicit opt-in

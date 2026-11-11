@@ -906,6 +906,10 @@ pub struct Tunables {
     mem_streak: Mutex<(i8, u32)>,
     /// Last cache direction change: prevents grow/shrink flapping.
     last_cache_change: Mutex<Option<(Instant, i8)>>,
+    /// Previous ZFS ARC hits/misses counters, for delta-based hit rates.
+    arc_prev: Mutex<Option<(u64, u64)>>,
+    /// Unix seconds of the last uncapped-ARC warning (rate-limited to 1/h).
+    arc_warn_at: AtomicU64,
     /// Opt-in routine memtable resize. The target must persist for 10 min.
     adaptive_memtables: AtomicBool,
     memtables_locked: bool,
@@ -1187,6 +1191,8 @@ impl Tunables {
             runtime_mib: budget.runtime_mib,
             mem_streak: Mutex::new((0, 0)),
             last_cache_change: Mutex::new(None),
+            arc_prev: Mutex::new(None),
+            arc_warn_at: AtomicU64::new(0),
             adaptive_memtables: AtomicBool::new(
                 cfg.index.adaptive_memtables && cfg.index.write_buffer_mib == 0,
             ),
@@ -1512,8 +1518,14 @@ impl Tunables {
                 self.bulk_commit_ms.store(30_000, Ordering::Relaxed);
                 self.batch_blocks.store(512, Ordering::Relaxed);
                 self.max_group_txs.store(250_000, Ordering::Relaxed);
+                // The pool splits between flush and compaction, so `phys/2`
+                // gave a 4-core host a single compaction thread. Bulk ingest is
+                // I/O-bound (CPU is mostly idle) and a single thread let
+                // `pending_compaction` grow ~70 GiB/h at drain rates; give
+                // compaction half of the physical cores (2 flush + N/2
+                // compaction).
                 self.background_jobs
-                    .store((phys / 2).clamp(2, 4), Ordering::Relaxed);
+                    .store(phys.clamp(2, 8), Ordering::Relaxed);
             }
             Profile::Nvme => {
                 self.readers
@@ -1523,7 +1535,7 @@ impl Tunables {
                 self.batch_blocks.store(512, Ordering::Relaxed);
                 self.max_group_txs.store(250_000, Ordering::Relaxed);
                 self.background_jobs
-                    .store((phys / 2).clamp(2, 4), Ordering::Relaxed);
+                    .store(phys.clamp(2, 8), Ordering::Relaxed);
             }
             Profile::Auto | Profile::Manual => {}
         }
@@ -2067,9 +2079,81 @@ impl Tunables {
         if let Some(stats) = stats {
             self.publish(store, stats);
         }
+        // Alpha logs at `debug`: the controller decision, I/O pressure and ARC
+        // effectiveness go next to the summary line so a log alone explains
+        // every cache change.
+        let reason = if critical {
+            "critical (<256 MiB available)"
+        } else if safety {
+            "safety (cache above ceiling or available below reserve)"
+        } else if pressure {
+            "pressure (<1024 MiB available)"
+        } else if dir < 0 {
+            "shrink streak (2 samples)"
+        } else {
+            "grow streak (2 samples)"
+        };
+        crate::debug_log!(
+            "cache-controller: {} {} -> {} MiB ({}; available {} MiB, reserve {} MiB, \
+             dynamic ceiling {} MiB, profile cap {} MiB)",
+            action.name(),
+            old,
+            new,
+            reason,
+            mem.available_mib,
+            dynamic_reserve,
+            max_cache,
+            self.max_cache_mib
+        );
+        let mut arc_rate: Option<Option<u64>> = None;
+        if let Some(now) = zfs_arc_counters() {
+            if let Ok(mut prev) = self.arc_prev.lock() {
+                arc_rate = Some(match *prev {
+                    Some((h, m)) => {
+                        let dh = now.0.saturating_sub(h);
+                        let dm = now.1.saturating_sub(m);
+                        dh.checked_mul(100).and_then(|n| n.checked_div(dh + dm))
+                    }
+                    None => None,
+                });
+                *prev = Some(now);
+            }
+        }
+        let pressure_now = io_pressure();
+        if arc_rate.is_some() || pressure_now.is_some() {
+            let arc_text = match arc_rate {
+                None => "n/a".to_string(),
+                Some(None) => "hit n/a (no traffic or first sample)".to_string(),
+                Some(Some(p)) => format!("hit {p}%"),
+            };
+            let pressure_text = pressure_now
+                .map(|(s10, s60, f10, f60)| {
+                    format!("some {s10:.2}/{s60:.2} full {f10:.2}/{f60:.2} avg10/avg60")
+                })
+                .unwrap_or_else(|| "n/a".to_string());
+            crate::debug_log!("io-pressure: {} | arc {}", pressure_text, arc_text);
+        }
+        self.maybe_warn_uncapped_arc(&mem);
         Some(format!(
             "memory: cache {old} -> {new} MiB, readers {readers}"
         ))
+    }
+
+    /// ZFS ARC is invisible to `MemAvailable`; when it grows past a quarter of
+    /// RAM the cache controller shrinks on a false signal. Warn with the
+    /// recommended cap, rate-limited to once per hour.
+    fn maybe_warn_uncapped_arc(&self, mem: &MemoryInfo) {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let last = self.arc_warn_at.load(Ordering::Relaxed);
+        if last != 0 && now.saturating_sub(last) < 3600 {
+            return;
+        }
+        if warn_uncapped_arc(mem, "[e-lite] WARNING:") {
+            self.arc_warn_at.store(now.max(1), Ordering::Relaxed);
+        }
     }
 
     /// Give RAM back before Core resumes downloads. Called once per bulk pause:
@@ -2456,16 +2540,85 @@ fn zfs_arc_mib() -> Option<u64> {
 /// (4 = uint64), the value is the third. Taking the second column made
 /// `arc` print 0 MiB on every ZFS host (4 bytes / 1024 / 1024).
 fn parse_zfs_arc_mib(text: &str) -> Option<u64> {
+    zfs_arc_field(text, "size").map(|bytes| bytes / 1024 / 1024)
+}
+
+/// Read one numeric field from `/proc/spl/kstat/zfs/arcstats` content.
+fn zfs_arc_field(text: &str, field: &str) -> Option<u64> {
     for line in text.lines() {
         let mut fields = line.split_whitespace();
-        if fields.next() != Some("size") {
+        if fields.next() != Some(field) {
             continue;
         }
         fields.next()?; // kstat type column
-        let bytes = fields.next()?.parse::<u64>().ok()?;
-        return Some(bytes / 1024 / 1024);
+        return fields.next()?.parse::<u64>().ok();
     }
     None
+}
+
+/// Cumulative ZFS ARC `hits`/`misses` counters, for delta-based hit rates.
+pub fn zfs_arc_counters() -> Option<(u64, u64)> {
+    let text = std::fs::read_to_string("/proc/spl/kstat/zfs/arcstats").ok()?;
+    parse_zfs_arc_counters(&text)
+}
+
+fn parse_zfs_arc_counters(text: &str) -> Option<(u64, u64)> {
+    Some((zfs_arc_field(text, "hits")?, zfs_arc_field(text, "misses")?))
+}
+
+/// Warn about an apparently uncapped ZFS ARC. A cap at the recommended 25%
+/// never triggers: `arc * 4 <= total` at exactly 25%. Returns true when it
+/// printed, so callers can rate-limit. `prefix` is the log prefix.
+pub fn warn_uncapped_arc(mem: &MemoryInfo, prefix: &str) -> bool {
+    let (Some(arc), Some(total)) = (mem.arc_mib, mem.total_mib) else {
+        return false;
+    };
+    if total == 0 || arc * 4 <= total {
+        return false;
+    }
+    let pct = arc * 100 / total;
+    let suggest = (total / 4).min(8192);
+    eprintln!(
+        "{prefix} ZFS ARC is using {arc} MiB ({pct}% of RAM) without an apparent cap; it is \
+         invisible to MemAvailable and squeezes the cache plan. Cap it, e.g. \
+         zfs_arc_max={suggest} MiB (min(25% RAM, 8 GiB)) in /sys/module/zfs/parameters/\
+         zfs_arc_max and /etc/modprobe.d",
+    );
+    true
+}
+
+/// Linux PSI pressure for I/O: `(some avg10, some avg60, full avg10,
+/// full avg60)`. `None` when PSI is unavailable (file missing, `psi=0`).
+pub fn io_pressure() -> Option<(f64, f64, f64, f64)> {
+    let text = std::fs::read_to_string("/proc/pressure/io").ok()?;
+    parse_io_pressure(&text)
+}
+
+fn parse_io_pressure(text: &str) -> Option<(f64, f64, f64, f64)> {
+    let mut some = None;
+    let mut full = None;
+    for line in text.lines() {
+        let mut parts = line.split_whitespace();
+        let kind = parts.next()?;
+        let mut avg10 = None;
+        let mut avg60 = None;
+        for kv in parts {
+            let (k, v) = kv.split_once('=')?;
+            match k {
+                "avg10" => avg10 = v.parse::<f64>().ok(),
+                "avg60" => avg60 = v.parse::<f64>().ok(),
+                _ => {}
+            }
+        }
+        match kind {
+            "some" => some = Some((avg10?, avg60?)),
+            "full" => full = Some((avg10?, avg60?)),
+            _ => {}
+        }
+    }
+    let (s10, s60) = some?;
+    let (f10, f60) = full?;
+    Some((s10, s60, f10, f60))
 }
 
 pub fn process_rss_mib() -> u64 {
@@ -3024,6 +3177,17 @@ pub enum CacheAction {
     Shrink,
 }
 
+impl CacheAction {
+    /// Short label for the cache-controller debug line.
+    pub fn name(self) -> &'static str {
+        match self {
+            CacheAction::Grow => "grow",
+            CacheAction::Hold => "hold",
+            CacheAction::Shrink => "shrink",
+        }
+    }
+}
+
 /// One sample of the hot memory policy. `cached_mib` is page cache: growing the
 /// RocksDB cache evicts it, so it is the guard that keeps block reads fast.
 pub fn cache_action(
@@ -3113,6 +3277,18 @@ mod tests {
                     size                            4    4294967296\n";
         assert_eq!(parse_zfs_arc_mib(text), Some(4096));
         assert_eq!(parse_zfs_arc_mib("no size here\n"), None);
+    }
+
+    #[test]
+    fn parse_arc_counters_and_psi() {
+        let arc = "size                            4    21474836480\n\
+                   hits                            4    100\n\
+                   misses                          4    25\n";
+        assert_eq!(parse_zfs_arc_counters(arc), Some((100, 25)));
+        let psi = "some avg10=1.23 avg60=0.45 avg300=0.12 total=123\n\
+                   full avg10=0.00 avg60=0.10 avg300=0.02 total=4\n";
+        assert_eq!(parse_io_pressure(psi), Some((1.23, 0.45, 0.0, 0.10)));
+        assert_eq!(parse_io_pressure("some avg10=1.0\n"), None);
     }
 
     #[test]

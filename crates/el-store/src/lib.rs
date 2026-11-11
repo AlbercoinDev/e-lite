@@ -9,6 +9,7 @@ use el_model::{
     BlockRecord, Chain, Hash32, HistoryEffect, IndexedTip, NetworkIdentity, Outpoint, ScriptHash,
     UndoRecord, UtxoValue,
 };
+use rocksdb::statistics::{Histogram, StatsLevel, Ticker};
 use rocksdb::{
     BlockBasedOptions, Cache, ColumnFamilyDescriptor, DBCompressionType, Direction, IteratorMode,
     Options, WriteBatch, WriteBufferManager, WriteOptions, DB,
@@ -209,6 +210,9 @@ pub struct Store {
     /// Last commit split: txids append+fsync and RocksDB write.
     commit_txids_us: AtomicU64,
     commit_db_us: AtomicU64,
+    /// The options handle with live statistics tickers/histograms (shared
+    /// with the DB); kept so the debug log can query them at any time.
+    rocksdb_opts: std::sync::Mutex<Options>,
 }
 
 /// Tunables for the RocksDB instance. `Store::open` uses conservative
@@ -339,7 +343,21 @@ impl Store {
             cf_opts.set_block_based_table_factory(&table);
             descriptors.push(ColumnFamilyDescriptor::new(name, cf_opts));
         }
-        let db = DB::open_cf_descriptors(&opts, &path, descriptors)?;
+        // Tick counters and the WAL-sync histogram feed the `debug:` statistics
+        // line. `ExceptDetailedTimers` keeps the fsync/get/write timers (the
+        // numbers the analysis needs) and skips only mutex and compression
+        // timers, so the write path is not measured twice.
+        opts.enable_statistics();
+        opts.set_statistics_level(StatsLevel::ExceptDetailedTimers);
+        // The stats object is shared with the opened DB; keeping the options
+        // handle lets the log query the live counters without a new handle.
+        let rocksdb_opts = std::sync::Mutex::new(opts);
+        let db = {
+            let guard = rocksdb_opts
+                .lock()
+                .map_err(|_| "rocksdb options mutex poisoned".to_string())?;
+            DB::open_cf_descriptors(&guard, &path, descriptors)?
+        };
 
         let txids_path = path.join("txids.dat");
         let txids = OpenOptions::new()
@@ -361,6 +379,7 @@ impl Store {
             exclude: store_opts.exclude_paths.clone(),
             commit_txids_us: AtomicU64::new(0),
             commit_db_us: AtomicU64::new(0),
+            rocksdb_opts,
         };
         store.check_schema()?;
         store.reconcile_txids()?;
@@ -1053,7 +1072,7 @@ impl Store {
     /// Per-column-family pressure for `/status`. The sum hides which family is
     /// causing write stalls; this returns pending compaction, memtable, SST and
     /// table-reader bytes plus a "all properties were read" flag for each CF.
-    pub fn cf_stats(&self) -> Vec<(&'static str, u64, u64, u64, u64, bool)> {
+    pub fn cf_stats(&self) -> Vec<(&'static str, u64, u64, u64, u64, u64, bool)> {
         let mut out = Vec::with_capacity(CF_NAMES.len());
         for name in CF_NAMES {
             let mut ok = true;
@@ -1076,11 +1095,67 @@ impl Store {
             let memtable = read("rocksdb.cur-size-all-mem-tables");
             let sst = read("rocksdb.total-sst-files-size");
             let readers = read("rocksdb.estimate-table-readers-mem");
-            out.push((name, pending, memtable, sst, readers, ok));
+            let level0 = read("rocksdb.num-files-at-level0");
+            out.push((name, pending, memtable, sst, readers, level0, ok));
         }
         out
     }
 
+    /// Summed file count per compaction level (0..=max_level) across every
+    /// family. A rising level 0 with one running compaction is the stall
+    /// signal; deep-level counts show where the compaction debt sits.
+    pub fn level_files(&self, max_level: u32) -> Vec<u64> {
+        let mut out = vec![0u64; (max_level + 1) as usize];
+        for name in CF_NAMES {
+            let Ok(cf) = self.cf(name) else {
+                continue;
+            };
+            for (i, slot) in out.iter_mut().enumerate() {
+                if let Ok(Some(v)) = self
+                    .db
+                    .property_int_value_cf(cf, &format!("rocksdb.num-files-at-level{i}"))
+                {
+                    *slot = slot.saturating_add(v);
+                }
+            }
+        }
+        out
+    }
+
+    /// Live RocksDB counters for the `debug:` statistics line: cache
+    /// hit/miss, bytes written by flush/compaction/WAL, and the WAL-sync /
+    /// get / write latency histograms (p50/p95 in µs). `None` when the
+    /// statistics handle is unavailable.
+    pub fn statistics_line(&self) -> Option<String> {
+        let opts = self.rocksdb_opts.lock().ok()?;
+        let hit = opts.get_ticker_count(Ticker::BlockCacheHit);
+        let miss = opts.get_ticker_count(Ticker::BlockCacheMiss);
+        let total = hit.saturating_add(miss);
+        let hit_pct = hit
+            .checked_mul(100)
+            .and_then(|h| h.checked_div(total))
+            .unwrap_or(0);
+        let wal = opts.get_histogram_data(Histogram::WalFileSyncMicros);
+        let get = opts.get_histogram_data(Histogram::DbGet);
+        Some(format!(
+            "cache hit {}% ({} hits / {} miss), compact r/w {}M/{}M, flush w {}M, \
+             wal w {}M, wal fsync p50/p95/max {:.0}/{:.0}/{:.0}µs, get p50/p95/max \
+             {:.0}/{:.0}/{:.0}µs",
+            hit_pct,
+            hit,
+            miss,
+            opts.get_ticker_count(Ticker::CompactReadBytes) / (1024 * 1024),
+            opts.get_ticker_count(Ticker::CompactWriteBytes) / (1024 * 1024),
+            opts.get_ticker_count(Ticker::FlushWriteBytes) / (1024 * 1024),
+            opts.get_ticker_count(Ticker::WalFileBytes) / (1024 * 1024),
+            wal.median(),
+            wal.p95(),
+            wal.max(),
+            get.median(),
+            get.p95(),
+            get.max(),
+        ))
+    }
     /// Live memtables as accounted by the shared WriteBufferManager.
     pub fn memtable_budget_usage(&self) -> usize {
         self.write_buffer_manager.get_usage()
@@ -1258,7 +1333,7 @@ mod tests {
         assert!(stats.properties_ok, "{stats:?}");
         let cf = s.cf_stats();
         assert_eq!(cf.len(), CF_NAMES.len());
-        assert!(cf.iter().all(|row| row.5), "{cf:?}");
+        assert!(cf.iter().all(|row| row.6), "{cf:?}");
     }
 
     #[test]

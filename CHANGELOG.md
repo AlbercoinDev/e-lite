@@ -1,5 +1,58 @@
 # Changelog
 
+## 0.1.0-alpha.29.8.8 — 2026-11-11
+
+### Log levels, a bolder compaction plan and the ARC warning
+
+No schema, protocol or consensus change. Three pieces from the mainnet A/B
+logs of 29.8.6/29.8.7 (4C/8T, 32 GiB, ZFS pool).
+
+**Log levels: `info` < `debug` < `trace`.** `[logging] level` / `--log-level`,
+hot-reloadable via SIGUSR1 like every other hot field. The historical
+`[e-lite]` lines are INFO and their format is unchanged, so existing parsing
+keeps working; the new detail prints as `[e-lite] debug:` / `[e-lite] trace:`
+lines. Alpha default is `debug`; stable releases will default to `info`.
+
+At `debug` the log gains, every 10 minutes next to the `rocksdb:` line:
+
+```text
+debug: rocksdb-cf meta: l0 2 pending 12 MiB memtable 0 MiB sst 3200 MiB readers 10 MiB ok true   (one per family)
+debug: rocksdb-levels: l0 27 l1 42 l2 108 l3 913 files (summed)
+debug: rocksdb-stats: cache hit 93% (1.2M hits / 88K miss), compact r/w 2150M/3080M,
+                      flush w 512M, wal w 1440M, wal fsync p50/p95/max 2/8/1200µs,
+                      get p50/p95/max 0/2/90µs
+```
+
+and next to every hot `memory:` line:
+
+```text
+debug: cache-controller: shrink 2928 -> 2650 MiB (safety (...); available 4698 MiB, reserve 2048 MiB, dynamic ceiling 2650 MiB, profile cap 7994 MiB)
+debug: io-pressure: some 1.20/0.80 full 0.00/0.10 avg10/avg60 | arc hit 97%
+```
+
+RocksDB statistics are enabled with `ExceptDetailedTimers` (WAL sync, get and
+write timers kept; mutex and compression timers skipped). `trace` adds one
+line per commit group (duration, blocks/txs/bytes, txids vs db split, sync
+flag). Phase transitions print the byte-window arithmetic (`scheduler:`), and
+`/status.rocksdb.cf` now includes `level0_files` per family.
+
+**The compaction plan no longer starves on fast disks.** With the old plan
+(`physical/2`, 2..4) a 4-core host ran one flush and one compaction thread;
+the 29.8.7 log showed `pending_compaction` growing ~70 GiB/h at a 3.5 blocks/s
+drain while the same window with four jobs stayed flat. SSD/NVMe profiles now
+plan `background_jobs = physical cores` clamped to 2..8 (2 flush + N/2
+compaction on a 4-core host); HDD keeps 2 (extra compaction threads only add
+seeking) and virtual/unknown keeps the conservative `physical/2`. Explicit
+`[index] background_jobs` still wins. The next mainnet log validates it:
+flat pending debt, commit/blk back around 60-100 ms.
+
+**Uncapped ZFS ARC warning.** ARC is invisible to `MemAvailable`; at ~20.5 GiB
+it starved the dynamic cache (1.3 GiB against a 3.3-8 GiB plan) while the
+controller acted on a false signal. e-lite now warns at startup and, at most
+once per hour, whenever ARC exceeds a quarter of RAM, with the suggested cap
+(`min(25% RAM, 8 GiB)`). A host capped at exactly that value never triggers
+the warning.
+
 ## 0.1.0-alpha.29.8.7 — 2026-11-10
 
 ### Two measurement fixes found by the first 29.8.6 mainnet log

@@ -1,13 +1,80 @@
 //! Tee stdout/stderr to a file so the console and `e-lite.log` show the same
 //! lines. Implemented with a pipe + `dup2` so every existing `println!` and
 //! `eprintln!` is captured without changing call sites.
+//!
+//! Verbosity levels: the historical `[e-lite]` lines are INFO and always
+//! print; `debug:` and `trace:` lines are extra detail gated by the atomic
+//! level so SIGUSR1 hot reload can change it live. Alpha default is `debug`.
 
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
 use std::os::fd::FromRawFd;
 use std::path::Path;
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::thread::JoinHandle;
+
+pub const INFO: u8 = 0;
+pub const DEBUG: u8 = 1;
+pub const TRACE: u8 = 2;
+
+static LEVEL: AtomicU8 = AtomicU8::new(DEBUG);
+
+/// Current verbosity: `INFO`, `DEBUG` or `TRACE`.
+pub fn level() -> u8 {
+    LEVEL.load(Ordering::Relaxed)
+}
+
+/// Change the verbosity live (config hot reload).
+pub fn set_level(level: u8) {
+    LEVEL.store(level.min(TRACE), Ordering::Relaxed);
+}
+
+pub fn debug_enabled() -> bool {
+    LEVEL.load(Ordering::Relaxed) >= DEBUG
+}
+
+pub fn trace_enabled() -> bool {
+    LEVEL.load(Ordering::Relaxed) >= TRACE
+}
+
+/// Parse a level name (`info|debug|trace`, case-insensitive).
+pub fn parse(text: &str) -> Option<u8> {
+    match text.trim().to_ascii_lowercase().as_str() {
+        "info" => Some(INFO),
+        "debug" => Some(DEBUG),
+        "trace" => Some(TRACE),
+        _ => None,
+    }
+}
+
+pub fn name(level: u8) -> &'static str {
+    match level {
+        INFO => "info",
+        DEBUG => "debug",
+        _ => "trace",
+    }
+}
+
+/// Print a DEBUG-gated line with a greppable `[e-lite] debug:` prefix.
+#[macro_export]
+macro_rules! debug_log {
+    ($($arg:tt)*) => {
+        if $crate::logging::debug_enabled() {
+            eprintln!("[e-lite] debug: {}", ::std::format_args!($($arg)*));
+        }
+    };
+}
+
+/// Print a TRACE-gated line with a greppable `[e-lite] trace:` prefix.
+#[macro_export]
+macro_rules! trace_log {
+    ($($arg:tt)*) => {
+        if $crate::logging::trace_enabled() {
+            eprintln!("[e-lite] trace: {}", ::std::format_args!($($arg)*));
+        }
+    };
+}
 
 static HANDLE: OnceLock<Mutex<Option<JoinHandle<()>>>> = OnceLock::new();
 

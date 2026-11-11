@@ -167,6 +167,16 @@ byte pause/resume requires 10 s at the watermark (`reader_pressure` pauses
 immediately). The memory line prints SReclaimable, Shmem, ZFS ARC when
 available and the process RSS.
 
+**ZFS ARC is invisible to `MemAvailable`.** When ARC grows past a quarter of
+RAM, the cache controller shrinks the RocksDB cache on a false signal while
+ARC holds the memory. e-lite warns at startup and at most once per hour when
+that happens, suggesting `zfs_arc_max = min(25% RAM, 8 GiB)`. On a ZFS pool,
+cap the ARC so the kernel's `MemAvailable` and e-lite's ledger describe the
+same reality (for example `echo 8589934592 > /sys/module/zfs/parameters/
+zfs_arc_max` for 8 GiB on a 32 GiB host, persisted in `/etc/modprobe.d/`).
+`/status` and the `debug:` lines report the ARC hit rate, so you can check
+what the cap costs in read warmth.
+
 ## Controller cadence
 
 The controller is a dedicated thread (`el-tune`), not part of the indexing
@@ -466,11 +476,13 @@ not warn.
 
 RocksDB falls back to slow/stop writes when L0 accumulates faster than a
 single compaction thread can drain it; that shows up as long commits with
-`running 1` and rising `l0`. The lever is `[index] background_jobs`
-(`0` = plan, `physical/2` clamped 2..4; `4` = two flush + two compaction
-threads on a 4-core host). It applies on hot reload; compare the
-`pending_compaction` trend and commit/blk before and after in the same phase
-before changing the default.
+`running 1` and rising `l0`. Since 0.1.0-alpha.29.8.8 the plan gives SSD/NVMe
+disks `background_jobs = physical cores` clamped to 2..8 (two flush plus half
+the physical cores as compaction threads on a 4-core host; HDD keeps 2 and
+virtual/unknown keeps `physical/2`), because the old `physical/2` default let
+the debt grow ~70 GiB/h at drain rates. `[index] background_jobs` still
+overrides the plan for A/B; compare the `pending_compaction` trend and
+commit/blk in the same phase before changing it back.
 
 ### Measured on a real mainnet IBD with defaults (2026-11-08)
 

@@ -1,9 +1,9 @@
 # Session handoff
 
-**Updated:** 2026-11-10
-**Latest published release:** `0.1.0-alpha.29.8.7`
-**Release:** https://github.com/AlbercoinDev/e-lite/releases/tag/v0.1.0-alpha.29.8.7
-**Main commit at handoff:** tag `v0.1.0-alpha.29.8.7`
+**Updated:** 2026-11-11
+**Latest published release:** `0.1.0-alpha.29.8.8`
+**Release:** https://github.com/AlbercoinDev/e-lite/releases/tag/v0.1.0-alpha.29.8.8
+**Main commit at handoff:** tag `v0.1.0-alpha.29.8.8`
 
 This file is the short “where we are” for a new session. The invariants live in
 [`AGENTS.md`](../AGENTS.md) and [`PROJECT_MEMORY.md`](PROJECT_MEMORY.md); the
@@ -86,6 +86,36 @@ no repitas contexto ni rehagas decisiones ya documentadas.
   the onion setup, reset and security.
 - `docs/ROADMAP.md` contains future features/improvements. Do not present them as
   available.
+
+## Last change (alpha.29.8.8)
+
+Log levels, a bolder compaction plan and the ARC warning.
+
+- **Log levels** `info < debug < trace`: `[logging] level` / `--log-level`,
+  hot-reloadable, alpha default `debug` (stable will flip to `info`). INFO
+  lines unchanged; new detail prints as `[e-lite] debug:` / `trace:`:
+  per-family and per-level RocksDB counters, live statistics (cache hit
+  ratio, WAL-sync latency histogram, compact/flush/WAL bytes) every 10 min,
+  PSI + ARC hit rate and the cache-controller decision next to every memory
+  sample, byte-window arithmetic at phase changes, per-commit-group lines at
+  `trace`. `/status.rocksdb.cf` gains `level0_files`.
+- **Plan: `background_jobs = physical cores, 2..8` on SSD/NVMe** (HDD keeps 2,
+  virtual keeps `physical/2`): the old `physical/2` plan gave a 4-core host
+  one compaction thread and the debt grew ~70 GiB/h at drain; four jobs kept
+  it flat. Explicit config still wins. Validated by the next mainnet log.
+- **ZFS ARC warning**: startup + hourly when ARC > 25% of RAM, with the
+  suggested cap `min(25% RAM, 8 GiB)`. ARC is invisible to `MemAvailable`
+  and starved the cache plan at ~20.5 GiB.
+- Tests: fmt, clippy, workspace (232, incl. ARC/PSI parser tests).
+
+### Not decided in 29.8.8
+
+- Crediting ARC headroom into the cache ledger: defer until an ARC-capped
+  log shows the ledger working with a true `MemAvailable`.
+- `prefetch_deadline_ms` stays opt-in; the `rocksdb-stats` line now gives the
+  data to decide.
+- Default log level flips to `info` for stable releases; keep `debug` through
+  alpha.
 
 ## Last change (alpha.29.8.7)
 

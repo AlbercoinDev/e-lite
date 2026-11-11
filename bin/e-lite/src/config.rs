@@ -452,6 +452,16 @@ pub struct LoggingCfg {
     /// Rotate `e-lite.log` to `e-lite.log.1` above this size. 0 disables it.
     #[serde(default = "d_log_max_mib")]
     pub max_mib: u64,
+    /// Verbosity of the extra diagnostic lines: `info` prints only the
+    /// standard lines, `debug` adds per-family/levels/statistics/pressure/
+    /// controller detail, `trace` adds per-commit-group lines. Alpha default
+    /// is `debug`; stable releases default to `info`.
+    #[serde(default = "d_log_level")]
+    pub level: String,
+}
+
+fn d_log_level() -> String {
+    "debug".to_string()
 }
 
 impl Default for LoggingCfg {
@@ -459,6 +469,7 @@ impl Default for LoggingCfg {
         LoggingCfg {
             file: None,
             max_mib: d_log_max_mib(),
+            level: d_log_level(),
         }
     }
 }
@@ -1007,6 +1018,11 @@ impl Config {
         }
         if !matches!(self.index.commit_sync.as_str(), "auto" | "always" | "txids") {
             return Err("[index] commit_sync must be auto, always or txids".to_string());
+        }
+        if crate::logging::parse(&self.logging.level).is_none() {
+            return Err(
+                "[logging] level must be info, debug or trace (alpha default: debug)".to_string(),
+            );
         }
         if self.index.prefetch_deadline_ms != 0
             && !(50..=60_000).contains(&self.index.prefetch_deadline_ms)

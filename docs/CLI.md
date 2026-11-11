@@ -335,7 +335,22 @@ These are escape hatches for measurements, not normal configuration:
 |---|---|---|
 | `--log-file <path>` | `logging.file` | `<data-dir>/e-lite.log` |
 | `--log-max-mib <n>` | `logging.max_mib` | `16` (0 disables rotation) |
+| `--log-level <level>` | `logging.level` | `debug` (alpha; stable: `info`) |
 | `--no-log-file` | — | logging enabled |
+
+`logging.level` selects how much extra detail is logged:
+`info` < `debug` < `trace`. The historical `[e-lite]` lines are INFO and are
+always printed with an unchanged format; the extra detail prints as
+`[e-lite] debug:` / `[e-lite] trace:` lines and the level is hot-reloadable
+(SIGUSR1) like the other hot fields.
+
+- `debug`: per-family RocksDB counters (`rocksdb-cf`), per-level file counts
+  (`rocksdb-levels`), live RocksDB statistics with cache hit ratio and
+  WAL-sync latency (`rocksdb-stats`), Linux I/O pressure and the ZFS ARC hit
+  rate next to every memory sample (`io-pressure`), the cache controller's
+  decision with its inputs (`cache-controller`) and the byte-window
+  arithmetic at every scheduler phase change (`scheduler:`).
+- `trace`: additionally one line per commit group with its txids/db split.
 
 The file receives exactly the same lines as the console (stdout + stderr),
 including progress, milestones, tuning and TLS messages. Rotation keeps one

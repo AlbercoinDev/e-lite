@@ -275,6 +275,7 @@ struct Args {
     restart: Option<bool>,
     log_file: Option<String>,
     log_max_mib: Option<u64>,
+    log_level: Option<String>,
     no_log_file: bool,
 }
 
@@ -431,6 +432,7 @@ fn parse_args() -> R<Args> {
             "--log-file" => args.log_file = Some(value("--log-file")?),
             "--log-max-mib" => args.log_max_mib = Some(value("--log-max-mib")?.parse()?),
             "--no-log-file" => args.no_log_file = true,
+            "--log-level" => args.log_level = Some(value("--log-level")?),
             "--stop-on-exit" => args.stop_on_exit = Some(true),
             "--no-stop-on-exit" => args.stop_on_exit = Some(false),
             "--restart" => args.restart = Some(true),
@@ -733,6 +735,9 @@ fn effective_config(args: &Args) -> R<(Config, Chain)> {
     }
     if let Some(v) = args.log_max_mib {
         cfg.logging.max_mib = v;
+    }
+    if let Some(v) = &args.log_level {
+        cfg.logging.level = v.clone();
     }
     if cfg.index.block_source != "auto"
         && cfg.index.block_source != "rpc"
@@ -1175,12 +1180,19 @@ fn run() -> R<()> {
     }
 
     let (cfg, chain) = effective_config(&args)?;
+    if let Some(level) = logging::parse(&cfg.logging.level) {
+        logging::set_level(level);
+    }
     if matches!(cmd, Command::Index | Command::Serve | Command::Run) && !args.no_log_file {
         let path = cfg.app_log_file(chain);
         if let Err(e) = logging::init(&path, cfg.logging.max_mib) {
             eprintln!("[e-lite] WARNING: {e}; continuing without a log file");
         }
     }
+    eprintln!(
+        "[e-lite] log level: {} ([logging] level or --log-level; hot-reloadable)",
+        logging::name(logging::level())
+    );
     match cmd {
         Command::Init => cmd_init(&cfg, chain),
         Command::Doctor => cmd_doctor(&cfg, chain),
@@ -1329,6 +1341,8 @@ TOR / ONION:
 LOGGING:
     --log-file <path>       application log (default <data-dir>/e-lite.log)
     --log-max-mib <n>       rotate to e-lite.log.1 above N MiB (0 = never)
+    --log-level <level>     info | debug | trace (alpha default: debug;
+                            extra diagnostic lines are gated by this level)
     --no-log-file           disable the application log
 "#
     );
@@ -2649,6 +2663,18 @@ impl Indexer {
                     prev_per_block,
                 );
             }
+            crate::trace_log!(
+                "commit-group: {} ms, {} blocks / {} txs / {} MiB, reason {}, \
+                 txids {} us, db {} us, sync {}",
+                commit_elapsed.as_millis(),
+                blocks,
+                txids.len(),
+                bytes / (1024 * 1024),
+                reason.name(),
+                ct,
+                cd,
+                sync
+            );
             if let Err(e) = result {
                 // Whatever happened, keep the flat file aligned with the DB.
                 if let Ok(Some(t)) = self.store.committed_tip() {
@@ -2692,7 +2718,7 @@ impl Indexer {
                 .rocksdb_properties_ok
                 .store(c.properties_ok, Ordering::Relaxed);
             let mut cf_map = serde_json::Map::new();
-            for (name, pending, memtable, sst, readers, ok) in self.store.cf_stats() {
+            for (name, pending, memtable, sst, readers, level0, ok) in self.store.cf_stats() {
                 cf_map.insert(
                     name.to_string(),
                     json!({
@@ -2700,6 +2726,7 @@ impl Indexer {
                         "memtable_bytes": memtable,
                         "sst_bytes": sst,
                         "table_readers_bytes": readers,
+                        "level0_files": level0,
                         "properties_ok": ok,
                     }),
                 );
@@ -2795,6 +2822,29 @@ impl Indexer {
     /// 1 Core paused/e-lite draining, 2 Core downloading/e-lite paused.
     fn update_phase(&self, phase: u64, committed: u64) {
         let changed = self.phase.swap(phase, Ordering::Relaxed) != phase;
+        if changed {
+            // The byte window is easier to audit with the arithmetic in the
+            // log: backlog = lag x average block size, compared with the
+            // configured pause/resume marks.
+            let lag = self.tunables.core_height().saturating_sub(committed);
+            let avg = self.tunables.avg_block_bytes();
+            let backlog_gib = lag.saturating_mul(avg) / GIB;
+            let name = match phase {
+                1 => "draining",
+                2 => "core",
+                _ => "indexing",
+            };
+            crate::debug_log!(
+                "scheduler: phase {} (lag {} blocks x avgblk {} KiB = backlog {} GiB; \
+                 pause at {} GiB, resume at {} GiB)",
+                name,
+                lag,
+                avg / 1024,
+                backlog_gib,
+                self.cfg.pruning.max_bulk_lag_gib,
+                self.cfg.pruning.core_resume_ahead_gib
+            );
+        }
         let (blocks, elapsed_ms) = if let Ok(mut state) = self.phase_state.lock() {
             if changed || state.is_none() {
                 *state = Some((Instant::now(), committed));
@@ -4026,6 +4076,35 @@ impl Indexer {
                         sh.stats.rocksdb_properties_ok.load(Ordering::Relaxed),
                     );
                     *last = Instant::now();
+                    // Extra detail at `debug`: the per-family split shows
+                    // which family holds the compaction debt, the level
+                    // counts show where it sits, and the live counters show
+                    // whether the cache and the write path behave.
+                    for (name, pending, memtable, sst, readers, level0, ok) in self.store.cf_stats()
+                    {
+                        crate::debug_log!(
+                            "rocksdb-cf {}: l0 {} pending {} MiB memtable {} MiB \
+                             sst {} MiB readers {} MiB ok {}",
+                            name,
+                            level0,
+                            pending / (1024 * 1024),
+                            memtable / (1024 * 1024),
+                            sst / (1024 * 1024),
+                            readers / (1024 * 1024),
+                            ok
+                        );
+                    }
+                    let levels = self.store.level_files(3);
+                    crate::debug_log!(
+                        "rocksdb-levels: l0 {} l1 {} l2 {} l3 {} files (summed)",
+                        levels.first().copied().unwrap_or(0),
+                        levels.get(1).copied().unwrap_or(0),
+                        levels.get(2).copied().unwrap_or(0),
+                        levels.get(3).copied().unwrap_or(0)
+                    );
+                    if let Some(stats_line) = self.store.statistics_line() {
+                        crate::debug_log!("rocksdb-stats: {}", stats_line);
+                    }
                 }
             }
         }
@@ -4477,6 +4556,9 @@ fn preflight(cfg: &Config, chain: Chain, require_min_ram: bool, core_running: bo
             mplan.data_disk.fstype,
             mplan.data_disk.source
         );
+        if mplan.data_disk.kind == tuning::DiskKind::Zfs {
+            tuning::warn_uncapped_arc(&mplan.mem, "[e-lite] WARNING:");
+        }
     }
     let mem = tuning::memory_info();
     let mut b = tuning::budget_with(
@@ -4809,8 +4891,17 @@ fn reload_hot(
                 eprintln!("[e-lite] reload rejected ({e}); keeping the previous config");
                 return;
             }
-            let changed = idx.tunables.reload(&new);
+            let mut changed = idx.tunables.reload(&new);
             idx.tunables.apply_store(&idx.store);
+            if let (Some(a), Some(b)) = (
+                logging::parse(&new.logging.level),
+                logging::parse(&old.logging.level),
+            ) {
+                if a != b {
+                    logging::set_level(a);
+                    changed.push("logging.level");
+                }
+            }
             if changed.contains(&"profile") {
                 if let Err(e) = idx
                     .store
