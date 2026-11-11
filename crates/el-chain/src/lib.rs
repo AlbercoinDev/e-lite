@@ -124,7 +124,9 @@ pub struct SupervisorConfig {
     /// on low disk bypasses this.
     pub prune_interval: Duration,
     /// Skip normal pruning while free space is at or above this many bytes.
-    /// Emergency pruning (below `disk_low_bytes`) still runs.
+    /// Emergency pruning (below `disk_low_bytes`) still runs. Once the index
+    /// is caught up with a Core that left IBD, the deferral is bypassed so
+    /// already-indexed blocks are released; `min_gain` keeps batching after.
     pub prune_defer_free_bytes: Option<u64>,
 }
 
@@ -152,6 +154,9 @@ pub struct TickInput {
     pub core_pruneheight: u32,
     pub free_bytes: Option<u64>,
     pub readers_min: Option<u32>,
+    /// Core is still in IBD. When it is not and the index matches the tip,
+    /// the free-space deferral stops holding already-indexed blocks hostage.
+    pub core_ibd: bool,
 }
 
 /// Maximum index lag allowed when Core is pruning automatically. Core always
@@ -296,14 +301,21 @@ impl Supervisor {
         // a minimum wall-clock interval. It runs even while Core downloads are
         // paused for disk pressure: draining the index and pruning is how we
         // recover free space. Low disk bypasses the interval (emergency prune).
-        // With plenty of free space, normal pruning is pure I/O churn.
+        // With plenty of free space, normal pruning is pure I/O churn —
+        // but only while Core is still building: once the index is caught up,
+        // the deferral would hold every already-indexed block forever (a
+        // from-zero IBD leaves ~90k blocks / ~140 GiB behind the safe cut).
+        // Caught up, the gate prunes to the safe max and `min_gain` keeps
+        // batching the trickle afterwards.
         // Emergency (low-disk) pruning remains active below the threshold.
+        let caught_up = !input.core_ibd && input.committed_height >= input.core_tip;
         let defer_prune = self
             .cfg
             .prune_defer_free_bytes
             .zip(input.free_bytes)
             .map(|(threshold, free)| free >= threshold)
-            .unwrap_or(false);
+            .unwrap_or(false)
+            && !caught_up;
         if self.cfg.prune_enabled && input.core_pruned && !defer_prune {
             let safe = safe_prune_height(
                 input.committed_height,
@@ -412,6 +424,19 @@ mod tests {
             core_pruneheight: 0,
             free_bytes: Some(1000),
             readers_min: None,
+            core_ibd: true,
+        }
+    }
+
+    fn caught_up_input(committed: u32, core_tip: u32) -> TickInput {
+        TickInput {
+            committed_height: committed,
+            core_tip,
+            core_pruned: true,
+            core_pruneheight: 0,
+            free_bytes: Some(1000),
+            readers_min: None,
+            core_ibd: false,
         }
     }
 
@@ -449,6 +474,53 @@ mod tests {
             s.tick(&i).iter().any(|a| matches!(a, Action::Prune(_))),
             "below the threshold the normal prune gate runs"
         );
+    }
+
+    #[test]
+    fn caught_up_prune_bypasses_the_free_space_deferral() {
+        let mut c = cfg();
+        c.prune_defer_free_bytes = Some(500);
+        let mut s = Supervisor::new(c.clone());
+        // Core out of IBD and the index at its tip: the 1000 free bytes would
+        // defer pruning forever while the safe cut sits 10 blocks below the
+        // index. Caught up, the gate prunes to the safe max.
+        let mut i = caught_up_input(100, 100);
+        i.core_pruneheight = 0;
+        i.free_bytes = Some(1000);
+        assert_eq!(
+            s.tick(&i),
+            vec![Action::Prune(90)],
+            "caught up prunes to committed - undo_margin"
+        );
+        // Core still in IBD at the same heights: the deferral holds.
+        let mut s2 = Supervisor::new(c.clone());
+        let mut j = input(100, 100);
+        j.core_pruneheight = 0;
+        j.free_bytes = Some(1000);
+        assert!(
+            s2.tick(&j).is_empty(),
+            "IBD defers pruning on high free space"
+        );
+    }
+
+    #[test]
+    fn caught_up_live_mode_batches_after_the_transition_prune() {
+        let mut c = cfg();
+        c.prune_defer_free_bytes = Some(500);
+        c.min_gain = 5;
+        let mut s = Supervisor::new(c);
+        let mut i = caught_up_input(100, 100);
+        i.core_pruneheight = 0;
+        i.free_bytes = Some(1000);
+        assert_eq!(s.tick(&i), vec![Action::Prune(90)]);
+        s.on_prune_requested(90);
+        s.on_pruned(90);
+        // One block later in live mode: below min_gain (5), no request even
+        // with the deferral bypassed. The batching keeps live churn low.
+        let mut j = caught_up_input(101, 101);
+        j.core_pruneheight = 90;
+        j.free_bytes = Some(1000);
+        assert!(s.tick(&j).is_empty(), "live gain below min_gain: no prune");
     }
 
     #[test]

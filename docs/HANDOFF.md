@@ -1,9 +1,9 @@
 # Session handoff
 
 **Updated:** 2026-11-11
-**Latest published release:** `0.1.0-alpha.29.8.9`
-**Release:** https://github.com/AlbercoinDev/e-lite/releases/tag/v0.1.0-alpha.29.8.9
-**Main commit at handoff:** tag `v0.1.0-alpha.29.8.9`
+**Latest published release:** `0.1.0-alpha.29.9.0`
+**Release:** https://github.com/AlbercoinDev/e-lite/releases/tag/v0.1.0-alpha.29.9.0
+**Main commit at handoff:** tag `v0.1.0-alpha.29.9.0`
 
 This file is the short “where we are” for a new session. The invariants live in
 [`AGENTS.md`](../AGENTS.md) and [`PROJECT_MEMORY.md`](PROJECT_MEMORY.md); the
@@ -86,6 +86,29 @@ no repitas contexto ni rehagas decisiones ya documentadas.
   the onion setup, reset and security.
 - `docs/ROADMAP.md` contains future features/improvements. Do not present them as
   available.
+
+## Last change (alpha.29.9.0)
+
+Prune to the safe maximum once the index is caught up.
+
+- **Finding (AUD-122)**: `prune_defer_free_gib = 20` deferred all normal
+  pruning while free space stayed above the margin — on the mainnet ZFS host
+  (~170 GiB free) a from-zero IBD left Core holding ~89k already-indexed
+  blocks (~140 GiB) with `pruneheight` frozen at 886146 for days.
+- **Fix**: once Core is out of IBD and the index matches Core's tip, the
+  free-space deferral is bypassed: one prune to the safe maximum
+  (`index - 288`), then `min_gain_blocks` batches the live trickle. During
+  Core's IBD nothing changes. Durability invariants untouched (durable tip,
+  WAL barrier, safe-height cap, retry-after-backoff).
+- Tests: caught-up bypass + live batching in `el-chain`; the IBD deferral
+  test still passes. Workspace 234.
+
+### Not decided in 29.9.0
+
+- Whether the caught-up bypass should also apply while a Core **out of IBD**
+  still has a large index backlog (lag > 0): today it does not — the drain
+  phases defer as before, and the backlog's own `min_gain` windows release
+  most of it. Revisit with a log.
 
 ## Last change (alpha.29.8.9)
 

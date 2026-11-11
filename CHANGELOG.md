@@ -1,5 +1,41 @@
 # Changelog
 
+## 0.1.0-alpha.29.9.0 — 2026-11-11
+
+### Prune to the safe maximum once the index is caught up
+
+No schema, protocol or consensus change. Found on the mainnet ZFS host: a
+from-zero IBD finished with Core's `pruneheight` frozen at **886146** while
+the index sat at ~975k — Core was holding ~89k already-indexed blocks
+(~140 GiB) because normal pruning is deferred while free space stays above
+`prune_defer_free_gib = 20` (the host had ~170 GiB free). The safe cut
+(`index - 288`) was ~90k blocks ahead and `min_gain_blocks` (5,000) was
+already satisfied: the free-space deferral was the only blocker, and it never
+expires on its own.
+
+**The deferral ends at the tip.** The prune gate now bypasses the free-space
+deferral when Core is out of IBD **and** the index matches Core's tip: the
+next supervisor tick prunes to the safe maximum, releasing everything behind
+it. Live mode then batches again under `min_gain_blocks` (default 5,000 —
+roughly one prune per day at mainnet block rates), so there is no per-block
+churn. During Core's IBD the behaviour is exactly as before.
+
+Durability is untouched: the prune still starts from a durable tip behind
+the `SyncWAL(true)` barrier, is capped by the committed tip, the undo window
+(`index - 288`) and Core's own retention (`tip - 288`), and a failed request
+retries the same safe height after backoff.
+
+```text
+[prune gate, caught up, ~170 GiB free]
+before:  prune 886146 (deferred forever, ~140 GiB held)
+after:   prune 975124 (safe max), then batching at min_gain
+```
+
+Tests: `caught_up_prune_bypasses_the_free_space_deferral` (bypass at the tip,
+deferral still holds during IBD) and
+`caught_up_live_mode_batches_after_the_transition_prune` (live batching).
+`docs/AUDIT.md` AUD-122 records the evidence.
+
 ## 0.1.0-alpha.29.8.9 — 2026-11-11
 
 ### The index now reaches the tip: the last-blocks stall and honest READY

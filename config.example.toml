@@ -77,7 +77,7 @@ scheduler = "overlap"               # overlap (e-lite indexes while Core downloa
                                     # | alternate (take turns; opt-in, needs
                                     # prune_mib = 1 and
                                     # pause_core_during_bulk = true)
-prune_defer_free_gib = 20           # keep 20 GiB free before normal pruning (low disk bypasses)
+prune_defer_free_gib = 20           # keep 20 GiB free before normal pruning (low disk bypasses; once the index is caught up with a Core out of IBD, the deferral is bypassed so indexed blocks are released)
 min_gain_blocks = 5000              # evaluate/execute prune every ~5k safe blocks
 prune_interval_seconds = 30         # minimum time between prune requests (low disk bypasses)
 repair_max_gap_blocks = 2048        # auto-repair a prune gap from verified sources

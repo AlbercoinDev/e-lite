@@ -4445,6 +4445,7 @@ fn supervisor_tick(
         core_pruneheight: info.pruneheight.min(u32::MAX as u64) as u32,
         free_bytes: free,
         readers_min: readers.and_then(|r| r.earliest()),
+        core_ibd: info.initialblockdownload,
     };
     Ok(sup.tick(&input))
 }

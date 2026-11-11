@@ -547,6 +547,16 @@ gain only if prune I/O is a measured problem. Low-disk emergency pruning still
 runs. `--core-arg` can also reduce Core's memory/IO footprint (for example
 `--core-arg=-dbcache=128`).
 
+**The free-space deferral ends at the tip.** While Core downloads (IBD),
+plenty of free space defers normal pruning — it would be churn. Once Core is
+out of IBD **and** the index matches Core's tip, the deferral is bypassed:
+the gate prunes to the safe maximum (`index - 288`) on the next tick,
+releasing every already-indexed block a from-zero IBD leaves behind (~90k
+blocks / ~140 GiB on mainnet). Live mode then batches again under
+`min_gain_blocks`. Durability is unchanged: the prune still starts from a
+durable tip behind the WAL barrier and retries the same safe height after a
+failure.
+
 `commit_sync = auto` (default) uses `txids` durability during bulk/IBD and
 strict `always` when live. `txids` still fsyncs `txids.dat`; a crash can only
 lose the last interval, which is reindexed from Core.
