@@ -73,7 +73,8 @@ rpc_password = "..."
 ```
 
 RPC-only; no remote block files. First pruned IBD is not supported against a
-remote pruned node; use a full node/local owned Core/snapshot.
+remote pruned node; use a full node/local owned Core, or restore a full
+snapshot (`export-snapshot --with-core`) that already contains the chain.
 
 ### WAN Core
 
@@ -302,6 +303,35 @@ gap-repair path protect the index. It is opt-in.
 
 Snapshots are optional. A snapshot can restore an index on another host but is
 not required by the from-zero flow.
+
+### Backing up and restoring index + Core (one network at a time)
+
+```bash
+# Backup (stop e-lite and Core first; the export refuses while Core runs)
+e-lite export-snapshot --network mainnet --allow-mainnet \
+  --output /backups/full-mainnet-<tip>.tar.gz --with-core --hash-files
+
+# Restore into an empty data dir and verify the pair
+e-lite import-snapshot --network mainnet --allow-mainnet \
+  --data-dir ~/e-lite/mainnet --input /backups/full-mainnet-<tip>.tar.gz \
+  --verify=full
+```
+
+- `--with-core` bundles the network's Core datadir (`<data-dir>/bitcoin`)
+  under `bitcoin/` in the archive; wallets/mempool/peers/cookie/log files are
+  excluded. A probe Core records tip, prune height and version in the
+  manifest; the pair rules are enforced on both sides (`index tip <= Core
+  tip`, `prune_height <= index tip - 288` undo window).
+- Without `--with-core` the archive is index-only and never contains the
+  Core datadir. `--compress-level` is gzip 0..9 (default 3, balanced);
+  `--hash-files` adds SHA-256 per Core file to the manifest.
+- `--verify` checks the per-file sizes/hashes; `--verify=full` opens the
+  restored Core isolated (`-connect=0 -listen=0`), checks both tips and runs
+  a bounded `verifychain(2, 288)` before e-lite is started again.
+- Run the command once per network: `mainnet`, `testnet4` and `signet` each
+  produce their own archive with their own manifest identity checks.
+- A restored instance starts with a new onion address (`tor/` is excluded)
+  and no TLS change (`tls/` is excluded too).
 
 ## Disks and LXC
 

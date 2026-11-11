@@ -37,6 +37,9 @@ no repitas contexto ni rehagas decisiones ya documentadas.
   by itself; the prune gate keeps the cut below `index - 288`.
 - `prune_mib >= 550` requires `[pruning] allow_auto_prune = true`.
 - Snapshots are optional and are not needed for the from-zero flow.
+  `export-snapshot` is per-network; `--with-core` bundles the network's Core
+  datadir with an index archive (manifest format 2, coherence-checked,
+  `--verify=full` opens the restored Core). `AGENTS.md` has the details.
 - Electrum binds per-network defaults: plain/TLS/metrics are
   `55011/55022/55084` (mainnet), `55111/55122/55184` (testnet4),
   `55211/55222/55284` (signet) and `55311/55322/55384` (regtest), on `0.0.0.0`
@@ -86,6 +89,37 @@ no repitas contexto ni rehagas decisiones ya documentadas.
   the onion setup, reset and security.
 - `docs/ROADMAP.md` contains future features/improvements. Do not present them as
   available.
+
+## Last change (alpha.29.10.0)
+
+Full per-network snapshots: index + Bitcoin Core in one archive.
+
+- **AUD-124 (P1, fixed)**: `snapshot.rs::add_tree` never excluded the nested
+  Core datadir, so an index `export-snapshot` silently packed all of Core
+  (hundreds of GB, inconsistent `chainstate/`). Index snapshots now always
+  exclude `bitcoin/`; the full-backup path is explicit.
+- **`export-snapshot --with-core`**: refuses while a Core is running, probes
+  it (start + RPC + stop), packs `<data-dir>/bitcoin` under `bitcoin/`
+  (wallets/mempool/peers/cookie/logs excluded) and records tip, prune height
+  and subversion in manifest **format 2** (format 1 still imports). Pair
+  rules enforced: `index tip <= Core tip`, `prune_height <= index tip - 288`.
+  gzip level `--compress-level` (default 3, balanced); `--hash-files` adds
+  per-file SHA-256.
+- **`import-snapshot`**: empty target, all format-1 checks plus the Core
+  section: file sizes/hashes (`--verify`), coherence, and `--verify=full`
+  (isolated Core `-connect=0 -listen=0`, tip checks, `verifychain(2, 288)`).
+- Per network: run per `--network mainnet|testnet4|signet`; regtest covered
+  by `tests/e2e_snapshot.sh` (9 new unit tests + the e2e).
+- **AUD-125 (P2, mitigated)**: hand-mixed index/datadir pairs could restore
+  with a prune cut deeper than the undo window; the manifest now rejects it.
+
+### Not decided in 29.10.0
+
+- Whether gzip level 3 is the right default for Core-heavy archives (the
+  `blk*.dat` gains ~10-20 %); revisit with a mainnet-size measurement — the
+  level is already a flag.
+- `--verify` remains opt-in; sizes are checked always. Decide whether the
+  hash check should be default once real mainnet archives exist.
 
 ## Last change (alpha.29.9.2)
 

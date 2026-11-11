@@ -25,7 +25,11 @@ core logs        print the last 50 lines of a Core launched by e-lite
 onion show       show the Tor onion address, ports and managed-Tor state
 onion reset      generate a new onion address (stop e-lite first)
 export-snapshot  print the canonical digest or write --output
+                 (--with-core bundles the network's Core datadir; --hash-files
+                 adds SHA-256 per Core file; --compress-level 0..9, default 3)
 import-snapshot  restore --input into an empty target
+                 (--verify checks per-file hashes; --verify=full opens the
+                 restored Core and runs a bounded verifychain)
 version          print version
 ```
 
@@ -44,6 +48,10 @@ version          print version
 | `--block-source <src>` | `auto`, `rpc`, `files` |
 | `--manage <mode>` | `external`, `auto`, `managed` |
 | `--prune-mib <n>` | `1` manual (default), `0` full, `>=550` auto + opt-in |
+| `--output <path>` | snapshot file for `export-snapshot` |
+| `--input <path>` | snapshot file for `import-snapshot` |
+| `--with-core`, `--hash-files`, `--compress-level <n>` | export-snapshot: bundle the Core datadir, hash its files (gzip level default 3) |
+| `--verify [basic\|full]` | import-snapshot: per-file hash check, or open the restored Core and `verifychain` |
 | `--min-free-gib <n>`, `--critical-free-gib <n>` | disk guards |
 | `--listen <addr>`, `--metrics <addr>` | Electrum plain / metrics listeners |
 | `--tls` / `--no-tls` | enable (default) or disable Electrum TLS |
@@ -118,6 +126,18 @@ Fixed values, no controller:
 ```bash
 e-lite run --network mainnet --allow-mainnet \
   --profile ssd --no-adaptive --readers 4 --cache-mib 1024 --commit-interval-ms 3000
+```
+
+Snapshot backup of one network, restored on another host (run per network;
+stop e-lite and Core first — the export refuses otherwise):
+
+```bash
+e-lite export-snapshot --network mainnet --allow-mainnet \
+  --output /backups/full-mainnet-<tip>.tar.gz --with-core --hash-files
+
+e-lite import-snapshot --network mainnet --allow-mainnet \
+  --data-dir ~/e-lite/mainnet --input /backups/full-mainnet-<tip>.tar.gz \
+  --verify=full
 ```
 
 ## Pruning and Core

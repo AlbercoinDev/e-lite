@@ -100,6 +100,9 @@ available**.
 | Adaptive memory budget | experimental | fitted to available RAM; hot cache ceiling and opt-in hot memtables; 75 % ceiling; reserve |
 | READY / FULLY SYNCED status | experimental | log, `/status`, `/metrics`, `e-lite status` |
 | Ordered startup/shutdown | experimental | `run` waits for Core; threads joined before Core stop |
+| Snapshot export (index only) | experimental | `export-snapshot --output`: manifest format 2 (network/genesis/tip/schema/digest); the nested Core datadir is excluded |
+| Snapshot export (index + Core) | experimental | `--with-core`: probes Core (start + RPC + stop), bundles its datadir with tip/prune/version in the manifest; refuses while Core runs; `--hash-files`, `--compress-level` (default 3) |
+| Snapshot import + verification | experimental | `import-snapshot`: empty target, digest/tip/genesis validation, Core coherence (`index tip <= Core tip`, 288-block prune margin); `--verify` checks file hashes; `--verify=full` opens the restored Core and runs a bounded `verifychain` |
 | CLI overrides and `--set` | stable | every TOML field; see `docs/CLI.md` |
 | Progress percentages and milestones | experimental | height/Core %, 10k blocks or 6 h; disk usage |
 | One-line install/update | stable | installer verifies SHA256SUMS; Tor bundle by default |

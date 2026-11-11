@@ -1,5 +1,6 @@
 mod config;
 mod core_plan;
+mod core_probe;
 mod core_supervisor;
 mod ibd_lock;
 mod logging;
@@ -224,6 +225,10 @@ struct Args {
     no_rawtx: bool,
     output: Option<String>,
     input: Option<String>,
+    with_core: bool,
+    hash_files: bool,
+    compress_level: Option<u32>,
+    verify: Option<String>,
     set: Vec<String>,
     profile: Option<String>,
     adaptive: Option<bool>,
@@ -330,6 +335,20 @@ fn parse_args() -> R<Args> {
             "--min-free-gib" => args.min_free_gib = Some(value("--min-free-gib")?.parse()?),
             "--output" => args.output = Some(value("--output")?),
             "--input" => args.input = Some(value("--input")?),
+            "--with-core" => args.with_core = true,
+            "--hash-files" => args.hash_files = true,
+            "--compress-level" => args.compress_level = Some(value("--compress-level")?.parse()?),
+            "--verify" => {
+                let v = inline.clone().unwrap_or_else(|| "basic".to_string());
+                if v != "basic" && v != "full" {
+                    return fail(
+                        "--verify takes `basic` (per-file hashes) or `full` \
+                                 (hashes + a bounded verifychain on the restored Core)"
+                            .to_string(),
+                    );
+                }
+                args.verify = Some(v);
+            }
             "--set" => args.set.push(value("--set")?),
             "--profile" => args.profile = Some(value("--profile")?),
             "--cache-mib" => args.cache_mib = Some(value("--cache-mib")?.parse()?),
@@ -1215,8 +1234,17 @@ fn run() -> R<()> {
             args.purge,
             args.yes,
         ),
-        Command::ExportSnapshot => cmd_export(&cfg, chain, args.output.as_deref()),
-        Command::ImportSnapshot => cmd_import(&cfg, chain, args.input.as_deref()),
+        Command::ExportSnapshot => cmd_export(
+            &cfg,
+            chain,
+            args.output.as_deref(),
+            args.with_core,
+            args.hash_files,
+            args.compress_level,
+        ),
+        Command::ImportSnapshot => {
+            cmd_import(&cfg, chain, args.input.as_deref(), args.verify.as_deref())
+        }
         Command::Help | Command::Version => unreachable!(),
     }
 }
@@ -1240,7 +1268,11 @@ COMMANDS:
     onion show       print the Tor onion address and managed-Tor state
     onion reset      generate a new onion address (stop e-lite first)
     export-snapshot  print the canonical digest, or write a backup with --output
+                     (--with-core bundles the network's Core datadir; --hash-files
+                     adds SHA-256 per Core file; --compress-level 0..9, default 3)
     import-snapshot  restore a backup with --input (target must be empty)
+                     (--verify checks per-file hashes; --verify=full opens the
+                     restored Core and runs a bounded verifychain)
     version          print version
 
 OPTIONS:
@@ -1274,6 +1306,10 @@ OPTIONS:
     --json                  JSON output for status
     --output <path>         snapshot file for export-snapshot
     --input <path>          snapshot file for import-snapshot
+    --with-core             export-snapshot: bundle the network's Core datadir
+    --hash-files            export-snapshot: SHA-256 every Core file in the manifest
+    --compress-level <n>    export-snapshot gzip level (0..9, default 3)
+    --verify [basic|full]   import-snapshot: hash check, or Core verifychain
     --set <key=value>       override any TOML field, e.g. index.profile=ssd
                             (values: true, 42, ["a","b"], or a bare string)
 
@@ -6375,7 +6411,14 @@ fn print_status_human(v: &serde_json::Value) {
     );
 }
 
-fn cmd_export(cfg: &Config, chain: Chain, output: Option<&str>) -> R<()> {
+fn cmd_export(
+    cfg: &Config,
+    chain: Chain,
+    output: Option<&str>,
+    with_core: bool,
+    hash_files: bool,
+    compress_level: Option<u32>,
+) -> R<()> {
     let store = open_store(cfg, chain)?;
     let tip = store.committed_tip()?;
     let digest = store.canonical_digest()?;
@@ -6389,7 +6432,37 @@ fn cmd_export(cfg: &Config, chain: Chain, output: Option<&str>) -> R<()> {
             println!("logical_snapshot_hash: {digest}");
         }
         Some(path) => {
-            let info = snapshot::export(&store, chain, std::path::Path::new(path), VERSION)?;
+            let mut options = snapshot::ExportOptions {
+                version: VERSION.to_string(),
+                with_core,
+                compress_level: compress_level.unwrap_or(3),
+                hash_files,
+                core: None,
+                core_dir: None,
+            };
+            if with_core {
+                // Starts and stops a short-lived Core to record tip, prune
+                // height and version. Refuses while a real Core is running.
+                let index_tip = tip
+                    .as_ref()
+                    .map(|t| t.height as u64)
+                    .ok_or("cannot export an empty index")?;
+                let facts = core_probe::export_facts(cfg, chain, index_tip)?;
+                println!(
+                    "[e-lite] Core probed: tip {} {} prune {} ({})",
+                    facts.tip_height, facts.tip_hash, facts.prune_height, facts.version
+                );
+                options.core = Some(snapshot::CoreSnapshot {
+                    version: facts.version,
+                    tip_height: facts.tip_height,
+                    tip_hash: facts.tip_hash,
+                    pruned: facts.pruned,
+                    prune_height: facts.prune_height,
+                    bytes: 0,
+                });
+                options.core_dir = Some(cfg.core_datadir(chain));
+            }
+            let info = snapshot::export(&store, chain, std::path::Path::new(path), &options)?;
             println!(
                 "snapshot: {} ({:.2} MiB)",
                 info.path.display(),
@@ -6399,20 +6472,115 @@ fn cmd_export(cfg: &Config, chain: Chain, output: Option<&str>) -> R<()> {
             println!("tip: {} {}", info.height, info.hash);
             println!("txnum: {}", info.txnum);
             println!("logical_snapshot_hash: {}", info.digest);
+            if let Some(core) = &info.core {
+                println!(
+                    "core: tip {} {}  prune {}{}  version {}",
+                    core.tip_height,
+                    core.tip_hash,
+                    core.prune_height,
+                    if core.pruned { "" } else { " (not pruned)" },
+                    core.version
+                );
+            }
         }
     }
     Ok(())
 }
 
-fn cmd_import(cfg: &Config, chain: Chain, input: Option<&str>) -> R<()> {
+fn cmd_import(cfg: &Config, chain: Chain, input: Option<&str>, verify: Option<&str>) -> R<()> {
     let input = input.ok_or("import-snapshot requires --input <file.tar.gz>")?;
     let target = cfg.data_dir(chain);
-    let info = snapshot::import(std::path::Path::new(input), &target, chain)?;
+    let info = snapshot::import(
+        std::path::Path::new(input),
+        &target,
+        chain,
+        &snapshot::ImportOptions {
+            verify_hashes: verify.is_some(),
+        },
+    )?;
     println!("restored: {}", target.display());
     println!("network: {}", chain.name());
     println!("tip: {} {}", info.height, info.hash);
     println!("txnum: {}", info.txnum);
     println!("logical_snapshot_hash: {}", info.digest);
+    let mut core_restored = None;
+    if let Some(core) = &info.core {
+        core_restored = Some((core.tip_height, core.tip_hash.clone()));
+        println!(
+            "core: tip {} {}  prune {}{}",
+            core.tip_height,
+            core.tip_hash,
+            core.prune_height,
+            if core.pruned { "" } else { " (not pruned)" }
+        );
+        // The archive restores Core to `<data-dir>/bitcoin`; an operator with
+        // a custom [core] core_datadir must move it there.
+        let default_core = target.join("bitcoin");
+        let effective = cfg.core_datadir(chain);
+        if effective != default_core {
+            println!(
+                "note: Core was restored to {}; the config points at {}; move the directory \
+                 or adjust [core] core_datadir",
+                default_core.display(),
+                effective.display()
+            );
+        }
+    }
+    match verify {
+        Some("basic") => {
+            println!("verify: per-file sizes/hashes checked");
+        }
+        Some("full") => {
+            let core_dir = target.join("bitcoin");
+            if !core_dir.is_dir() {
+                return fail(
+                    "snapshot has no Core section to verify with --verify=full".to_string(),
+                );
+            }
+            println!("[e-lite] verify=full: starting Core on the restored datadir...");
+            let (tip_height, core_tip_hash) =
+                core_restored.ok_or("snapshot has no Core section to verify with --verify=full")?;
+            let report = core_probe::verify_restored(
+                cfg,
+                chain,
+                &core_dir,
+                info.height as u64,
+                &info.hash,
+                Some(&core_tip_hash),
+            )?;
+            if report.core_tip_height != tip_height {
+                return fail(format!(
+                    "restored Core tip {} does not match the manifest tip {}",
+                    report.core_tip_height, tip_height
+                ));
+            }
+            println!(
+                "verify: core tip {} {}  prune {}  index-tip block {}  verifychain {}",
+                report.core_tip_height,
+                report.core_tip_hash,
+                report.prune_height,
+                if report.index_tip_block_ok {
+                    "ok"
+                } else {
+                    "MISMATCH"
+                },
+                if report.verifychain_ok {
+                    "ok"
+                } else {
+                    "FAILED"
+                }
+            );
+            if !report.index_tip_block_ok || !report.verifychain_ok {
+                return fail("restored pair did not pass full verification".to_string());
+            }
+            println!("verify=full: OK");
+        }
+        _ => {
+            if !info.core.is_none() {
+                println!("verify: sizes checked; use --verify to check hashes, --verify=full to open the restored Core");
+            }
+        }
+    }
     Ok(())
 }
 

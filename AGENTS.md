@@ -57,6 +57,20 @@ Never treat a version number in this file as authoritative over the code/tag.
   pruning every 5,000 safe blocks by default (low disk bypasses it).
 - `prune_mib >= 550` requires `[pruning] allow_auto_prune = true`.
 - Snapshots are optional; they are never required by the from-zero flow.
+  `export-snapshot` writes one archive per network (manifest format 2:
+  network, genesis, index tip, schema, txnum, canonical digest) and **always
+  excludes the nested Core datadir `<data-dir>/bitcoin`** from the index
+  section (AUD-124). `--with-core` additionally bundles that network's Core
+  datadir under `bitcoin/` after a probe Core (start + RPC + stop) records
+  tip, prune height and version; it refuses while any Core is running and on
+  a non-loopback RPC URL; wallets/mempool/peers/cookie/logs are never copied.
+  gzip level is `--compress-level` (default 3, balanced; 0 stores).
+  `import-snapshot` needs an empty target and validates network/genesis/
+  schema/tip/digest plus the Core rules `index tip <= Core tip` and
+  `prune_height <= index tip - 288`; `--verify` checks the per-file SHA-256
+  table and `--verify=full` opens the restored Core with `-connect=0`
+  `-listen=0`, checks both tips and runs `verifychain(2, 288)`. Cover:
+  `tests/e2e_snapshot.sh`.
 - Long bulk catch-up pauses Core by default and resumes at 7 GiB of unindexed
   backlog (legacy: 5,000 blocks) to pre-warm peers; normal pruning keeps a
   20 GiB free-space margin by default (`prune_defer_free_gib = 20`) and runs

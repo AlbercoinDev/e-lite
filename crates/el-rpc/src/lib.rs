@@ -329,6 +329,17 @@ impl CoreClient {
         self.call("getblockchaininfo", serde_json::json!([]))
     }
 
+    /// Ask Core to shut down cleanly. The cookie is deleted when it exits.
+    pub fn stop(&self) -> Result<String> {
+        self.call("stop", serde_json::json!([]))
+    }
+
+    /// Bounded `verifychain`: re-checks recent blocks from the tip. Used by the
+    /// snapshot `--verify=full` path, never on the serving path.
+    pub fn verify_chain(&self, checklevel: u32, nblocks: u32) -> Result<bool> {
+        self.call("verifychain", serde_json::json!([checklevel, nblocks]))
+    }
+
     pub fn block_hash(&self, height: u64) -> Result<String> {
         self.call("getblockhash", serde_json::json!([height]))
     }

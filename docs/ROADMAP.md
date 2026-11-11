@@ -30,7 +30,7 @@ acceptance signal that would move it to `FEATURES.md`.
 | P1 | History compaction / deduplication | reduce `history` size on mainnet; must preserve canonical digest semantics or version the schema. |
 | P2 | 40-bit tx refs / compact occurrence encoding | storage reduction with migration and BIP30 tests. |
 | P2 | zstd/bottommost compression experiments | measure size vs CPU on HDD/SSD; no silent format change. |
-| P2 | Incremental/encrypted snapshots | faster backups and optional confidentiality; checksum/signature verification. |
+| P2 | Incremental/encrypted snapshots | Per-file sizes/SHA-256 and `--verify=full` verification are delivered (alpha.29.10.0). Still missing: incremental backups and optional confidentiality. |
 | P3 | Undo retention policy | bounded reorg window is already conservative; tune only with recovery tests. |
 
 ## Privacy

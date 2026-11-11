@@ -1,5 +1,49 @@
 # Changelog
 
+## 0.1.0-alpha.29.10.0 — 2026-11-11
+
+### Full per-network snapshots: index + Bitcoin Core in one archive
+
+No schema, protocol or consensus change to the index itself; the snapshot
+manifest moves to **format 2** (format 1 archives still import).
+
+**`export-snapshot --with-core`** bundles the network's Core datadir with the
+Electrum index so a backup restores both halves of a pruned from-zero node:
+
+- The datadir is only consistent while Core is stopped: the export **refuses**
+  while any Core answers, then starts a probe instance (`-connect=0
+  `-listen=0``, small cache), records tip height/hash, prune height and
+  subversion via RPC, stops it and only then packs `bitcoin/`. Non-loopback
+  RPC URLs are refused (a remote datadir cannot be copied from here).
+- Wallets, `mempool.dat`, `peers.dat`, `banlist.dat`, `.cookie`,
+  `anchors.dat`, logs and lock files are never copied.
+- The manifest records the Core section plus a per-file table (sizes always,
+  SHA-256 with `--hash-files`), and enforces the pair rules at export:
+  `index tip <= Core tip` and, when pruned, `prune_height <= index tip - 288`
+  (the undo window). Compression is gzip **level 3** by default
+  (`--compress-level 0..9`; 0 stores). The archive writes to `<output>.tmp`
+  and is renamed atomically.
+- Index-only exports (format 1 behaviour) no longer include the nested
+  `<data-dir>/bitcoin` at all — previously the "index" tar silently packed
+  the whole Core datadir (AUD-124).
+
+**`import-snapshot --input <file>`** restores into an empty target and, for
+format 2, verifies the Core section: manifest file sizes (always) and
+SHA-256 hashes (`--verify`), `index tip <= Core tip`, the 288-block prune
+margin and the manifest's Core tip. **`--verify=full`** opens the restored
+datadir with an isolated Core (`-connect=0 -listen=0`), checks that the Core
+tip matches the manifest and the index-tip block exists, runs a bounded
+`verifychain(checklevel=2, nblocks=288)` and stops the probe.
+
+Cross-network use: run the command per network (`--network mainnet`,
+`testnet4`, `signet`); each archive is self-contained for that chain.
+
+Tests: 9 new snapshot unit tests (manifest v2 round-trip, coherence rules,
+index/Core walk exclusions, SHA-256, gzip level, sparse acceptance, wrong
+network/unknown format rejection) and `tests/e2e_snapshot.sh` (export refusal
+while Core runs, index-only without `bitcoin/`, full export with hashes,
+import + digest equality, second import rejected, `--verify=full` OK).
+
 ## 0.1.0-alpha.29.9.2 — 2026-11-11
 
 ### Live-mode prune batching on the day scale
