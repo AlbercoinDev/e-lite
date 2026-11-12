@@ -90,6 +90,26 @@ no repitas contexto ni rehagas decisiones ya documentadas.
 - `docs/ROADMAP.md` contains future features/improvements. Do not present them as
   available.
 
+## Unreleased (after alpha.29.10.0)
+
+A static review (2026-11-12) recorded AUD-126..AUD-147 in `docs/AUDIT.md`
+under "Open findings". Fixed since, not yet released (see `CHANGELOG.md`
+"Unreleased"):
+
+- **AUD-126**: `--with-core` packs only `blocks/`, `chainstate/`, `indexes/`
+  of the network (allowlist); wallets, keys and `bitcoin.conf` never enter
+  the archive.
+- **AUD-127**: the provider gate is skipped for an unpruned Core; for a
+  pruned Core it stays fail-closed (AUD-045), with opt-in
+  `[public_servers] open_without_provider`.
+- **AUD-129**: 32-byte prefix extractor + prefix bloom on `history`,
+  `utxo_by_script`, `tx_occurrences`; no migration. Mainnet cold-scan
+  latency still to measure.
+
+Next candidates from the open list: AUD-128 (clearnet fallback default,
+design decision), AUD-130 (schema v2 for disk), AUD-131 (undo in memory),
+AUD-132 (log redaction).
+
 ## Last change (alpha.29.10.0)
 
 Full per-network snapshots: index + Bitcoin Core in one archive.

@@ -93,7 +93,8 @@ p2p_peers = []             # empty = discover from local Core
 [public_servers]
 # file = ""               # empty = <config dir>/public-servers.toml
 generate = true           # create it from the shipped template when missing
-require_ready = true      # run: refuse wallets until a provider answers
+require_ready = true      # run + pruned Core: refuse wallets until a provider answers
+open_without_provider = false  # true: open with local data after ready_timeout_seconds
 ```
 
 ## Tor and clearnet
@@ -113,10 +114,15 @@ require_ready = true      # run: refuse wallets until a provider answers
   the address can query it: e-lite does not authenticate clients; rate limiting
   is only a throttle, not access control. Treat the address as a secret; use
   `[tor] mode = "off"` to disable the onion.
-- `run` waits for at least one provider to answer `/block-height/0` and serve
-  the genesis raw block with a matching header hash before opening the Electrum
-  listeners (`require_ready = true` by default). This prevents a wallet from
-  receiving a history it cannot fully resolve.
+- With a **pruned** Core, `run` waits for at least one provider to answer
+  `/block-height/0` and serve the genesis raw block with a matching header hash
+  before opening the Electrum listeners (`require_ready = true` by default).
+  This prevents a wallet from receiving a history it cannot fully resolve
+  (Sparrow stores a failed `transaction.get` as an unfetchable transaction).
+  An unpruned Core serves every raw transaction locally, so the listeners open
+  at once. `open_without_provider = true` opens them with local data after
+  `ready_timeout_seconds`; e-lite then re-probes every 60 s with the same
+  wallet-free requests until a provider answers.
 - A provider that fails a Tor or direct request is skipped temporarily; the
   last provider that answered is retried first and cooled for at most 30 s. If
   every provider is cooling down, one request is still attempted rather than

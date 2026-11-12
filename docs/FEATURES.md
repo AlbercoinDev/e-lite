@@ -81,7 +81,7 @@ available**.
 | Electrum rate limit | experimental | 200 req/s, burst 5000 for every client; over-budget requests wait, never error; `0` disables |
 | Block hash/header/Merkle/witness validation | experimental | before serving/caching |
 | Configurable Esplora endpoints | experimental | editable `public-servers.toml`; shipped defaults; fail-closed if no provider and `require_ready` |
-| Provider readiness gate | experimental | probes `/block-height/0` + genesis raw block before opening Electrum; `require_ready`, latency/state in `/status` |
+| Provider readiness gate | experimental | probes `/block-height/0` + genesis raw block before opening Electrum when Core is pruned (an unpruned Core skips it); `require_ready`, opt-in `open_without_provider` after `ready_timeout_seconds`, 60 s re-probe, latency/state in `/status` |
 | Provider health cooldown | experimental | failed Tor/direct provider skipped for `provider_cooldown_seconds` (300 s); last good first and cooled for max 30 s; forced attempt when all are cooling |
 | In-flight block dedup | experimental | concurrent tx/prefetch of the same block share one download; `max_parallel_fetches=4` |
 | History block prefetch | experimental | background fetch of confirmed history blocks before `transaction.get`; 1 worker, 16 heights per history, bounded queue, no decoys |
@@ -101,7 +101,7 @@ available**.
 | READY / FULLY SYNCED status | experimental | log, `/status`, `/metrics`, `e-lite status` |
 | Ordered startup/shutdown | experimental | `run` waits for Core; threads joined before Core stop |
 | Snapshot export (index only) | experimental | `export-snapshot --output`: manifest format 2 (network/genesis/tip/schema/digest); the nested Core datadir is excluded |
-| Snapshot export (index + Core) | experimental | `--with-core`: probes Core (start + RPC + stop), bundles its datadir with tip/prune/version in the manifest; refuses while Core runs; `--hash-files`, `--compress-level` (default 3) |
+| Snapshot export (index + Core) | experimental | `--with-core`: probes Core (start + RPC + stop), bundles its chain data only (`blocks/`, `chainstate/`, `indexes/`; wallets, keys and config are never copied) with tip/prune/version in the manifest; refuses while Core runs; `--hash-files`, `--compress-level` (default 3) |
 | Snapshot import + verification | experimental | `import-snapshot`: empty target, digest/tip/genesis validation, Core coherence (`index tip <= Core tip`, 288-block prune margin); `--verify` checks file hashes; `--verify=full` opens the restored Core and runs a bounded `verifychain` |
 | CLI overrides and `--set` | stable | every TOML field; see `docs/CLI.md` |
 | Progress percentages and milestones | experimental | height/Core %, 10k blocks or 6 h; disk usage |

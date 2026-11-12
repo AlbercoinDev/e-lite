@@ -11,8 +11,9 @@ use el_model::{
 };
 use rocksdb::statistics::{Histogram, StatsLevel, Ticker};
 use rocksdb::{
-    BlockBasedOptions, Cache, ColumnFamilyDescriptor, DBCompressionType, Direction, IteratorMode,
-    Options, WriteBatch, WriteBufferManager, WriteOptions, DB,
+    BlockBasedOptions, Cache, ColumnFamilyDescriptor, DBCompressionType, DBIteratorWithThreadMode,
+    Direction, IteratorMode, Options, ReadOptions, SliceTransform, WriteBatch, WriteBufferManager,
+    WriteOptions, DB,
 };
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
@@ -135,6 +136,15 @@ pub const CF_NAMES: [&str; 7] = [
     "utxo_by_script",
     "undo",
 ];
+
+/// Families read only by a 32-byte prefix (script hash or txid). They get a
+/// fixed-prefix extractor so the bloom filter answers "this script has no
+/// rows in this SST" without a disk read (AUD-129): a wallet's gap-limit scan
+/// is mostly addresses that were never used. Keys are 40 (`history`,
+/// `tx_occurrences`) and 68 (`utxo_by_script`) bytes, all with the prefix in
+/// the first 32.
+pub const PREFIX_CFS: [&str; 3] = ["tx_occurrences", "history", "utxo_by_script"];
+pub const PREFIX_LEN: usize = 32;
 
 /// Relative write pressure of each family. `utxo` and `history` dominate an
 /// IBD; giving them a larger memtable avoids frequent flushes and commit
@@ -340,6 +350,15 @@ impl Store {
             // prevout lookup into an extra disk read.
             table.set_cache_index_and_filter_blocks(false);
             table.set_pin_l0_filter_and_index_blocks_in_cache(true);
+            if PREFIX_CFS.contains(&name) {
+                // These families are never read by whole key, so the filter
+                // holds prefixes only (also smaller table readers). SSTs
+                // written before the extractor existed record no extractor
+                // name; RocksDB skips their prefix filter and reads them as
+                // before, so an existing index needs no migration.
+                cf_opts.set_prefix_extractor(SliceTransform::create_fixed_prefix(PREFIX_LEN));
+                table.set_whole_key_filtering(false);
+            }
             cf_opts.set_block_based_table_factory(&table);
             descriptors.push(ColumnFamilyDescriptor::new(name, cf_opts));
         }
@@ -429,6 +448,31 @@ impl Store {
         self.db
             .cf_handle(name)
             .ok_or_else(|| StoreError(format!("missing column family {name}")))
+    }
+
+    /// Rows of one 32-byte prefix in a `PREFIX_CFS` family. The iterator
+    /// stops at the end of the prefix and uses the prefix bloom to skip SSTs
+    /// that do not contain it. Callers still check the prefix of every key.
+    fn prefix_iter<'a>(
+        &'a self,
+        name: &str,
+        prefix: &[u8; PREFIX_LEN],
+    ) -> Result<DBIteratorWithThreadMode<'a, DB>> {
+        let cf = self.cf(name)?;
+        let mut opts = ReadOptions::default();
+        opts.set_prefix_same_as_start(true);
+        Ok(self
+            .db
+            .iterator_cf_opt(cf, opts, IteratorMode::From(prefix, Direction::Forward)))
+    }
+
+    /// Whole family in key order, independent of any prefix extractor. Used
+    /// by digests and maintenance scans that must see every key.
+    fn full_iter<'a>(&'a self, name: &str) -> Result<DBIteratorWithThreadMode<'a, DB>> {
+        let cf = self.cf(name)?;
+        let mut opts = ReadOptions::default();
+        opts.set_total_order_seek(true);
+        Ok(self.db.iterator_cf_opt(cf, opts, IteratorMode::Start))
     }
 
     // ------------------------------------------------------------------- meta
@@ -593,12 +637,8 @@ impl Store {
     }
 
     pub fn occurrences(&self, txid: Hash32) -> Result<Vec<(u32, u32)>> {
-        let cf = self.cf("tx_occurrences")?;
         let mut out = Vec::new();
-        for item in self
-            .db
-            .iterator_cf(&cf, IteratorMode::From(txid.as_bytes(), Direction::Forward))
-        {
+        for item in self.prefix_iter("tx_occurrences", txid.as_bytes())? {
             let (k, _) = item?;
             if k.len() != 40 || &k[..32] != txid.as_bytes() {
                 break;
@@ -644,13 +684,9 @@ impl Store {
     }
 
     pub fn history_for_script(&self, script: ScriptHash) -> Result<Vec<(u32, u32, HistoryEffect)>> {
-        let cf = self.cf("history")?;
         let prefix = script.0.as_bytes();
         let mut out = Vec::new();
-        for item in self
-            .db
-            .iterator_cf(&cf, IteratorMode::From(prefix, Direction::Forward))
-        {
+        for item in self.prefix_iter("history", prefix)? {
             let (k, v) = item?;
             if k.len() != 40 || &k[..32] != prefix {
                 break;
@@ -726,13 +762,9 @@ impl Store {
     }
 
     pub fn utxos_for_script(&self, script: ScriptHash) -> Result<Vec<(Outpoint, u64, u32, bool)>> {
-        let cf = self.cf("utxo_by_script")?;
         let prefix = script.0.as_bytes();
         let mut out = Vec::new();
-        for item in self
-            .db
-            .iterator_cf(&cf, IteratorMode::From(prefix, Direction::Forward))
-        {
+        for item in self.prefix_iter("utxo_by_script", prefix)? {
             let (k, v) = item?;
             if k.len() != 68 || &k[..32] != prefix {
                 break;
@@ -922,8 +954,7 @@ impl Store {
         for name in CF_NAMES {
             hasher.update(name.as_bytes());
             hasher.update([0u8]);
-            let cf = self.cf(name)?;
-            for item in self.db.iterator_cf(&cf, IteratorMode::Start) {
+            for item in self.full_iter(name)? {
                 let (k, v) = item?;
                 hasher.update((k.len() as u32).to_be_bytes());
                 hasher.update(&k);
@@ -953,8 +984,7 @@ impl Store {
         let mut out = Vec::new();
         for name in CF_NAMES {
             let mut hasher = Sha256::new();
-            let cf = self.cf(name)?;
-            for item in self.db.iterator_cf(&cf, IteratorMode::Start) {
+            for item in self.full_iter(name)? {
                 let (k, v) = item?;
                 hasher.update((k.len() as u32).to_be_bytes());
                 hasher.update(&k);
@@ -1544,6 +1574,186 @@ mod tests {
         };
         let s = Store::open(&dir).unwrap();
         assert_eq!(d1, s.canonical_digest().unwrap());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Scripts that differ only in the last byte: the worst case for a
+    /// prefix scan that runs past its prefix.
+    fn neighbour_scripts() -> [ScriptHash; 3] {
+        let mut a = [0x42u8; 32];
+        a[31] = 0x10;
+        let mut b = a;
+        b[31] = 0x11;
+        let mut c = a;
+        c[31] = 0x0f;
+        [
+            ScriptHash(Hash32(a)),
+            ScriptHash(Hash32(b)),
+            ScriptHash(Hash32(c)),
+        ]
+    }
+
+    fn effect(sat: u64) -> HistoryEffect {
+        HistoryEffect {
+            received_sat: sat,
+            spent_sat: 0,
+            flags: 0,
+        }
+    }
+
+    fn assert_prefix_reads(s: &Store, scripts: &[ScriptHash; 3], txid_a: Hash32, txid_b: Hash32) {
+        let [a, b, c] = *scripts;
+        let ha = s.history_for_script(a).unwrap();
+        assert_eq!(
+            ha.iter().map(|r| (r.0, r.1)).collect::<Vec<_>>(),
+            vec![(1, 0), (2, 3)]
+        );
+        assert_eq!(s.history_for_script(b).unwrap().len(), 1);
+        assert!(s.history_for_script(c).unwrap().is_empty());
+        let ua = s.utxos_for_script(a).unwrap();
+        assert_eq!(ua.len(), 1);
+        assert_eq!(ua[0].1, 7);
+        assert!(s.utxos_for_script(c).unwrap().is_empty());
+        assert_eq!(s.occurrences(txid_a).unwrap(), vec![(1, 0), (5, 2)]);
+        assert_eq!(s.occurrences(txid_b).unwrap(), vec![(2, 3)]);
+    }
+
+    #[test]
+    fn prefix_scans_stop_at_the_script_boundary() {
+        let _guard = serial();
+        let dir = tmp("prefix");
+        let s = Store::open(&dir).unwrap();
+        let scripts = neighbour_scripts();
+        let [a, b, _] = scripts;
+        let txid_a = Hash32([0x55; 32]);
+        let mut txid_b = txid_a;
+        txid_b.0[31] = 0x56;
+
+        let mut batch = Store::batch();
+        s.put_history(&mut batch, a, 1, 0, &effect(1)).unwrap();
+        s.put_history(&mut batch, a, 2, 3, &effect(2)).unwrap();
+        s.put_history(&mut batch, b, 1, 1, &effect(3)).unwrap();
+        let op = Outpoint {
+            txid: txid_a,
+            vout: 0,
+        };
+        let val = UtxoValue {
+            value_sat: 7,
+            script_hash: a,
+            creation_height: 1,
+            coinbase: false,
+        };
+        s.put_utxo(&mut batch, &op, &val).unwrap();
+        let op_b = Outpoint {
+            txid: txid_b,
+            vout: 1,
+        };
+        let val_b = UtxoValue {
+            script_hash: b,
+            ..val
+        };
+        s.put_utxo(&mut batch, &op_b, &val_b).unwrap();
+        s.put_occurrence(&mut batch, txid_a, 1, 0).unwrap();
+        s.put_occurrence(&mut batch, txid_a, 5, 2).unwrap(); // BIP30 duplicate
+        s.put_occurrence(&mut batch, txid_b, 2, 3).unwrap();
+        s.write_batch(batch, true).unwrap();
+
+        // Memtable path, then SST path (prefix bloom active).
+        assert_prefix_reads(&s, &scripts, txid_a, txid_b);
+        let digest = s.canonical_digest().unwrap();
+        s.flush_all().unwrap();
+        assert_prefix_reads(&s, &scripts, txid_a, txid_b);
+        // Full scans still see every key in order.
+        assert_eq!(digest, s.canonical_digest().unwrap());
+        assert_eq!(s.full_iter("history").unwrap().count(), 3);
+        assert_eq!(s.full_iter("utxo_by_script").unwrap().count(), 2);
+        assert_eq!(s.full_iter("tx_occurrences").unwrap().count(), 3);
+
+        // An unused script inside an SST's key range is answered by the
+        // prefix bloom, not by reading data blocks: the point of AUD-129.
+        let mut batch = Store::batch();
+        s.put_history(&mut batch, ScriptHash(Hash32([0x00; 32])), 9, 0, &effect(1))
+            .unwrap();
+        s.put_history(&mut batch, ScriptHash(Hash32([0xff; 32])), 9, 1, &effect(1))
+            .unwrap();
+        s.write_batch(batch, true).unwrap();
+        s.flush_all().unwrap();
+        // Iterator seeks report prefix-filter hits on these tickers (the
+        // `BloomFilterPrefix*` ones count point lookups only).
+        let useful = || {
+            let opts = s.rocksdb_opts.lock().unwrap();
+            opts.get_ticker_count(Ticker::NonLastLevelSeekFiltered)
+                + opts.get_ticker_count(Ticker::LastLevelSeekFiltered)
+        };
+        let before = useful();
+        assert!(s
+            .history_for_script(ScriptHash(Hash32([0x80; 32])))
+            .unwrap()
+            .is_empty());
+        assert!(
+            useful() > before,
+            "the prefix bloom must reject an unused script"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn index_written_without_prefix_extractor_still_reads() {
+        // An index built by an older release has SSTs without a prefix
+        // extractor. Opening it with the new options must not hide rows.
+        let _guard = serial();
+        let dir = tmp("legacy-prefix");
+        let scripts = neighbour_scripts();
+        let [a, b, c] = scripts;
+        {
+            let mut opts = Options::default();
+            opts.create_if_missing(true);
+            opts.create_missing_column_families(true);
+            let descriptors = CF_NAMES
+                .iter()
+                .map(|n| ColumnFamilyDescriptor::new(*n, Options::default()));
+            let db = DB::open_cf_descriptors(&opts, &dir, descriptors).unwrap();
+            let history = db.cf_handle("history").unwrap();
+            db.put_cf(
+                history,
+                codec::history_key(a, 1, 0),
+                codec::history_value(&effect(1)),
+            )
+            .unwrap();
+            db.put_cf(
+                history,
+                codec::history_key(b, 1, 1),
+                codec::history_value(&effect(3)),
+            )
+            .unwrap();
+            db.flush_cf(history).unwrap();
+        }
+        let s = Store::open(&dir).unwrap();
+        assert_eq!(s.history_for_script(a).unwrap().len(), 1);
+        assert_eq!(s.history_for_script(b).unwrap().len(), 1);
+        assert!(s.history_for_script(c).unwrap().is_empty());
+        // New SSTs (with the extractor) and old ones are read together.
+        let mut batch = Store::batch();
+        s.put_history(&mut batch, a, 2, 3, &effect(2)).unwrap();
+        s.write_batch(batch, true).unwrap();
+        s.flush_all().unwrap();
+        assert_eq!(
+            s.history_for_script(a)
+                .unwrap()
+                .iter()
+                .map(|r| (r.0, r.1))
+                .collect::<Vec<_>>(),
+            vec![(1, 0), (2, 3)]
+        );
+        assert_eq!(s.history_for_script(b).unwrap().len(), 1);
+        assert_eq!(s.full_iter("history").unwrap().count(), 3);
+        drop(s);
+        // And after a full compaction merges both kinds of files.
+        let s = Store::open(&dir).unwrap();
+        s.db.compact_range_cf(s.cf("history").unwrap(), None::<&[u8]>, None::<&[u8]>);
+        assert_eq!(s.history_for_script(a).unwrap().len(), 2);
+        assert_eq!(s.history_for_script(b).unwrap().len(), 1);
+        assert!(s.history_for_script(c).unwrap().is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -54,15 +54,22 @@ pub struct PublicServersCfg {
     /// run. Existing files are never overwritten.
     #[serde(default = "d_true")]
     pub generate: bool,
-    /// Refuse to start `run` when no public provider answers for the network.
+    /// `run` keeps the Electrum listeners closed until a public provider
+    /// answers, when Core is pruned (an unpruned Core never needs one).
     #[serde(default = "d_true")]
     pub require_ready: bool,
     /// Timeout for each provider probe.
     #[serde(default = "d_probe_timeout")]
     pub probe_timeout_seconds: u64,
-    /// How long to wait for a provider before failing `run`.
+    /// How long one readiness round waits for a provider before logging and
+    /// probing again.
     #[serde(default = "d_ready_timeout")]
     pub ready_timeout_seconds: u64,
+    /// Open the listeners after `ready_timeout_seconds` even if no provider
+    /// answered (AUD-127). Off by default: with a pruned Core some wallets
+    /// (Sparrow) mishandle a failed `transaction.get` (AUD-045).
+    #[serde(default)]
+    pub open_without_provider: bool,
 }
 
 impl Default for PublicServersCfg {
@@ -73,6 +80,7 @@ impl Default for PublicServersCfg {
             require_ready: true,
             probe_timeout_seconds: d_probe_timeout(),
             ready_timeout_seconds: d_ready_timeout(),
+            open_without_provider: false,
         }
     }
 }

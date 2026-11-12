@@ -50,7 +50,7 @@ version          print version
 | `--prune-mib <n>` | `1` manual (default), `0` full, `>=550` auto + opt-in |
 | `--output <path>` | snapshot file for `export-snapshot` |
 | `--input <path>` | snapshot file for `import-snapshot` |
-| `--with-core`, `--hash-files`, `--compress-level <n>` | export-snapshot: bundle the Core datadir, hash its files (gzip level default 3) |
+| `--with-core`, `--hash-files`, `--compress-level <n>` | export-snapshot: bundle the Core chain data (`blocks/`, `chainstate/`, `indexes/` only; never wallets, keys or `bitcoin.conf`), hash its files (gzip level default 3) |
 | `--verify [basic\|full]` | import-snapshot: per-file hash check, or open the restored Core and `verifychain` |
 | `--min-free-gib <n>`, `--critical-free-gib <n>` | disk guards |
 | `--listen <addr>`, `--metrics <addr>` | Electrum plain / metrics listeners |
@@ -218,6 +218,7 @@ e-lite run --network mainnet --allow-mainnet \
 | `--set rawtx.max_parallel_fetches=<n>` | concurrent external block downloads | `4` |
 | `--set rawtx.p2p_timeout_seconds=<n>` | P2P connect/handshake/block timeout | `8` |
 | `--set public_servers.require_ready=false` | start without a ready provider | `true` |
+| `--set public_servers.open_without_provider=true` | pruned Core: open Electrum with local data after `ready_timeout_seconds` if no provider answered | `false` |
 | `--no-rawtx` | `rawtx.enabled=false` | enabled |
 | `--tls` / `--no-tls` | `server.tls` | `true` |
 | `--tls-listen <addr>` | `server.tls_listen` | host of `listen` + network TLS port |

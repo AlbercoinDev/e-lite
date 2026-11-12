@@ -128,7 +128,8 @@ echo "reorg recovered to $NEWTIP"
 
 echo "== write failure (file-size limit) then restart =="
 set +e
-( ulimit -f 8192; index_run "$DATA2" ) >"$MODEL/limit.log" 2>&1
+# No core dump here: SIGXFSZ is the expected outcome, and each core is ~5 MiB.
+( ulimit -c 0; ulimit -f 8192; index_run "$DATA2" ) >"$MODEL/limit.log" 2>&1
 LIMIT_RC=$?
 set -e
 echo "limited run exit: $LIMIT_RC (expected failure or partial progress)"

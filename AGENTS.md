@@ -63,7 +63,11 @@ Never treat a version number in this file as authoritative over the code/tag.
   section (AUD-124). `--with-core` additionally bundles that network's Core
   datadir under `bitcoin/` after a probe Core (start + RPC + stop) records
   tip, prune height and version; it refuses while any Core is running and on
-  a non-loopback RPC URL; wallets/mempool/peers/cookie/logs are never copied.
+  a non-loopback RPC URL. The Core section is an **allowlist**: only
+  `blocks/`, `chainstate/` and `indexes/` of that network are packed; wallets
+  (any name), `onion_v3_private_key`/`i2p_private_key`, `bitcoin.conf`,
+  `settings.json`, mempool/peers/cookie/logs and other networks' subdirs are
+  never copied and are listed as "not copied" by the export (AUD-126).
   gzip level is `--compress-level` (default 3, balanced; 0 stores).
   `import-snapshot` needs an empty target and validates network/genesis/
   schema/tip/digest plus the Core rules `index tip <= Core tip` and
@@ -213,7 +217,14 @@ Never treat a version number in this file as authoritative over the code/tag.
   without a disk-pressure cap. Snapshots are manual only.
 - `run` probes the network's providers (`/block-height/0` plus the genesis raw
   block with a header-hash check) and does not open Electrum until at least one
-  answers; `require_ready`/`ready_timeout_seconds` control the gate.
+  answers; `require_ready`/`ready_timeout_seconds` control the gate. The gate
+  applies only to a **pruned** Core (or one that did not answer): an unpruned
+  Core serves every raw transaction locally, so Electrum opens at once. It is
+  fail-closed by default because Sparrow persists an unfetchable transaction
+  when `transaction.get` fails (AUD-045); `[public_servers]
+  open_without_provider = true` opens with local data after
+  `ready_timeout_seconds` (AUD-127), and an `el-providers` thread re-probes
+  every 60 s until one answers.
   `tor_fallback_clearnet = true` uses clearnet when Tor is unavailable or a
   request fails (log + `/status`), while `.onion` still needs Tor; set it to
   `false` for fail-closed.

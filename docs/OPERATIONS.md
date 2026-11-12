@@ -317,9 +317,12 @@ e-lite import-snapshot --network mainnet --allow-mainnet \
   --verify=full
 ```
 
-- `--with-core` bundles the network's Core datadir (`<data-dir>/bitcoin`)
-  under `bitcoin/` in the archive; wallets/mempool/peers/cookie/log files are
-  excluded. A probe Core records tip, prune height and version in the
+- `--with-core` bundles the network's Core **chain data** (`<data-dir>/bitcoin`)
+  under `bitcoin/` in the archive: only `blocks/`, `chainstate/` and
+  `indexes/` of that network. Wallets (whatever their name), Core's onion/I2P
+  private keys, `bitcoin.conf`, `settings.json`, mempool/peers/cookie/log
+  files and other networks' subdirectories are never copied; the export
+  prints them as "not copied" so you can back them up separately. A probe Core records tip, prune height and version in the
   manifest; the pair rules are enforced on both sides (`index tip <= Core
   tip`, `prune_height <= index tip - 288` undo window).
 - Without `--with-core` the archive is index-only and never contains the

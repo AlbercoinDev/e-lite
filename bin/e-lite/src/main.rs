@@ -5594,6 +5594,50 @@ fn requires_ready_provider(cfg: &Config, chain: Chain) -> bool {
         && chain != Chain::Regtest
 }
 
+/// Whether `run` holds the wallet listeners for a provider (AUD-127). An
+/// unpruned Core serves every raw transaction locally, so public providers
+/// are never needed for wallet data; `core_pruned = None` (Core did not
+/// answer) keeps the conservative gate.
+fn provider_gate_required(cfg: &Config, chain: Chain, core_pruned: Option<bool>) -> bool {
+    requires_ready_provider(cfg, chain) && core_pruned != Some(false)
+}
+
+/// With `open_without_provider` the gate gives up after
+/// `ready_timeout_seconds` and opens the listeners with local data. By default
+/// it stays fail-closed: a pruned Core plus a failed `transaction.get` makes
+/// Sparrow persist an unfetchable transaction (AUD-045).
+fn provider_gate_expired(cfg: &Config, waited: Duration) -> bool {
+    cfg.public_servers.open_without_provider
+        && waited >= Duration::from_secs(cfg.public_servers.ready_timeout_seconds)
+}
+
+/// Keep probing in the background after the listeners opened without a
+/// ready provider, so `/status.public_servers.provider_ready` and the log
+/// reflect a provider that comes back. Only constant, wallet-free requests
+/// are sent (`/block-height/0` and the genesis block).
+fn spawn_provider_reprobe(shared: Arc<Shared>, cfg: Config) {
+    if !cfg.rawtx.enabled || !cfg.rawtx.use_esplora || shared.public_servers.is_empty() {
+        return;
+    }
+    let spawned = std::thread::Builder::new()
+        .name("el-providers".to_string())
+        .spawn(move || {
+            while !shared.provider_ready.load(Ordering::Relaxed) {
+                for _ in 0..60 {
+                    if shared.shutdown.load(Ordering::Relaxed) {
+                        return;
+                    }
+                    std::thread::sleep(Duration::from_secs(1));
+                }
+                refresh_providers(&shared, &cfg, false);
+            }
+            eprintln!("[e-lite] a public provider answered; raw transactions of pruned blocks are available again");
+        });
+    if let Err(e) = spawned {
+        eprintln!("[e-lite] cannot start the provider re-probe thread: {e}");
+    }
+}
+
 fn effective_rate_limit(cfg: &Config) -> (u64, u64) {
     // Same generous budget for every client. The limiter delays instead of
     // rejecting, so an initial wallet scan never aborts; a sustained abuser is
@@ -5928,6 +5972,7 @@ fn cmd_serve(cfg: &Config, chain: Chain) -> R<()> {
             "[e-lite] WARNING: serve mode without a ready public provider; \
              local queries work, some raw transactions/history entries may be unavailable"
         );
+        spawn_provider_reprobe(Arc::clone(&shared), cfg.clone());
     }
     let transports = start_transports(&shared, cfg)?;
     let tip = shared
@@ -6172,18 +6217,40 @@ fn cmd_run(cfg: &Config, chain: Chain) -> R<()> {
         result
     });
 
-    let require_ready = requires_ready_provider(cfg, chain);
-    refresh_providers(&shared, cfg, true);
+    let core_pruned = shared.core.blockchain_info().ok().map(|info| info.pruned);
+    let require_ready = provider_gate_required(cfg, chain, core_pruned);
+    if requires_ready_provider(cfg, chain) && !require_ready {
+        eprintln!(
+            "[e-lite] Core is not pruned: every raw transaction is served locally; \
+             Electrum opens without waiting for public providers"
+        );
+    }
+    let gate_started = Instant::now();
+    // Only wait inside the probe when the gate is actually holding the
+    // listeners; otherwise one quick probe fills `/status`.
+    refresh_providers(&shared, cfg, require_ready);
     let mut warned = false;
     while require_ready
         && !shared.provider_ready.load(Ordering::Relaxed)
         && !flag.load(Ordering::SeqCst)
         && !index_thread.is_finished()
     {
+        if provider_gate_expired(cfg, gate_started.elapsed()) {
+            eprintln!(
+                "[e-lite] WARNING: no public provider answered within {}s; opening \
+                 Electrum with local data (open_without_provider). History, balances \
+                 and UTXOs are complete; raw transactions of pruned blocks fail until \
+                 a provider answers",
+                cfg.public_servers.ready_timeout_seconds
+            );
+            break;
+        }
         if !warned {
             eprintln!(
                 "[e-lite] no public provider is ready yet; indexing continues and \
-                 Electrum will open when one answers"
+                 Electrum will open when one answers (Core is pruned; set \
+                 [public_servers] open_without_provider = true to open with local \
+                 data after ready_timeout_seconds)"
             );
             warned = true;
         }
@@ -6213,8 +6280,11 @@ fn cmd_run(cfg: &Config, chain: Chain) -> R<()> {
     {
         eprintln!(
             "[e-lite] WARNING: no public provider is ready; serving local data only \
-             (some wallet histories may be incomplete)"
+             (raw transactions of pruned blocks are unavailable until one answers)"
         );
+        if core_pruned != Some(false) {
+            spawn_provider_reprobe(Arc::clone(&shared), cfg.clone());
+        }
     }
     let transports = match start_transports(&shared, cfg) {
         Ok(t) => t,
@@ -6480,6 +6550,14 @@ fn cmd_export(
                     core.prune_height,
                     if core.pruned { "" } else { " (not pruned)" },
                     core.version
+                );
+            }
+            if !info.core_skipped.is_empty() {
+                // Only chain data is packed. Wallets, keys and configuration
+                // must be backed up separately (AUD-126).
+                println!(
+                    "core: not copied (chain data only; back these up separately if needed): {}",
+                    info.core_skipped.join(", ")
                 );
             }
         }
@@ -6836,6 +6914,26 @@ mod tests {
         cfg.rawtx.enabled = true;
         cfg.rawtx.use_esplora = false;
         assert!(!requires_ready_provider(&cfg, Chain::Signet));
+    }
+
+    #[test]
+    fn provider_gate_skips_unpruned_core_and_expires() {
+        let cfg = Config::default();
+        // An unpruned Core serves every raw transaction: no gate.
+        assert!(!provider_gate_required(&cfg, Chain::Signet, Some(false)));
+        // Pruned, or Core did not answer: the gate holds the listeners.
+        assert!(provider_gate_required(&cfg, Chain::Signet, Some(true)));
+        assert!(provider_gate_required(&cfg, Chain::Signet, None));
+        // Regtest never gates, whatever Core reports.
+        assert!(!provider_gate_required(&cfg, Chain::Regtest, Some(true)));
+        // Fail-closed by default (AUD-045): the gate never expires ...
+        assert!(!provider_gate_expired(&cfg, Duration::from_secs(86_400)));
+        // ... unless the operator opts in, and then only after the timeout.
+        let mut open = Config::default();
+        open.public_servers.open_without_provider = true;
+        open.public_servers.ready_timeout_seconds = 60;
+        assert!(!provider_gate_expired(&open, Duration::from_secs(59)));
+        assert!(provider_gate_expired(&open, Duration::from_secs(60)));
     }
 
     #[test]

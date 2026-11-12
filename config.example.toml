@@ -169,9 +169,13 @@ p2p_peers = []                      # empty: discover from local Core
 # data only (fail closed).
 # file = ""                         # empty = <config dir>/public-servers.toml
 generate = true                     # create it from the template when missing
-require_ready = true                # run: refuse wallets if no provider answers
+require_ready = true                # run + pruned Core: keep wallets out until a provider answers
+                                    # (an unpruned Core serves every raw tx locally: no gate)
 probe_timeout_seconds = 5           # per-provider probe timeout
-ready_timeout_seconds = 60          # wait for a provider before failing run
+ready_timeout_seconds = 60          # one readiness round; logged, then probed again
+open_without_provider = false       # true: open Electrum with local data after
+                                    # ready_timeout_seconds; raw txs of pruned blocks
+                                    # then fail (Sparrow mishandles that, AUD-045)
 
 [silent_payments]
 enabled = false                     # opt-in gate; BIP352 indexer not included yet

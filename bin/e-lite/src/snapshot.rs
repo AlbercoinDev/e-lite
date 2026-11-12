@@ -9,6 +9,9 @@
 //!
 //! Consistency model:
 //! - The index is flushed and its committed tip/digest recorded first.
+//! - Only Core chain data is copied (`blocks/`, `chainstate/`, `indexes/` of
+//!   the exported network): wallets, private keys and configuration never
+//!   enter the archive, whatever their name (AUD-126).
 //! - The Core datadir is only copied while Core is stopped; the export command
 //!   probes Core (short-lived start + RPC + stop) to record tip, prune height
 //!   and version in the manifest, then copies the files.
@@ -91,6 +94,9 @@ pub struct SnapshotInfo {
     pub digest: String,
     pub bytes: u64,
     pub core: Option<CoreSnapshot>,
+    /// Core datadir entries left out of a `--with-core` export (wallets,
+    /// keys, configuration, other networks). Empty on import.
+    pub core_skipped: Vec<String>,
 }
 
 pub struct ExportOptions {
@@ -174,6 +180,7 @@ pub fn export(
         fs::create_dir_all(parent)?;
     }
     let tmp = output.with_extension("tmp");
+    let mut core_skipped = Vec::new();
     {
         let file = File::create(&tmp)?;
         // The default level 3 is the balanced point for the index (and gains
@@ -184,13 +191,10 @@ pub fn export(
         add_tree(&mut builder, data_dir, data_dir)?;
         let mut core_bytes = 0u64;
         if let Some(core_dir) = options.core_dir.as_deref() {
-            core_bytes = add_core_tree(
-                &mut builder,
-                core_dir,
-                "bitcoin",
-                &mut manifest.files,
-                options.hash_files,
-            )?;
+            let walk = add_core_datadir(&mut builder, core_dir, chain, options.hash_files)?;
+            core_bytes = walk.bytes;
+            manifest.files = walk.files;
+            core_skipped = walk.skipped;
         }
         if let Some(core) = manifest.core.as_mut() {
             core.bytes = core_bytes;
@@ -215,6 +219,7 @@ pub fn export(
         digest: digest.to_hex(),
         bytes,
         core: manifest.core.clone(),
+        core_skipped,
     })
 }
 
@@ -260,12 +265,56 @@ fn excluded_from_index(name: &str) -> bool {
     )
 }
 
-/// Files of a Core datadir that are never copied: wallets and runtime state
-/// that a chain-only restore must not carry (stale auth, peer state, logs).
+/// Chain-data directories of a Core datadir. Only these are copied, at the
+/// datadir root (mainnet) or inside the network subdirectory (`testnet4/`,
+/// `signet/`, `regtest/`). Everything else at those two levels — legacy
+/// `wallet.dat` files with arbitrary names, `onion_v3_private_key`,
+/// `i2p_private_key`, `bitcoin.conf` (may hold `rpcpassword`),
+/// `settings.json`, other networks' subdirectories — is skipped (AUD-126).
+const CORE_DATA_DIRS: [&str; 3] = ["blocks", "chainstate", "indexes"];
+
+/// Where `add_core_tree` is inside the Core datadir.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CoreLevel {
+    /// The datadir root.
+    Root,
+    /// `<root>/<network subdir>` for every network except mainnet.
+    Network,
+    /// Inside `blocks/`, `chainstate/` or `indexes/`.
+    Data,
+}
+
+/// Allowlist decision for one entry. Returns the level to descend into for a
+/// directory, `Some(Data)` for a file inside chain data, or `None` to skip.
+fn core_entry_level(level: CoreLevel, name: &str, is_dir: bool, subdir: &str) -> Option<CoreLevel> {
+    match level {
+        CoreLevel::Root if !subdir.is_empty() => {
+            (is_dir && name == subdir).then_some(CoreLevel::Network)
+        }
+        CoreLevel::Root | CoreLevel::Network => {
+            (is_dir && CORE_DATA_DIRS.contains(&name)).then_some(CoreLevel::Data)
+        }
+        CoreLevel::Data => (!excluded_from_core(name)).then_some(CoreLevel::Data),
+    }
+}
+
+/// Names never copied even inside chain data: wallets and runtime state that
+/// a chain-only restore must not carry (stale auth, peer state, logs). The
+/// allowlist above already keeps these out of the root; this is the second
+/// line of defence for unusual layouts.
 fn excluded_from_core(name: &str) -> bool {
     matches!(
         name,
         "wallets"
+            | "wallet.dat"
+            | "database"
+            | "db.log"
+            | ".walletlock"
+            | "onion_v3_private_key"
+            | "onion_private_key"
+            | "i2p_private_key"
+            | "bitcoin.conf"
+            | "settings.json"
             | "mempool.dat"
             | "peers.dat"
             | "banlist.dat"
@@ -311,29 +360,63 @@ fn add_tree<W: Write>(builder: &mut tar::Builder<W>, base: &Path, dir: &Path) ->
     Ok(())
 }
 
-/// Walk the Core datadir, append its files under `bitcoin/` and record the
-/// per-file table (sizes always, SHA-256 when `hash_files`). `prefix` is the
-/// archive path of `dir` (`bitcoin`, then `bitcoin/regtest`, ...).
+/// What the Core walk packed and what it deliberately left out.
+#[derive(Debug, Default)]
+struct CoreWalk {
+    files: Vec<FileEntry>,
+    /// Archive-relative names skipped by the allowlist (root/network level)
+    /// or the denylist, reported so the operator knows what to keep apart.
+    skipped: Vec<String>,
+    bytes: u64,
+}
+
+/// Walk the Core datadir of `chain`, append its chain data under `bitcoin/`
+/// and record the per-file table (sizes always, SHA-256 when `hash_files`).
+fn add_core_datadir<W: Write>(
+    builder: &mut tar::Builder<W>,
+    dir: &Path,
+    chain: Chain,
+    hash_files: bool,
+) -> Result<CoreWalk, E> {
+    let mut walk = CoreWalk::default();
+    add_core_tree(
+        builder,
+        dir,
+        "bitcoin",
+        CoreLevel::Root,
+        chain.core_subdir(),
+        hash_files,
+        &mut walk,
+    )?;
+    Ok(walk)
+}
+
+/// `prefix` is the archive path of `dir` (`bitcoin`, then `bitcoin/regtest`,
+/// ...); `level` drives the allowlist.
 fn add_core_tree<W: Write>(
     builder: &mut tar::Builder<W>,
     dir: &Path,
     prefix: &str,
-    files: &mut Vec<FileEntry>,
+    level: CoreLevel,
+    subdir: &str,
     hash_files: bool,
-) -> Result<u64, E> {
-    let mut total = 0u64;
-    for entry in fs::read_dir(dir)? {
-        let entry = entry?;
+    walk: &mut CoreWalk,
+) -> Result<(), E> {
+    let mut entries = fs::read_dir(dir)?.collect::<Result<Vec<_>, _>>()?;
+    entries.sort_by_key(|e| e.file_name());
+    for entry in entries {
         let name = entry.file_name();
         let name = name.to_string_lossy();
-        if excluded_from_core(&name) {
-            continue;
-        }
         let path = entry.path();
         let tar_name = format!("{prefix}/{name}");
-        if entry.file_type()?.is_dir() {
+        let is_dir = entry.file_type()?.is_dir();
+        let Some(next) = core_entry_level(level, &name, is_dir, subdir) else {
+            walk.skipped.push(tar_name);
+            continue;
+        };
+        if is_dir {
             builder.append_dir(&tar_name, &path)?;
-            total += add_core_tree(builder, &path, &tar_name, files, hash_files)?;
+            add_core_tree(builder, &path, &tar_name, next, subdir, hash_files, walk)?;
         } else {
             let size = entry.metadata()?.len();
             let sha256 = if hash_files {
@@ -341,16 +424,16 @@ fn add_core_tree<W: Write>(
             } else {
                 None
             };
-            files.push(FileEntry {
+            walk.files.push(FileEntry {
                 path: tar_name.clone(),
                 size,
                 sha256,
             });
-            total += size;
+            walk.bytes += size;
             builder.append_path_with_name(&path, &tar_name)?;
         }
     }
-    Ok(total)
+    Ok(())
 }
 
 /// Verify the extracted Core files against the manifest: sizes are always
@@ -497,6 +580,7 @@ pub fn import(
         digest: digest.to_hex(),
         bytes,
         core: manifest.core.clone(),
+        core_skipped: Vec::new(),
     })
 }
 
@@ -599,13 +683,122 @@ mod tests {
             "anchors.dat",
             "debug.log",
             ".lock",
+            "wallet.dat",
+            "onion_v3_private_key",
+            "i2p_private_key",
+            "bitcoin.conf",
+            "settings.json",
         ] {
             assert!(excluded_from_core(name), "{name} must be excluded");
         }
         // Chain data is copied.
-        for name in ["blocks", "chainstate", "indexes", "bitcoin.conf"] {
+        for name in ["blocks", "chainstate", "indexes", "blk00000.dat", "xor.dat"] {
             assert!(!excluded_from_core(name), "{name} must be copied");
         }
+    }
+
+    #[test]
+    fn core_allowlist_only_descends_into_chain_data() {
+        use CoreLevel::*;
+        // Mainnet: chain data lives at the root; other networks are skipped.
+        assert_eq!(core_entry_level(Root, "blocks", true, ""), Some(Data));
+        assert_eq!(core_entry_level(Root, "chainstate", true, ""), Some(Data));
+        assert_eq!(core_entry_level(Root, "indexes", true, ""), Some(Data));
+        assert_eq!(core_entry_level(Root, "testnet4", true, ""), None);
+        assert_eq!(core_entry_level(Root, "blocks", false, ""), None);
+        // A legacy wallet may have any name; at the root it is never copied.
+        assert_eq!(core_entry_level(Root, "my-savings.dat", false, ""), None);
+        // Other networks: only their subdirectory, and mainnet data is skipped.
+        assert_eq!(
+            core_entry_level(Root, "regtest", true, "regtest"),
+            Some(Network)
+        );
+        assert_eq!(core_entry_level(Root, "blocks", true, "regtest"), None);
+        assert_eq!(
+            core_entry_level(Network, "blocks", true, "regtest"),
+            Some(Data)
+        );
+        assert_eq!(core_entry_level(Network, "wallets", true, "regtest"), None);
+        // Inside chain data the denylist still applies.
+        assert_eq!(
+            core_entry_level(Data, "blk00000.dat", false, ""),
+            Some(Data)
+        );
+        assert_eq!(core_entry_level(Data, "wallet.dat", false, ""), None);
+    }
+
+    #[test]
+    fn mainnet_core_walk_leaves_wallets_keys_and_config_out() {
+        let dir = std::env::temp_dir().join(format!(
+            "e-lite-coremain-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let core = dir.join("bitcoin");
+        std::fs::create_dir_all(core.join("blocks/index")).unwrap();
+        std::fs::create_dir_all(core.join("chainstate")).unwrap();
+        std::fs::create_dir_all(core.join("testnet4/blocks")).unwrap();
+        std::fs::write(core.join("blocks/blk00000.dat"), b"block").unwrap();
+        std::fs::write(core.join("blocks/index/000001.ldb"), b"idx").unwrap();
+        std::fs::write(core.join("chainstate/000002.ldb"), b"utxo").unwrap();
+        std::fs::write(core.join("testnet4/blocks/blk00000.dat"), b"other").unwrap();
+        for secret in [
+            "wallet.dat",
+            "savings.dat",
+            "onion_v3_private_key",
+            "i2p_private_key",
+            "bitcoin.conf",
+            "settings.json",
+        ] {
+            std::fs::write(core.join(secret), b"secret").unwrap();
+        }
+
+        let archive_path = dir.join("core.tar.gz");
+        let walk = {
+            let file = File::create(&archive_path).unwrap();
+            let enc = GzEncoder::new(file, Compression::default());
+            let mut tar = tar::Builder::new(enc);
+            let walk = add_core_datadir(&mut tar, &core, Chain::Mainnet, false).unwrap();
+            tar.into_inner().unwrap().finish().unwrap();
+            walk
+        };
+        assert_eq!(walk.bytes, 5 + 3 + 4);
+        let mut packed: Vec<_> = walk.files.iter().map(|f| f.path.as_str()).collect();
+        packed.sort();
+        assert_eq!(
+            packed,
+            vec![
+                "bitcoin/blocks/blk00000.dat",
+                "bitcoin/blocks/index/000001.ldb",
+                "bitcoin/chainstate/000002.ldb",
+            ]
+        );
+        for skipped in [
+            "bitcoin/wallet.dat",
+            "bitcoin/savings.dat",
+            "bitcoin/onion_v3_private_key",
+            "bitcoin/i2p_private_key",
+            "bitcoin/bitcoin.conf",
+            "bitcoin/settings.json",
+            "bitcoin/testnet4",
+        ] {
+            assert!(
+                walk.skipped.iter().any(|s| s == skipped),
+                "{skipped} must be reported as skipped"
+            );
+        }
+        // The archive itself must not contain a single secret byte.
+        let file = File::open(&archive_path).unwrap();
+        for entry in tar::Archive::new(GzDecoder::new(file)).entries().unwrap() {
+            let mut entry = entry.unwrap();
+            let mut body = Vec::new();
+            std::io::Read::read_to_end(&mut entry, &mut body).unwrap();
+            assert_ne!(body, b"secret", "{}", entry.path().unwrap().display());
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -656,16 +849,22 @@ mod tests {
         std::fs::write(core.join("bitcoin.conf"), b"prune=1\n").unwrap();
         std::fs::write(core.join("regtest/.cookie"), b"user:pass").unwrap();
         std::fs::write(core.join("wallets/wallet.dat"), b"secret").unwrap();
+        std::fs::create_dir_all(core.join("regtest/wallets/w")).unwrap();
+        std::fs::write(core.join("regtest/wallets/w/wallet.dat"), b"secret").unwrap();
 
         let archive_path = dir.join("core.tar.gz");
         {
             let file = File::create(&archive_path).unwrap();
             let enc = GzEncoder::new(file, Compression::default());
             let mut tar = tar::Builder::new(enc);
-            let mut files = Vec::new();
-            let total = add_core_tree(&mut tar, &core, "bitcoin", &mut files, true).unwrap();
+            let walk = add_core_datadir(&mut tar, &core, Chain::Regtest, true).unwrap();
             tar.into_inner().unwrap().finish().unwrap();
-            assert_eq!(total, 3 + 5 + 8, "wallets and .cookie must not count");
+            assert_eq!(
+                walk.bytes,
+                3 + 5,
+                "wallets, .cookie and bitcoin.conf must not count"
+            );
+            assert!(walk.files.iter().all(|f| f.sha256.is_some()));
         }
         let file = File::open(&archive_path).unwrap();
         let mut names = Vec::new();
@@ -679,7 +878,6 @@ mod tests {
         assert_eq!(
             names,
             vec![
-                "bitcoin/bitcoin.conf",
                 "bitcoin/regtest/blocks/blk00000.dat",
                 "bitcoin/regtest/chainstate/MANIFEST-000001",
             ]

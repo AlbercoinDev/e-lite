@@ -1,5 +1,46 @@
 # Changelog
 
+## Unreleased
+
+### Snapshot secrets, provider gate and prefix bloom (AUD-126, AUD-127, AUD-129)
+
+No schema, protocol or snapshot-format change. An existing index opens
+without migration.
+
+- **AUD-126 (P1, security)**: `export-snapshot --with-core` now packs Core
+  through an **allowlist**: only `blocks/`, `chainstate/` and `indexes/` of
+  the exported network. Before, it walked the whole datadir minus a few
+  names, so a legacy root `wallet.dat` (or a wallet file with any other
+  name), `onion_v3_private_key`, `i2p_private_key`, `bitcoin.conf` (may hold
+  `rpcpassword`), `settings.json` and other networks' subdirectories could
+  enter the archive. The export prints what it left out ("not copied"). A
+  restore no longer brings `bitcoin.conf`; e-lite passes the managed Core's
+  flags on the command line, so a managed node needs nothing from it.
+- **AUD-127 (P1)**: the `run` provider gate is skipped when Core is **not
+  pruned** — every raw transaction is local, so Electrum opens at once instead
+  of waiting for public servers. For a pruned Core it stays fail-closed by
+  default (AUD-045: Sparrow persists a failed `transaction.get`); the new
+  `[public_servers] open_without_provider = true` opens the listeners with
+  local data after `ready_timeout_seconds`. When listeners open without a
+  ready provider (`run` opt-in or `serve`), an `el-providers` thread re-probes
+  every 60 s with the same wallet-free requests and logs the recovery. With
+  `require_ready = false` the start-up probe no longer waits
+  `ready_timeout_seconds` before opening.
+- **AUD-129 (P1, wallet speed)**: `history`, `utxo_by_script` and
+  `tx_occurrences` get a 32-byte fixed-prefix extractor; prefix scans use
+  `prefix_same_as_start` and digests/full scans use `total_order_seek`. The
+  bloom filter now rejects an unused script/txid per SST without reading data
+  blocks (gap-limit scans are mostly unused addresses), and those three
+  families store prefix-only filters (smaller table readers). SSTs written by
+  older releases have no extractor and are read as before until compaction
+  rewrites them. Not yet measured on mainnet: compare a cold wallet scan and
+  `/status.rocksdb.table_readers_bytes` before/after.
+- Tests: `core_allowlist_only_descends_into_chain_data`,
+  `mainnet_core_walk_leaves_wallets_keys_and_config_out`,
+  `provider_gate_skips_unpruned_core_and_expires`,
+  `prefix_scans_stop_at_the_script_boundary` (includes the RocksDB
+  seek-filter counter), `index_written_without_prefix_extractor_still_reads`.
+
 ## 0.1.0-alpha.29.10.0 — 2026-11-11
 
 ### Full per-network snapshots: index + Bitcoin Core in one archive
