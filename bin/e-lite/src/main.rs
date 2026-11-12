@@ -206,6 +206,7 @@ struct Args {
     cookie_file: Option<String>,
     listen: Option<String>,
     tls: Option<bool>,
+    plain_lan: bool,
     tls_listen: Option<String>,
     tls_cert: Option<String>,
     tls_key: Option<String>,
@@ -226,7 +227,7 @@ struct Args {
     output: Option<String>,
     input: Option<String>,
     with_core: bool,
-    hash_files: bool,
+    no_hash_files: bool,
     compress_level: Option<u32>,
     verify: Option<String>,
     expect_digest: Option<String>,
@@ -326,6 +327,7 @@ fn parse_args() -> R<Args> {
             "--tls-listen" => args.tls_listen = Some(value("--tls-listen")?),
             "--tls" => args.tls = Some(true),
             "--no-tls" => args.tls = Some(false),
+            "--plain-lan" => args.plain_lan = true,
             "--tls-cert" => args.tls_cert = Some(value("--tls-cert")?),
             "--tls-key" => args.tls_key = Some(value("--tls-key")?),
             "--metrics" => args.metrics = Some(value("--metrics")?),
@@ -337,7 +339,9 @@ fn parse_args() -> R<Args> {
             "--output" => args.output = Some(value("--output")?),
             "--input" => args.input = Some(value("--input")?),
             "--with-core" => args.with_core = true,
-            "--hash-files" => args.hash_files = true,
+            // Hashing is the default (AUD-143); the old flag is accepted.
+            "--hash-files" => args.no_hash_files = false,
+            "--no-hash-files" => args.no_hash_files = true,
             "--compress-level" => args.compress_level = Some(value("--compress-level")?.parse()?),
             "--verify" => {
                 let v = inline.clone().unwrap_or_else(|| "basic".to_string());
@@ -543,6 +547,9 @@ fn effective_config(args: &Args) -> R<(Config, Chain)> {
     }
     if let Some(v) = args.tls {
         cfg.server.tls = v;
+    }
+    if args.plain_lan {
+        cfg.server.plain_lan = true;
     }
     if let Some(l) = &args.tls_listen {
         cfg.server.tls_listen = l.clone();
@@ -1241,7 +1248,7 @@ fn run() -> R<()> {
             chain,
             args.output.as_deref(),
             args.with_core,
-            args.hash_files,
+            !args.no_hash_files,
             args.compress_level,
         ),
         Command::ImportSnapshot => cmd_import(
@@ -1274,8 +1281,9 @@ COMMANDS:
     onion show       print the Tor onion address and managed-Tor state
     onion reset      generate a new onion address (stop e-lite first)
     export-snapshot  print the canonical digest, or write a backup with --output
-                     (--with-core bundles the network's Core datadir; --hash-files
-                     adds SHA-256 per Core file; --compress-level 0..9, default 3)
+                     (--with-core bundles the network's Core chain data with a
+                     SHA-256 per file; gzip: index stored, Core level 3,
+                     --compress-level 0..9 sets both)
     import-snapshot  restore a backup with --input (target must be empty)
                      (--verify checks per-file hashes; --verify=full opens the
                      restored Core and runs a bounded verifychain;
@@ -1298,7 +1306,9 @@ OPTIONS:
     --manage <mode>         external | auto | managed (default auto)
     --prune-mib <n>         Core prune mode: 1 manual (default), 0 full, >=550 auto (needs opt-in)
     --min-free-gib <n>      pause Core downloads below this free space
-    --listen <addr>         Electrum plain listen (default 0.0.0.0:<network port>)
+    --listen <addr>         Electrum plain listen (default 127.0.0.1:<network port>;
+                            an explicit address also moves TLS to that host)
+    --plain-lan             offer the plain listener on 0.0.0.0 (TLS already is)
     --tls / --no-tls        enable (default) or disable Electrum TLS
     --tls-listen <addr>     Electrum TLS listen (default <listen host>:<network TLS port>)
     --tls-cert <path>       PEM certificate chain (default: generated self-signed)
@@ -1314,8 +1324,9 @@ OPTIONS:
     --output <path>         snapshot file for export-snapshot
     --input <path>          snapshot file for import-snapshot
     --with-core             export-snapshot: bundle the network's Core datadir
-    --hash-files            export-snapshot: SHA-256 every Core file in the manifest
-    --compress-level <n>    export-snapshot gzip level (0..9, default 3)
+    --no-hash-files         export-snapshot: skip the SHA-256 of every Core file
+    --compress-level <n>    export-snapshot gzip level for both sections (0..9;
+                            default: index 0 = stored, Core 3)
     --verify [basic|full]   import-snapshot: hash check, or Core verifychain
     --expect-digest <hex>   import-snapshot: refuse unless the recomputed index
                             digest equals this value (from your export output)
@@ -5731,7 +5742,9 @@ fn build_shared(
     };
     let resolver = build_resolver(cfg, chain, &store, &core, public_servers.clone())?;
     let readers = el_chain::ReaderTracker::new();
-    let prefetch = if resolver.external_sources() > 0 && cfg.rawtx.enabled {
+    // Opt-in (AUD-134). P2P may gain peers later, so the configured sources
+    // count, not the ones usable right now.
+    let prefetch = if cfg.rawtx.prefetch && cfg.rawtx.enabled {
         el_serve::Prefetcher::new(Arc::clone(&resolver), Arc::clone(&readers), 1, 64)
     } else {
         el_serve::Prefetcher::disabled()
@@ -6578,7 +6591,9 @@ fn cmd_export(
             let mut options = snapshot::ExportOptions {
                 version: VERSION.to_string(),
                 with_core,
-                compress_level: compress_level.unwrap_or(3),
+                // An explicit --compress-level applies to both sections.
+                index_level: compress_level.unwrap_or(0),
+                core_level: compress_level.unwrap_or(3),
                 hash_files,
                 core: None,
                 core_dir: None,
@@ -6657,7 +6672,7 @@ fn cmd_import(
         &target,
         chain,
         &snapshot::ImportOptions {
-            verify_hashes: verify.is_some(),
+            skip_hashes: false,
             expect_digest: expect_digest.map(str::to_string),
         },
     )?;
@@ -6740,7 +6755,7 @@ fn cmd_import(
         }
         _ => {
             if !info.core.is_none() {
-                println!("verify: sizes checked; use --verify to check hashes, --verify=full to open the restored Core");
+                println!("verify: per-file sizes and recorded hashes checked; use --verify=full to open the restored Core");
             }
         }
     }
@@ -7034,6 +7049,19 @@ mod tests {
         cfg.rawtx.p2p_peers.clear();
         cfg.rawtx.use_p2p = false;
         assert!(!p2p_discovery_enabled(&cfg));
+    }
+
+    #[test]
+    fn external_fetches_are_private_by_default() {
+        // AUD-128 / AUD-134: no clearnet fallback and no speculative prefetch
+        // unless the operator opts in.
+        let cfg = Config::default();
+        assert!(!cfg.rawtx.tor_fallback_clearnet);
+        assert!(!cfg.rawtx.allow_clearnet);
+        assert!(!cfg.rawtx.prefetch);
+        let parsed: Config = toml::from_str("[rawtx]\nenabled = true\n").unwrap();
+        assert!(!parsed.rawtx.tor_fallback_clearnet);
+        assert!(!parsed.rawtx.prefetch);
     }
 
     #[test]

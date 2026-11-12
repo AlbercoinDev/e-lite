@@ -102,9 +102,18 @@ def negotiated(reply):
 
 assert negotiated(call(plain, False)) == "1.4"
 assert negotiated(call(tls, True)) == "1.4"
+# AUD-147: cleartext is not offered on the network unless --plain-lan / listen.
+if lan_ip and not lan_ip.startswith("127."):
+    try:
+        socket.create_connection((lan_ip, plain), timeout=2).close()
+    except OSError:
+        pass
+    else:
+        raise SystemExit(f"plain listener reachable on {lan_ip} by default")
+    socket.create_connection((lan_ip, tls), timeout=2).close()
 st = json.load(urllib.request.urlopen(f"http://127.0.0.1:{metrics}/status"))
 assert st["tls_listen"] == f"0.0.0.0:{tls}", st.get("tls_listen")
-assert st["listen"] == f"0.0.0.0:{plain}", st.get("listen")
+assert st["listen"] == f"127.0.0.1:{plain}", st.get("listen")  # plain is loopback-only by default
 assert st["tls_handshakes"] >= 1, st.get("tls_handshakes")
 
 def verified(host, server_hostname):

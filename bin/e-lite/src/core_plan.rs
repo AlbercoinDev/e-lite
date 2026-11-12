@@ -146,6 +146,11 @@ pub fn plan_core(cfg: &Config, chain: Chain) -> Result<CorePlan, String> {
         );
     }
 
+    let facts = NetFacts::detect(cfg, chain);
+    let (net_args, net_notes) = network_args(cfg, &facts)?;
+    plan.args.extend(net_args);
+    plan.notes.extend(net_notes);
+
     // `prune_mib = 0` used to omit the flag entirely, so a `prune=` line in an
     // existing bitcoin.conf could turn a full node into a pruned one (or the
     // other way around). Always state it.
@@ -164,6 +169,187 @@ pub fn plan_core(cfg: &Config, chain: Chain) -> Result<CorePlan, String> {
         chain.name()
     ));
     Ok(plan)
+}
+
+/// What the host offers for Core's P2P privacy (AUD-136).
+#[derive(Debug, Clone, Default)]
+pub struct NetFacts {
+    /// SOCKS5 address of a Tor that Core can use.
+    pub tor_socks: Option<String>,
+    /// I2P SAM router address.
+    pub i2p_sam: Option<String>,
+    /// The configured `bitcoind` knows `-privatebroadcast`.
+    pub private_broadcast_supported: bool,
+}
+
+fn tcp_answers(addr: &str) -> bool {
+    use std::net::ToSocketAddrs;
+    addr.to_socket_addrs()
+        .ok()
+        .and_then(|mut a| a.next())
+        .is_some_and(|a| {
+            std::net::TcpStream::connect_timeout(&a, std::time::Duration::from_millis(300)).is_ok()
+        })
+}
+
+impl NetFacts {
+    pub fn detect(cfg: &Config, chain: Chain) -> Self {
+        // The managed Tor (its port is fixed by `tor::prepare` in `run`; before
+        // that, or in `index`, the network default is the best guess), else an
+        // operator proxy that answers.
+        let tor_socks = if cfg.tor.managed() && crate::tor::resolve_binary(cfg).is_some() {
+            let port = if cfg.tor.socks_port > 0 {
+                cfg.tor.socks_port
+            } else {
+                chain.default_socks_port()
+            };
+            Some(format!("127.0.0.1:{port}"))
+        } else {
+            cfg.rawtx
+                .tor_socks
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty() && tcp_answers(s))
+                .map(str::to_string)
+        };
+        let i2p_sam = match cfg.core.i2p_sam.trim() {
+            "" => None,
+            "auto" => Some("127.0.0.1:7656".to_string()).filter(|a| tcp_answers(a)),
+            addr => Some(addr.to_string()),
+        };
+        // Only asked when needed: it runs `bitcoind -help`.
+        let private_broadcast_supported = cfg.core.private_broadcast
+            && std::process::Command::new(&cfg.core.bitcoind)
+                .arg("-help")
+                .output()
+                .map(|o| String::from_utf8_lossy(&o.stdout).contains("-privatebroadcast"))
+                .unwrap_or(false);
+        NetFacts {
+            tor_socks,
+            i2p_sam,
+            private_broadcast_supported,
+        }
+    }
+}
+
+/// Core arguments an operator may set to take over the network setup.
+const NETWORK_ARGS: [&str; 6] = [
+    "-proxy",
+    "-onion",
+    "-onlynet",
+    "-i2psam",
+    "-connect",
+    "-privatebroadcast",
+];
+
+/// P2P network arguments for a Core started by e-lite (AUD-136).
+///
+/// * `auto`: clearnet **plus** every private network available. Core then
+///   also reaches onion/I2P/CJDNS peers; block download speed is unchanged.
+/// * `private`: **only** private networks. No Bitcoin peer ever sees the
+///   node's IP: no clearnet peers, no listening, no DNS, no address
+///   discovery. Slower IBD. Fails when no private network is available.
+/// * `clearnet`: nothing is added.
+///
+/// `private_broadcast` adds `-privatebroadcast=1` when Core supports it and
+/// Tor or I2P is available: wallet transactions leave through short-lived
+/// Tor/I2P connections even though blocks still come over clearnet.
+pub fn network_args(cfg: &Config, facts: &NetFacts) -> Result<(Vec<String>, Vec<String>), String> {
+    let mut args = Vec::new();
+    let mut notes = Vec::new();
+    let mode = cfg.core.network.as_str();
+    if let Some(set) = NETWORK_ARGS.iter().find(|a| operator_sets(cfg, a)) {
+        if mode == "private" {
+            return Err(format!(
+                "[core] network = \"private\" conflicts with {set} in [core] extra_args; \
+                 remove one of them"
+            ));
+        }
+        notes.push(format!(
+            "operator set {set}; e-lite leaves Core's network settings alone"
+        ));
+        return Ok((args, notes));
+    }
+    if mode == "clearnet" {
+        notes.push("Core network: clearnet only ([core] network = \"clearnet\")".to_string());
+        return Ok((args, notes));
+    }
+    let private = mode == "private";
+    let mut nets: Vec<&str> = Vec::new();
+    if let Some(socks) = &facts.tor_socks {
+        if private {
+            // Everything through Tor, including name lookups.
+            args.push(format!("-proxy={socks}"));
+            args.push("-onlynet=onion".to_string());
+        } else {
+            args.push(format!("-onion={socks}"));
+        }
+        nets.push("onion");
+    }
+    if let Some(sam) = &facts.i2p_sam {
+        args.push(format!("-i2psam={sam}"));
+        // Outbound only: no persistent I2P address is published.
+        args.push("-i2pacceptincoming=0".to_string());
+        if private {
+            args.push("-onlynet=i2p".to_string());
+        }
+        nets.push("i2p");
+    }
+    if cfg.core.cjdns {
+        args.push("-cjdnsreachable=1".to_string());
+        if private {
+            args.push("-onlynet=cjdns".to_string());
+        }
+        nets.push("cjdns");
+    }
+    if private {
+        if nets.is_empty() {
+            return Err(
+                "[core] network = \"private\" needs a private network: the managed Tor \
+                 ([tor] mode = \"managed\"), a reachable [rawtx] tor_socks, an I2P SAM router \
+                 ([core] i2p_sam) or CJDNS ([core] cjdns = true). Refusing to start Core on \
+                 clearnet."
+                    .to_string(),
+            );
+        }
+        args.push("-listen=0".to_string());
+        args.push("-dnsseed=0".to_string());
+        args.push("-dns=0".to_string());
+        args.push("-discover=0".to_string());
+        args.push("-natpmp=0".to_string());
+        notes.push(format!(
+            "Core network: private only ({}); no clearnet peers, no listening, no DNS",
+            nets.join(" + ")
+        ));
+    } else if nets.is_empty() {
+        notes.push("Core network: clearnet only (no Tor, I2P or CJDNS available)".to_string());
+    } else {
+        notes.push(format!("Core network: clearnet + {}", nets.join(" + ")));
+    }
+    if cfg.core.private_broadcast {
+        let anonymous = facts.tor_socks.is_some() || facts.i2p_sam.is_some();
+        if !facts.private_broadcast_supported {
+            notes.push(
+                "WARNING: private_broadcast requested but this bitcoind has no \
+                 -privatebroadcast; wallet transactions are broadcast normally"
+                    .to_string(),
+            );
+        } else if !anonymous {
+            notes.push(
+                "WARNING: private_broadcast requested but neither Tor nor I2P is \
+                 available; wallet transactions are broadcast normally"
+                    .to_string(),
+            );
+        } else {
+            args.push("-privatebroadcast=1".to_string());
+            notes.push(
+                "wallet transactions are broadcast over short-lived Tor/I2P connections \
+                 (-privatebroadcast)"
+                    .to_string(),
+            );
+        }
+    }
+    Ok((args, notes))
 }
 
 /// One-line summary for `doctor` and the startup log.
@@ -243,5 +429,103 @@ mod tests {
         c.core.manage = CoreManage::External;
         let plan = plan_core(&c, Chain::Mainnet).unwrap();
         assert!(plan.args.is_empty());
+    }
+
+    fn facts(tor: bool, i2p: bool, pb: bool) -> NetFacts {
+        NetFacts {
+            tor_socks: tor.then(|| "127.0.0.1:9050".to_string()),
+            i2p_sam: i2p.then(|| "127.0.0.1:7656".to_string()),
+            private_broadcast_supported: pb,
+        }
+    }
+
+    #[test]
+    fn auto_network_adds_private_networks_to_clearnet() {
+        let c = cfg();
+        let (args, notes) = network_args(&c, &facts(true, true, false)).unwrap();
+        assert_eq!(
+            args,
+            vec![
+                "-onion=127.0.0.1:9050",
+                "-i2psam=127.0.0.1:7656",
+                "-i2pacceptincoming=0"
+            ]
+        );
+        // Clearnet stays: nothing restricts or proxies it.
+        assert!(!args
+            .iter()
+            .any(|a| a.starts_with("-onlynet") || a.starts_with("-proxy")));
+        assert!(notes.iter().any(|n| n.contains("clearnet + onion + i2p")));
+        // Nothing available: Core starts exactly as before.
+        let (args, notes) = network_args(&c, &facts(false, false, false)).unwrap();
+        assert!(args.is_empty());
+        assert!(notes.iter().any(|n| n.contains("clearnet only")));
+    }
+
+    #[test]
+    fn private_network_never_touches_clearnet() {
+        let mut c = cfg();
+        c.core.network = "private".to_string();
+        c.core.cjdns = true;
+        let (args, _) = network_args(&c, &facts(true, true, false)).unwrap();
+        for wanted in [
+            "-proxy=127.0.0.1:9050",
+            "-onlynet=onion",
+            "-onlynet=i2p",
+            "-onlynet=cjdns",
+            "-listen=0",
+            "-dnsseed=0",
+            "-dns=0",
+            "-discover=0",
+        ] {
+            assert!(
+                args.iter().any(|a| a == wanted),
+                "{wanted} missing in {args:?}"
+            );
+        }
+        assert!(!args
+            .iter()
+            .any(|a| a == "-onlynet=ipv4" || a == "-onlynet=ipv6"));
+        // Fail closed: never fall back to clearnet.
+        c.core.cjdns = false;
+        let err = network_args(&c, &facts(false, false, false)).unwrap_err();
+        assert!(err.contains("Refusing to start Core on clearnet"), "{err}");
+        // An operator proxy would fight with the private plan.
+        c.core.extra_args = vec!["-proxy=10.0.0.1:9050".to_string()];
+        assert!(network_args(&c, &facts(true, false, false)).is_err());
+    }
+
+    #[test]
+    fn clearnet_mode_and_operator_args_add_nothing() {
+        let mut c = cfg();
+        c.core.network = "clearnet".to_string();
+        assert!(network_args(&c, &facts(true, true, true))
+            .unwrap()
+            .0
+            .is_empty());
+        let mut c = cfg();
+        c.core.extra_args = vec!["-onlynet=onion".to_string()];
+        let (args, notes) = network_args(&c, &facts(true, true, true)).unwrap();
+        assert!(args.is_empty());
+        assert!(notes.iter().any(|n| n.contains("operator set -onlynet")));
+    }
+
+    #[test]
+    fn private_broadcast_needs_support_and_an_anonymous_network() {
+        let mut c = cfg();
+        c.core.private_broadcast = true;
+        let (args, _) = network_args(&c, &facts(true, false, true)).unwrap();
+        assert!(args.iter().any(|a| a == "-privatebroadcast=1"));
+        // Old Core: the flag would stop it from starting.
+        let (args, notes) = network_args(&c, &facts(true, false, false)).unwrap();
+        assert!(!args.iter().any(|a| a.starts_with("-privatebroadcast")));
+        assert!(notes.iter().any(|n| n.contains("WARNING")));
+        // No Tor/I2P: nothing to broadcast through.
+        let (args, notes) = network_args(&c, &facts(false, false, true)).unwrap();
+        assert!(!args.iter().any(|a| a.starts_with("-privatebroadcast")));
+        assert!(notes.iter().any(|n| n.contains("neither Tor nor I2P")));
+        // Off by default.
+        let (args, _) = network_args(&cfg(), &facts(true, true, true)).unwrap();
+        assert!(!args.iter().any(|a| a.starts_with("-privatebroadcast")));
     }
 }

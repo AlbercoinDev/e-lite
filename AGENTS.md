@@ -57,8 +57,11 @@ Never treat a version number in this file as authoritative over the code/tag.
   pruning every 5,000 safe blocks by default (low disk bypasses it).
 - `prune_mib >= 550` requires `[pruning] allow_auto_prune = true`.
 - Snapshots are optional; they are never required by the from-zero flow.
-  `export-snapshot` writes one archive per network (manifest format 2:
-  network, genesis, index tip, schema, txnum, canonical digest) and **always
+  `export-snapshot` writes one archive per network (manifest **format 3**:
+  network, genesis, index tip, schema, txnum, canonical digest; the manifest
+  is also the first tar entry, `e-lite-snapshot.head.json`, so import refuses
+  a wrong network/schema before extracting; one gzip member per section, read
+  with `MultiGzDecoder`; formats 1-2 still import) and **always
   excludes the nested Core datadir `<data-dir>/bitcoin`** from the index
   section (AUD-124). `--with-core` additionally bundles that network's Core
   datadir under `bitcoin/` after a probe Core (start + RPC + stop) records
@@ -68,7 +71,10 @@ Never treat a version number in this file as authoritative over the code/tag.
   (any name), `onion_v3_private_key`/`i2p_private_key`, `bitcoin.conf`,
   `settings.json`, mempool/peers/cookie/logs and other networks' subdirs are
   never copied and are listed as "not copied" by the export (AUD-126).
-  gzip level is `--compress-level` (default 3, balanced; 0 stores).
+  gzip: the index section is stored (level 0, its files are already
+  compressed) and Core uses level 3; `--compress-level` sets both. A SHA-256
+  per Core file is recorded by default (`--no-hash-files`) and checked on
+  import whenever present (AUD-140/143).
   `import-snapshot` needs an empty target, extracts and validates in a
   sibling `.<name>.import-partial` staging dir and renames it into place only
   when every check passed (AUD-141; a leftover staging dir is removed on the
@@ -175,8 +181,12 @@ Never treat a version number in this file as authoritative over the code/tag.
   per-family pressure used to tune them.
 - Electrum binds per-network defaults: plain/TLS/metrics are
   `55011/55022/55084` (mainnet), `55111/55122/55184` (testnet4),
-  `55211/55222/55284` (signet) and `55311/55322/55384` (regtest), on `0.0.0.0`
-  for Electrum and loopback for metrics. TLS is **on by default** (`server.tls`)
+  `55211/55222/55284` (signet) and `55311/55322/55384` (regtest). TLS binds
+  `0.0.0.0`; the **plain listener binds loopback** by default (same-host
+  wallets and the onion target) and reaches the network only with
+  `[server] plain_lan = true`/`--plain-lan`, an explicit `listen`, or when TLS
+  is disabled (AUD-147). An explicit `listen` is never rewritten and TLS then
+  follows its host. Metrics stay on loopback. TLS is **on by default** (`server.tls`)
   with an auto-generated self-signed certificate; TLS is independent of Tor.
   `[tor] mode = "managed"` publishes the same plain/TLS ports as a v3 onion
   service. Neither listener authenticates clients; the onion address is the
@@ -198,8 +208,8 @@ Never treat a version number in this file as authoritative over the code/tag.
   header hash/merkle root but fails the BIP141 check with `missing witness
   reserved value`. Reject peers that do not advertise `NODE_WITNESS`, and
   validate the witness commitment inside the P2P source before marking a peer
-  good. P2P is fail-fast: connected peers first, last-good peer first, per-peer
-  timeout/failed-peer cooldown, total 2× timeout, and a Tor circuit breaker
+  good. P2P is fail-fast: random order among the discovered peers (no peer is
+  preferred, AUD-135), per-peer timeout/failed-peer cooldown, total 2× timeout, and a Tor circuit breaker
   before clearnet fallback. Never let one block spend minutes trying dead peers.
 - BIP141: when several coinbase outputs match the commitment pattern, the
   highest output index is the commitment; the coinbase witness must be exactly
@@ -219,14 +229,17 @@ Never treat a version number in this file as authoritative over the code/tag.
   are refreshed every 10 min (60 s while empty) by `el-p2p-peers`; pinned
   `p2p_peers` are never replaced (AUD-137).
 - Provider health is sticky: a failed Tor **or direct** request cools that
-  provider for `provider_cooldown_seconds` (300 s), and the last successful
-  provider is tried first. A provider that already answered is cooled for at
+  provider for `provider_cooldown_seconds` (300 s). Providers are tried in
+  **random order**; never prefer the one that answered last, which sent every
+  block of a wallet to a single provider (AUD-135). A provider that already
+  answered is cooled for at
   most 30 s after a failure; if every provider is cooling down, e-lite forces
   one attempt rather than failing the wallet request. `max_parallel_fetches`
   (4) bounds total external downloads; concurrent requests for the same block
   share one download.
 - Decoys default to 1, at most 2 are in flight, and the prefetch never spawns
-  decoys. The prefetcher enqueues up to 16 confirmed history blocks per
+  decoys. For that reason the history prefetch is **off by default**
+  (`[rawtx] prefetch`, AUD-134). When enabled, the prefetcher enqueues up to 16 confirmed history blocks per
   history response, each with **all** of that history's txids in the block
   (`prefetch_block_txs`: one download caches them all), with one worker; it is
   an optimisation, never correctness.
@@ -258,9 +271,11 @@ Never treat a version number in this file as authoritative over the code/tag.
   open_without_provider = true` opens with local data after
   `ready_timeout_seconds` (AUD-127), and an `el-providers` thread re-probes
   every 60 s until one answers.
-  `tor_fallback_clearnet = true` uses clearnet when Tor is unavailable or a
-  request fails (log + `/status`), while `.onion` still needs Tor; set it to
-  `false` for fail-closed.
+  External fetches are **Tor-only and fail-closed by default**
+  (`tor_fallback_clearnet = false`, AUD-128): the opt-in fallback uses
+  clearnet when Tor is unavailable or a request fails (log + `/status`),
+  while `.onion` still needs Tor. Do not turn the default back on: it ties
+  the operator IP to the blocks of the wallet.
 - Electrum protocol versions are negotiated per connection. This build serves
   1.4–1.7 (`server.version` returns the negotiated version). A request for a
   future or skipped version falls back to the newest implemented version at or
@@ -347,6 +362,19 @@ Never treat a version number in this file as authoritative over the code/tag.
   -daemonwait/-rpcbind/-rpcport/-rpcallowip/-prune` in `extra_args` are
   rejected. An external Core is never configured, paused or restarted. Core's
   shutdown grace is 120 s.
+- Core P2P networks (AUD-136, `core_plan::network_args`): `[core] network =
+  "auto"` adds `-onion=<Tor SOCKS>` (+ `-i2psam`/`-i2pacceptincoming=0` when a
+  SAM router answers, `-cjdnsreachable` with `cjdns = true`) and keeps
+  clearnet; `"private"` adds `-proxy`, `-onlynet=onion|i2p|cjdns`, `-listen=0`,
+  `-dnsseed=0`, `-dns=0`, `-discover=0`, `-natpmp=0` and **fails instead of
+  starting Core on clearnet** when no private network exists (the supervisor
+  never starts Core with a rejected plan); `"clearnet"` adds nothing.
+  `private_broadcast` adds `-privatebroadcast=1` only if `bitcoind -help` has
+  it and Tor or I2P is available; it stays opt-in because Core marks it
+  experimental and the transaction reaches the mempool only when relayed
+  back. Operator `-proxy/-onion/-onlynet/-i2psam/-connect/-privatebroadcast`
+  win. The Tor is the managed one (`tor.socks_port`, else the network default
+  port) or a reachable `rawtx.tor_socks`.
 - Core RPC is HTTP; LAN/WAN use requires SSH/VPN. e-lite warns on a non-loopback
   `rpc_url`; `[core] require_loopback_rpc = true` makes it fatal. There is no
   native Core RPC TLS.
@@ -417,7 +445,7 @@ Never treat a version number in this file as authoritative over the code/tag.
 - `CertWatcher` reloads changed PEMs by mtime without restart and keeps the old
   cert if the new pair is invalid (Let's Encrypt renewals need no restart).
 - TLS only encrypts; there is no client auth and rate limiting is only a
-  throttle (AUD-010). The default bind is `0.0.0.0`; restrict with a
+  throttle (AUD-010). TLS binds `0.0.0.0` by default; restrict with a
   firewall/VPN/allowlist, or set `listen = "127.0.0.1:..."` (TLS follows it).
 - Data layout: `~/e-lite/<network>` holds the index, TLS, Tor and logs, and
   `<data-dir>/bitcoin` is that network's Core datadir. Two instances must never

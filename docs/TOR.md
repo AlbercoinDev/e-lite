@@ -34,9 +34,14 @@ onion for Bitcoin Core's P2P listener. A Core started by e-lite therefore gets
 `-listenonion=0`; otherwise Core would default to `-listenonion=1` and retry
 `127.0.0.1:9051` forever, logging `Error connecting to address 127.0.0.1:9051`.
 
+- A Core started by e-lite uses the managed Tor for **outbound** connections:
+  `[core] network = "auto"` (default) adds `-onion=<SOCKS>` so Core reaches
+  onion peers besides clearnet, and `network = "private"` routes everything
+  through it (`-proxy`, `-onlynet=onion`, no listening, no DNS). See
+  "Bitcoin Core's own network" in [`PRIVACY.md`](PRIVACY.md).
 - `/status.tor` reports the effective SOCKS port (`socks_port`), whether it is
   managed by e-lite, and `control_port: 0`. Use that SOCKS address if you set
-  Core's `-proxy` yourself.
+  Core's `-proxy` yourself (e-lite then leaves Core's network flags alone).
 - `e-lite doctor` prints `core onion: disabled by e-lite` for a managed Core.
   If you force `-listenonion=1` in `[core] extra_args`, it warns that the
   managed Tor has no control port.

@@ -114,8 +114,9 @@ sha256sum -c SHA256SUMS   # inside the release artifact directory
 
 ## Electrum connection
 
-Wallets connect to `0.0.0.0:55011` (plain) or `0.0.0.0:55022` (TLS) for
-mainnet; testnet4 uses `55111`/`55122`, signet `55211`/`55222` and regtest
+Wallets connect to port `55022` (TLS, every interface) or, on the same host,
+`127.0.0.1:55011` (plain) for mainnet. Plain is not offered on the network
+unless `[server] plain_lan = true` / `--plain-lan` is set; testnet4 uses `55111`/`55122`, signet `55211`/`55222` and regtest
 `55311`/`55322`. TLS is enabled by default and a local CA plus a server
 certificate signed by it are generated on first start in `<data-dir>/tls/`; the
 startup log prints both fingerprints. Import `ca.crt` into the wallet trust

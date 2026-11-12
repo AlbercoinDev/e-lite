@@ -25,8 +25,8 @@ core logs        print the last 50 lines of a Core launched by e-lite
 onion show       show the Tor onion address, ports and managed-Tor state
 onion reset      generate a new onion address (stop e-lite first)
 export-snapshot  print the canonical digest or write --output
-                 (--with-core bundles the network's Core datadir; --hash-files
-                 adds SHA-256 per Core file; --compress-level 0..9, default 3)
+                 (--with-core bundles the network's Core chain data with a
+                 SHA-256 per file; index stored, Core gzip 3; --compress-level sets both)
 import-snapshot  restore --input into an empty target (atomic: staged, then renamed)
                  (--verify checks per-file hashes; --verify=full opens the
                  restored Core and runs a bounded verifychain;
@@ -51,7 +51,7 @@ version          print version
 | `--prune-mib <n>` | `1` manual (default), `0` full, `>=550` auto + opt-in |
 | `--output <path>` | snapshot file for `export-snapshot` |
 | `--input <path>` | snapshot file for `import-snapshot` |
-| `--with-core`, `--hash-files`, `--compress-level <n>` | export-snapshot: bundle the Core chain data (`blocks/`, `chainstate/`, `indexes/` only; never wallets, keys or `bitcoin.conf`), hash its files (gzip level default 3) |
+| `--with-core`, `--no-hash-files`, `--compress-level <n>` | export-snapshot: bundle the Core chain data (`blocks/`, `chainstate/`, `indexes/` only; never wallets, keys or `bitcoin.conf`), with a SHA-256 per file unless `--no-hash-files` (gzip: index 0, Core 3; the flag sets both) |
 | `--verify [basic\|full]` | import-snapshot: per-file hash check, or open the restored Core and `verifychain` |
 | `--expect-digest <hex>` | import-snapshot: refuse unless the recomputed index digest equals the `logical_snapshot_hash` printed by your export |
 | `--min-free-gib <n>`, `--critical-free-gib <n>` | disk guards |
@@ -135,7 +135,7 @@ stop e-lite and Core first — the export refuses otherwise):
 
 ```bash
 e-lite export-snapshot --network mainnet --allow-mainnet \
-  --output /backups/full-mainnet-<tip>.tar.gz --with-core --hash-files
+  --output /backups/full-mainnet-<tip>.tar.gz --with-core
 
 e-lite import-snapshot --network mainnet --allow-mainnet \
   --data-dir ~/e-lite/mainnet --input /backups/full-mainnet-<tip>.tar.gz \
@@ -214,7 +214,12 @@ e-lite run --network mainnet --allow-mainnet \
 | `--set rawtx.cache_dir=<path>` | `rawtx.cache_dir` | `<data-dir>/rawtx-cache`; tmpfs keeps it off disk |
 | `--tor-socks <addr>` | `rawtx.tor_socks` | `127.0.0.1:9050` |
 | `--allow-clearnet` | `rawtx.allow_clearnet` | `false` |
-| `--set rawtx.tor_fallback_clearnet=true` | use clearnet when Tor fails | `true` |
+| `--set rawtx.tor_fallback_clearnet=true` | use clearnet when Tor fails (exposes your IP to the provider) | `false` |
+| `--set rawtx.prefetch=true` | download a wallet's history blocks in the background (faster first load, no decoys) | `false` |
+| `--plain-lan` / `--set server.plain_lan=true` | plain Electrum on `0.0.0.0` | `false` |
+| `--set core.network=auto\|private\|clearnet` | P2P networks of a Core started by e-lite | `auto` |
+| `--set core.private_broadcast=true` | broadcast wallet transactions over short-lived Tor/I2P connections (experimental in Core) | `false` |
+| `--set core.i2p_sam=auto\|host:port` , `--set core.cjdns=true` | extra private networks for Core | `auto`, `false` |
 | `--set rawtx.request_timeout_seconds=<n>` | per-provider block timeout | `8` |
 | `--set rawtx.provider_cooldown_seconds=<n>` | cool down a failed provider (Tor or direct) | `300` |
 | `--set rawtx.max_parallel_fetches=<n>` | concurrent external block downloads | `4` |
@@ -239,8 +244,11 @@ Empty values are filled from the active network, so several e-lite instances
 | signet | 55211 | 55222 | 55284 | `~/e-lite/signet` | `~/e-lite/signet/bitcoin` |
 | regtest | 55311 | 55322 | 55384 | `~/e-lite/regtest` | `~/e-lite/regtest/bitcoin` |
 
-The plain listener binds `0.0.0.0`; the TLS listener copies its host, so
-`[server] listen = "127.0.0.1:55011"` keeps TLS on loopback. `--listen`,
+By default TLS binds `0.0.0.0` and the plain listener `127.0.0.1` (wallets on
+this host and the onion service). `--plain-lan` / `[server] plain_lan = true`
+puts plain on `0.0.0.0` too. An explicit `listen` is used as given and the TLS
+listener then copies its host, so `[server] listen = "127.0.0.1:55011"` keeps
+TLS on loopback. `--listen`,
 `--tls-listen` and `--metrics` override the ports.
 
 The default data directory only applies to new installs. An existing

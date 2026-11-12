@@ -8,7 +8,7 @@ use crate::{BlockSource, RawtxError, Result};
 use el_model::Hash32;
 use rand::seq::SliceRandom;
 use rand::thread_rng;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::Read;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
@@ -29,7 +29,9 @@ pub struct EsploraSource {
     cooldown: Duration,
     tor_failures: Mutex<HashMap<String, Instant>>,
     direct_failures: Mutex<HashMap<String, Instant>>,
-    last_good: Mutex<Option<String>>,
+    /// Providers that have answered at least once: after a failure they are
+    /// cooled for a short time only. They get no priority in the order.
+    good: Mutex<HashSet<String>>,
 }
 
 const MAX_BLOCK_BYTES: u64 = 8 * 1024 * 1024;
@@ -105,7 +107,7 @@ impl EsploraSource {
             cooldown,
             tor_failures: Mutex::new(HashMap::new()),
             direct_failures: Mutex::new(HashMap::new()),
-            last_good: Mutex::new(None),
+            good: Mutex::new(HashSet::new()),
         })
     }
 
@@ -156,8 +158,8 @@ impl EsploraSource {
     }
 
     fn mark_good(&self, base: &str, tor: bool) {
-        if let Ok(mut good) = self.last_good.lock() {
-            *good = Some(base.to_string());
+        if let Ok(mut good) = self.good.lock() {
+            good.insert(base.to_string());
         }
         let map = if tor {
             &self.tor_failures
@@ -169,17 +171,17 @@ impl EsploraSource {
         }
     }
 
-    fn is_last_good(&self, base: &str) -> bool {
-        self.last_good
+    fn is_known_good(&self, base: &str) -> bool {
+        self.good
             .lock()
-            .map(|good| good.as_deref() == Some(base))
+            .map(|good| good.contains(base))
             .unwrap_or(false)
     }
 
     /// A provider that answered recently should not be disabled for the full
     /// cooldown after one transient error; retry it soon.
     fn failure_cooldown(&self, base: &str) -> Duration {
-        if self.is_last_good(base) {
+        if self.is_known_good(base) {
             self.cooldown.min(Duration::from_secs(30))
         } else {
             self.cooldown
@@ -200,7 +202,7 @@ impl EsploraSource {
         let idx = order
             .iter()
             .copied()
-            .find(|&i| self.is_last_good(&self.bases[i]))
+            .find(|&i| self.is_known_good(&self.bases[i]))
             .or_else(|| order.first().copied());
         let Some(idx) = idx else {
             return;
@@ -223,19 +225,9 @@ impl BlockSource for EsploraSource {
     fn fetch_block(&self, hash: &Hash32) -> Result<Vec<u8>> {
         let mut order: Vec<usize> = (0..self.bases.len()).collect();
         order.shuffle(&mut thread_rng());
-        // Providers that answered recently go first. This avoids paying a
-        // dead provider's timeout on every block while keeping the rest
-        // shuffled for less predictable traffic.
-        let last_idx = self.last_good.lock().ok().and_then(|good| {
-            good.as_ref()
-                .and_then(|base| self.bases.iter().position(|b| b == base))
-        });
-        if let Some(idx) = last_idx {
-            if let Some(pos) = order.iter().position(|&i| i == idx) {
-                let idx = order.remove(pos);
-                order.insert(0, idx);
-            }
-        }
+        // Purely random order (AUD-135): preferring the provider that answered
+        // last sent every block of a wallet to the same one. A dead provider
+        // is not paid for on every block because a failure cools it down.
         if !order.iter().any(|&i| self.attemptable(&self.bases[i])) {
             self.force_one(&order);
         }
@@ -403,6 +395,36 @@ mod tests {
             "the failed provider must not be retried on every block"
         );
         assert!(good_requests.load(Ordering::SeqCst) >= 2);
+    }
+
+    #[test]
+    fn healthy_providers_share_the_requests() {
+        // AUD-135: no provider is preferred because it answered last.
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let counters: Vec<Arc<AtomicUsize>> =
+            (0..3).map(|_| Arc::new(AtomicUsize::new(0))).collect();
+        let bases = counters
+            .iter()
+            .map(|c| serve_ok(vec![1, 2, 3], Arc::clone(c)))
+            .collect();
+        let src = EsploraSource::new(
+            bases,
+            None,
+            true,
+            false,
+            Duration::from_secs(5),
+            Duration::from_secs(60),
+        )
+        .unwrap();
+        for i in 0..90u8 {
+            src.fetch_block(&Hash32([i; 32])).unwrap();
+        }
+        let seen: Vec<usize> = counters.iter().map(|c| c.load(Ordering::SeqCst)).collect();
+        assert_eq!(seen.iter().sum::<usize>(), 90);
+        // Uniform would be 30 each; a sticky provider would take ~88.
+        assert!(seen.iter().all(|n| *n >= 10), "{seen:?}");
     }
 
     #[test]

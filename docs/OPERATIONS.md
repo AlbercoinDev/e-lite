@@ -18,7 +18,8 @@ e-lite run --network signet --manage managed \
 - `run` starts Core if needed, waits for RPC, initializes the DB and indexes.
 - `prune_mib=1` is manual pruning: Core never deletes on its own; e-lite’s prune
   gate keeps the cut below `index - 288`.
-- Electrum: `0.0.0.0:55011` (plain) and `0.0.0.0:55022` (TLS) for mainnet;
+- Electrum: `0.0.0.0:55022` (TLS) and loopback-only `127.0.0.1:55011` (plain)
+  for mainnet (`plain_lan = true` puts plain on `0.0.0.0` as well);
   testnet4 uses `55111`/`55122`, signet `55211`/`55222`, regtest `55311`/`55322`.
   TLS is on by default and uses a generated self-signed certificate unless
   `[server] tls_cert/tls_key` are set. Status/metrics: `127.0.0.1:55084`
@@ -182,9 +183,11 @@ openssl verify -CAfile <data-dir>/tls/ca.crt <data-dir>/tls/self-signed.crt
 
 ```toml
 [server]
-listen = "0.0.0.0:55011"      # empty = 0.0.0.0:<network plain port>
+listen = ""                   # empty = 127.0.0.1:<network plain port> (loopback only)
+plain_lan = false             # true = plain on 0.0.0.0 as well
 tls = true
-tls_listen = "0.0.0.0:55022"  # empty = host of listen + <network TLS port>
+tls_listen = ""               # empty = 0.0.0.0:<network TLS port>; with an explicit
+                              # `listen`, empty = host of listen + TLS port
 # tls_cert = "/etc/e-lite/tls/fullchain.pem"   # optional, operator-managed
 # tls_key = "/etc/e-lite/tls/privkey.pem"
 ```
@@ -309,7 +312,7 @@ not required by the from-zero flow.
 ```bash
 # Backup (stop e-lite and Core first; the export refuses while Core runs)
 e-lite export-snapshot --network mainnet --allow-mainnet \
-  --output /backups/full-mainnet-<tip>.tar.gz --with-core --hash-files
+  --output /backups/full-mainnet-<tip>.tar.gz --with-core
 
 # Restore into an empty data dir and verify the pair
 e-lite import-snapshot --network mainnet --allow-mainnet \
@@ -326,8 +329,14 @@ e-lite import-snapshot --network mainnet --allow-mainnet \
   manifest; the pair rules are enforced on both sides (`index tip <= Core
   tip`, `prune_height <= index tip - 288` undo window).
 - Without `--with-core` the archive is index-only and never contains the
-  Core datadir. `--compress-level` is gzip 0..9 (default 3, balanced);
-  `--hash-files` adds SHA-256 per Core file to the manifest.
+  Core datadir. The index section is stored (gzip level 0: its files are
+  already compressed) and the Core section uses level 3; `--compress-level
+  0..9` sets both. A SHA-256 per Core file is recorded by default
+  (`--no-hash-files` skips it) and checked on import. Archives are manifest
+  **format 3**: the manifest is also the first entry, so an archive for
+  another network or a newer schema is refused before anything is extracted.
+  Format 3 needs e-lite alpha.29.12.0 or later to import; formats 1 and 2
+  still import.
 - The export prints `logical_snapshot_hash`. Store it **apart from the
   archive** (password manager, notes): the digest inside the archive only
   detects corruption, while `--expect-digest` also detects an archive that

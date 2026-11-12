@@ -11,6 +11,7 @@ available**.
 | Networks: regtest, signet, testnet4, mainnet | experimental | mainnet requires explicit opt-in |
 | Core `external`, `auto`, `managed` | experimental | only owned Core can be paused/pruned/stopped |
 | Local Core, LAN Core, WAN via SSH/VPN | experimental | RPC-only for LAN/WAN; no remote block files |
+| Core P2P networks | experimental | `[core] network = auto` (clearnet + onion via the managed Tor, + I2P/CJDNS when available), `private` (only those networks, fail-closed) or `clearnet`; opt-in `private_broadcast` (`-privatebroadcast`, needs Core 30+) |
 | Core RPC exposure guard | experimental | warns on non-loopback; `require_loopback_rpc` makes it fatal; no native TLS |
 | Block source `files`, `rpc`, `auto` | experimental | files reads `blk*.dat`, XOR aware, read-only |
 | From-zero pruned IBD with `prune_mib=1` | experimental | manual prune gate; default 5k safe-block gain |
@@ -73,7 +74,7 @@ available**.
 |---|---|---|
 | Local-first rawtx | experimental | Core/cache before external |
 | Whole-block external fetch | experimental | by hash, never txid |
-| Tor SOCKS5h with clearnet fallback | experimental | Tor first; `tor_fallback_clearnet` (default true) uses clearnet if Tor fails; `allow_clearnet` forces it |
+| Tor SOCKS5h, fail-closed | experimental | Tor only by default; opt-in `tor_fallback_clearnet` uses clearnet if Tor fails; `allow_clearnet` forces it |
 | Managed Tor + onion service | experimental | network plain/TLS ports; `e-lite onion show/reset` |
 | Auto self-signed TLS cert | experimental | generated without Tor; SAN includes localhost, hostname and onion; reloaded on change |
 | Decoys and random source order | experimental | `decoys=1` default; max 2 in flight; prefetch spawns none |
@@ -82,10 +83,10 @@ available**.
 | Block hash/header/Merkle/witness validation | experimental | before serving/caching |
 | Configurable Esplora endpoints | experimental | editable `public-servers.toml`; shipped defaults; fail-closed if no provider and `require_ready` |
 | Provider readiness gate | experimental | probes `/block-height/0` + genesis raw block before opening Electrum when Core is pruned (an unpruned Core skips it); `require_ready`, opt-in `open_without_provider` after `ready_timeout_seconds`, 60 s re-probe, latency/state in `/status` |
-| Provider health cooldown | experimental | failed Tor/direct provider skipped for `provider_cooldown_seconds` (300 s); last good first and cooled for max 30 s; forced attempt when all are cooling |
+| Provider health cooldown | experimental | failed Tor/direct provider skipped for `provider_cooldown_seconds` (300 s); random order among healthy providers (none preferred), a provider that answered before is cooled for max 30 s; forced attempt when all are cooling |
 | In-flight block dedup | experimental | concurrent tx/prefetch of the same block share one download; `max_parallel_fetches=4` |
-| History block prefetch | experimental | background fetch of confirmed history blocks before `transaction.get`; 1 worker, 16 heights per history, bounded queue, no decoys |
-| P2P peers auto/config | experimental | `MSG_WITNESS_BLOCK`, `NODE_WITNESS` required, connected peers first, last-good peer first, failed-peer cooldown, total timeout; BIP324 v2 + v1 |
+| History block prefetch | experimental, off by default (`rawtx.prefetch`) | background fetch of confirmed history blocks before `transaction.get`; 1 worker, 16 heights per history, bounded queue, no decoys |
+| P2P peers auto/config | experimental | `MSG_WITNESS_BLOCK`, `NODE_WITNESS` required, random order among discovered peers, failed-peer cooldown, total timeout; BIP324 v2 + v1 |
 | Prune-gap repair from verified sources | experimental | bounded by `repair_max_gap_blocks` |
 | Silent payments privacy | **not available** | gate only |
 
@@ -100,8 +101,8 @@ available**.
 | Adaptive memory budget | experimental | fitted to available RAM; hot cache ceiling and opt-in hot memtables; 75 % ceiling; reserve |
 | READY / FULLY SYNCED status | experimental | log, `/status`, `/metrics`, `e-lite status` |
 | Ordered startup/shutdown | experimental | `run` waits for Core; threads joined before Core stop |
-| Snapshot export (index only) | experimental | `export-snapshot --output`: manifest format 2 (network/genesis/tip/schema/digest); the nested Core datadir is excluded |
-| Snapshot export (index + Core) | experimental | `--with-core`: probes Core (start + RPC + stop), bundles its chain data only (`blocks/`, `chainstate/`, `indexes/`; wallets, keys and config are never copied) with tip/prune/version in the manifest; refuses while Core runs; `--hash-files`, `--compress-level` (default 3) |
+| Snapshot export (index only) | experimental | `export-snapshot --output`: manifest format 3 (network/genesis/tip/schema/digest; manifest first, index stored, formats 1-2 still import); the nested Core datadir is excluded |
+| Snapshot export (index + Core) | experimental | `--with-core`: probes Core (start + RPC + stop), bundles its chain data only (`blocks/`, `chainstate/`, `indexes/`; wallets, keys and config are never copied) with tip/prune/version in the manifest; refuses while Core runs; SHA-256 per file by default (`--no-hash-files`); gzip index 0 / Core 3 (`--compress-level` sets both) |
 | Snapshot import + verification | experimental | `import-snapshot`: empty target, staged extraction renamed into place only after every check, optional `--expect-digest`, digest/tip/genesis validation, Core coherence (`index tip <= Core tip`, 288-block prune margin); `--verify` checks file hashes; `--verify=full` opens the restored Core and runs a bounded `verifychain` |
 | CLI overrides and `--set` | stable | every TOML field; see `docs/CLI.md` |
 | Progress percentages and milestones | experimental | height/Core %, 10k blocks or 6 h; disk usage |

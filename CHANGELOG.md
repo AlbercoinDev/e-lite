@@ -1,5 +1,68 @@
 # Changelog
 
+## Unreleased
+
+### Private by default: Tor-only fetches, plain on loopback, Core networks, snapshot format 3
+
+The owner decisions left open by the 2026-11-12 audit. **Defaults change**;
+read the upgrade notes. No index schema or Electrum protocol change.
+
+**Upgrade notes**
+
+- The plain Electrum listener now binds `127.0.0.1` by default. A wallet on
+  another machine must use the TLS port, or you set `[server] plain_lan =
+  true` / `--plain-lan`. A configuration with an explicit `listen` (for
+  example a container that publishes the port) is unchanged.
+- External block fetches no longer fall back to clearnet when Tor fails. With
+  a pruned Core and no working Tor, raw transactions of pruned blocks fail
+  (and `run` keeps the wallet listeners closed, as before) until Tor works or
+  you set `tor_fallback_clearnet = true`.
+- The history prefetch is off: the first load of a wallet can be slower. Set
+  `[rawtx] prefetch = true` to get the old behaviour.
+- Snapshots are written in manifest format 3, which older e-lite versions
+  cannot import. This version imports formats 1, 2 and 3.
+
+**Changes**
+
+- **AUD-128**: `[rawtx] tor_fallback_clearnet` defaults to `false`.
+- **AUD-134**: new `[rawtx] prefetch`, default `false`; the prefetcher (which
+  never uses decoys) only runs when it is enabled.
+- **AUD-135**: Esplora providers and P2P peers are tried in random order.
+  Before, the one that answered last went first, so one provider received
+  nearly every block of a wallet. Failed providers still cool down.
+- **AUD-136**: a Core started by e-lite uses more networks. `[core] network =
+  "auto"` (default) adds `-onion=<Tor SOCKS>` to clearnet, `-i2psam` when an
+  I2P SAM router answers (`i2p_sam`) and `-cjdnsreachable` with `cjdns =
+  true`. `network = "private"` uses only those networks (`-proxy`,
+  `-onlynet`, `-listen=0`, `-dnsseed=0`, `-dns=0`, `-discover=0`,
+  `-natpmp=0`) and refuses to start Core on clearnet when none is available;
+  `"clearnet"` keeps the old behaviour. Opt-in `private_broadcast = true`
+  adds `-privatebroadcast=1` when the installed Core supports it. The
+  supervisor no longer starts Core with an empty plan when the plan was
+  rejected.
+- **AUD-147**: plain listener on loopback by default; `plain_lan` /
+  `--plain-lan`. TLS stays on `0.0.0.0`. With `tls = false` the plain
+  listener keeps `0.0.0.0`.
+- **AUD-140 / AUD-141 / AUD-143**: snapshot manifest **format 3**. The
+  manifest is also the first archive entry, so an archive for another
+  network or a newer schema is refused before extraction. The index section
+  is stored (gzip 0) and Core uses gzip 3, as separate gzip members;
+  `--compress-level` sets both. A SHA-256 per Core file is recorded by
+  default (`--no-hash-files`; `--hash-files` is still accepted) and verified
+  on import whenever present. Old manifests are no longer re-packed as index
+  files by a later export.
+- Tests: `external_fetches_are_private_by_default`,
+  `healthy_providers_share_the_requests`, four `core_plan` network tests,
+  `plain_on_the_network_is_opt_in`,
+  `format_3_puts_the_manifest_first_and_rejects_early`,
+  `gzip_level_can_change_between_sections`; `e2e_defaults.sh` checks that
+  plain is not reachable on the LAN address.
+- Not verified: `private_broadcast` end to end (it needs a funded mainnet
+  transaction and real Tor peers; on regtest Core accepted the flags and
+  returned the txid without adding it to the mempool), and `network =
+  "private"` against real onion peers (Core accepted the flags and reported
+  only onion/I2P/CJDNS as reachable).
+
 ## 0.1.0-alpha.29.11.0 — 2026-11-12
 
 Audit release: the 2026-11-12 review of IBD/indexing, wallet serving and

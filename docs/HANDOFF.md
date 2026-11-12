@@ -96,6 +96,22 @@ no repitas contexto ni rehagas decisiones ya documentadas.
 - `docs/ROADMAP.md` contains future features/improvements. Do not present them as
   available.
 
+## Unreleased (after alpha.29.11.0)
+
+Owner decisions of 2026-11-12, implemented (see `CHANGELOG.md` "Unreleased"):
+AUD-128 (no clearnet fallback), AUD-134 (prefetch opt-in), AUD-135 (random
+provider order), AUD-136 (`[core] network`, `private_broadcast`), AUD-147
+(plain listener on loopback), AUD-140/141/143 (snapshot format 3). Defaults
+changed: read the upgrade notes before releasing.
+
+Open: AUD-130 (schema v2; the owner's mainnet index is 283 GiB with a 15 GiB
+Core, and the owner asked to do it after this batch), online export, decoy
+weighting, incremental backups. Measured by the owner on mainnet (version not
+stated, before this batch): an xpub wallet scan took 6 minutes. Each client
+connection is served serially, so `transaction.get` requests download blocks
+one after another; serving them concurrently per connection is the next
+candidate for that scan time.
+
 ## Last change (alpha.29.11.0)
 
 A static review (2026-11-12) recorded AUD-126..AUD-147 in `docs/AUDIT.md`

@@ -22,7 +22,7 @@
 use el_model::codec::SCHEMA_VERSION;
 use el_model::{Chain, Hash32};
 use el_store::Store;
-use flate2::read::GzDecoder;
+use flate2::read::MultiGzDecoder;
 use flate2::write::GzEncoder;
 use flate2::Compression;
 use serde::{Deserialize, Serialize};
@@ -38,6 +38,85 @@ pub const MANIFEST_NAME: &str = "e-lite-snapshot.json";
 pub const FORMAT: u32 = 1;
 /// Format 2: index plus an optional Core section and per-file sizes/hashes.
 pub const FORMAT_V2: u32 = 2;
+/// Format 3: same content as 2, plus a copy of the manifest as the **first**
+/// archive entry (`HEAD_NAME`) so a wrong network/schema is rejected before
+/// anything is extracted, and one gzip member per section so the index and
+/// Core can use different compression levels (AUD-140/141).
+pub const FORMAT_V3: u32 = 3;
+/// Early manifest: no per-file table and no Core byte count yet.
+pub const HEAD_NAME: &str = "e-lite-snapshot.head.json";
+
+/// gzip writer whose level can change between tar entries. Each level change
+/// starts a new gzip member; `MultiGzDecoder` reads them as one stream.
+struct LeveledGz {
+    enc: Option<GzEncoder<File>>,
+}
+
+impl LeveledGz {
+    fn new(file: File, level: u32) -> Self {
+        LeveledGz {
+            enc: Some(GzEncoder::new(file, Compression::new(level.clamp(0, 9)))),
+        }
+    }
+
+    fn set_level(&mut self, level: u32) -> std::io::Result<()> {
+        let file = self.enc.take().expect("encoder present").finish()?;
+        self.enc = Some(GzEncoder::new(file, Compression::new(level.clamp(0, 9))));
+        Ok(())
+    }
+
+    fn finish(mut self) -> std::io::Result<File> {
+        self.enc.take().expect("encoder present").finish()
+    }
+}
+
+impl Write for LeveledGz {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.enc.as_mut().expect("encoder present").write(buf)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.enc.as_mut().expect("encoder present").flush()
+    }
+}
+
+fn append_manifest<W: Write>(
+    builder: &mut tar::Builder<W>,
+    name: &str,
+    manifest: &Manifest,
+) -> Result<(), E> {
+    let json = serde_json::to_vec_pretty(manifest)?;
+    let mut header = tar::Header::new_gnu();
+    header.set_size(json.len() as u64);
+    header.set_mode(0o644);
+    header.set_mtime(0);
+    header.set_cksum();
+    builder.append_data(&mut header, name, json.as_slice())?;
+    Ok(())
+}
+
+/// Checks that need only the manifest: format, network and schema.
+fn check_manifest_header(manifest: &Manifest, chain: Chain) -> Result<(), E> {
+    if !(FORMAT..=FORMAT_V3).contains(&manifest.format) {
+        return Err(format!("unsupported snapshot format {}", manifest.format).into());
+    }
+    if manifest.network != chain.name() {
+        return Err(format!(
+            "snapshot belongs to {}, config says {}",
+            manifest.network,
+            chain.name()
+        )
+        .into());
+    }
+    if manifest.schema > SCHEMA_VERSION {
+        return Err(format!(
+            "snapshot schema v{} is newer than supported v{}",
+            manifest.schema, SCHEMA_VERSION
+        )
+        .into());
+    }
+    Ok(())
+}
 
 /// Undo/reorg margin: e-lite keeps Core's prune cut at or below
 /// `index - 288`, so a restored pair must preserve at least this window.
@@ -103,10 +182,15 @@ pub struct ExportOptions {
     /// e-lite version recorded in the manifest.
     pub version: String,
     pub with_core: bool,
-    /// gzip level 0..=9; 3 is the default (balanced), 0 stores without
-    /// compressing (useful when the Core section dominates the archive).
-    pub compress_level: u32,
+    /// gzip level 0..=9 for the index section. Default 0 (stored): the SSTs
+    /// are already LZ4-compressed and `txids.dat` is random, so gzip only
+    /// costs time there (AUD-140).
+    pub index_level: u32,
+    /// gzip level 0..=9 for the Core section. Default 3: `blk*.dat` gains
+    /// ~10-20 %.
+    pub core_level: u32,
     /// SHA-256 every Core file into the manifest (sizes are always recorded).
+    /// On by default (AUD-143).
     pub hash_files: bool,
     /// Probed Core facts; `--with-core` requires `Some`.
     pub core: Option<CoreSnapshot>,
@@ -119,8 +203,9 @@ impl Default for ExportOptions {
         ExportOptions {
             version: String::new(),
             with_core: false,
-            compress_level: 3,
-            hash_files: false,
+            index_level: 0,
+            core_level: 3,
+            hash_files: true,
             core: None,
             core_dir: None,
         }
@@ -129,8 +214,9 @@ impl Default for ExportOptions {
 
 #[derive(Debug, Default)]
 pub struct ImportOptions {
-    /// Verify manifest SHA-256 hashes against the extracted files.
-    pub verify_hashes: bool,
+    /// Skip the per-file SHA-256 check of the Core section. Hashes recorded
+    /// in the manifest are verified by default (AUD-143).
+    pub skip_hashes: bool,
     /// Refuse the snapshot unless the recomputed index digest equals this
     /// value. The manifest digest travels inside the archive, so it only
     /// detects corruption; a digest the operator recorded at export time
@@ -153,7 +239,7 @@ pub fn export(
         .ok_or("database is not initialized")?;
     let digest = store.canonical_digest()?;
     let mut manifest = Manifest {
-        format: FORMAT_V2,
+        format: FORMAT_V3,
         version: options.version.clone(),
         network: identity.chain.name().to_string(),
         genesis: identity.genesis.to_hex(),
@@ -188,14 +274,16 @@ pub fn export(
     let mut core_skipped = Vec::new();
     {
         let file = File::create(&tmp)?;
-        // The default level 3 is the balanced point for the index (and gains
-        // ~10-20 % on Core's blk*.dat); 0 stores without compressing.
-        let encoder = GzEncoder::new(file, Compression::new(options.compress_level.clamp(0, 9)));
-        let mut builder = tar::Builder::new(encoder);
+        let mut builder = tar::Builder::new(LeveledGz::new(file, options.index_level));
+        // First entry: everything the importer can check before extracting.
+        append_manifest(&mut builder, HEAD_NAME, &manifest)?;
         let data_dir = store.path();
         add_tree(&mut builder, data_dir, data_dir)?;
         let mut core_bytes = 0u64;
         if let Some(core_dir) = options.core_dir.as_deref() {
+            if options.core_level != options.index_level {
+                builder.get_mut().set_level(options.core_level)?;
+            }
             let walk = add_core_datadir(&mut builder, core_dir, chain, options.hash_files)?;
             core_bytes = walk.bytes;
             manifest.files = walk.files;
@@ -204,15 +292,8 @@ pub fn export(
         if let Some(core) = manifest.core.as_mut() {
             core.bytes = core_bytes;
         }
-        let json = serde_json::to_vec_pretty(&manifest)?;
-        let mut header = tar::Header::new_gnu();
-        header.set_size(json.len() as u64);
-        header.set_mode(0o644);
-        header.set_mtime(0);
-        header.set_cksum();
-        builder.append_data(&mut header, MANIFEST_NAME, json.as_slice())?;
-        let encoder = builder.into_inner()?;
-        encoder.finish()?;
+        append_manifest(&mut builder, MANIFEST_NAME, &manifest)?;
+        builder.into_inner()?.finish()?.sync_all()?;
     }
     fs::rename(&tmp, output)?;
     let bytes = fs::metadata(output)?.len();
@@ -256,6 +337,8 @@ fn excluded_from_index(name: &str) -> bool {
     matches!(
         name,
         "rawtx-cache"
+            | MANIFEST_NAME
+            | HEAD_NAME
             | "tor"
             | "tls"
             | "LOG"
@@ -592,9 +675,18 @@ fn import_into(
     let mut next_check = FREE_SPACE_CHECK_BYTES;
 
     let file = File::open(input)?;
-    let mut archive = tar::Archive::new(GzDecoder::new(file));
+    let mut archive = tar::Archive::new(MultiGzDecoder::new(file));
     for entry in archive.entries()? {
         let mut entry = entry?;
+        if entry.path()?.as_os_str() == HEAD_NAME {
+            // Format 3: reject a wrong network/format/schema before the bulk
+            // of the archive is extracted. The entry itself is not unpacked.
+            let mut json = Vec::new();
+            std::io::Read::read_to_end(&mut std::io::Read::take(&mut entry, 1 << 20), &mut json)?;
+            let head: Manifest = serde_json::from_slice(&json)?;
+            check_manifest_header(&head, chain)?;
+            continue;
+        }
         written = written.saturating_add(entry.header().size().unwrap_or(0));
         if written >= next_check {
             check_free_space(target, IMPORT_FREE_FLOOR, written)?;
@@ -622,30 +714,13 @@ fn import_into(
 
     let manifest_path = target.join(MANIFEST_NAME);
     let manifest: Manifest = serde_json::from_slice(&fs::read(&manifest_path)?)?;
-    if manifest.format != FORMAT && manifest.format != FORMAT_V2 {
-        return Err(format!("unsupported snapshot format {}", manifest.format).into());
-    }
-    if manifest.network != chain.name() {
-        return Err(format!(
-            "snapshot belongs to {}, config says {}",
-            manifest.network,
-            chain.name()
-        )
-        .into());
-    }
-    if manifest.schema > SCHEMA_VERSION {
-        return Err(format!(
-            "snapshot schema v{} is newer than supported v{}",
-            manifest.schema, SCHEMA_VERSION
-        )
-        .into());
-    }
+    check_manifest_header(&manifest, chain)?;
 
     // Format 2: verify the Core section before trusting the pair. Sizes are
     // checked always; hashes only when the export recorded them and the
     // operator asked for verification.
     if manifest.format >= FORMAT_V2 {
-        verify_core_files(target, &manifest, options.verify_hashes)?;
+        verify_core_files(target, &manifest, !options.skip_hashes)?;
     }
 
     let store = Store::open(target)?;
@@ -904,7 +979,10 @@ mod tests {
         }
         // The archive itself must not contain a single secret byte.
         let file = File::open(&archive_path).unwrap();
-        for entry in tar::Archive::new(GzDecoder::new(file)).entries().unwrap() {
+        for entry in tar::Archive::new(MultiGzDecoder::new(file))
+            .entries()
+            .unwrap()
+        {
             let mut entry = entry.unwrap();
             let mut body = Vec::new();
             std::io::Read::read_to_end(&mut entry, &mut body).unwrap();
@@ -980,7 +1058,10 @@ mod tests {
         }
         let file = File::open(&archive_path).unwrap();
         let mut names = Vec::new();
-        for entry in tar::Archive::new(GzDecoder::new(file)).entries().unwrap() {
+        for entry in tar::Archive::new(MultiGzDecoder::new(file))
+            .entries()
+            .unwrap()
+        {
             let entry = entry.unwrap();
             if entry.header().entry_type().is_file() {
                 names.push(entry.path().unwrap().display().to_string());
@@ -1199,5 +1280,90 @@ mod tests {
             .to_string();
         assert!(err.contains("not enough free space"), "{err}");
         assert!(err.contains("5.0 GiB extracted"), "{err}");
+    }
+
+    #[test]
+    fn format_3_puts_the_manifest_first_and_rejects_early() {
+        // AUD-140/141: head manifest first, one gzip member per level, and a
+        // wrong network is refused from the head.
+        let dir = std::env::temp_dir().join(format!(
+            "e-lite-snapshot-v3-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (archive, digest) = exported_regtest_snapshot(&dir);
+        let file = File::open(&archive).unwrap();
+        let mut names = Vec::new();
+        for entry in tar::Archive::new(MultiGzDecoder::new(file))
+            .entries()
+            .unwrap()
+        {
+            names.push(entry.unwrap().path().unwrap().display().to_string());
+        }
+        assert_eq!(names.first().map(String::as_str), Some(HEAD_NAME));
+        assert_eq!(names.last().map(String::as_str), Some(MANIFEST_NAME));
+
+        // The head alone is enough to refuse another network: an archive
+        // that is cut right after it still gives the precise error.
+        let err = import(
+            &archive,
+            &dir.join("other"),
+            Chain::Signet,
+            &ImportOptions::default(),
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("snapshot belongs to regtest"),
+            "{err}"
+        );
+
+        // Round trip; the head is not left in the restored data dir and a
+        // re-export does not carry the old manifests as index files.
+        let target = dir.join("restored");
+        let info = import(&archive, &target, Chain::Regtest, &ImportOptions::default()).unwrap();
+        assert_eq!(info.digest, digest);
+        assert!(!target.join(HEAD_NAME).exists());
+        assert!(excluded_from_index(MANIFEST_NAME) && excluded_from_index(HEAD_NAME));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn gzip_level_can_change_between_sections() {
+        let dir = std::env::temp_dir().join(format!(
+            "e-lite-leveled-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("two-members.gz");
+        let zeros = vec![0u8; 200_000];
+        {
+            let mut gz = LeveledGz::new(File::create(&path).unwrap(), 0);
+            gz.write_all(&zeros).unwrap();
+            gz.set_level(6).unwrap();
+            gz.write_all(&zeros).unwrap();
+            gz.finish().unwrap();
+        }
+        // Stored member (~200 kB) + compressed member (tiny).
+        let size = std::fs::metadata(&path).unwrap().len();
+        assert!(size > 200_000 && size < 210_000, "{size}");
+        let mut out = Vec::new();
+        std::io::Read::read_to_end(
+            &mut MultiGzDecoder::new(File::open(&path).unwrap()),
+            &mut out,
+        )
+        .unwrap();
+        assert_eq!(out.len(), 400_000);
+        let defaults = ExportOptions::default();
+        assert_eq!((defaults.index_level, defaults.core_level), (0, 3));
+        assert!(defaults.hash_files, "hashes are recorded by default");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

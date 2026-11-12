@@ -124,9 +124,9 @@ if tar -tzf "$RUN/index-only.tar.gz" | grep -q '^bitcoin/'; then
 fi
 echo "index-only archive: $(tar -tzf "$RUN/index-only.tar.gz" | wc -l) entries, no bitcoin/"
 
-echo "== full export (--with-core --hash-files) =="
+echo "== full export (--with-core, hashes by default) =="
 "$BIN" export-snapshot --config "$CONF" --output "$RUN/full.tar.gz" \
-  --with-core --hash-files >"$RUN/export2.log"
+  --with-core >"$RUN/export2.log"
 cat "$RUN/export2.log"
 TARLIST=$(tar -tzf "$RUN/full.tar.gz")
 echo "$TARLIST" | grep -q '^bitcoin/regtest/chainstate/' \
@@ -140,15 +140,21 @@ python3 - "$RUN" "$INDEX_TIP" <<'PY'
 import json, subprocess, sys, tarfile
 run, index_tip = sys.argv[1], sys.argv[2]
 with tarfile.open(f"{run}/full.tar.gz") as t:
+    names = t.getnames()
     m = json.load(t.extractfile("e-lite-snapshot.json"))
-assert m["format"] == 2, m["format"]
+    head = json.load(t.extractfile("e-lite-snapshot.head.json"))
+# Format 3: the manifest is also the first entry, for an early check.
+assert names[0] == "e-lite-snapshot.head.json", names[0]
+assert names[-1] == "e-lite-snapshot.json", names[-1]
+assert head["network"] == "regtest" and head["digest"] == m["digest"], head
+assert m["format"] == 3, m["format"]
 assert m["network"] == "regtest", m["network"]
 assert int(m["height"]) == int(index_tip), (m["height"], index_tip)
 core = m["core"]
 assert core["tip_height"] >= int(index_tip), core
 assert core["version"].startswith("/Satoshi:"), core["version"]
 assert m["files"] and all(e["sha256"] is not None for e in m["files"]), "hashes missing"
-print(f"manifest ok: format 2, core tip {core['tip_height']}, {len(m['files'])} hashed files")
+print(f"manifest ok: format 3, core tip {core['tip_height']}, {len(m['files'])} hashed files")
 PY
 
 echo "== import (hash verification) into an empty target =="

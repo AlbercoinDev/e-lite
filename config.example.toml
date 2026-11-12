@@ -22,6 +22,23 @@ bitcoind = "bitcoind"
 # cookie_file = ""                  # explicit cookie; overrides core_datadir
 # require_loopback_rpc = false      # true: refuse a non-loopback rpc_url
 #                                   # (Core RPC is HTTP; use SSH/VPN for LAN/WAN)
+# P2P networks of a Core started by e-lite (an external Core is never changed):
+#   auto     = clearnet + every private network available: Tor onion peers
+#              (through the Tor e-lite uses), I2P if a SAM router answers,
+#              CJDNS if enabled. Same IBD speed, more networks.
+#   private  = ONLY those private networks. No Bitcoin peer sees your IP: no
+#              clearnet peers, no listening, no DNS. Slower IBD. Core does not
+#              start if no private network is available.
+#   clearnet = nothing is added.
+network = "auto"
+private_broadcast = false           # true: wallet transactions leave through
+                                    # short-lived Tor/I2P connections even when
+                                    # blocks use clearnet (-privatebroadcast,
+                                    # experimental, Core 30+). The wallet sees its
+                                    # transaction a few seconds later, when the
+                                    # network relays it back.
+i2p_sam = "auto"                    # auto = 127.0.0.1:7656 if it answers; "host:port"; "" = off
+cjdns = false                       # true if this host has a CJDNS interface
 timeout_seconds = 30
 prune_mib = 1                       # 1 = manual pruning (safe from zero); 0 = full node;
                                     # >=550 = automatic pruning, requires allow_auto_prune
@@ -91,9 +108,12 @@ repair_max_gap_blocks = 2048        # auto-repair a prune gap from verified sour
 poll_seconds = 10
 
 [server]
-# Empty = 0.0.0.0:<network plain port>:
+# Plain (unencrypted) listener. Empty = 127.0.0.1:<network plain port>: only
+# wallets on this host and the onion service reach it; the network gets TLS.
 # mainnet 55011, testnet4 55111, signet 55211, regtest 55311.
+# An explicit address is used as given (and TLS then follows its host).
 listen = ""
+plain_lan = false                   # true = plain on 0.0.0.0 as well (cleartext on the LAN)
 # TLS is on by default. A local CA (ca.crt) plus a server certificate signed by
 # it are generated on first start in <data-dir>/tls (SANs: localhost, 127.0.0.1,
 # ::1, hostname, LAN IPs and the onion address once known). Trust ca.crt in the
@@ -152,7 +172,10 @@ cache_mib = 256                     # verified LRU cache, total disk budget: tra
 decoys = 1                          # extra blocks fetched per real fetch (max 2 in flight)
 tor_socks = "127.0.0.1:9050"        # empty requires allow_clearnet = true
 allow_clearnet = false              # fail closed without Tor; also gates repair
-tor_fallback_clearnet = true        # if Tor fails, use clearnet (IP exposed)
+tor_fallback_clearnet = false       # true: if Tor fails, use clearnet (your IP is tied
+                                    # to the blocks of your wallet)
+prefetch = false                    # true: download a wallet's history blocks in the
+                                    # background (faster first load; no decoys)
 request_timeout_seconds = 8         # per Esplora block request
 provider_cooldown_seconds = 300     # cool down a failed provider (Tor or direct)
 max_parallel_fetches = 4            # total external block downloads in flight

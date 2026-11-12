@@ -40,7 +40,8 @@ e-lite run    --network signet --manage managed \
   --core-datadir "$CORE" --data-dir "$DATA" --prune-mib 1
 ```
 
-Electrum/Sparrow: `0.0.0.0:55011` plain and `0.0.0.0:55022` TLS for mainnet
+Electrum/Sparrow: `0.0.0.0:55022` TLS on the network and `127.0.0.1:55011`
+plain on this host only for mainnet (`--plain-lan` also offers plain on the LAN)
 (`55111`/`55122` testnet4, `55211`/`55222` signet, `55311`/`55322` regtest).
 TLS is on by default: on first start e-lite generates a local CA and a server
 certificate signed by it in `<data-dir>/tls/`, and prints both fingerprints.
@@ -100,8 +101,9 @@ See [`docs/CLI.md`](docs/CLI.md) for every flag and `--set` example.
 
 ## Security notes
 
-- Electrum listens on `0.0.0.0:55011` (plain) and `0.0.0.0:55022` (TLS) by
-  default for mainnet. TLS encrypts the connection but there is **no client
+- Electrum listens on `0.0.0.0:55022` (TLS) and, on this host only,
+  `127.0.0.1:55011` (plain) by default for mainnet; `[server] plain_lan = true`
+  offers plain on the LAN too. TLS encrypts the connection but there is **no client
   authentication**: restrict access with a firewall, SSH/VPN tunnel or Tor. If
   you only want local access, set `[server] listen = "127.0.0.1:55011"` (the TLS
   listener follows the same host). Each network has its own ports, so several

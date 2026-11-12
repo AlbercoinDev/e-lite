@@ -11,7 +11,8 @@ repairing a prune gap.
 - Electrum queries and subscriptions.
 - Merkle/checkpoint proofs (computed from the local index and header cache).
 - Mempool view, fee estimates and broadcasts come from the local/remote **Core**
-  you configured, not from a public Electrum server.
+  you configured, not from a public Electrum server. How Core itself reaches
+  the Bitcoin network is described in "Bitcoin Core's own network" below.
 - Logs and metrics do not print scripts, addresses, txids, wallet labels or
   the block hash of a wallet request: failures are logged by height and error
   class, and any 64-hex value in an error is replaced by `<hash>`.
@@ -84,7 +85,8 @@ cache_mib = 256
 decoys = 1
 tor_socks = "127.0.0.1:9050"
 allow_clearnet = false
-tor_fallback_clearnet = true
+tor_fallback_clearnet = false
+prefetch = false
 request_timeout_seconds = 8
 provider_cooldown_seconds = 300
 max_parallel_fetches = 4
@@ -105,16 +107,20 @@ open_without_provider = false  # true: open with local data after ready_timeout_
 
 ## Tor and clearnet
 
-- Default is **Tor-first with clearnet fallback**: `tor_fallback_clearnet = true`
-  tries Tor first, then the clearnet provider if the Tor proxy is unavailable or
-  a Tor request fails. The fallback exposes the operator IP to that provider; set
-  `tor_fallback_clearnet = false` to stay fail-closed. `allow_clearnet = true`
-  makes clearnet a normal source instead of a fallback.
+- Default is **Tor only, fail-closed**: external blocks are requested through
+  Tor, and if Tor is unavailable the request fails (history, balances and
+  UTXOs keep working from the local index). `tor_fallback_clearnet = true`
+  retries on clearnet when the Tor proxy is unavailable or a Tor request
+  fails; that ties your IP to the block hashes of your wallet's transactions,
+  which is why it is opt-in. `allow_clearnet = true` makes clearnet a normal
+  source instead of a fallback.
 - Every Esplora request over Tor uses a fresh random SOCKS username. Tor
   isolates streams by SOCKS credentials (`IsolateSOCKSAuth`, on by default),
   so each block is fetched over its own circuit and a provider cannot group
-  the blocks of one wallet by exit IP. Timing and the last-good-provider
-  preference still let a single provider see most of them.
+  the blocks of one wallet by exit IP. Providers and P2P peers are tried in
+  random order among the healthy ones, so no single provider is preferred and
+  the blocks of one wallet are spread over all of them. Timing can still
+  correlate requests.
 - e-lite runs its own Tor by default (`[tor] mode = "managed"`) and uses that
   SOCKS proxy for external rawtx/repair requests. There is no dependency on a
   system Tor daemon.
@@ -134,15 +140,15 @@ open_without_provider = false  # true: open with local data after ready_timeout_
   at once. `open_without_provider = true` opens them with local data after
   `ready_timeout_seconds`; e-lite then re-probes every 60 s with the same
   wallet-free requests until a provider answers.
-- A provider that fails a Tor or direct request is skipped temporarily; the
-  last provider that answered is retried first and cooled for at most 30 s. If
+- A provider that fails a Tor or direct request is skipped temporarily (one
+  that answered before, for at most 30 s). If
   every provider is cooling down, one request is still attempted rather than
   failing the wallet's history/tx load.
 - `allow_clearnet = true` permits direct clearnet access if you explicitly
   accept the privacy trade-off. It is not the default.
 - `decoys = 1` fetches one extra random block after a real external fetch, so
   the provider's view is not a single “interesting” block. At most two decoy
-  downloads run at once and the background prefetch never spawns decoys. Set
+  downloads run at once. Set
   `decoys = 0` to reduce bandwidth at the cost of privacy.
 - The validated cache reduces repeated external fetches, and every avoided
   re-download is a block hash a provider does not see again. It defaults to
@@ -158,6 +164,48 @@ open_without_provider = false  # true: open with local data after ready_timeout_
   is available. The cache directory names the transactions you fetched: it
   is as sensitive as the wallet.
 
+## History prefetch (off by default)
+
+`[rawtx] prefetch = true` downloads the blocks of a wallet's confirmed history
+in the background as soon as the wallet asks for the history, so the
+transactions are already cached when it asks for them. It makes the first load
+of a wallet faster, but it fetches up to 16 blocks per history request with
+**no decoys**, including blocks the wallet would never have asked for (a
+wallet that already has its transactions). Leave it off unless that first load
+matters more to you than what a provider can observe.
+
+## Bitcoin Core's own network
+
+A wallet transaction you broadcast is handed to Core, and Core announces it to
+its peers. On clearnet, those peers see your IP as the first announcer. For a
+Core started by e-lite, `[core] network` decides which networks Core uses:
+
+| `network` | Core flags | Who sees your IP | Cost |
+|---|---|---|---|
+| `auto` (default) | `-onion=<Tor SOCKS>`; plus `-i2psam` if an I2P SAM router answers and `-cjdnsreachable` if `cjdns = true` | clearnet peers, as any Bitcoin node | none: clearnet keeps the IBD fast, and Core also reaches onion/I2P/CJDNS peers |
+| `private` | `-proxy=<Tor SOCKS> -onlynet=onion` (and `-onlynet=i2p`/`cjdns` when available), `-listen=0 -dnsseed=0 -dns=0 -discover=0 -natpmp=0` | **no Bitcoin peer** | much slower IBD; Core does not start if no private network is available (it never falls back to clearnet) |
+| `clearnet` | none | clearnet peers | none |
+
+`[core] private_broadcast = true` adds `-privatebroadcast=1` (experimental in
+Bitcoin Core; e-lite checks that the installed `bitcoind` has it): transactions
+submitted by wallets leave through short-lived Tor/I2P connections, so with
+`auto` you keep fast clearnet blocks **and** hide the origin of your
+transactions. Consequences to know: Core does not put the transaction in its
+mempool until the network relays it back, so the wallet sees it a few seconds
+later; and if Tor is down, Core keeps the transaction pending instead of
+failing. Package broadcasts (`broadcast_package`) are not covered by Core's
+option.
+
+Tor is the one e-lite already runs (`[tor] mode = "managed"`) or the proxy in
+`[rawtx] tor_socks` when it answers. I2P needs a router with SAM enabled that
+you run yourself (i2pd or Java I2P); e-lite does not ship one. Core uses a
+random SOCKS credential per connection (`-proxyrandomize`), so its Tor
+connections are on separate circuits. Core's own onion **listener** stays off
+(`-listenonion=0`): the node does not accept inbound connections over Tor.
+Operator flags win: if `[core] extra_args` sets `-proxy`, `-onion`, `-onlynet`,
+`-i2psam`, `-connect` or `-privatebroadcast`, e-lite adds none of the above.
+An external Core is never changed: set these flags in its `bitcoin.conf`.
+
 ## P2P details
 
 - Minimal Bitcoin P2P client: `version`/`verack`, `ping`/`pong`, `getdata` for
@@ -169,11 +217,11 @@ open_without_provider = false  # true: open with local data after ready_timeout_
   addrman, and the list is refreshed every 10 minutes (every 60 s while it is
   empty, for example right after Core starts). Pinned `p2p_peers` are never
   replaced. Up to three peers are tried per fetch, with a total 2× timeout cap.
-- The last peer that answered is tried first. A failed peer is skipped for
+- Peers are tried in random order. A failed peer is skipped for
   `provider_cooldown_seconds` (300 s by default), so every block does not pay
   the same dead peer's timeout.
 - If a Tor SOCKS connect fails, P2P uses clearnet for non-onion peers for the
-  cooldown window (when `tor_fallback_clearnet = true`); `.onion` peers still
+  cooldown window (only when `tor_fallback_clearnet = true`); `.onion` peers still
   require Tor.
 - Tor is used for P2P when configured; otherwise clearnet requires
   `allow_clearnet = true`.

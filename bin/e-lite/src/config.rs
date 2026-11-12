@@ -153,6 +153,27 @@ pub struct CoreCfg {
     /// Log file for a Core process launched by e-lite.
     #[serde(default)]
     pub log_file: Option<String>,
+    /// P2P networks of a Core started by e-lite (AUD-136):
+    /// `auto` (default) keeps clearnet and adds every private network that is
+    /// available (Tor onion peers through the Tor e-lite uses, I2P when a SAM
+    /// router answers, CJDNS when enabled); `private` uses **only** those
+    /// networks, so the node's IP is never shown to a Bitcoin peer (slower
+    /// IBD); `clearnet` adds nothing.
+    #[serde(default = "d_core_network")]
+    pub network: String,
+    /// Broadcast wallet transactions through short-lived Tor/I2P connections
+    /// (`-privatebroadcast`, experimental in Core, needs a version that has
+    /// it). The transaction reaches Core's mempool only when the network
+    /// relays it back, so wallets see it a few seconds later.
+    #[serde(default)]
+    pub private_broadcast: bool,
+    /// I2P SAM router for Core: `auto` (default) uses 127.0.0.1:7656 when it
+    /// answers, an explicit `host:port` forces it, empty disables it.
+    #[serde(default = "d_i2p_sam")]
+    pub i2p_sam: String,
+    /// This host has a CJDNS interface (`-cjdnsreachable`).
+    #[serde(default)]
+    pub cjdns: bool,
     /// Refuse a non-loopback `rpc_url`. Core RPC is HTTP only, so credentials
     /// would cross LAN/WAN in cleartext; use an SSH/VPN tunnel or leave this off
     /// and accept the warning.
@@ -179,6 +200,10 @@ impl Default for CoreCfg {
             restart: true,
             stop_on_exit: true,
             log_file: None,
+            network: d_core_network(),
+            private_broadcast: false,
+            i2p_sam: d_i2p_sam(),
+            cjdns: false,
             require_loopback_rpc: false,
         }
     }
@@ -304,9 +329,16 @@ impl Default for IndexCfg {
 #[derive(Debug, Clone, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ServerCfg {
-    /// Plain Electrum listener. Empty = `0.0.0.0:<network default>`.
+    /// Plain (unencrypted) Electrum listener. Empty = the network default
+    /// port on loopback only: wallets on this host and the onion service use
+    /// it, the LAN gets TLS (AUD-147). With `plain_lan = true`, or when TLS
+    /// is disabled, the default is `0.0.0.0`. An explicit address always wins.
     #[serde(default)]
     pub listen: String,
+    /// Offer the plain listener on every interface (`0.0.0.0`). Off by
+    /// default: with TLS available, cleartext on the network is opt-in.
+    #[serde(default)]
+    pub plain_lan: bool,
     /// Serve TLS as well. Enabled by default; `false` disables it.
     #[serde(default = "d_true")]
     pub tls: bool,
@@ -348,6 +380,7 @@ impl Default for ServerCfg {
     fn default() -> Self {
         ServerCfg {
             listen: String::new(),
+            plain_lan: false,
             tls: true,
             tls_listen: String::new(),
             tls_cert: String::new(),
@@ -424,6 +457,12 @@ impl Default for TorCfg {
     }
 }
 
+fn d_core_network() -> String {
+    "auto".to_string()
+}
+fn d_i2p_sam() -> String {
+    "auto".to_string()
+}
 fn d_tor_mode() -> String {
     "managed".to_string()
 }
@@ -609,9 +648,16 @@ pub struct RawtxCfg {
     pub tor_socks: Option<String>,
     #[serde(default)]
     pub allow_clearnet: bool,
-    /// Use clearnet when Tor is unavailable or a Tor request fails.
-    #[serde(default = "d_true")]
+    /// Use clearnet when Tor is unavailable or a Tor request fails. Off by
+    /// default (AUD-128): the fallback ties the operator IP to the block
+    /// hashes of wallet transactions.
+    #[serde(default)]
     pub tor_fallback_clearnet: bool,
+    /// Download the blocks of a wallet's confirmed history in the background
+    /// as soon as the history is requested. Off by default (AUD-134): it
+    /// fetches blocks the wallet may never ask for, without decoys.
+    #[serde(default)]
+    pub prefetch: bool,
     /// Timeout for each Esplora raw-block request.
     #[serde(default = "d_rawtx_timeout")]
     pub request_timeout_seconds: u64,
@@ -649,7 +695,8 @@ impl Default for RawtxCfg {
             decoys: d_decoys(),
             tor_socks: d_tor_socks(),
             allow_clearnet: false,
-            tor_fallback_clearnet: true,
+            tor_fallback_clearnet: false,
+            prefetch: false,
             request_timeout_seconds: d_rawtx_timeout(),
             provider_cooldown_seconds: d_provider_cooldown(),
             max_parallel_fetches: d_max_parallel_fetches(),
@@ -1016,12 +1063,24 @@ impl Config {
     /// Fill the per-network listener, metrics and TLS defaults. Called after
     /// the chain is known and before validation/binding.
     pub fn apply_network_defaults(&mut self, chain: Chain) {
-        if self.server.listen.trim().is_empty() {
-            self.server.listen = format!("0.0.0.0:{}", chain.default_electrum_port());
+        // An explicit `listen` keeps its old meaning: TLS follows its host.
+        // By default TLS is the network listener and plain stays on loopback.
+        let explicit_plain = !self.server.listen.trim().is_empty();
+        if !explicit_plain {
+            let host = if self.server.plain_lan || !self.server.tls {
+                "0.0.0.0"
+            } else {
+                "127.0.0.1"
+            };
+            self.server.listen = format!("{host}:{}", chain.default_electrum_port());
         }
         if self.server.tls {
             if self.server.tls_listen.trim().is_empty() {
-                let host = listener_host(&self.server.listen);
+                let host = if explicit_plain {
+                    listener_host(&self.server.listen)
+                } else {
+                    "0.0.0.0".to_string()
+                };
                 self.server.tls_listen = format!("{host}:{}", chain.default_electrum_tls_port());
             }
             let tls_dir = self.data_dir(chain).join("tls");
@@ -1041,6 +1100,12 @@ impl Config {
     }
 
     pub fn validate(&self) -> Result<(), String> {
+        if !matches!(self.core.network.as_str(), "auto" | "private" | "clearnet") {
+            return Err(format!(
+                "[core] network = \"{}\" is not valid; use auto, private or clearnet",
+                self.core.network
+            ));
+        }
         if self.index.batch_blocks == 0 {
             return Err("[index] batch_blocks must be >= 1".to_string());
         }
@@ -1318,25 +1383,25 @@ mod tests {
         let cases = [
             (
                 Chain::Mainnet,
-                "0.0.0.0:55011",
+                "127.0.0.1:55011",
                 "0.0.0.0:55022",
                 "127.0.0.1:55084",
             ),
             (
                 Chain::Testnet4,
-                "0.0.0.0:55111",
+                "127.0.0.1:55111",
                 "0.0.0.0:55122",
                 "127.0.0.1:55184",
             ),
             (
                 Chain::Signet,
-                "0.0.0.0:55211",
+                "127.0.0.1:55211",
                 "0.0.0.0:55222",
                 "127.0.0.1:55284",
             ),
             (
                 Chain::Regtest,
-                "0.0.0.0:55311",
+                "127.0.0.1:55311",
                 "0.0.0.0:55322",
                 "127.0.0.1:55384",
             ),
@@ -1355,6 +1420,29 @@ mod tests {
             }
             cfg.validate().unwrap();
         }
+    }
+
+    #[test]
+    fn plain_on_the_network_is_opt_in() {
+        // AUD-147: by default cleartext stays on loopback and TLS serves the
+        // network.
+        use el_model::Chain;
+        let mut cfg = Config::default();
+        cfg.server.plain_lan = true;
+        cfg.apply_network_defaults(Chain::Mainnet);
+        assert_eq!(cfg.server.listen, "0.0.0.0:55011");
+        assert_eq!(cfg.server.tls_listen, "0.0.0.0:55022");
+        // Without TLS the plain listener is the only one: keep it reachable.
+        let mut cfg = Config::default();
+        cfg.server.tls = false;
+        cfg.apply_network_defaults(Chain::Mainnet);
+        assert_eq!(cfg.server.listen, "0.0.0.0:55011");
+        // An explicit address is never rewritten, and TLS follows its host.
+        let mut cfg = Config::default();
+        cfg.server.listen = "192.168.1.5:50001".to_string();
+        cfg.apply_network_defaults(Chain::Mainnet);
+        assert_eq!(cfg.server.listen, "192.168.1.5:50001");
+        assert_eq!(cfg.server.tls_listen, "192.168.1.5:55022");
     }
 
     #[test]

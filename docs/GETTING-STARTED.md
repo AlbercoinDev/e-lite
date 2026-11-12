@@ -55,7 +55,8 @@ Expected:
 - Core starts or is adopted; state `WAITING_FOR_CORE` → `BUILDING_INDEX` → `READY`.
 - `prune_mib=1`: Core does not prune by itself; e-lite’s prune gate does.
 - `/status` shows `indexed_height`, `core_height`, `pruneheight`, `tuning`.
-- Electrum at `0.0.0.0:55011` (plain) and `0.0.0.0:55022` (TLS) for mainnet;
+- Electrum at `0.0.0.0:55022` (TLS) and loopback-only `127.0.0.1:55011`
+  (plain) for mainnet;
   signet uses `55211`/`55222`; metrics at `127.0.0.1:55084` (`55284` signet).
 - TLS is enabled by default on the network TLS port with a generated
   self-signed certificate; `--no-tls` disables it. Operator PEMs:

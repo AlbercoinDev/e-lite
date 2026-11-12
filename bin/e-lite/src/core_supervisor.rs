@@ -143,6 +143,10 @@ pub struct CoreSupervisor {
     cgroup_io_weight: Option<u64>,
     /// Parameters derived from the machine's resources (dbcache/par/...).
     plan_args: Vec<String>,
+    /// Why the parameter plan was rejected. Core is then never started: an
+    /// empty plan would, for example, put a `network = "private"` node on
+    /// clearnet (AUD-136).
+    plan_error: Option<String>,
     restart: bool,
     stop_on_exit: bool,
     log_file: PathBuf,
@@ -156,6 +160,10 @@ pub struct CoreSupervisor {
 
 impl CoreSupervisor {
     pub fn new(cfg: &Config, chain: Chain) -> Self {
+        let plan = core_plan::plan_core(cfg, chain);
+        if let Err(e) = &plan {
+            eprintln!("[e-lite] Core parameter plan rejected: {e}");
+        }
         CoreSupervisor {
             manage: cfg.core.manage,
             bitcoind: cfg.core.bitcoind.clone(),
@@ -166,15 +174,8 @@ impl CoreSupervisor {
             extra_args: cfg.core.extra_args.clone(),
             io_priority: cfg.core.io_priority,
             cgroup_io_weight: cfg.core.cgroup_io_weight,
-            plan_args: match core_plan::plan_core(cfg, chain) {
-                Ok(plan) => plan.args,
-                Err(e) => {
-                    // Preflight rejects conflicting arguments before we get
-                    // here; never start Core with a half-applied plan.
-                    eprintln!("[e-lite] Core parameter plan rejected: {e}");
-                    Vec::new()
-                }
-            },
+            plan_args: plan.as_ref().map(|p| p.args.clone()).unwrap_or_default(),
+            plan_error: plan.err(),
             restart: cfg.core.restart,
             stop_on_exit: cfg.core.stop_on_exit,
             log_file: cfg.log_file(chain),
@@ -281,6 +282,11 @@ impl CoreSupervisor {
     }
 
     fn spawn(&mut self) -> Result<(), String> {
+        if let Some(e) = &self.plan_error {
+            return Err(format!(
+                "Core parameter plan rejected, not starting Core: {e}"
+            ));
+        }
         fs::create_dir_all(&self.datadir)
             .map_err(|e| format!("cannot create Core datadir {}: {e}", self.datadir.display()))?;
         if let Some(parent) = self.log_file.parent() {

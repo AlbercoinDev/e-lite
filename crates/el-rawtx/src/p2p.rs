@@ -40,7 +40,8 @@ pub struct P2pSource {
     cooldown: Duration,
     total_timeout: Duration,
     peer_failures: Mutex<HashMap<String, Instant>>,
-    last_good: Mutex<Option<String>>,
+    /// Peers that have served a block (statistics only; no priority).
+    good: Mutex<HashSet<String>>,
     tor_cooldown_until: Mutex<Option<Instant>>,
     stats: Option<Arc<RawtxStats>>,
 }
@@ -421,7 +422,7 @@ impl P2pSource {
             cooldown,
             total_timeout: timeout.saturating_mul(2),
             peer_failures: Mutex::new(HashMap::new()),
-            last_good: Mutex::new(None),
+            good: Mutex::new(HashSet::new()),
             tor_cooldown_until: Mutex::new(None),
             stats: None,
         }
@@ -436,10 +437,8 @@ impl P2pSource {
         if let Ok(mut failures) = self.peer_failures.lock() {
             failures.retain(|peer, _| seen.contains(peer));
         }
-        if let Ok(mut good) = self.last_good.lock() {
-            if good.as_ref().is_some_and(|g| !seen.contains(g)) {
-                *good = None;
-            }
+        if let Ok(mut good) = self.good.lock() {
+            good.retain(|peer| seen.contains(peer));
         }
         if let Ok(mut current) = self.peers.write() {
             *current = peers;
@@ -743,12 +742,8 @@ impl BlockSource for P2pSource {
             return Err(RawtxError::Unavailable("no p2p peers".into()));
         }
         peers.shuffle(&mut thread_rng());
-        if let Some(good) = self.last_good.lock().ok().and_then(|g| g.clone()) {
-            if let Some(pos) = peers.iter().position(|p| *p == good) {
-                let good = peers.remove(pos);
-                peers.insert(0, good);
-            }
-        }
+        // Purely random order (AUD-135): no peer is preferred because it
+        // answered last; failed peers are skipped while they cool down.
 
         let now = Instant::now();
         let cooling: HashSet<String> = self
@@ -788,8 +783,8 @@ impl BlockSource for P2pSource {
             });
             match self.fetch_from(&peer, hash, budget) {
                 Ok(bytes) => {
-                    if let Ok(mut good) = self.last_good.lock() {
-                        *good = Some(peer.clone());
+                    if let Ok(mut good) = self.good.lock() {
+                        good.insert(peer.clone());
                     }
                     if let Ok(mut failures) = self.peer_failures.lock() {
                         failures.remove(&peer);

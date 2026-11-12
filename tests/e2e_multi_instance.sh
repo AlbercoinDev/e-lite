@@ -142,7 +142,7 @@ assert height(b_tls, True) == 80
 sa = json.load(urllib.request.urlopen(f"http://127.0.0.1:{a_metrics}/status"))
 sb = json.load(urllib.request.urlopen(f"http://127.0.0.1:{b_metrics}/status"))
 assert sa["indexed_height"] == 40 and sb["indexed_height"] == 80
-assert sa["listen"] == "0.0.0.0:55311", sa["listen"]
+assert sa["listen"] == "127.0.0.1:55311", sa["listen"]
 assert sb["listen"] == "127.0.0.1:55411", sb["listen"]
 assert sa["tls_listen"] == "0.0.0.0:55322", sa["tls_listen"]
 assert sb["tls_listen"] == "127.0.0.1:55422", sb["tls_listen"]
