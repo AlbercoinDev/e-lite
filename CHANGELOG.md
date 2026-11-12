@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.1.0-alpha.29.12.0 — 2026-11-12
 
 ### Private by default: Tor-only fetches, plain on loopback, Core networks, snapshot format 3
 

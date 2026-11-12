@@ -1,9 +1,9 @@
 # Session handoff
 
 **Updated:** 2026-11-12
-**Latest published release:** `0.1.0-alpha.29.11.0`
-**Release:** https://github.com/AlbercoinDev/e-lite/releases/tag/v0.1.0-alpha.29.11.0
-**Main commit at handoff:** tag `v0.1.0-alpha.29.11.0`
+**Latest published release:** `0.1.0-alpha.29.12.0`
+**Release:** https://github.com/AlbercoinDev/e-lite/releases/tag/v0.1.0-alpha.29.12.0
+**Main commit at handoff:** tag `v0.1.0-alpha.29.12.0`
 
 alpha.29.11.0 was verified after publishing: `ci` and `release` workflows
 green, and both one-line installers (`--no-core` and `--with-core --yes`)
@@ -96,13 +96,27 @@ no repitas contexto ni rehagas decisiones ya documentadas.
 - `docs/ROADMAP.md` contains future features/improvements. Do not present them as
   available.
 
-## Unreleased (after alpha.29.11.0)
+## Last change (alpha.29.12.0)
 
-Owner decisions of 2026-11-12, implemented (see `CHANGELOG.md` "Unreleased"):
+Owner decisions of 2026-11-12, implemented (see `CHANGELOG.md` 29.12.0):
 AUD-128 (no clearnet fallback), AUD-134 (prefetch opt-in), AUD-135 (random
 provider order), AUD-136 (`[core] network`, `private_broadcast`), AUD-147
-(plain listener on loopback), AUD-140/141/143 (snapshot format 3). Defaults
-changed: read the upgrade notes before releasing.
+(plain listener on loopback), AUD-140/141/143 (snapshot format 3). **Defaults
+changed**: read the upgrade notes before upgrading wallets/hosts.
+
+Signet validation of the whole 29.9.x-29.12.0 chain (owner log,
+2026-11-12): full sync 0 -> 330574 in **48m44s (113 blocks/s)** with
+`jobs=4` from the plan, FULLY SYNCED once, then the caught-up prune ran
+(`deferred prune at 330286` -> `pruned Core blocks below 329970`, ~329k block
+locators dropped) and the process kept serving. The mid-sync dip to 37 b/s
+tracked block size (avgblk 138 -> 407 KiB) against a constant ~20 MB/s
+effective write ceiling on the ZFS pool; it recovered when blocks shrank.
+`arc: dynamic management unavailable (cannot write zfs_arc_max: Read-only
+file system)` - the signet run had no sysfs permission, so the manager stayed
+warn-only as designed (ARC 17.7 GiB, e-lite cache squeezed to 205 MiB). For
+the dynamic ARC to work, e-lite needs write access to
+`/sys/module/zfs/parameters/zfs_arc_max` (root, group-writable parameter or a
+non-read-only mount).
 
 Open: AUD-130 (schema v2; the owner's mainnet index is 283 GiB with a 15 GiB
 Core, and the owner asked to do it after this batch), online export, decoy
@@ -111,6 +125,11 @@ stated, before this batch): an xpub wallet scan took 6 minutes. Each client
 connection is served serially, so `transaction.get` requests download blocks
 one after another; serving them concurrently per connection is the next
 candidate for that scan time.
+
+Candidate raised by the signet log: `phase indexing X b/s` is the cumulative
+phase average (it only resets on a phase change), so it read 117 b/s while
+the real interval was 37; a recent-rate EWMA (~60 s) in the `height` line
+would make the instantaneous rate unambiguous.
 
 ## Last change (alpha.29.11.0)
 
