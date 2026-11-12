@@ -1,6 +1,10 @@
 # Changelog
 
-## Unreleased
+## 0.1.0-alpha.29.11.0 — 2026-11-12
+
+Audit release: the 2026-11-12 review of IBD/indexing, wallet serving and
+backups (`docs/AUDIT.md`, AUD-126..AUD-147) and the fixes that need no owner
+decision. No index schema, Electrum protocol or snapshot-format change.
 
 ### Transaction cache, incremental mempool, faster notifications
 

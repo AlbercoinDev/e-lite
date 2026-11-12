@@ -90,11 +90,10 @@ no repitas contexto ni rehagas decisiones ya documentadas.
 - `docs/ROADMAP.md` contains future features/improvements. Do not present them as
   available.
 
-## Unreleased (after alpha.29.10.0)
+## Last change (alpha.29.11.0)
 
 A static review (2026-11-12) recorded AUD-126..AUD-147 in `docs/AUDIT.md`
-under "Open findings". Fixed since, not yet released (see `CHANGELOG.md`
-"Unreleased"):
+under "Open findings". Fixed in alpha.29.11.0 (see `CHANGELOG.md`):
 
 - **AUD-126**: `--with-core` packs only `blocks/`, `chainstate/`, `indexes/`
   of the network (allowlist); wallets, keys and `bitcoin.conf` never enter
