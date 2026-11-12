@@ -379,8 +379,10 @@ always printed with an unchanged format; the extra detail prints as
   (`rocksdb-levels`), live RocksDB statistics with cache hit ratio and
   WAL-sync latency (`rocksdb-stats`), Linux I/O pressure and the ZFS ARC hit
   rate next to every memory sample (`io-pressure`), the cache controller's
-  decision with its inputs (`cache-controller`) and the byte-window
-  arithmetic at every scheduler phase change (`scheduler:`).
+  decision with its inputs (`cache-controller`), the byte-window arithmetic
+  at every scheduler phase change (`scheduler:`) and the wallet-session
+  diagnostics (`wallet:`, `wallet session:` — counts and milliseconds only,
+  never a hash, script or txid).
 - `trace`: additionally one line per commit group with its txids/db split.
 
 The file receives exactly the same lines as the console (stdout + stderr),
@@ -415,6 +417,10 @@ and TOML arrays are parsed as TOML.
 - Core blocks/headers and percentage, plus verification progress during IBD;
 - lag, blocks/s, tx/s, elapsed time and read/decode/prefetch/wait/apply/commit
   metrics, plus `commit/blk`;
+- `phase X b/s` is the average since the phase changed (the whole session if
+  it never changes). `recent` is the rate over the last 60 s of full commit
+  groups — the honest "right now" — and `eta` is `lag / recent` when caught
+  up is still ahead;
 - a milestone line every `milestone_blocks` or `milestone_seconds` (whichever
   happens first) with interval throughput and disk usage for e-lite and Core.
 

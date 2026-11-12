@@ -29,6 +29,19 @@ pub use version::{
     ProtocolVersion, PRE_1_6_VERSIONS, SERVER_MAX, SERVER_MIN, SERVER_VERSIONS, V1_6, V1_7,
 };
 
+/// Debug-gated diagnostics, mirrored from the binary's `[logging] level`.
+/// The wire format stays byte-compatible: these lines only add information.
+static DEBUG_LOGS: AtomicBool = AtomicBool::new(false);
+
+/// Enable/disable the extra `debug:` lines (wallet sessions, provider notes).
+pub fn set_debug_logs(on: bool) {
+    DEBUG_LOGS.store(on, Ordering::Relaxed);
+}
+
+fn debug_logs() -> bool {
+    DEBUG_LOGS.load(Ordering::Relaxed)
+}
+
 /// Electrum clients ask for a script's full history. A script with millions of
 /// entries would hold the index lock for too long; keep a generous cap that
 /// still protects the server from pathological scripts.
@@ -705,9 +718,105 @@ pub struct ClientState {
     /// requires version negotiation to be the first message; older traffic
     /// caps the connection at 1.4.2.
     pub saw_message: AtomicBool,
+    /// Aggregate counters for the `debug:` wallet-session line. Counts and
+    /// milliseconds only: never a hash, script or txid (AUD-132/133).
+    pub stats: Mutex<ClientStats>,
+}
+
+/// Per-connection aggregates for the wallet reconstruction diagnostics. No
+/// identifiers are stored: a wallet scan shows up as counts and latencies.
+#[derive(Debug)]
+pub struct ClientStats {
+    pub opened: Instant,
+    pub last_summary: Instant,
+    /// Requests recorded since the last summary line (rate limit only).
+    pub window_requests: u32,
+    /// Lifetime counters, printed every 60 s of activity and on close.
+    pub history_requests: u64,
+    pub history_us_total: u64,
+    pub history_us_max: u64,
+    pub tx_gets: u64,
+    pub tx_us_total: u64,
+    pub tx_us_max: u64,
+    /// Milliseconds between the last `get_history` reply and the first
+    /// `transaction.get`: the moment a wallet starts reconstructing.
+    pub first_tx_after_history: Option<u64>,
+    pub last_history_at: Option<Instant>,
+}
+
+impl ClientStats {
+    fn empty() -> Self {
+        let now = Instant::now();
+        ClientStats {
+            opened: now,
+            last_summary: now,
+            window_requests: 0,
+            history_requests: 0,
+            history_us_total: 0,
+            history_us_max: 0,
+            tx_gets: 0,
+            tx_us_total: 0,
+            tx_us_max: 0,
+            first_tx_after_history: None,
+            last_history_at: None,
+        }
+    }
 }
 
 impl ClientState {
+    /// Record one dispatched request for the wallet-session diagnostics and
+    /// print a summary every 60 s of activity. Counts and milliseconds only.
+    fn record_request(&self, method: &str, elapsed: Duration) {
+        if !debug_logs() {
+            return;
+        }
+        let Ok(mut s) = self.stats.lock() else {
+            return;
+        };
+        s.window_requests = s.window_requests.saturating_add(1);
+        let us = elapsed.as_micros() as u64;
+        match method {
+            "blockchain.scripthash.get_history" | "blockchain.scriptpubkey.get_history" => {
+                s.history_requests += 1;
+                s.history_us_total += us;
+                s.history_us_max = s.history_us_max.max(us);
+                s.last_history_at = Some(Instant::now());
+            }
+            "blockchain.transaction.get" => {
+                if s.first_tx_after_history.is_none() {
+                    if let Some(at) = s.last_history_at {
+                        let ms = at.elapsed().as_millis() as u64;
+                        s.first_tx_after_history = Some(ms);
+                        eprintln!(
+                            "[e-lite] debug: wallet: first tx.get {ms} ms after get_history \
+                             (reconstruction phase)"
+                        );
+                    }
+                }
+                s.tx_gets += 1;
+                s.tx_us_total += us;
+                s.tx_us_max = s.tx_us_max.max(us);
+            }
+            _ => {}
+        }
+        if s.last_summary.elapsed() >= Duration::from_secs(60) && s.window_requests > 0 {
+            let avg = |total: u64, n: u64| total.checked_div(n).unwrap_or(0);
+            eprintln!(
+                "[e-lite] debug: wallet session: {}s, history {} ({} ms avg, {} ms max), \
+                 tx.get {} ({} ms avg, {} ms max)",
+                s.opened.elapsed().as_secs(),
+                s.history_requests,
+                avg(s.history_us_total, s.history_requests) / 1000,
+                s.history_us_max / 1000,
+                s.tx_gets,
+                avg(s.tx_us_total, s.tx_gets) / 1000,
+                s.tx_us_max / 1000,
+            );
+            s.last_summary = Instant::now();
+            s.window_requests = 0;
+        }
+    }
+
     /// Push a notification. The write gets a short timeout: a client that
     /// does not drain its socket must not hold the notifier thread (shared by
     /// every client) for the 30 s response timeout. Such a client is
@@ -814,6 +923,7 @@ impl ClientRegistry {
             tls,
             protocol: Mutex::new(None),
             saw_message: AtomicBool::new(false),
+            stats: Mutex::new(ClientStats::empty()),
         });
         if let Ok(mut c) = self.clients.lock() {
             c.insert(id, Arc::clone(&state));
@@ -3634,9 +3744,25 @@ fn read_line_limited<R: BufRead>(
 }
 
 fn handle_client(shared: &Shared, client: Arc<ClientState>) -> std::io::Result<()> {
+    if debug_logs() {
+        eprintln!(
+            "[e-lite] debug: wallet: connection {} (tls {})",
+            client.id, client.tls
+        );
+    }
     let result = client_loop(shared, &client);
     client.alive.store(false, Ordering::SeqCst);
     shared.clients.unregister(client.id);
+    if debug_logs() {
+        if let Ok(s) = client.stats.lock() {
+            eprintln!(
+                "[e-lite] debug: wallet: closed after {}s (history {}, tx.get {})",
+                s.opened.elapsed().as_secs(),
+                s.history_requests,
+                s.tx_gets
+            );
+        }
+    }
     result
 }
 
@@ -3777,7 +3903,12 @@ pub fn process_line_for(
         }
     }
     let version = negotiated_client_version(client);
-    match dispatch_for(shared, client, version, method, &params) {
+    let started = Instant::now();
+    let outcome = dispatch_for(shared, client, version, method, &params);
+    if let Some(c) = client {
+        c.record_request(method, started.elapsed());
+    }
+    match outcome {
         Ok(result) => LineOutcome {
             response: if is_notification {
                 None

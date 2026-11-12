@@ -1,9 +1,9 @@
 # Session handoff
 
 **Updated:** 2026-11-12
-**Latest published release:** `0.1.0-alpha.29.12.0`
-**Release:** https://github.com/AlbercoinDev/e-lite/releases/tag/v0.1.0-alpha.29.12.0
-**Main commit at handoff:** tag `v0.1.0-alpha.29.12.0`
+**Latest published release:** `0.1.0-alpha.29.12.1`
+**Release:** https://github.com/AlbercoinDev/e-lite/releases/tag/v0.1.0-alpha.29.12.1
+**Main commit at handoff:** tag `v0.1.0-alpha.29.12.1`
 
 alpha.29.11.0 was verified after publishing: `ci` and `release` workflows
 green, and both one-line installers (`--no-core` and `--with-core --yes`)
@@ -95,6 +95,27 @@ no repitas contexto ni rehagas decisiones ya documentadas.
   the onion setup, reset and security.
 - `docs/ROADMAP.md` contains future features/improvements. Do not present them as
   available.
+
+## Last change (alpha.29.12.1)
+
+ARC without root, honest rate/ETA, wallet-session diagnostics.
+
+- **`e-lite arc-setup`** (+ `--apply` as root) and an automatic
+  `e-lite-arc-cap.service` from `install.sh`: `zfs_arc_max` becomes
+  group-writable so the dynamic ARC manager works without running e-lite as
+  root. Negative permission probes are retried every 10 min (signet had the
+  parameter read-only and the manager stayed warn-only with a 205 MiB cache).
+- **Height line**: `recent X b/s` (60 s sliding window over full commit
+  groups) + `eta` = `lag / recent`; `phase X b/s` stays as the phase
+  average. The signet dip showed the phase average (117) hiding a real
+  37 b/s interval.
+- **`debug:` wallet-session lines** (counts/ms only): connection open/close,
+  first `tx.get` after `get_history` (reconstruction start), and a 60 s
+  summary with history/tx.get counts and avg/max latency. This is the
+  measurement step for the xpub-scan work.
+- **Owner decision (this session): schema v2 (AUD-130) will be developed as a
+  from-zero reindex with a from-zero Core — no in-place migration.**
+- Tests: fmt, clippy, workspace (282).
 
 ## Last change (alpha.29.12.0)
 

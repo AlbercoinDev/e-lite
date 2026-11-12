@@ -297,6 +297,41 @@ install_tor() {
 }
 install_tor
 
+# ----------------------------------------------------- ZFS ARC (best effort)
+# Let e-lite manage the ZFS ARC cap (grow while Core downloads, shrink to the
+# minimum once fully synced) without running as root: the sysfs parameter is
+# made group-writable and a systemd oneshot restores it after every boot.
+configure_arc() {
+  arc="/sys/module/zfs/parameters/zfs_arc_max"
+  [ -e "$arc" ] || return 0
+  command -v systemctl >/dev/null 2>&1 || return 0
+  group="$(id -gn "${SUDO_USER:-$USER}" 2>/dev/null || true)"
+  [ -n "$group" ] || return 0
+  unit=/etc/systemd/system/e-lite-arc-cap.service
+  if [ -w "$(dirname "$unit")" ] || [ "$(id -u)" = 0 ]; then
+    cat > "$unit" <<EOF
+[Unit]
+Description=e-lite: allow the ZFS ARC cap to be managed by group $group
+After=zfs-load-module.service systemd-modules-load.service
+ConditionPathExists=$arc
+
+[Service]
+Type=oneshot
+ExecStart=/bin/chgrp $group $arc
+ExecStart=/bin/chmod 0664 $arc
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    systemctl daemon-reload >/dev/null 2>&1 || true
+    systemctl enable --now e-lite-arc-cap.service >/dev/null 2>&1 || true
+    log "ZFS ARC: e-lite-arc-cap.service installed (group $group); e-lite can manage the cap"
+  else
+    log "ZFS ARC: run 'sudo e-lite arc-setup --apply' to let e-lite manage the ARC cap"
+  fi
+}
+configure_arc
+
 # ---------------------------------------------------------------------- done
 log ""
 log "Next steps:"

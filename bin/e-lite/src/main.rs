@@ -188,6 +188,7 @@ enum Command {
     ImportSnapshot,
     Core,
     Onion,
+    ArcSetup,
 }
 
 #[derive(Default)]
@@ -245,6 +246,8 @@ struct Args {
     memory_reserve_mib: Option<u64>,
     memory_fraction: Option<f64>,
     allow_low_memory: bool,
+    /// `arc-setup --apply`: run the setup as root (writes the systemd unit).
+    apply: bool,
     background_jobs: Option<usize>,
     milestone_blocks: Option<u64>,
     milestone_seconds: Option<u64>,
@@ -381,6 +384,7 @@ fn parse_args() -> R<Args> {
                 args.memory_fraction = Some(value("--memory-fraction")?.parse()?)
             }
             "--allow-low-memory" => args.allow_low_memory = true,
+            "--apply" => args.apply = true,
             "--background-jobs" => {
                 args.background_jobs = Some(value("--background-jobs")?.parse()?)
             }
@@ -497,6 +501,7 @@ fn parse_args() -> R<Args> {
                     "onion" => Command::Onion,
                     "export-snapshot" => Command::ExportSnapshot,
                     "import-snapshot" => Command::ImportSnapshot,
+                    "arc-setup" => Command::ArcSetup,
                     "version" => Command::Version,
                     "help" => Command::Help,
                     _ => return fail(format!("unknown command: {other}")),
@@ -1218,6 +1223,7 @@ fn run() -> R<()> {
     if let Some(level) = logging::parse(&cfg.logging.level) {
         logging::set_level(level);
     }
+    el_serve::set_debug_logs(logging::debug_enabled());
     if matches!(cmd, Command::Index | Command::Serve | Command::Run) && !args.no_log_file {
         let path = cfg.app_log_file(chain);
         if let Err(e) = logging::init(&path, cfg.logging.max_mib) {
@@ -1258,7 +1264,111 @@ fn run() -> R<()> {
             args.verify.as_deref(),
             args.expect_digest.as_deref(),
         ),
+        Command::ArcSetup => cmd_arc_setup(args.apply),
         Command::Help | Command::Version => unreachable!(),
+    }
+}
+
+/// `e-lite arc-setup`: print (and optionally apply, as root) the setup that
+/// lets e-lite manage the ZFS ARC cap without running as root: the sysfs
+/// parameter becomes group-writable and a systemd oneshot restores the
+/// permissions after every boot.
+fn cmd_arc_setup(apply: bool) -> R<()> {
+    let path = tuning::ARC_CAP_PATH;
+    if !std::path::Path::new(path).exists() {
+        println!(
+            "ZFS ARC parameter not present ({path}); this host is not using ZFS, \
+             nothing to set up"
+        );
+        return Ok(());
+    }
+    let euid = unsafe { libc::geteuid() };
+    let sudo_user = std::env::var("SUDO_USER").ok();
+    let target_user = if euid == 0 {
+        sudo_user.clone().unwrap_or_else(|| "root".to_string())
+    } else {
+        std::env::var("USER").unwrap_or_else(|_| "root".to_string())
+    };
+    let group = group_of_user(&target_user).unwrap_or_else(|| "root".to_string());
+    let unit = format!(
+        "[Unit]\n\
+         Description=e-lite: allow the ZFS ARC cap to be managed by group {group}\n\
+         After=zfs-load-module.service systemd-modules-load.service\n\
+         ConditionPathExists={path}\n\
+         \n\
+         [Service]\n\
+         Type=oneshot\n\
+         ExecStart=/bin/chgrp {group} {path}\n\
+         ExecStart=/bin/chmod 0664 {path}\n\
+         \n\
+         [Install]\n\
+         WantedBy=multi-user.target\n"
+    );
+    println!(
+        "To let e-lite ({target_user}, group {group}) manage the ZFS ARC cap without root:\n\
+         \n\
+         One-time, now:\n\
+           sudo chgrp {group} {path}\n\
+           sudo chmod 0664 {path}\n\
+         \n\
+         Persist after every boot (systemd):\n\
+           sudo tee /etc/systemd/system/e-lite-arc-cap.service <<'EOF'\n\
+         {unit}\
+         EOF\n\
+           sudo systemctl daemon-reload\n\
+           sudo systemctl enable --now e-lite-arc-cap.service\n"
+    );
+    if !apply {
+        println!("Run `e-lite arc-setup --apply` as root to do all of the above now.");
+        return Ok(());
+    }
+    if euid != 0 {
+        return fail("arc-setup --apply needs root (use sudo)");
+    }
+    let run = |args: &[&str]| -> R<()> {
+        let status = std::process::Command::new(args[0])
+            .args(&args[1..])
+            .status()
+            .map_err(|e| format!("{}: {e}", args[0]))?;
+        if !status.success() {
+            return fail(format!("{} failed with {status}", args.join(" ")));
+        }
+        Ok(())
+    };
+    run(&["chgrp", &group, path])?;
+    run(&["chmod", "0664", path])?;
+    let unit_path = "/etc/systemd/system/e-lite-arc-cap.service";
+    std::fs::write(unit_path, unit).map_err(|e| format!("cannot write {unit_path}: {e}"))?;
+    if std::process::Command::new("systemctl")
+        .args(["daemon-reload"])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+    {
+        let _ = std::process::Command::new("systemctl")
+            .args(["enable", "--now", "e-lite-arc-cap.service"])
+            .status();
+    }
+    println!(
+        "arc-setup applied: {path} is now group-writable by {group} and the unit is installed"
+    );
+    Ok(())
+}
+
+/// Primary group name of `user` (`id -gn`), for the arc-setup unit.
+fn group_of_user(user: &str) -> Option<String> {
+    let out = std::process::Command::new("id")
+        .args(["-gn", user])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let group = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if group.is_empty() {
+        None
+    } else {
+        Some(group)
     }
 }
 
@@ -1288,6 +1398,8 @@ COMMANDS:
                      (--verify checks per-file hashes; --verify=full opens the
                      restored Core and runs a bounded verifychain;
                      --expect-digest <hex> requires the digest you recorded)
+    arc-setup        let e-lite manage the ZFS ARC cap without root
+                     (prints the chgrp/chmod + systemd unit; --apply as root)
     version          print version
 
 OPTIONS:
@@ -4172,9 +4284,22 @@ impl Indexer {
             2 => "core",
             _ => "indexing",
         };
+        let recent_rate = self.tunables.window_rate();
+        // The phase rate is the average since the phase changed (the whole
+        // session when it never changes); the window rate is the honest
+        // "right now". The ETA uses the window rate.
+        let eta_note = if lag > 0 && recent_rate > 0 {
+            format!(
+                " eta {}",
+                format_uptime(Duration::from_secs(lag / recent_rate.max(1)))
+            )
+        } else {
+            String::new()
+        };
         eprintln!(
             "[e-lite] height {} ({})  txnum {}  core {}/{} ({})  prune {}  lag {}  \
-             {:.1} blocks/s  {:.0} tx/s  elapsed {}  phase {} {:.1} b/s avgblk {}KiB  \
+             {:.1} blocks/s  {:.0} tx/s  elapsed {}  phase {} {:.1} b/s  \
+             recent {} b/s{} avgblk {}KiB  \
              read {}ms decode {}ms prefetch p50/p95/max {}/{}/{}ms wait p50/p95 {}/{}ms \
              apply {}ms commit {}ms commit/blk {}ms group {} reason {}{}",
             tip.height,
@@ -4190,6 +4315,8 @@ impl Indexer {
             format_uptime(self.progress_started.elapsed()),
             phase_name,
             phase_rate,
+            recent_rate,
+            eta_note,
             self.tunables.avg_block_bytes() / 1024,
             read_ms,
             decode_ms,
@@ -5048,6 +5175,7 @@ fn reload_hot(
             ) {
                 if a != b {
                     logging::set_level(a);
+                    el_serve::set_debug_logs(a >= logging::DEBUG);
                     changed.push("logging.level");
                 }
             }

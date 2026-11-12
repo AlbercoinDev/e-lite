@@ -185,9 +185,13 @@ the cap drops to `zfs_arc_min_mib` (default 1024 MiB) and the RAM becomes
 visible to `MemAvailable` again, so the memory plan and the cache recover.
 Writes go to `/sys/module/zfs/parameters/zfs_arc_max` (bytes) on the 5 s
 `el-tune` tick with a 5 min dwell, logged as `arc: cap X -> Y MiB (phase)`.
-It needs root or a writable parameter: without permission e-lite stays in
-warn-only mode and logs it once. Setting `zfs_arc_dynamic = false` freezes
-whatever cap is in place — remember to raise it again before a long IBD.
+It needs write access: run `e-lite arc-setup` (prints the `chgrp`/`chmod`
+and the `e-lite-arc-cap.service` unit) or `sudo e-lite arc-setup --apply`;
+`install.sh` installs the unit automatically when ZFS is present. A failed
+permission probe is retried every 10 minutes, so granting the permissions
+enables the manager without a restart. Setting `zfs_arc_dynamic = false`
+freezes whatever cap is in place — remember to raise it again before a long
+IBD.
 
 ## Controller cadence
 

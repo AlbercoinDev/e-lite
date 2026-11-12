@@ -952,6 +952,10 @@ pub struct Tunables {
     pub avg_block_bytes: AtomicU64,
     /// Blocks/s over the last commit cycle, used by the drain-time lag policy.
     recent_blocks_per_sec: AtomicU64,
+    /// Full commit groups from the last 60 s: `(started, blocks)`. The height
+    /// line prints a time-bounded rate from this window, which is honest even
+    /// when one group is much larger than its neighbours.
+    recent_groups: Mutex<VecDeque<(Instant, u64)>>,
     pub total_read_us: AtomicU64,
     pub total_decode_us: AtomicU64,
     pub total_prefetch_us: AtomicU64,
@@ -1235,6 +1239,7 @@ impl Tunables {
             blocks_per_sec: AtomicU64::new(0),
             avg_block_bytes: AtomicU64::new(1_500_000),
             recent_blocks_per_sec: AtomicU64::new(0),
+            recent_groups: Mutex::new(VecDeque::with_capacity(128)),
             total_read_us: AtomicU64::new(0),
             total_decode_us: AtomicU64::new(0),
             total_prefetch_us: AtomicU64::new(0),
@@ -1402,6 +1407,18 @@ impl Tunables {
         self.record_commit(d);
         let per_block = (d.as_millis() as u64) / blocks.max(1);
         self.commit_per_block_ms.store(per_block, Ordering::Relaxed);
+        if let Ok(mut groups) = self.recent_groups.lock() {
+            groups.push_back((started, blocks));
+            let cutoff = Instant::now()
+                .checked_sub(Duration::from_secs(60))
+                .unwrap_or_else(Instant::now);
+            while groups.len() > 1 && groups.front().map(|(at, _)| *at < cutoff).unwrap_or(false) {
+                groups.pop_front();
+            }
+            while groups.len() > 128 {
+                groups.pop_front();
+            }
+        }
         let cycle = if let Ok(mut last) = self.last_commit_start.lock() {
             let cycle = last
                 .map(|prev| started.saturating_duration_since(prev).as_millis() as u64)
@@ -1441,6 +1458,37 @@ impl Tunables {
     /// Blocks/s over the last commit cycle; falls back to the since-start
     /// average only until a cycle is available. Do not take the maximum: an
     /// optimistic rate would allow a larger backlog than the target.
+    /// Blocks/s over the last 60 s of full commit groups. Unlike the
+    /// cumulative `blocks/s` and the phase average, this tracks the real
+    /// current rate: a 10k-block signet interval at 37 b/s reports 37, not
+    /// the session average of 113.
+    pub fn window_rate(&self) -> u64 {
+        let Ok(groups) = self.recent_groups.lock() else {
+            return 0;
+        };
+        let now = Instant::now();
+        let cutoff = now
+            .checked_sub(Duration::from_secs(60))
+            .unwrap_or_else(Instant::now);
+        let mut blocks = 0u64;
+        let mut oldest: Option<Instant> = None;
+        for (at, count) in groups.iter() {
+            if *at < cutoff {
+                continue;
+            }
+            blocks = blocks.saturating_add(*count);
+            oldest = Some(match oldest {
+                Some(current) if current <= *at => current,
+                _ => *at,
+            });
+        }
+        let Some(oldest) = oldest else {
+            return 0;
+        };
+        let span = now.saturating_duration_since(oldest).as_secs_f64().max(1.0);
+        (blocks as f64 / span).round() as u64
+    }
+
     pub fn recent_blocks_rate(&self) -> u64 {
         let recent = self.recent_blocks_per_sec.load(Ordering::Relaxed);
         if recent > 0 {
@@ -2222,17 +2270,39 @@ impl Tunables {
         else {
             return;
         };
-        if state.writable.is_none() {
+        if state.writable.is_none() || state.writable == Some(false) {
             // Probe by writing the current value back: it changes nothing on
-            // success and fails with EACCES/EPERM without permission.
+            // success and fails with EACCES/EPERM without permission. A
+            // negative result is retried every 10 minutes, so granting the
+            // permissions (see `e-lite arc-setup`) enables the manager
+            // without restarting.
+            if let Some(at) = state.last_probe {
+                if at.elapsed() < Duration::from_secs(600) {
+                    return;
+                }
+            }
+            state.last_probe = Some(Instant::now());
+            let previous = state.writable;
             match std::fs::write(ARC_PARAM_PATH, (current_mib * 1024 * 1024).to_string()) {
-                Ok(()) => state.writable = Some(true),
+                Ok(()) => {
+                    state.writable = Some(true);
+                    if previous == Some(false) {
+                        eprintln!(
+                            "[e-lite] arc: dynamic management enabled (zfs_arc_max is \
+                             writable now)"
+                        );
+                    }
+                }
                 Err(e) => {
+                    let was = previous;
                     state.writable = Some(false);
-                    eprintln!(
-                        "[e-lite] arc: dynamic management unavailable (cannot write \
-                         zfs_arc_max: {e}); keep the manual cap from the startup warning"
-                    );
+                    if was.is_none() {
+                        eprintln!(
+                            "[e-lite] arc: dynamic management unavailable (cannot write \
+                             zfs_arc_max: {e}); run `e-lite arc-setup` or keep the manual cap \
+                             from the startup warning"
+                        );
+                    }
                     return;
                 }
             }
@@ -2682,9 +2752,15 @@ struct ArcManagerState {
     /// Cap actually written by this run, so unchanged targets are skipped.
     last_written_mib: Option<u64>,
     last_change: Option<Instant>,
+    /// Last permission probe (a negative result is retried, so the operator
+    /// can fix the sysfs permissions without restarting e-lite).
+    last_probe: Option<Instant>,
 }
 
 const ARC_PARAM_PATH: &str = "/sys/module/zfs/parameters/zfs_arc_max";
+
+/// Public path of the ZFS ARC cap parameter (used by `e-lite arc-setup`).
+pub const ARC_CAP_PATH: &str = ARC_PARAM_PATH;
 
 /// Read one numeric field from `/proc/spl/kstat/zfs/arcstats` content.
 fn zfs_arc_field(text: &str, field: &str) -> Option<u64> {

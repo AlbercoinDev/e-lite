@@ -1,5 +1,48 @@
 # Changelog
 
+## 0.1.0-alpha.29.12.1 — 2026-11-12
+
+### ARC without root, honest rate/ETA, wallet-session diagnostics
+
+No schema, protocol or consensus change. Three items from the signet
+validation of 29.9.0-29.12.0.
+
+**The dynamic ARC works without running e-lite as root.** `e-lite arc-setup`
+prints the exact steps (or runs them with `--apply` as root): the
+`zfs_arc_max` parameter becomes group-writable and a systemd oneshot
+(`e-lite-arc-cap.service`, installed automatically by `install.sh` when ZFS
+is present) restores the permissions after every boot. A failed permission
+probe is now retried every 10 minutes, so fixing the permissions enables the
+manager without a restart (`arc: dynamic management enabled`). The signet
+log showed `cannot write zfs_arc_max: Read-only file system` and the manager
+stayed warn-only, which is why the cache plan was squeezed to 205 MiB.
+
+**The height line reports the real current rate and an ETA.** The `phase X
+b/s` field is the average since the phase changed — the whole session when it
+never changes — so it read 117 b/s during a 37 b/s interval. New fields from a
+60 s sliding window over full commit groups:
+
+```text
+... phase indexing 113.1 b/s  recent 37 b/s eta 24m ... avgblk 407KiB ...
+```
+
+`recent` is the honest "right now" (bounded in time, not skewed by one large
+group) and `eta` is `lag / recent`.
+
+**`debug:` wallet-session diagnostics.** Counts and milliseconds only, never
+a hash, script or txid (AUD-132/133):
+
+```text
+debug: wallet: connection 4 (tls true)
+debug: wallet: first tx.get 45 ms after get_history (reconstruction phase)
+debug: wallet session: 60s, history 4 (3 ms avg, 12 ms max), tx.get 210 (12 ms avg, 340 ms max)
+debug: wallet: closed after 340s (history 4, tx.get 210)
+```
+
+The summary prints every 60 s of activity and on close; the first `tx.get`
+after a `get_history` reply marks the start of a wallet reconstruction. This
+is the measurement step before touching the per-connection serving path.
+
 ## 0.1.0-alpha.29.12.0 — 2026-11-12
 
 ### Private by default: Tor-only fetches, plain on loopback, Core networks, snapshot format 3
