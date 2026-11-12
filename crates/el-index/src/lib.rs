@@ -339,6 +339,7 @@ pub fn apply_block(
         overlay,
         batch,
         store_undo,
+        store_undo,
         None,
     )
 }
@@ -380,8 +381,60 @@ pub fn apply_prepared_with_prefetch(
         overlay,
         batch,
         store_undo,
+        store_undo,
         prefetched,
     )
+}
+
+/// Apply a prepared block and return its undo record **without** writing it
+/// to `batch`. The caller writes only the records that the committed tip
+/// still needs (`height >= tip - reorg_window`), so a bulk group does not
+/// write undo into RocksDB just to delete it at commit time (AUD-131).
+#[allow(clippy::too_many_arguments)]
+pub fn apply_prepared_deferred_undo(
+    store: &Store,
+    height: u32,
+    prepared: &PreparedBlock,
+    prev_tip: Option<IndexedTip>,
+    overlay: &mut GroupOverlay,
+    batch: &mut WriteBatch,
+    prefetched: Option<&PrefetchedPrevouts>,
+) -> Result<ApplyOutcome> {
+    apply_inner(
+        store,
+        height,
+        &prepared.block,
+        prepared.block_hash,
+        &prepared.txids,
+        &prepared.out_script_hashes,
+        prev_tip,
+        overlay,
+        batch,
+        true,
+        false,
+        prefetched,
+    )
+}
+
+/// Write the undo records a commit at `tip_height` still needs: the reorg
+/// window `[tip - window, tip]`. Older records are skipped entirely.
+/// Returns how many were written.
+pub fn write_window_undo<'a>(
+    store: &Store,
+    batch: &mut WriteBatch,
+    records: impl IntoIterator<Item = &'a UndoRecord>,
+    tip_height: u32,
+    window: u32,
+) -> Result<usize> {
+    let cutoff = tip_height.saturating_sub(window);
+    let mut written = 0;
+    for rec in records {
+        if rec.height >= cutoff && rec.height <= tip_height {
+            store.put_undo(batch, rec)?;
+            written += 1;
+        }
+    }
+    Ok(written)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -396,8 +449,11 @@ fn apply_inner(
     overlay: &mut GroupOverlay,
     batch: &mut WriteBatch,
     store_undo: bool,
+    write_undo: bool,
     prefetched: Option<&PrefetchedPrevouts>,
 ) -> Result<ApplyOutcome> {
+    // `store_undo` builds the undo record; `write_undo` also puts it in the
+    // batch. The deferred path builds it and lets the caller decide.
     // --- continuity -------------------------------------------------------
     let prev_hash = hash_from_blockhash(&block.header.prev_blockhash)?;
     let expected_height = prev_tip.map(|t| t.height + 1).unwrap_or(0);
@@ -591,7 +647,7 @@ fn apply_inner(
         txnum_base,
     };
     store.put_block(batch, &rec)?;
-    if store_undo {
+    if store_undo && write_undo {
         store.put_undo(batch, &undo)?;
     }
 
@@ -1113,6 +1169,81 @@ mod tests {
             assert!(store.get_undo(h).unwrap().is_some(), "height {h} kept");
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// AUD-131: a group applied with deferred undo and committed with only
+    /// the window's records must leave exactly the database the old path
+    /// (write every record, prune at commit) produced, and must rewind.
+    #[test]
+    fn deferred_undo_matches_write_then_prune_and_rewinds() {
+        failpoints::set(failpoints::NONE);
+        const WINDOW: u32 = 10;
+        let gen = ChainGen::new(ChainSpec {
+            seed: 23,
+            tx_per_block: 6,
+            script_pool: 9,
+        });
+        let blocks: Vec<_> = gen.take(40).collect();
+
+        // Old path: undo for every block, pruned to the window afterwards.
+        let old_dir = tmp("undo-old");
+        let old = Store::open(&old_dir).unwrap();
+        apply_group(&old, &blocks, 0).unwrap();
+        let tip = old.committed_tip().unwrap().unwrap();
+        let mut prune = Store::batch();
+        prune_undo(&old, tip.height, WINDOW, &mut prune).unwrap();
+        old.commit_tip_only(prune, &tip).unwrap();
+
+        // New path: one group, undo kept in memory, window written at commit.
+        let dir = tmp("undo-deferred");
+        let store = Store::open(&dir).unwrap();
+        let mut overlay = GroupOverlay::new();
+        let mut batch = WriteBatch::default();
+        let mut txids = Vec::new();
+        let mut undos = Vec::new();
+        let mut tip = None;
+        for (h, block) in blocks.iter().enumerate() {
+            let raw = bitcoin::consensus::serialize(block);
+            let prepared =
+                prepare_block_bytes(&raw, &block.block_hash().to_string(), h as u32).unwrap();
+            let out = apply_prepared_deferred_undo(
+                &store,
+                h as u32,
+                &prepared,
+                tip,
+                &mut overlay,
+                &mut batch,
+                None,
+            )
+            .unwrap();
+            txids.extend_from_slice(&out.txids);
+            tip = Some(out.tip);
+            undos.push(out.undo);
+        }
+        let tip = tip.unwrap();
+        let written = write_window_undo(&store, &mut batch, &undos, tip.height, WINDOW).unwrap();
+        assert_eq!(written, WINDOW as usize + 1);
+        store.commit(batch, &tip, &txids).unwrap();
+
+        assert_eq!(
+            store.canonical_digest().unwrap(),
+            old.canonical_digest().unwrap(),
+            "deferred undo must produce the same database"
+        );
+        for h in 0..tip.height - WINDOW {
+            assert!(store.get_undo(h).unwrap().is_none(), "no undo at {h}");
+        }
+
+        // The window is enough to rewind to its bottom and match the oracle.
+        let target = tip.height - WINDOW;
+        rewind_to(&store, target).unwrap();
+        let mut oracle = Oracle::new();
+        for (h, b) in blocks.iter().enumerate().take(target as usize + 1) {
+            oracle.apply(h as u32, b);
+        }
+        oracle.assert_matches(&store).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&old_dir);
     }
 
     #[test]

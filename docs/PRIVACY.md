@@ -12,7 +12,13 @@ repairing a prune gap.
 - Merkle/checkpoint proofs (computed from the local index and header cache).
 - Mempool view, fee estimates and broadcasts come from the local/remote **Core**
   you configured, not from a public Electrum server.
-- Logs and metrics do not print scripts, addresses, txids or wallet labels.
+- Logs and metrics do not print scripts, addresses, txids, wallet labels or
+  the block hash of a wallet request: failures are logged by height and error
+  class, and any 64-hex value in an error is replaced by `<hash>`.
+- External requests do not name e-lite: HTTP requests use a generic
+  `User-Agent` (`Mozilla/5.0`) and the P2P `version` message a common Core
+  subversion. Behaviour (one `getdata`, then disconnect) can still be
+  fingerprinted by a determined peer.
 
 ## What can leave the machine
 
@@ -104,6 +110,11 @@ open_without_provider = false  # true: open with local data after ready_timeout_
   a Tor request fails. The fallback exposes the operator IP to that provider; set
   `tor_fallback_clearnet = false` to stay fail-closed. `allow_clearnet = true`
   makes clearnet a normal source instead of a fallback.
+- Every Esplora request over Tor uses a fresh random SOCKS username. Tor
+  isolates streams by SOCKS credentials (`IsolateSOCKSAuth`, on by default),
+  so each block is fetched over its own circuit and a provider cannot group
+  the blocks of one wallet by exit IP. Timing and the last-good-provider
+  preference still let a single provider see most of them.
 - e-lite runs its own Tor by default (`[tor] mode = "managed"`) and uses that
   SOCKS proxy for external rawtx/repair requests. There is no dependency on a
   system Tor daemon.
@@ -146,7 +157,9 @@ open_without_provider = false  # true: open with local data after ready_timeout_
 - BIP324 v2 is attempted first; v1 is the fallback within the same per-peer
   timeout budget.
 - Peers are discovered from Core's current connections first, then from
-  addrman. Up to three peers are tried per fetch, with a total 2× timeout cap.
+  addrman, and the list is refreshed every 10 minutes (every 60 s while it is
+  empty, for example right after Core starts). Pinned `p2p_peers` are never
+  replaced. Up to three peers are tried per fetch, with a total 2× timeout cap.
 - The last peer that answered is tried first. A failed peer is skipped for
   `provider_cooldown_seconds` (300 s by default), so every block does not pay
   the same dead peer's timeout.

@@ -2,6 +2,52 @@
 
 ## Unreleased
 
+### IBD write volume, log redaction, Tor isolation, P2P peers, safer restores
+
+No schema, protocol or snapshot-format change; the database written by the
+new undo path is byte-identical to the old one (same canonical digest).
+
+- **AUD-131 (IBD)**: undo is built for every applied block but kept in
+  memory, trimmed to the reorg window, and only the records inside the
+  window of the committed tip are written. Before, every block's undo went
+  into the `WriteBatch` and most of it was deleted again in the same or the
+  next commit — an estimated third of the RocksDB write volume during IBD.
+  Early commits (time/tx/byte limit, boundary, shutdown) stay fully
+  rewindable. Not yet measured on mainnet: compare `tests/bench_ibd.sh`
+  and the `commit-group` / WAL counters.
+- **AUD-132 (privacy, logs)**: `e-lite.log` no longer records the script
+  hash of a failed `get_history`, nor the txid/block hash of a failed or
+  rejected raw transaction (height and error class only; 64-hex values in
+  error details become `<hash>`). reqwest errors are logged without their
+  URL, which contained the block hash.
+- **AUD-133 (privacy, fingerprint)**: HTTP requests send a generic
+  `User-Agent` (`Mozilla/5.0`) instead of `e-lite/<version>`, and the P2P
+  `version` message a common Core subversion instead of `/e-lite:0.1/`.
+- **AUD-135 (privacy, Tor)**: every Esplora request over Tor uses a fresh
+  random SOCKS username, so Tor puts each block on its own circuit.
+- **AUD-137 (P2P)**: the P2P source exists even when Core had no peers at
+  start, and `el-p2p-peers` refreshes the discovered list from Core every
+  10 minutes (60 s while empty). Pinned `[rawtx] p2p_peers` are untouched. An
+  empty P2P source does not count as a repair/rawtx source.
+- **AUD-140/141/142 (snapshots)**: `export-snapshot --output` computes the
+  canonical digest once instead of twice and prints a reminder to keep it.
+  `import-snapshot` extracts into `.<name>.import-partial` next to the target
+  and renames it only after every check, so a failed or interrupted import
+  leaves nothing half-restored (a leftover is removed by the next import).
+  New `--expect-digest <hex>` refuses an archive whose recomputed digest is
+  not the one recorded at export.
+- **AUD-144**: an Esplora body without `Content-Length` is read through an
+  8 MiB + 1 bound instead of being buffered whole first.
+- Tests: `deferred_undo_matches_write_then_prune_and_rewinds`,
+  `undo_window_is_measured_from_the_real_commit_tip`,
+  `errors_and_logs_do_not_carry_the_block_hash`,
+  `requests_do_not_identify_e_lite`, `each_tor_request_gets_its_own_circuit`,
+  `chunked_body_above_the_limit_is_rejected`,
+  `p2p_source_counts_only_once_it_has_peers`,
+  `p2p_peers_refresh_soon_when_empty_and_honour_pinned_peers`,
+  `import_is_atomic_and_checks_the_expected_digest`; `version_advertises_witness`
+  now also checks the user agent.
+
 ### Snapshot secrets, provider gate and prefix bloom (AUD-126, AUD-127, AUD-129)
 
 No schema, protocol or snapshot-format change. An existing index opens
@@ -35,7 +81,7 @@ without migration.
   older releases have no extractor and are read as before until compaction
   rewrites them. Not yet measured on mainnet: compare a cold wallet scan and
   `/status.rocksdb.table_readers_bytes` before/after.
-- Tests: `core_allowlist_only_descends_into_chain_data`,
+- Tests (first batch): `core_allowlist_only_descends_into_chain_data`,
   `mainnet_core_walk_leaves_wallets_keys_and_config_out`,
   `provider_gate_skips_unpruned_core_and_expires`,
   `prefix_scans_stop_at_the_script_boundary` (includes the RocksDB

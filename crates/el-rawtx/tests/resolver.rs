@@ -526,3 +526,36 @@ fn external_sources_fail_closed_without_tor() {
     assert_eq!(resolver.external_sources(), 0);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn p2p_source_counts_only_once_it_has_peers() {
+    // AUD-137: P2P exists even when Core had no peers at start, and the list
+    // can be refreshed later. An empty P2P source is not a usable source.
+    let dir = tmp("p2p-refresh");
+    let store = Arc::new(Store::open(&dir).unwrap());
+    let mut cfg = config(0, 0);
+    cfg.use_p2p = true;
+    let resolver = Resolver::new(Arc::clone(&store), &cfg).unwrap();
+    assert_eq!(resolver.p2p_peers(), Some(0));
+    assert_eq!(resolver.external_sources(), 0);
+    assert!(!resolver.has_repair_sources());
+
+    let count = resolver.refresh_p2p_peers(vec![
+        "192.0.2.1:18444".into(),
+        "192.0.2.2:18444".into(),
+        "192.0.2.1:18444".into(),
+    ]);
+    assert_eq!(count, Some(2), "duplicates are dropped");
+    assert_eq!(resolver.external_sources(), 1);
+    assert!(resolver.has_repair_sources());
+
+    assert_eq!(resolver.refresh_p2p_peers(Vec::new()), Some(0));
+    assert_eq!(resolver.external_sources(), 0);
+
+    // P2P disabled: nothing to refresh.
+    let off = Resolver::new(Arc::clone(&store), &config(0, 0)).unwrap();
+    assert_eq!(off.p2p_peers(), None);
+    assert_eq!(off.refresh_p2p_peers(vec!["192.0.2.3:18444".into()]), None);
+    drop(store);
+    let _ = std::fs::remove_dir_all(&dir);
+}

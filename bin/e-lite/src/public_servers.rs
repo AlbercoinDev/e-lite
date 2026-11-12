@@ -71,14 +71,14 @@ pub fn probe(
         .and_then(|proxy| {
             reqwest::blocking::Client::builder()
                 .timeout(timeout)
-                .user_agent(concat!("e-lite/", env!("CARGO_PKG_VERSION")))
+                .user_agent(el_rawtx::HTTP_USER_AGENT)
                 .proxy(reqwest::Proxy::all(format!("socks5h://{proxy}")).ok()?)
                 .build()
                 .ok()
         });
     let direct = reqwest::blocking::Client::builder()
         .timeout(timeout)
-        .user_agent(concat!("e-lite/", env!("CARGO_PKG_VERSION")))
+        .user_agent(el_rawtx::HTTP_USER_AGENT)
         .build()
         .ok();
     let fallback = cfg.rawtx.tor_fallback_clearnet;

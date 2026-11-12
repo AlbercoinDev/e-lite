@@ -22,6 +22,17 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
+/// HTTP `User-Agent` for every external request. A generic value: the
+/// project name and version would put the operator in a tiny anonymity set
+/// for every provider (AUD-133).
+pub const HTTP_USER_AGENT: &str = "Mozilla/5.0";
+
+/// P2P `version` user agent. A common Core subversion instead of an
+/// e-lite-specific one, so spy nodes cannot single out e-lite clients by
+/// the cheapest filter (AUD-133). Behaviour (one getdata, then disconnect)
+/// can still be fingerprinted.
+pub const P2P_USER_AGENT: &[u8] = b"/Satoshi:29.0.0/";
+
 pub use cache::BlockCache;
 pub use core_source::CoreBlockSource;
 pub use esplora::EsploraSource;
@@ -49,6 +60,20 @@ impl fmt::Display for RawtxError {
 
 impl std::error::Error for RawtxError {}
 
+impl RawtxError {
+    /// Error class without details. Details can carry a txid or the block
+    /// hash of a wallet transaction, which must not reach the log (AUD-132);
+    /// the wallet still receives the full message in its RPC error.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            RawtxError::Unavailable(_) => "unavailable",
+            RawtxError::Verify(_) => "verification failed",
+            RawtxError::Config(_) => "config",
+            RawtxError::Io(_) => "io",
+        }
+    }
+}
+
 impl From<el_store::StoreError> for RawtxError {
     fn from(e: el_store::StoreError) -> Self {
         RawtxError::Io(e.to_string())
@@ -62,6 +87,32 @@ impl From<el_model::CodecError> for RawtxError {
 }
 
 pub type Result<T> = std::result::Result<T, RawtxError>;
+
+/// Replace every 64-hex-digit run (txid, block hash, script hash) with
+/// `<hash>`, so an error that mentions one can be logged (AUD-132).
+pub fn redact_hashes(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut out = String::with_capacity(text.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let run = bytes[i..]
+            .iter()
+            .take_while(|b| b.is_ascii_hexdigit())
+            .count();
+        if run >= 64 {
+            out.push_str("<hash>");
+            i += run;
+        } else if run > 0 {
+            out.push_str(&text[i..i + run]);
+            i += run;
+        } else {
+            let ch = text[i..].chars().next().unwrap_or(' ');
+            out.push(ch);
+            i += ch.len_utf8();
+        }
+    }
+    out
+}
 
 /// A source that can return a **whole raw block** by hash.
 pub trait BlockSource: Send + Sync {
@@ -186,8 +237,11 @@ pub struct Resolver {
     store: Arc<Store>,
     /// Local source, tried first and never cached.
     local: Option<Arc<dyn BlockSource>>,
-    /// External sources, tried in random order.
+    /// External sources other than P2P, tried in random order.
     external: Vec<Arc<dyn BlockSource>>,
+    /// P2P source, kept apart so its peer list can be refreshed (AUD-137).
+    /// It counts as a source only while it has peers.
+    p2p: Option<Arc<P2pSource>>,
     cache: Option<BlockCache>,
     cache_dir: std::path::PathBuf,
     decoys: u32,
@@ -201,15 +255,18 @@ pub struct Resolver {
 impl Resolver {
     pub fn new(store: Arc<Store>, cfg: &RawtxConfig) -> Result<Self> {
         let mut external: Vec<Arc<dyn BlockSource>> = Vec::new();
+        let mut p2p = None;
         let tor = cfg.tor_socks.clone();
         let stats = Arc::new(RawtxStats::default());
 
         if cfg.enabled {
-            if cfg.use_p2p && !cfg.p2p_peers.is_empty() {
+            // Created even with no peers yet: the list is refreshed from Core
+            // at runtime, and an empty source is not counted as a source.
+            if cfg.use_p2p {
                 if tor.is_none() && !cfg.allow_clearnet && !cfg.fallback_clearnet {
                     // fail closed: no external P2P without Tor and no fallback
                 } else {
-                    external.push(Arc::new(
+                    p2p = Some(Arc::new(
                         P2pSource::new(
                             cfg.p2p_peers.clone(),
                             tor.clone(),
@@ -255,6 +312,7 @@ impl Resolver {
             store,
             local: None,
             external,
+            p2p,
             cache,
             cache_dir,
             decoys: cfg.decoys,
@@ -282,7 +340,30 @@ impl Resolver {
     }
 
     pub fn external_sources(&self) -> usize {
-        self.external.len()
+        self.sources().len()
+    }
+
+    /// External sources usable right now: the configured ones plus P2P when
+    /// it has at least one peer.
+    fn sources(&self) -> Vec<Arc<dyn BlockSource>> {
+        let mut out = self.external.clone();
+        if let Some(p2p) = &self.p2p {
+            if p2p.peer_count() > 0 {
+                out.push(Arc::clone(p2p) as Arc<dyn BlockSource>);
+            }
+        }
+        out
+    }
+
+    /// Replace the P2P peer list (discovered from Core). Returns the new
+    /// count, or `None` when P2P is disabled.
+    pub fn refresh_p2p_peers(&self, peers: Vec<String>) -> Option<usize> {
+        self.p2p.as_ref().map(|p2p| p2p.set_peers(peers))
+    }
+
+    /// Current P2P peer count, `None` when P2P is disabled.
+    pub fn p2p_peers(&self) -> Option<usize> {
+        self.p2p.as_ref().map(|p2p| p2p.peer_count())
     }
 
     /// Directory used by the validated rawtx cache.
@@ -298,7 +379,7 @@ impl Resolver {
     /// Whether a pruned-index repair has any chance: a validated block cache
     /// or at least one external whole-block source.
     pub fn has_repair_sources(&self) -> bool {
-        !self.external.is_empty() || self.cache.as_ref().map(|c| !c.is_empty()).unwrap_or(false)
+        !self.sources().is_empty() || self.cache.as_ref().map(|c| !c.is_empty()).unwrap_or(false)
     }
 
     /// Fetch a whole block by hash for index repair, verifying its hash and
@@ -339,10 +420,11 @@ impl Resolver {
             }
         }
 
-        let mut order: Vec<usize> = (0..self.external.len()).collect();
+        let sources = self.sources();
+        let mut order: Vec<usize> = (0..sources.len()).collect();
         order.shuffle(&mut thread_rng());
         for idx in order {
-            let source = &self.external[idx];
+            let source = &sources[idx];
             match source.fetch_block(hash) {
                 Ok(bytes) => {
                     self.stats.fetches.fetch_add(1, Ordering::Relaxed);
@@ -405,7 +487,10 @@ impl Resolver {
                     }
                     Err(e) => {
                         self.stats.verify_failures.fetch_add(1, Ordering::Relaxed);
-                        eprintln!("[e-lite] cached block {} rejected: {e}", rec.hash);
+                        eprintln!(
+                            "[e-lite] cached block at height {height} rejected ({})",
+                            e.kind()
+                        );
                         let _ = cache.remove(&rec.hash);
                     }
                 }
@@ -422,14 +507,14 @@ impl Resolver {
                     }
                     Err(e) => {
                         self.stats.verify_failures.fetch_add(1, Ordering::Relaxed);
-                        eprintln!("[e-lite] local rawtx rejected: {e}");
+                        eprintln!("[e-lite] local rawtx rejected ({})", e.kind());
                     }
                 }
             }
         }
 
         // 3) External sources, shared across concurrent callers.
-        if self.external.is_empty() {
+        if self.sources().is_empty() {
             self.stats.unavailable.fetch_add(1, Ordering::Relaxed);
             return Err(RawtxError::Unavailable(
                 "no external source configured (or Tor is required and unavailable)".to_string(),
@@ -439,8 +524,9 @@ impl Resolver {
             Ok(bytes) => bytes,
             Err(e) => {
                 eprintln!(
-                    "[e-lite] rawtx {txid} at height {height} (block {}) failed: {e}",
-                    rec.hash
+                    "[e-lite] rawtx at height {height} failed ({}); sources: {}",
+                    e.kind(),
+                    redact_hashes(&e.to_string())
                 );
                 return Err(e);
             }
@@ -454,7 +540,10 @@ impl Resolver {
             }
             Err(e) => {
                 self.stats.verify_failures.fetch_add(1, Ordering::Relaxed);
-                eprintln!("[e-lite] external block {} rejected: {e}", rec.hash);
+                eprintln!(
+                    "[e-lite] external block at height {height} rejected ({})",
+                    e.kind()
+                );
                 Err(e)
             }
         }
@@ -538,7 +627,8 @@ impl Resolver {
 
     fn fetch_from_external_sources(&self, hash: &Hash32) -> Result<Vec<u8>> {
         let _permit = self.external_slots.acquire();
-        let mut order: Vec<usize> = (0..self.external.len()).collect();
+        let sources = self.sources();
+        let mut order: Vec<usize> = (0..sources.len()).collect();
         order.shuffle(&mut thread_rng());
         let started = Instant::now();
         let mut errors = Vec::new();
@@ -547,7 +637,7 @@ impl Resolver {
                 errors.push("external fetch deadline exceeded".to_string());
                 break;
             }
-            let source = &self.external[idx];
+            let source = &sources[idx];
             match source.fetch_block(hash) {
                 Ok(bytes) => {
                     self.stats.fetches.fetch_add(1, Ordering::Relaxed);
@@ -564,7 +654,11 @@ impl Resolver {
                         }
                         Err(e) => {
                             self.stats.verify_failures.fetch_add(1, Ordering::Relaxed);
-                            eprintln!("[e-lite] {} returned an invalid block: {e}", source.name());
+                            eprintln!(
+                                "[e-lite] {} returned an invalid block ({})",
+                                source.name(),
+                                e.kind()
+                            );
                             errors.push(format!("{}: {e}", source.name()));
                         }
                     }
@@ -607,7 +701,7 @@ impl Resolver {
     /// Fetch decoys in the background so the caller is not delayed.
     fn spawn_decoys(&self, exclude: Hash32) {
         const MAX_DECOYS_INFLIGHT: usize = 2;
-        if self.decoys == 0 || self.external.is_empty() {
+        if self.decoys == 0 || self.sources().is_empty() {
             return;
         }
         let tip = match self.store.committed_tip() {
@@ -638,7 +732,7 @@ impl Resolver {
                 self.decoys_inflight.fetch_sub(1, Ordering::Relaxed);
                 continue;
             };
-            let sources = self.external.clone();
+            let sources = self.sources();
             let stats = Arc::clone(&self.stats);
             let inflight = Arc::clone(&self.decoys_inflight);
             let slots = Arc::clone(&self.external_slots);

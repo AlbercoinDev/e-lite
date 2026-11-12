@@ -9,13 +9,19 @@ use el_model::Hash32;
 use rand::seq::SliceRandom;
 use rand::thread_rng;
 use std::collections::HashMap;
+use std::io::Read;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 pub struct EsploraSource {
     bases: Vec<String>,
-    tor_client: Option<reqwest::blocking::Client>,
+    /// Tor SOCKS address. Every block request builds its own client with a
+    /// random SOCKS username, so Tor puts it on its own circuit
+    /// (`IsolateSOCKSAuth`, on by default): providers cannot link the blocks
+    /// of one wallet by exit IP (AUD-135).
+    tor_proxy: Option<String>,
+    timeout: Duration,
     direct_client: Option<reqwest::blocking::Client>,
     fallback_clearnet: bool,
     allow_clearnet: bool,
@@ -28,6 +34,18 @@ pub struct EsploraSource {
 
 const MAX_BLOCK_BYTES: u64 = 8 * 1024 * 1024;
 
+/// A client whose SOCKS username is random. Tor isolates streams with
+/// different SOCKS credentials onto different circuits.
+fn isolated_tor_client(socks: &str, timeout: Duration) -> Option<reqwest::blocking::Client> {
+    let user = format!("el{:016x}", rand::random::<u64>());
+    reqwest::blocking::Client::builder()
+        .timeout(timeout)
+        .user_agent(crate::HTTP_USER_AGENT)
+        .proxy(reqwest::Proxy::all(format!("socks5h://{user}:x@{socks}")).ok()?)
+        .build()
+        .ok()
+}
+
 impl EsploraSource {
     pub fn new(
         bases: Vec<String>,
@@ -37,18 +55,12 @@ impl EsploraSource {
         timeout: Duration,
         cooldown: Duration,
     ) -> Result<Self> {
-        let tor_client = tor_socks.and_then(|socks| {
-            reqwest::blocking::Client::builder()
-                .timeout(timeout)
-                .user_agent(concat!("e-lite/", env!("CARGO_PKG_VERSION")))
-                .proxy(reqwest::Proxy::all(format!("socks5h://{socks}")).ok()?)
-                .build()
-                .ok()
-        });
+        // Keep the proxy only if a client can actually be built with it.
+        let tor_proxy = tor_socks.filter(|socks| isolated_tor_client(socks, timeout).is_some());
         let direct_client = if allow_clearnet || fallback_clearnet {
             reqwest::blocking::Client::builder()
                 .timeout(timeout)
-                .user_agent(concat!("e-lite/", env!("CARGO_PKG_VERSION")))
+                .user_agent(crate::HTTP_USER_AGENT)
                 .build()
                 .ok()
         } else {
@@ -68,10 +80,10 @@ impl EsploraSource {
             let is_onion = lower.contains(".onion");
             // Onion endpoints only work through Tor; clearnet works through Tor
             // or, when allowed/fallback is configured, directly.
-            if is_onion && tor_client.is_none() {
+            if is_onion && tor_proxy.is_none() {
                 continue;
             }
-            if !is_onion && tor_client.is_none() && direct_client.is_none() {
+            if !is_onion && tor_proxy.is_none() && direct_client.is_none() {
                 continue;
             }
             clean.push(b);
@@ -84,7 +96,8 @@ impl EsploraSource {
 
         Ok(EsploraSource {
             bases: clean,
-            tor_client,
+            tor_proxy,
+            timeout,
             direct_client,
             fallback_clearnet,
             allow_clearnet,
@@ -102,10 +115,12 @@ impl EsploraSource {
         hash: &Hash32,
     ) -> Result<Vec<u8>> {
         let url = format!("{}/block/{}/raw", base, hash.to_hex());
+        // `without_url`: reqwest errors print the request URL, which carries
+        // the block hash of a wallet transaction (AUD-132).
         let resp = client
             .get(&url)
             .send()
-            .map_err(|e| RawtxError::Unavailable(format!("{base}: {e}")))?;
+            .map_err(|e| RawtxError::Unavailable(format!("{base}: {}", e.without_url())))?;
         let status = resp.status();
         if !status.is_success() {
             return Err(RawtxError::Unavailable(format!("{base}: HTTP {status}")));
@@ -113,13 +128,18 @@ impl EsploraSource {
         if resp.content_length().unwrap_or(0) > MAX_BLOCK_BYTES {
             return Err(RawtxError::Unavailable(format!("{base}: block too large")));
         }
-        let bytes = resp
-            .bytes()
-            .map_err(|e| RawtxError::Unavailable(format!("{base}: {e}")))?;
+        // Bounded read: without Content-Length (chunked) the body must not be
+        // buffered past the limit before it is checked (AUD-144).
+        let mut bytes = Vec::new();
+        resp.take(MAX_BLOCK_BYTES + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|e| {
+                RawtxError::Unavailable(format!("{base}: body read failed ({})", e.kind()))
+            })?;
         if bytes.len() as u64 > MAX_BLOCK_BYTES {
             return Err(RawtxError::Unavailable(format!("{base}: block too large")));
         }
-        Ok(bytes.to_vec())
+        Ok(bytes)
     }
 
     fn cooled(failures: &Mutex<HashMap<String, Instant>>, base: &str) -> bool {
@@ -168,7 +188,7 @@ impl EsploraSource {
 
     fn attemptable(&self, base: &str) -> bool {
         let is_onion = base.to_ascii_lowercase().contains(".onion");
-        let tor_ok = self.tor_client.is_some() && !Self::cooled(&self.tor_failures, base);
+        let tor_ok = self.tor_proxy.is_some() && !Self::cooled(&self.tor_failures, base);
         let direct_ok =
             !is_onion && self.direct_client.is_some() && !Self::cooled(&self.direct_failures, base);
         tor_ok || direct_ok
@@ -225,11 +245,15 @@ impl BlockSource for EsploraSource {
             let base = &self.bases[idx];
             let is_onion = base.to_ascii_lowercase().contains(".onion");
 
-            if let Some(client) = &self.tor_client {
+            if let Some(client) = self
+                .tor_proxy
+                .as_deref()
+                .and_then(|socks| isolated_tor_client(socks, self.timeout))
+            {
                 if Self::cooled(&self.tor_failures, base) {
                     errors.push(format!("tor {base}: cooling down"));
                 } else {
-                    match Self::fetch_with(client, base, hash) {
+                    match Self::fetch_with(&client, base, hash) {
                         Ok(bytes) => {
                             self.mark_good(base, true);
                             return Ok(bytes);
@@ -404,6 +428,165 @@ mod tests {
             2,
             "each request gets one forced attempt instead of failing while cooling"
         );
+    }
+
+    #[test]
+    fn errors_and_logs_do_not_carry_the_block_hash() {
+        // AUD-132: a connection error must not echo the request URL, which
+        // contains the block hash of a wallet transaction.
+        let closed = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", closed.local_addr().unwrap());
+        drop(closed);
+        let src = EsploraSource::new(
+            vec![base],
+            None,
+            true,
+            false,
+            Duration::from_secs(2),
+            Duration::from_secs(2),
+        )
+        .unwrap();
+        let hash = Hash32([0xab; 32]);
+        let err = src.fetch_block(&hash).unwrap_err().to_string();
+        assert!(!err.contains(&hash.to_hex()), "{err}");
+        assert!(!err.contains("/block/"), "{err}");
+
+        let line = crate::redact_hashes(&format!(
+            "transaction {} is not in the block {}; tx 12ab",
+            "cd".repeat(32),
+            "ef".repeat(32)
+        ));
+        assert_eq!(
+            line,
+            "transaction <hash> is not in the block <hash>; tx 12ab"
+        );
+    }
+
+    /// Minimal SOCKS5 server: records the username of each connection and
+    /// then refuses the CONNECT, so the request fails without a network.
+    fn socks_recorder(conns: usize) -> (String, std::thread::JoinHandle<Vec<String>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let handle = std::thread::spawn(move || {
+            let mut users = Vec::new();
+            for _ in 0..conns {
+                let (mut sock, _) = listener.accept().unwrap();
+                let mut head = [0u8; 2];
+                sock.read_exact(&mut head).unwrap();
+                let mut methods = vec![0u8; head[1] as usize];
+                sock.read_exact(&mut methods).unwrap();
+                if !methods.contains(&2) {
+                    users.push(String::new());
+                    let _ = sock.write_all(&[5, 0xff]);
+                    continue;
+                }
+                sock.write_all(&[5, 2]).unwrap();
+                let mut ver_len = [0u8; 2];
+                sock.read_exact(&mut ver_len).unwrap();
+                let mut user = vec![0u8; ver_len[1] as usize];
+                sock.read_exact(&mut user).unwrap();
+                let mut plen = [0u8; 1];
+                sock.read_exact(&mut plen).unwrap();
+                let mut pass = vec![0u8; plen[0] as usize];
+                sock.read_exact(&mut pass).unwrap();
+                users.push(String::from_utf8_lossy(&user).into_owned());
+                sock.write_all(&[1, 0]).unwrap();
+                // Refuse the CONNECT: general SOCKS server failure.
+                let _ = sock.write_all(&[5, 1, 0, 1, 0, 0, 0, 0, 0, 0]);
+            }
+            users
+        });
+        (addr, handle)
+    }
+
+    #[test]
+    fn each_tor_request_gets_its_own_circuit() {
+        // AUD-135: distinct SOCKS usernames => distinct Tor circuits.
+        let (socks, handle) = socks_recorder(2);
+        let src = EsploraSource::new(
+            vec!["https://provider.invalid/api".into()],
+            Some(socks),
+            false,
+            false,
+            Duration::from_secs(5),
+            Duration::from_secs(1),
+        )
+        .unwrap();
+        assert!(src.fetch_block(&Hash32([0x31; 32])).is_err());
+        assert!(src.fetch_block(&Hash32([0x32; 32])).is_err());
+        let users = handle.join().unwrap();
+        assert_eq!(users.len(), 2);
+        assert!(users.iter().all(|u| !u.is_empty()), "{users:?}");
+        assert_ne!(users[0], users[1], "requests must not share a circuit");
+    }
+
+    #[test]
+    fn chunked_body_above_the_limit_is_rejected() {
+        // AUD-144: no Content-Length, body larger than a block can be.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let (mut sock, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 4096];
+            let _ = sock.read(&mut buf);
+            let _ = sock.write_all(
+                b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n",
+            );
+            let chunk = vec![0u8; 1024 * 1024];
+            for _ in 0..10 {
+                if sock
+                    .write_all(format!("{:x}\r\n", chunk.len()).as_bytes())
+                    .is_err()
+                    || sock.write_all(&chunk).is_err()
+                    || sock.write_all(b"\r\n").is_err()
+                {
+                    return;
+                }
+            }
+            let _ = sock.write_all(b"0\r\n\r\n");
+        });
+        let src = EsploraSource::new(
+            vec![format!("http://{addr}")],
+            None,
+            true,
+            false,
+            Duration::from_secs(10),
+            Duration::from_secs(5),
+        )
+        .unwrap();
+        let err = src
+            .fetch_block(&Hash32([0x41; 32]))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("block too large"), "{err}");
+    }
+
+    #[test]
+    fn requests_do_not_identify_e_lite() {
+        // AUD-133: the User-Agent must not name the project or its version.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = std::thread::spawn(move || {
+            let (mut sock, _) = listener.accept().unwrap();
+            let mut buf = vec![0u8; 4096];
+            let n = sock.read(&mut buf).unwrap();
+            let _ = sock
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 1\r\nConnection: close\r\n\r\nx");
+            String::from_utf8_lossy(&buf[..n]).to_ascii_lowercase()
+        });
+        let src = EsploraSource::new(
+            vec![format!("http://{addr}")],
+            None,
+            true,
+            false,
+            Duration::from_secs(5),
+            Duration::from_secs(5),
+        )
+        .unwrap();
+        let _ = src.fetch_block(&Hash32([0x11; 32]));
+        let request = handle.join().unwrap();
+        assert!(!request.contains("e-lite"), "{request}");
+        assert!(request.contains("user-agent: mozilla/5.0"), "{request}");
     }
 
     #[test]

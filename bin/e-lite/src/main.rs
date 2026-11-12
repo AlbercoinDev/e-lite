@@ -14,8 +14,8 @@ use config::{Config, CoreManage};
 use core_supervisor::{CoreStartOutcome, CoreSupervisor};
 use el_chain::ReaderTracker;
 use el_index::{
-    apply_prepared_with_prefetch, prefetch_prevouts, prefetch_prevouts_with_deadline,
-    prepare_block_bytes, prune_undo, rewind_to, GroupOverlay,
+    apply_prepared_deferred_undo, prefetch_prevouts, prefetch_prevouts_with_deadline,
+    prepare_block_bytes, prune_undo, rewind_to, write_window_undo, GroupOverlay,
 };
 use el_mempool::Mempool;
 use el_model::{Chain, Hash32, IndexedTip, NetworkIdentity, ScriptHash};
@@ -229,6 +229,7 @@ struct Args {
     hash_files: bool,
     compress_level: Option<u32>,
     verify: Option<String>,
+    expect_digest: Option<String>,
     set: Vec<String>,
     profile: Option<String>,
     adaptive: Option<bool>,
@@ -349,6 +350,7 @@ fn parse_args() -> R<Args> {
                 }
                 args.verify = Some(v);
             }
+            "--expect-digest" => args.expect_digest = Some(value("--expect-digest")?),
             "--set" => args.set.push(value("--set")?),
             "--profile" => args.profile = Some(value("--profile")?),
             "--cache-mib" => args.cache_mib = Some(value("--cache-mib")?.parse()?),
@@ -1242,9 +1244,13 @@ fn run() -> R<()> {
             args.hash_files,
             args.compress_level,
         ),
-        Command::ImportSnapshot => {
-            cmd_import(&cfg, chain, args.input.as_deref(), args.verify.as_deref())
-        }
+        Command::ImportSnapshot => cmd_import(
+            &cfg,
+            chain,
+            args.input.as_deref(),
+            args.verify.as_deref(),
+            args.expect_digest.as_deref(),
+        ),
         Command::Help | Command::Version => unreachable!(),
     }
 }
@@ -1272,7 +1278,8 @@ COMMANDS:
                      adds SHA-256 per Core file; --compress-level 0..9, default 3)
     import-snapshot  restore a backup with --input (target must be empty)
                      (--verify checks per-file hashes; --verify=full opens the
-                     restored Core and runs a bounded verifychain)
+                     restored Core and runs a bounded verifychain;
+                     --expect-digest <hex> requires the digest you recorded)
     version          print version
 
 OPTIONS:
@@ -1310,6 +1317,8 @@ OPTIONS:
     --hash-files            export-snapshot: SHA-256 every Core file in the manifest
     --compress-level <n>    export-snapshot gzip level (0..9, default 3)
     --verify [basic|full]   import-snapshot: hash check, or Core verifychain
+    --expect-digest <hex>   import-snapshot: refuse unless the recomputed index
+                            digest equals this value (from your export output)
     --set <key=value>       override any TOML field, e.g. index.profile=ssd
                             (values: true, 42, ["a","b"], or a bare string)
 
@@ -2654,30 +2663,29 @@ impl Indexer {
         blocks: u32,
         bytes: u64,
         last_block_ms: u64,
-        undo_heights: &[u32],
+        undo: &[el_model::UndoRecord],
         sync: bool,
         reason: CommitReason,
     ) -> R<()> {
         let mut batch = batch;
-        // Undo is written for every applied block so an early commit (time or
-        // transaction limit) can never leave a tip without its reorg window.
-        // Records older than the window are pruned here, including the ones
-        // added to this very batch.
+        // Undo is built for every applied block, so an early commit (time,
+        // transaction limit, boundary, shutdown) is as rewindable as a full
+        // batch. Only the records inside the window of the tip actually
+        // committed are written (AUD-131); older ones in the database are
+        // deleted in the same batch.
         prune_undo(
             &self.store,
             tip.height,
             self.cfg.index.reorg_window,
             &mut batch,
         )?;
-        let cutoff = undo_cutoff(tip.height as u64, self.cfg.index.reorg_window) as u32;
-        for height in undo_heights {
-            if *height < cutoff {
-                // Deleting a key inserted earlier in the same WriteBatch is
-                // ordered: the delete wins. Without this the batch resurrected
-                // undo the prune had just deleted from the database.
-                self.store.delete_undo(&mut batch, *height)?;
-            }
-        }
+        write_window_undo(
+            &self.store,
+            &mut batch,
+            undo,
+            tip.height,
+            self.cfg.index.reorg_window,
+        )?;
         {
             let _g = self.lock.write().map_err(|_| "lock poisoned")?;
             let commit_started = Instant::now();
@@ -3653,7 +3661,12 @@ impl Indexer {
         let mut applied_total = 0u64;
         let mut group_bytes = 0usize;
         let mut last_ms = 0u64;
-        let mut group_undo_heights: Vec<u32> = Vec::new();
+        // Undo records of the applied-but-uncommitted blocks, trimmed to the
+        // reorg window as the group grows. Only these are written at commit
+        // (AUD-131); bulk blocks far below the tip never reach RocksDB.
+        let mut group_undo: std::collections::VecDeque<el_model::UndoRecord> =
+            std::collections::VecDeque::new();
+        let undo_window = self.cfg.index.reorg_window;
         let mut result: R<()> = Ok(());
         let mut paused_by_disk = false;
         let mut group_started = Instant::now();
@@ -3725,19 +3738,22 @@ impl Indexer {
             // leave the new tip without its reorg window (or without undo at
             // all). Extra records are pruned inside the same commit.
             let undo_ready = true;
-            match apply_prepared_with_prefetch(
+            match apply_prepared_deferred_undo(
                 &self.store,
                 height as u32,
                 &prepared,
                 tip,
                 &mut overlay,
                 &mut batch,
-                true,
                 Some(&prevouts),
             ) {
                 Ok(out) => {
                     group_txids.extend_from_slice(&out.txids);
-                    group_undo_heights.push(height as u32);
+                    let floor = (height as u32).saturating_sub(undo_window);
+                    while group_undo.front().is_some_and(|u| u.height < floor) {
+                        group_undo.pop_front();
+                    }
+                    group_undo.push_back(out.undo);
                     if self.shared.is_some() {
                         group_scripts.extend(out.touched_scripts.iter().copied());
                     }
@@ -3836,14 +3852,14 @@ impl Indexer {
                     count,
                     group_bytes as u64,
                     last_ms,
-                    &group_undo_heights,
+                    group_undo.make_contiguous(),
                     sync,
                     reason,
                 ) {
                     result = Err(e);
                     break;
                 }
-                group_undo_heights.clear();
+                group_undo.clear();
                 committed_height = current.height as u64;
                 let (live_core, live_prune) =
                     self.live_core_and_prune(info.blocks, info.pruneheight);
@@ -3915,7 +3931,7 @@ impl Indexer {
                 count,
                 group_bytes as u64,
                 last_ms,
-                &group_undo_heights,
+                group_undo.make_contiguous(),
                 sync,
                 reason,
             )?;
@@ -4310,16 +4326,6 @@ fn commit_sync_policy(mode: &str, ibd: bool, height: u64, core_tip: u64) -> bool
         "txids" => false,
         _ => !(ibd || height.saturating_add(1_000) < core_tip),
     }
-}
-
-/// Oldest height whose undo record must survive a commit at `tip`.
-///
-/// Undo is generated for every applied block and pruned only at commit time,
-/// measured from the tip that is actually committed. A commit forced by the
-/// transaction limit, the time limit or the supervisor deadline is therefore
-/// just as rewindable as a full batch.
-fn undo_cutoff(tip: u64, window: u32) -> u64 {
-    tip.saturating_sub(window as u64)
 }
 
 /// Drain-time window: pause Core when the index would need more than
@@ -5515,40 +5521,9 @@ fn build_resolver(
     esplora_urls: Vec<String>,
 ) -> R<Arc<Resolver>> {
     let mut peers = cfg.rawtx.p2p_peers.clone();
-    if cfg.rawtx.enabled && cfg.rawtx.use_p2p && peers.is_empty() {
-        let mut connected = 0usize;
-        // Prefer peers Core is connected to right now: addrman contains many
-        // stale addresses, and each dead peer costs a timeout.
-        if let Ok(list) = core.connected_peers() {
-            for peer in list {
-                if peer.services & 1 == 0 {
-                    continue;
-                }
-                peers.push(peer.addr);
-            }
-            connected = peers.len();
-        }
-        if peers.len() < 8 {
-            if let Ok(addrs) = core.node_addresses(64) {
-                for a in addrs {
-                    if a.services & 1 == 0 {
-                        continue;
-                    }
-                    let host = if a.address.contains(':') && !a.address.starts_with('[') {
-                        format!("[{}]", a.address)
-                    } else {
-                        a.address.clone()
-                    };
-                    peers.push(format!("{host}:{}", a.port));
-                    if peers.len() >= 8 {
-                        break;
-                    }
-                }
-            }
-        }
-        let mut seen = std::collections::HashSet::new();
-        peers.retain(|peer| seen.insert(peer.clone()));
-        peers.truncate(8);
+    if p2p_discovery_enabled(cfg) {
+        let (found, connected) = discover_p2p_peers(core);
+        peers = found;
         if !peers.is_empty() {
             println!(
                 "p2p peers discovered from Core: {} ({} connected)",
@@ -5585,6 +5560,98 @@ fn build_resolver(
     Ok(Arc::new(
         resolver.with_local(Arc::new(CoreBlockSource::new(core.clone()))),
     ))
+}
+
+/// Peers are discovered from Core only when the operator did not pin
+/// `[rawtx] p2p_peers`.
+fn p2p_discovery_enabled(cfg: &Config) -> bool {
+    cfg.rawtx.enabled && cfg.rawtx.use_p2p && cfg.rawtx.p2p_peers.is_empty()
+}
+
+/// Up to 8 full-node (`NODE_NETWORK`) peers from Core: its current
+/// connections first (addrman holds many stale addresses and each dead peer
+/// costs a timeout), then addrman. Returns `(peers, connected)`.
+fn discover_p2p_peers(core: &CoreClient) -> (Vec<String>, usize) {
+    let mut peers = Vec::new();
+    let mut connected = 0usize;
+    if let Ok(list) = core.connected_peers() {
+        for peer in list {
+            if peer.services & 1 == 0 {
+                continue;
+            }
+            peers.push(peer.addr);
+        }
+        connected = peers.len();
+    }
+    if peers.len() < 8 {
+        if let Ok(addrs) = core.node_addresses(64) {
+            for a in addrs {
+                if a.services & 1 == 0 {
+                    continue;
+                }
+                let host = if a.address.contains(':') && !a.address.starts_with('[') {
+                    format!("[{}]", a.address)
+                } else {
+                    a.address.clone()
+                };
+                peers.push(format!("{host}:{}", a.port));
+                if peers.len() >= 8 {
+                    break;
+                }
+            }
+        }
+    }
+    let mut seen = std::collections::HashSet::new();
+    peers.retain(|peer| seen.insert(peer.clone()));
+    peers.truncate(8);
+    (peers, connected)
+}
+
+/// How long until the next peer refresh: soon while the list is empty (Core
+/// just started), otherwise every 10 minutes so dead peers are replaced
+/// before every fetch falls to Esplora.
+fn p2p_refresh_interval(peers: usize) -> Duration {
+    if peers == 0 {
+        Duration::from_secs(60)
+    } else {
+        Duration::from_secs(600)
+    }
+}
+
+/// Refresh the P2P peer list from Core for the whole session (AUD-137).
+fn spawn_p2p_refresh(shared: Arc<Shared>, cfg: &Config) {
+    if !p2p_discovery_enabled(cfg) || shared.resolver.p2p_peers().is_none() {
+        return;
+    }
+    let spawned = std::thread::Builder::new()
+        .name("el-p2p-peers".to_string())
+        .spawn(move || loop {
+            let current = shared.resolver.p2p_peers().unwrap_or(0);
+            let wait = p2p_refresh_interval(current);
+            let started = Instant::now();
+            while started.elapsed() < wait {
+                if shared.shutdown.load(Ordering::Relaxed) {
+                    return;
+                }
+                std::thread::sleep(Duration::from_secs(1));
+            }
+            let (peers, connected) = discover_p2p_peers(&shared.core);
+            // Keep the old list when Core is unreachable or reports none.
+            if peers.is_empty() {
+                continue;
+            }
+            let count = shared.resolver.refresh_p2p_peers(peers).unwrap_or(0);
+            if current == 0 {
+                eprintln!(
+                    "[e-lite] p2p peers discovered from Core: {count} ({connected} connected)"
+                );
+            } else {
+                crate::debug_log!("p2p peers refreshed from Core: {count} ({connected} connected)");
+            }
+        });
+    if let Err(e) = spawned {
+        eprintln!("[e-lite] cannot start the p2p peer refresh thread: {e}");
+    }
 }
 
 fn requires_ready_provider(cfg: &Config, chain: Chain) -> bool {
@@ -5761,6 +5828,7 @@ fn build_shared(
         );
     }
     publish_memory(&shared);
+    spawn_p2p_refresh(Arc::clone(&shared), cfg);
     Ok(shared)
 }
 
@@ -6491,9 +6559,12 @@ fn cmd_export(
 ) -> R<()> {
     let store = open_store(cfg, chain)?;
     let tip = store.committed_tip()?;
-    let digest = store.canonical_digest()?;
     match output {
         None => {
+            // Only the print-only mode needs the digest here; `export` computes
+            // it once while writing the archive (AUD-140: it read the whole
+            // index twice).
+            let digest = store.canonical_digest()?;
             println!("network: {}", chain.name());
             match tip {
                 Some(t) => println!("tip: {} {}", t.height, t.block_hash),
@@ -6542,6 +6613,11 @@ fn cmd_export(
             println!("tip: {} {}", info.height, info.hash);
             println!("txnum: {}", info.txnum);
             println!("logical_snapshot_hash: {}", info.digest);
+            println!(
+                "keep this digest apart from the archive; restore with \
+                 `import-snapshot --expect-digest {}`",
+                info.digest
+            );
             if let Some(core) = &info.core {
                 println!(
                     "core: tip {} {}  prune {}{}  version {}",
@@ -6565,7 +6641,13 @@ fn cmd_export(
     Ok(())
 }
 
-fn cmd_import(cfg: &Config, chain: Chain, input: Option<&str>, verify: Option<&str>) -> R<()> {
+fn cmd_import(
+    cfg: &Config,
+    chain: Chain,
+    input: Option<&str>,
+    verify: Option<&str>,
+    expect_digest: Option<&str>,
+) -> R<()> {
     let input = input.ok_or("import-snapshot requires --input <file.tar.gz>")?;
     let target = cfg.data_dir(chain);
     let info = snapshot::import(
@@ -6574,6 +6656,7 @@ fn cmd_import(cfg: &Config, chain: Chain, input: Option<&str>, verify: Option<&s
         chain,
         &snapshot::ImportOptions {
             verify_hashes: verify.is_some(),
+            expect_digest: expect_digest.map(str::to_string),
         },
     )?;
     println!("restored: {}", target.display());
@@ -6789,23 +6872,42 @@ mod tests {
 
     #[test]
     fn undo_window_is_measured_from_the_real_commit_tip() {
+        // AUD-131: only the window of the tip actually committed is written.
+        let dir = std::env::temp_dir().join(format!(
+            "e-lite-undo-window-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let store = Store::open(&dir).unwrap();
         let window = 288u32;
-        // A 512-block group that commits early at 1159 (time limit) still has
-        // undo for 1158: the old group-end prediction did not.
-        let early = 1_159u64;
-        let cutoff = undo_cutoff(early, window);
-        assert!(
-            1_158 >= cutoff,
-            "the block below an early tip must be undoable"
+        let records: Vec<el_model::UndoRecord> = (600..=1_200u32)
+            .map(|height| el_model::UndoRecord {
+                height,
+                ..Default::default()
+            })
+            .collect();
+        // A group that commits early at 1159 (time limit) still writes undo
+        // for 1158 down to 1159 - 288, and nothing above the committed tip.
+        let mut batch = WriteBatch::default();
+        let written = write_window_undo(&store, &mut batch, &records, 1_159, window).unwrap();
+        assert_eq!(written, window as usize + 1);
+        // A tip below the window keeps everything up to the tip.
+        let low: Vec<el_model::UndoRecord> = (0..=100u32)
+            .map(|height| el_model::UndoRecord {
+                height,
+                ..Default::default()
+            })
+            .collect();
+        let mut batch = WriteBatch::default();
+        assert_eq!(
+            write_window_undo(&store, &mut batch, &low, 100, window).unwrap(),
+            101
         );
-        assert!(early >= cutoff);
-        // A commit forced by the transaction limit at 1100 is fully covered.
-        let limited = 1_100u64;
-        assert!(undo_cutoff(limited, window) <= limited);
-        // Heights older than the window are pruned.
-        assert!(undo_cutoff(1_000, window) < 1_000 - window as u64 + 1);
-        // Tip below the window keeps everything.
-        assert_eq!(undo_cutoff(100, window), 0);
+        drop(store);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -6914,6 +7016,22 @@ mod tests {
         cfg.rawtx.enabled = true;
         cfg.rawtx.use_esplora = false;
         assert!(!requires_ready_provider(&cfg, Chain::Signet));
+    }
+
+    #[test]
+    fn p2p_peers_refresh_soon_when_empty_and_honour_pinned_peers() {
+        assert_eq!(p2p_refresh_interval(0), Duration::from_secs(60));
+        assert_eq!(p2p_refresh_interval(5), Duration::from_secs(600));
+        let mut cfg = Config::default();
+        assert!(p2p_discovery_enabled(&cfg));
+        cfg.rawtx.p2p_peers = vec!["192.0.2.1:8333".into()];
+        assert!(
+            !p2p_discovery_enabled(&cfg),
+            "pinned peers are never replaced"
+        );
+        cfg.rawtx.p2p_peers.clear();
+        cfg.rawtx.use_p2p = false;
+        assert!(!p2p_discovery_enabled(&cfg));
     }
 
     #[test]

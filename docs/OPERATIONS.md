@@ -314,7 +314,7 @@ e-lite export-snapshot --network mainnet --allow-mainnet \
 # Restore into an empty data dir and verify the pair
 e-lite import-snapshot --network mainnet --allow-mainnet \
   --data-dir ~/e-lite/mainnet --input /backups/full-mainnet-<tip>.tar.gz \
-  --verify=full
+  --verify=full --expect-digest <logical_snapshot_hash from the export>
 ```
 
 - `--with-core` bundles the network's Core **chain data** (`<data-dir>/bitcoin`)
@@ -328,6 +328,14 @@ e-lite import-snapshot --network mainnet --allow-mainnet \
 - Without `--with-core` the archive is index-only and never contains the
   Core datadir. `--compress-level` is gzip 0..9 (default 3, balanced);
   `--hash-files` adds SHA-256 per Core file to the manifest.
+- The export prints `logical_snapshot_hash`. Store it **apart from the
+  archive** (password manager, notes): the digest inside the archive only
+  detects corruption, while `--expect-digest` also detects an archive that
+  was replaced or tampered with. Only restore snapshots you made yourself.
+- The import extracts into a hidden `.<name>.import-partial` directory next
+  to the target and renames it into place only after every check passed, so
+  a failed or interrupted import leaves the target untouched; the next
+  import removes the leftover.
 - `--verify` checks the per-file sizes/hashes; `--verify=full` opens the
   restored Core isolated (`-connect=0 -listen=0`), checks both tips and runs
   a bounded `verifychain(2, 288)` before e-lite is started again.

@@ -106,9 +106,17 @@ under "Open findings". Fixed since, not yet released (see `CHANGELOG.md`
   `utxo_by_script`, `tx_occurrences`; no migration. Mainnet cold-scan
   latency still to measure.
 
-Next candidates from the open list: AUD-128 (clearnet fallback default,
-design decision), AUD-130 (schema v2 for disk), AUD-131 (undo in memory),
-AUD-132 (log redaction).
+- Second batch: AUD-131 (undo written only inside the window), AUD-132
+  (log redaction), AUD-133 (generic user agents), AUD-135 (per-request Tor
+  circuits), AUD-137 (P2P peer refresh), AUD-140/141/142 (single digest
+  pass, atomic import, `--expect-digest`), AUD-144, AUD-145.
+
+Still open and needing an owner decision: AUD-128 (clearnet fallback
+default), AUD-130 (schema v2 for disk), AUD-134 (prefetch without decoys is
+an AGENTS invariant), AUD-135 provider rotation (last-good-first is an
+invariant), AUD-136 (route Core through Tor), AUD-143 (hash Core files by
+default), AUD-147 (bind 0.0.0.0). Plain engineering left: AUD-138
+(mempool diff), AUD-139 (per-transaction cache), AUD-146.
 
 ## Last change (alpha.29.10.0)
 

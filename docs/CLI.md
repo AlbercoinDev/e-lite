@@ -27,9 +27,10 @@ onion reset      generate a new onion address (stop e-lite first)
 export-snapshot  print the canonical digest or write --output
                  (--with-core bundles the network's Core datadir; --hash-files
                  adds SHA-256 per Core file; --compress-level 0..9, default 3)
-import-snapshot  restore --input into an empty target
+import-snapshot  restore --input into an empty target (atomic: staged, then renamed)
                  (--verify checks per-file hashes; --verify=full opens the
-                 restored Core and runs a bounded verifychain)
+                 restored Core and runs a bounded verifychain;
+                 --expect-digest <hex> refuses an archive that is not yours)
 version          print version
 ```
 
@@ -52,6 +53,7 @@ version          print version
 | `--input <path>` | snapshot file for `import-snapshot` |
 | `--with-core`, `--hash-files`, `--compress-level <n>` | export-snapshot: bundle the Core chain data (`blocks/`, `chainstate/`, `indexes/` only; never wallets, keys or `bitcoin.conf`), hash its files (gzip level default 3) |
 | `--verify [basic\|full]` | import-snapshot: per-file hash check, or open the restored Core and `verifychain` |
+| `--expect-digest <hex>` | import-snapshot: refuse unless the recomputed index digest equals the `logical_snapshot_hash` printed by your export |
 | `--min-free-gib <n>`, `--critical-free-gib <n>` | disk guards |
 | `--listen <addr>`, `--metrics <addr>` | Electrum plain / metrics listeners |
 | `--tls` / `--no-tls` | enable (default) or disable Electrum TLS |
@@ -137,7 +139,7 @@ e-lite export-snapshot --network mainnet --allow-mainnet \
 
 e-lite import-snapshot --network mainnet --allow-mainnet \
   --data-dir ~/e-lite/mainnet --input /backups/full-mainnet-<tip>.tar.gz \
-  --verify=full
+  --verify=full --expect-digest <logical_snapshot_hash from the export>
 ```
 
 ## Pruning and Core

@@ -131,6 +131,11 @@ impl Default for ExportOptions {
 pub struct ImportOptions {
     /// Verify manifest SHA-256 hashes against the extracted files.
     pub verify_hashes: bool,
+    /// Refuse the snapshot unless the recomputed index digest equals this
+    /// value. The manifest digest travels inside the archive, so it only
+    /// detects corruption; a digest the operator recorded at export time
+    /// also detects a tampered archive (AUD-142).
+    pub expect_digest: Option<String>,
 }
 
 pub fn export(
@@ -474,7 +479,20 @@ pub fn verify_core_files(target: &Path, manifest: &Manifest, verify_hashes: bool
     Ok(())
 }
 
-/// Extract a snapshot into `target` (must be new or empty) and verify it.
+/// Staging directory next to `target` (same filesystem, so the final rename
+/// is atomic): `<parent>/.<name>.import-partial`.
+pub fn staging_dir(target: &Path) -> PathBuf {
+    let name = target
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "data".to_string());
+    target.with_file_name(format!(".{name}.import-partial"))
+}
+
+/// Extract a snapshot and verify it, then move it into `target` (must be new
+/// or empty). Extraction and every check run in a staging directory: an
+/// interrupted or rejected import never leaves a half-restored `target`, and
+/// a retry does not trip over "target not empty" (AUD-141).
 pub fn import(
     input: &Path,
     target: &Path,
@@ -491,8 +509,57 @@ pub fn import(
             .into());
         }
     }
-    fs::create_dir_all(target)?;
+    let expect_digest = options
+        .expect_digest
+        .as_deref()
+        .map(|hex| Hash32::from_hex(hex.trim()).map_err(|e| format!("--expect-digest: {e}")))
+        .transpose()?;
+    let staging = staging_dir(target);
+    if staging.exists() {
+        // Only e-lite creates this name: it is the leftover of an import
+        // that was interrupted (crash, power loss) before cleanup.
+        eprintln!(
+            "[e-lite] removing the leftover of an interrupted import: {}",
+            staging.display()
+        );
+        fs::remove_dir_all(&staging)?;
+    }
+    if let Some(parent) = staging.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::create_dir(&staging)?;
 
+    let result = import_into(input, &staging, chain, options, expect_digest);
+    let mut info = match result {
+        Ok(info) => info,
+        Err(e) => {
+            let _ = fs::remove_dir_all(&staging);
+            return Err(e);
+        }
+    };
+    if target.exists() {
+        fs::remove_dir(target)?; // empty, checked above
+    }
+    if let Err(e) = fs::rename(&staging, target) {
+        let _ = fs::remove_dir_all(&staging);
+        return Err(format!(
+            "cannot move the restored data into {}: {e}",
+            target.display()
+        )
+        .into());
+    }
+    info.path = target.to_path_buf();
+    Ok(info)
+}
+
+/// Extract and verify into `target` (the staging directory).
+fn import_into(
+    input: &Path,
+    target: &Path,
+    chain: Chain,
+    options: &ImportOptions,
+    expect_digest: Option<Hash32>,
+) -> Result<SnapshotInfo, E> {
     let file = File::open(input)?;
     let mut archive = tar::Archive::new(GzDecoder::new(file));
     for entry in archive.entries()? {
@@ -567,6 +634,15 @@ pub fn import(
         return Err(
             format!("snapshot digest mismatch: recomputed {digest}, manifest {expected}").into(),
         );
+    }
+    if let Some(wanted) = expect_digest {
+        if digest != wanted {
+            return Err(format!(
+                "snapshot digest {digest} is not the expected {wanted}; the archive is not the \
+                 one you exported (refusing)"
+            )
+            .into());
+        }
     }
     if let Some(core) = &manifest.core {
         validate_core_coherence(&manifest, core).map_err(|m| -> E { m.into() })?;
@@ -961,6 +1037,9 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.to_string().contains("snapshot belongs to mainnet"));
+        // AUD-141: a rejected import leaves no partial target behind.
+        assert!(!target.exists(), "target must not be created");
+        assert!(!staging_dir(&target).exists(), "staging must be cleaned");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1001,6 +1080,77 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.to_string().contains("unsupported snapshot format 99"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn exported_regtest_snapshot(dir: &Path) -> (PathBuf, String) {
+        let data = dir.join("source");
+        let store = Store::open(&data).unwrap();
+        store
+            .init_identity(&el_model::NetworkIdentity::new(
+                Chain::Regtest,
+                Chain::Regtest.known_genesis().unwrap(),
+            ))
+            .unwrap();
+        let tip = el_model::IndexedTip {
+            height: 5,
+            block_hash: Hash32([0x5a; 32]),
+            schema_version: SCHEMA_VERSION,
+            txnum: 0,
+        };
+        store.commit_tip_only(Store::batch(), &tip).unwrap();
+        let archive = dir.join("snap.tar.gz");
+        let info = export(&store, Chain::Regtest, &archive, &ExportOptions::default()).unwrap();
+        (archive, info.digest)
+    }
+
+    #[test]
+    fn import_is_atomic_and_checks_the_expected_digest() {
+        let dir = std::env::temp_dir().join(format!(
+            "e-lite-snapshot-atomic-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (archive, digest) = exported_regtest_snapshot(&dir);
+        let target = dir.join("restored");
+
+        // AUD-142: a digest the operator did not record is refused, and the
+        // refusal leaves nothing behind (AUD-141).
+        let wrong = ImportOptions {
+            expect_digest: Some("00".repeat(32)),
+            ..Default::default()
+        };
+        let err = import(&archive, &target, Chain::Regtest, &wrong).unwrap_err();
+        assert!(err.to_string().contains("not the expected"), "{err}");
+        assert!(!target.exists());
+        assert!(!staging_dir(&target).exists());
+        let bad_hex = ImportOptions {
+            expect_digest: Some("xyz".into()),
+            ..Default::default()
+        };
+        assert!(import(&archive, &target, Chain::Regtest, &bad_hex)
+            .unwrap_err()
+            .to_string()
+            .contains("--expect-digest"));
+
+        // The leftover of an interrupted import is replaced, and an empty
+        // existing target is accepted.
+        std::fs::create_dir_all(staging_dir(&target).join("junk")).unwrap();
+        std::fs::create_dir_all(&target).unwrap();
+        let right = ImportOptions {
+            expect_digest: Some(digest.to_uppercase()),
+            ..Default::default()
+        };
+        let info = import(&archive, &target, Chain::Regtest, &right).unwrap();
+        assert_eq!(info.digest, digest);
+        assert_eq!(info.path, target);
+        assert!(target.join(MANIFEST_NAME).is_file());
+        assert!(!target.join("junk").exists());
+        assert!(!staging_dir(&target).exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

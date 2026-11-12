@@ -69,7 +69,12 @@ Never treat a version number in this file as authoritative over the code/tag.
   `settings.json`, mempool/peers/cookie/logs and other networks' subdirs are
   never copied and are listed as "not copied" by the export (AUD-126).
   gzip level is `--compress-level` (default 3, balanced; 0 stores).
-  `import-snapshot` needs an empty target and validates network/genesis/
+  `import-snapshot` needs an empty target, extracts and validates in a
+  sibling `.<name>.import-partial` staging dir and renames it into place only
+  when every check passed (AUD-141; a leftover staging dir is removed on the
+  next import). `--expect-digest <hex>` refuses an archive whose recomputed
+  digest is not the one the operator recorded at export (AUD-142). It
+  validates network/genesis/
   schema/tip/digest plus the Core rules `index tip <= Core tip` and
   `prune_height <= index tip - 288`; `--verify` checks the per-file SHA-256
   table and `--verify=full` opens the restored Core with `-connect=0`
@@ -81,13 +86,16 @@ Never treat a version number in this file as authoritative over the code/tag.
   every 5k safe blocks / 30 s.
 - Never authorise a Core prune from a tip that is not durable: flush RocksDB/WAL
   first. A failed prune RPC must retry the same safe height after backoff.
-- Undo is generated for **every** applied block and pruned at commit time from
-  the tip that is actually committed (`undo_cutoff`). A commit forced by the
-  time limit, the transaction limit or the supervisor deadline must be as
-  rewindable as a full batch; the old group-end prediction could commit a tip
-  without undo. Pruning must also delete undo added by the same `WriteBatch`
-  (`group_undo_heights`), which a DB-only scan cannot see. A Core rollback
-  deeper than the window is `NEEDS_RECOVERY`, never a silent reindex.
+- Undo is **built** for every applied block (`apply_prepared_deferred_undo`)
+  and kept in memory, trimmed to the reorg window as the group grows; at
+  commit only the records inside the window of the tip actually committed are
+  written (`write_window_undo`), and older ones in the database are deleted
+  in the same batch (`prune_undo`). A commit forced by the time limit, the
+  transaction limit, a boundary or shutdown must be as rewindable as a full
+  batch; the old group-end prediction could commit a tip without undo.
+  Never write undo into a bulk batch just to delete it at commit (AUD-131: it
+  was ~a third of the IBD write volume). A Core rollback deeper than the
+  window is `NEEDS_RECOVERY`, never a silent reindex.
 - Crash recovery: SIGKILL during indexing, a write failure and a reorg at the
   indexed tip must all recover through RocksDB/WAL and undo. Covered by
   `tests/e2e_recovery.sh`; run it after touching commit, undo or rewind.
@@ -201,6 +209,15 @@ Never treat a version number in this file as authoritative over the code/tag.
   scriptpubkey subscriptions get a forced notification on reorg even if the
   status string is unchanged. Outpoint status resolution runs in a bounded
   worker pool, never in the notifier thread.
+- External requests do not identify e-lite: HTTP `User-Agent` is
+  `el_rawtx::HTTP_USER_AGENT` and the P2P subversion `P2P_USER_AGENT`
+  (AUD-133). Every Esplora request over Tor uses a fresh random SOCKS
+  username, so Tor (`IsolateSOCKSAuth`) puts each block on its own circuit
+  (AUD-135). Logs never print a script hash, txid or the block hash of a
+  wallet request: use `RawtxError::kind()`/`redact_hashes`, and reqwest
+  errors only via `without_url()` (AUD-132). P2P peers discovered from Core
+  are refreshed every 10 min (60 s while empty) by `el-p2p-peers`; pinned
+  `p2p_peers` are never replaced (AUD-137).
 - Provider health is sticky: a failed Tor **or direct** request cools that
   provider for `provider_cooldown_seconds` (300 s), and the last successful
   provider is tried first. A provider that already answered is cooled for at

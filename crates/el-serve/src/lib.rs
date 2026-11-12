@@ -2204,11 +2204,11 @@ fn mempool_value(shared: &Shared, script: ScriptHash) -> RpcResult<Value> {
 
 fn scripthash_history(shared: &Shared, params: &Value) -> RpcResult<Value> {
     let script = param_scripthash(params)?;
+    // Never log the script hash: it identifies a wallet address (AUD-132).
     history_value(shared, script, -32000).inspect_err(|e| {
         eprintln!(
-            "[e-lite] get_history {} failed: {}",
-            script.to_electrum_hex(),
-            e.message
+            "[e-lite] get_history failed: {}",
+            el_rawtx::redact_hashes(&e.message)
         );
     })
 }

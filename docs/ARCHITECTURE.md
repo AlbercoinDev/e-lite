@@ -129,8 +129,9 @@ provider details are in [`PRIVACY.md`](PRIVACY.md).
   `history`, `utxo`, `utxo_by_script`, `undo`.
 - Flat `txids.dat` in chain order; commits append/fsync it before atomically
   advancing `committed_tip`.
-- Undo records are retained for the reorg window; historical catch-up skips
-  writing undo far from the tip.
+- Undo records are retained for the reorg window. Catch-up builds undo for
+  every block in memory and writes only the records inside the window of the
+  committed tip, so historical blocks far below the tip never write undo.
 - Snapshots are optional tar.gz exports of the database plus a manifest
   (network, genesis, tip, schema, txnum, canonical digest). They are never
   required for the from-zero flow.

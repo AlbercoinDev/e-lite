@@ -16,7 +16,7 @@ use std::collections::{HashMap, HashSet};
 use std::io::{self, BufReader, Read, Write};
 use std::net::{IpAddr, TcpStream, ToSocketAddrs};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 const PROTOCOL_VERSION: i32 = 70016;
@@ -28,7 +28,9 @@ const NODE_WITNESS: u64 = 1 << 3;
 const MSG_WITNESS_BLOCK: u32 = 2 | (1 << 30);
 
 pub struct P2pSource {
-    peers: Vec<String>,
+    /// Replaced at runtime by `set_peers` (AUD-137): a list discovered once
+    /// at start goes stale, or is empty if Core had no peers yet.
+    peers: RwLock<Vec<String>>,
     tor_socks: Option<String>,
     timeout: Duration,
     magic: [u8; 4],
@@ -144,7 +146,7 @@ fn version_payload(services: u64, height: i32) -> Vec<u8> {
     p.extend_from_slice(&[0u8; 16]);
     p.extend_from_slice(&0u16.to_be_bytes());
     p.extend_from_slice(&rand::random::<u64>().to_le_bytes());
-    put_varstr(b"/e-lite:0.1/", &mut p);
+    put_varstr(crate::P2P_USER_AGENT, &mut p);
     p.extend_from_slice(&height.to_le_bytes());
     p.push(1);
     p
@@ -409,7 +411,7 @@ impl P2pSource {
         cooldown: Duration,
     ) -> Self {
         P2pSource {
-            peers,
+            peers: RwLock::new(peers),
             tor_socks,
             timeout,
             magic: chain.magic(),
@@ -423,6 +425,30 @@ impl P2pSource {
             tor_cooldown_until: Mutex::new(None),
             stats: None,
         }
+    }
+
+    /// Replace the peer list. Cooldowns and the last good peer are kept for
+    /// peers that are still listed. Returns the new peer count.
+    pub fn set_peers(&self, mut peers: Vec<String>) -> usize {
+        let mut seen = HashSet::new();
+        peers.retain(|p| seen.insert(p.clone()));
+        let count = peers.len();
+        if let Ok(mut failures) = self.peer_failures.lock() {
+            failures.retain(|peer, _| seen.contains(peer));
+        }
+        if let Ok(mut good) = self.last_good.lock() {
+            if good.as_ref().is_some_and(|g| !seen.contains(g)) {
+                *good = None;
+            }
+        }
+        if let Ok(mut current) = self.peers.write() {
+            *current = peers;
+        }
+        count
+    }
+
+    pub fn peer_count(&self) -> usize {
+        self.peers.read().map(|p| p.len()).unwrap_or(0)
     }
 
     /// Attach the resolver's counters (optional; tests omit it).
@@ -712,10 +738,10 @@ impl BlockSource for P2pSource {
     }
 
     fn fetch_block(&self, hash: &Hash32) -> Result<Vec<u8>> {
-        if self.peers.is_empty() {
+        let mut peers = self.peers.read().map(|p| p.clone()).unwrap_or_default();
+        if peers.is_empty() {
             return Err(RawtxError::Unavailable("no p2p peers".into()));
         }
-        let mut peers = self.peers.clone();
         peers.shuffle(&mut thread_rng());
         if let Some(good) = self.last_good.lock().ok().and_then(|g| g.clone()) {
             if let Some(pos) = peers.iter().position(|p| *p == good) {
@@ -911,6 +937,10 @@ mod tests {
         let payload = version_payload(NODE_WITNESS, 0);
         let services = u64::from_le_bytes(payload[4..12].try_into().unwrap());
         assert_eq!(services & NODE_WITNESS, NODE_WITNESS);
+        // AUD-133: no e-lite-specific user agent on the wire.
+        let ua = crate::P2P_USER_AGENT;
+        assert!(payload.windows(ua.len()).any(|w| w == ua));
+        assert!(!payload.windows(6).any(|w| w == b"e-lite"));
     }
 
     fn test_block() -> Block {
