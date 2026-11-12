@@ -479,6 +479,29 @@ pub fn verify_core_files(target: &Path, manifest: &Manifest, verify_hashes: bool
     Ok(())
 }
 
+/// Extraction re-checks free space after every this many bytes.
+const FREE_SPACE_CHECK_BYTES: u64 = 256 * 1024 * 1024;
+/// Never extract below this much free space on the target filesystem.
+const IMPORT_FREE_FLOOR: u64 = 1024 * 1024 * 1024;
+
+fn check_free_space(dir: &Path, needed: u64, written: u64) -> Result<(), E> {
+    let Some(free) = el_chain::disk_free_bytes(dir) else {
+        return Ok(()); // unknown filesystem: do not block the restore
+    };
+    if free < needed {
+        let gib = |b: u64| b as f64 / (1024.0 * 1024.0 * 1024.0);
+        return Err(format!(
+            "not enough free space for the restore: {:.1} GiB free, need at least {:.1} GiB \
+             more ({:.1} GiB extracted so far); the partial restore is removed",
+            gib(free),
+            gib(needed),
+            gib(written)
+        )
+        .into());
+    }
+    Ok(())
+}
+
 /// Staging directory next to `target` (same filesystem, so the final rename
 /// is atomic): `<parent>/.<name>.import-partial`.
 pub fn staging_dir(target: &Path) -> PathBuf {
@@ -560,10 +583,23 @@ fn import_into(
     options: &ImportOptions,
     expect_digest: Option<Hash32>,
 ) -> Result<SnapshotInfo, E> {
+    // The uncompressed size is only known at the end of the archive, so the
+    // free space is checked before (at least the archive size) and while
+    // extracting: a restore must fail cleanly, not fill the disk (AUD-141).
+    let archive_bytes = fs::metadata(input)?.len();
+    check_free_space(target, archive_bytes, 0)?;
+    let mut written = 0u64;
+    let mut next_check = FREE_SPACE_CHECK_BYTES;
+
     let file = File::open(input)?;
     let mut archive = tar::Archive::new(GzDecoder::new(file));
     for entry in archive.entries()? {
         let mut entry = entry?;
+        written = written.saturating_add(entry.header().size().unwrap_or(0));
+        if written >= next_check {
+            check_free_space(target, IMPORT_FREE_FLOOR, written)?;
+            next_check = written.saturating_add(FREE_SPACE_CHECK_BYTES);
+        }
         let kind = entry.header().entry_type();
         // Symlinks/hardlinks and device nodes would let a malicious archive
         // escape the target directory or create special files. Regular files,
@@ -1152,5 +1188,16 @@ mod tests {
         assert!(!target.join("junk").exists());
         assert!(!staging_dir(&target).exists());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn restore_refuses_to_fill_the_disk() {
+        let dir = std::env::temp_dir();
+        assert!(check_free_space(&dir, 0, 0).is_ok());
+        let err = check_free_space(&dir, u64::MAX, 5 << 30)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("not enough free space"), "{err}");
+        assert!(err.contains("5.0 GiB extracted"), "{err}");
     }
 }

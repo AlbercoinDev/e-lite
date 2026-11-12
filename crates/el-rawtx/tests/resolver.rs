@@ -118,8 +118,12 @@ fn tmp(name: &str) -> PathBuf {
 
 /// Store a chain of dummy headers plus the real block at `height`.
 fn setup(dir: &PathBuf, height: u32) -> (Arc<Store>, Hash32, Hash32, Vec<u8>) {
+    setup_with(dir, height, test_block())
+}
+
+/// Like `setup`, with any block at `height`. Returns the first txid.
+fn setup_with(dir: &PathBuf, height: u32, block: Block) -> (Arc<Store>, Hash32, Hash32, Vec<u8>) {
     let store = Arc::new(Store::open(dir).unwrap());
-    let block = test_block();
     let bytes = bitcoin::consensus::serialize(&block);
     let hash = Hash32::from_hex(&block.block_hash().to_string()).unwrap();
     let header: [u8; 80] = bitcoin::consensus::serialize(&block.header)
@@ -137,7 +141,11 @@ fn setup(dir: &PathBuf, height: u32) -> (Arc<Store>, Hash32, Hash32, Vec<u8>) {
                 Hash32([h as u8; 32])
             },
             header: if h == height { header } else { [h as u8; 80] },
-            tx_count: 1,
+            tx_count: if h == height {
+                block.txdata.len() as u32
+            } else {
+                1
+            },
             txnum_base: h as u64,
         };
         store.put_block(&mut batch, &rec).unwrap();
@@ -277,16 +285,19 @@ fn falls_back_to_a_good_source_after_a_corrupt_one() {
     let (store, _hash, txid, bytes) = setup(&dir, 0);
     let bad = MockSource::new("bad", bytes.clone(), true);
     let good = MockSource::new("good", bytes, false);
-    let resolver = Resolver::new(Arc::clone(&store), &config(0, 0))
-        .unwrap()
-        .with_external(bad.clone())
-        .with_external(good.clone());
-    // Sources are shuffled per request; over repeated calls the corrupt one is
-    // tried first at least once and the valid one is always reached.
+    // Sources are shuffled per request; over repeated fresh resolvers (no
+    // cache, no block kept in memory) the corrupt one is tried first at least
+    // once and the valid one is always reached.
+    let mut failures = 0;
     for _ in 0..20 {
+        let resolver = Resolver::new(Arc::clone(&store), &config(0, 0))
+            .unwrap()
+            .with_external(bad.clone())
+            .with_external(good.clone());
         assert!(resolver.raw_tx(txid, 0).is_ok());
+        failures += resolver.stats().verify_failures.load(Ordering::SeqCst);
     }
-    assert!(resolver.stats().verify_failures.load(Ordering::SeqCst) >= 1);
+    assert!(failures >= 1);
     assert!(good.calls.load(Ordering::SeqCst) >= 1);
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -558,4 +569,133 @@ fn p2p_source_counts_only_once_it_has_peers() {
     assert_eq!(off.refresh_p2p_peers(vec!["192.0.2.3:18444".into()]), None);
     drop(store);
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A block with a coinbase and `extra` plain transactions.
+fn multi_tx_block(extra: u8) -> Block {
+    let mut block = test_block();
+    for i in 0..extra {
+        block.txdata.push(Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint {
+                    txid: bitcoin::Txid::from_byte_array([i + 1; 32]),
+                    vout: 0,
+                },
+                script_sig: ScriptBuf::from_bytes(vec![i]),
+                sequence: Sequence::MAX,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(10 + i as u64),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x51, i]),
+            }],
+        });
+    }
+    block.header.merkle_root = block.compute_merkle_root().unwrap();
+    block
+}
+
+fn txid_of(tx: &Transaction) -> Hash32 {
+    Hash32::from_hex(&tx.compute_txid().to_string()).unwrap()
+}
+
+#[test]
+fn transaction_cache_serves_after_restart_without_any_source() {
+    // AUD-139: transactions, not blocks, are cached on disk, and they are
+    // authenticated against the indexed header after a restart.
+    let dir = tmp("txcache-restart");
+    let block = multi_tx_block(3);
+    let wanted = txid_of(&block.txdata[2]);
+    let (store, _hash, _txid, bytes) = setup_with(&dir, 0, block);
+    let src = MockSource::new("mock", bytes, false);
+    let first = Resolver::new(Arc::clone(&store), &config(0, 8))
+        .unwrap()
+        .with_external(src.clone());
+    let raw = first.raw_tx(wanted, 0).unwrap();
+    assert_eq!(src.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(first.cached_txs(), 1);
+    let cache_dir = first.cache_dir().to_path_buf();
+    drop(first);
+    // No whole block was written for a wallet request.
+    let blocks_on_disk = std::fs::read_dir(&cache_dir)
+        .unwrap()
+        .flatten()
+        .filter(|e| e.file_name().to_string_lossy().ends_with(".blk"))
+        .count();
+    assert_eq!(blocks_on_disk, 0);
+
+    let silent = MockSource::new("silent", Vec::new(), true);
+    let second = Resolver::new(Arc::clone(&store), &config(0, 8))
+        .unwrap()
+        .with_external(silent.clone());
+    assert_eq!(second.raw_tx(wanted, 0).unwrap(), raw);
+    assert_eq!(silent.calls.load(Ordering::SeqCst), 0, "served from disk");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_burst_and_a_prefetch_need_one_block_download() {
+    let dir = tmp("txcache-burst");
+    let block = multi_tx_block(4);
+    let ids: Vec<Hash32> = block.txdata.iter().map(txid_of).collect();
+    let (store, _hash, _txid, bytes) = setup_with(&dir, 0, block);
+    let src = MockSource::new("mock", bytes, false);
+    let resolver = Resolver::new(Arc::clone(&store), &config(0, 8))
+        .unwrap()
+        .with_external(src.clone());
+    // Prefetch caches every listed transaction from one download ...
+    assert_eq!(resolver.prefetch_block_txs(0, &ids[1..3]).unwrap(), 2);
+    assert_eq!(src.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(resolver.prefetch_block_txs(0, &ids[1..3]).unwrap(), 0);
+    // ... and other transactions of the same block come from memory.
+    for id in &ids {
+        resolver.raw_tx(*id, 0).unwrap();
+    }
+    assert_eq!(src.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(resolver.cached_txs(), ids.len());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_cached_transaction_that_does_not_match_the_header_is_dropped() {
+    let dir = tmp("txcache-forged");
+    let block = multi_tx_block(1);
+    let id = txid_of(&block.txdata[1]);
+    let (store, _hash, _txid, bytes) = setup_with(&dir, 0, block);
+    let src = MockSource::new("mock", bytes, false);
+    let resolver = Resolver::new(Arc::clone(&store), &config(0, 8))
+        .unwrap()
+        .with_external(src.clone());
+    resolver.raw_tx(id, 0).unwrap();
+    let cache_dir = resolver.cache_dir().join("tx");
+    drop(resolver);
+    // Rewrite the stored position: the branch no longer reproduces the root.
+    let hex = id.to_hex();
+    let path = cache_dir.join(&hex[..2]).join(format!("{hex}.tx"));
+    let mut entry = std::fs::read(&path).unwrap();
+    entry[8..12].copy_from_slice(&0u32.to_be_bytes());
+    std::fs::write(&path, entry).unwrap();
+
+    let resolver = Resolver::new(Arc::clone(&store), &config(0, 8))
+        .unwrap()
+        .with_external(src.clone());
+    resolver.raw_tx(id, 0).unwrap();
+    assert!(resolver.stats().verify_failures.load(Ordering::SeqCst) >= 1);
+    assert_eq!(
+        src.calls.load(Ordering::SeqCst),
+        2,
+        "refetched after rejection"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn cache_budget_is_split_between_blocks_and_transactions() {
+    assert_eq!(el_rawtx::cache_split(0), (0, 0));
+    assert_eq!(el_rawtx::cache_split(1), (1, 0));
+    assert_eq!(el_rawtx::cache_split(8), (2, 6));
+    assert_eq!(el_rawtx::cache_split(256), (64, 192));
+    assert_eq!(el_rawtx::cache_split(1024), (64, 960));
 }

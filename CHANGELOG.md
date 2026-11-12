@@ -2,6 +2,50 @@
 
 ## Unreleased
 
+### Transaction cache, incremental mempool, faster notifications
+
+No schema, protocol or snapshot-format change. The rawtx cache format
+changes (see AUD-139); old cache entries remain readable.
+
+- **AUD-139 (privacy + disk)**: the rawtx cache stores verified
+  **transactions** with their merkle branch (`rawtx-cache/tx/`), checked
+  against the indexed header on every read, instead of whole blocks. The
+  same `cache_mib` holds tens of thousands of wallet transactions instead of
+  ~170 blocks, so far fewer block hashes are sent to third parties again.
+  Whole blocks are kept only for prune-gap repair, in a quarter of the
+  budget (1..64 MiB); existing block caches above that are trimmed at start.
+  The last 8 verified external blocks stay in memory, and the history
+  prefetcher caches every history transaction of a block from one download.
+- **AUD-138 (mempool)**: the poller lists txids (`getrawmempool false`) every
+  3 s instead of the verbose listing of the whole mempool; only when the list
+  changed is the overlay cloned and `getmempoolentry` + the raw transaction
+  fetched for the new txids. Confirmed prevouts are cached while the index
+  tip does not change.
+- **AUD-146 (serving)**: notifications are sent as soon as a commit or a
+  mempool change marks a script (was a fixed 2 s poll); a notification gets a
+  2 s write timeout and a client that cannot take it is disconnected instead
+  of blocking every other client for 30 s. `listunspent` orders UTXOs by
+  height and **position in the block** (was txid). At the tip the catch-up
+  spawns no more reader threads than blocks requested.
+- **AUD-141**: `import-snapshot` checks free space before extracting (at
+  least the archive size) and every 256 MiB while extracting, and stops above
+  a 1 GiB floor with the partial restore removed.
+- **AUD-132**: `tests/log_redaction.rs` rejects any log macro that prints a
+  script hash or a txid.
+- `tests/e2e_regtest.sh` waits up to 50 s (was 20 s) for `/healthz`: `run`
+  waits up to 30 s for a freshly created managed Tor, so a slow Tor network
+  made the test fail intermittently. It now prints the log tail on failure.
+- Tests: `entries_round_trip_and_corruption_is_dropped`,
+  `evicts_least_recently_used_and_survives_reopen`,
+  `transaction_cache_serves_after_restart_without_any_source`,
+  `a_burst_and_a_prefetch_need_one_block_download`,
+  `a_cached_transaction_that_does_not_match_the_header_is_dropped`,
+  `cache_budget_is_split_between_blocks_and_transactions`,
+  `confirmed_prevouts_are_cached_until_the_tip_moves`,
+  `notifier_wakes_on_a_mark_instead_of_polling`,
+  `listunspent_follows_block_order_not_txid_order`,
+  `restore_refuses_to_fill_the_disk`, `log_macros_do_not_print_wallet_data`.
+
 ### IBD write volume, log redaction, Tor isolation, P2P peers, safer restores
 
 No schema, protocol or snapshot-format change; the database written by the

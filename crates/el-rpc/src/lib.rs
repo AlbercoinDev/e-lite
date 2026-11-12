@@ -484,6 +484,17 @@ impl CoreClient {
         self.call("getrawmempool", serde_json::json!([false]))
     }
 
+    /// `getmempoolentry` for a batch of txids. A transaction that left the
+    /// mempool between the listing and this call yields `None`.
+    pub fn batch_mempool_entries(&self, txids: &[String]) -> Result<Vec<Option<MempoolEntry>>> {
+        let params: Vec<serde_json::Value> = txids.iter().map(|t| serde_json::json!([t])).collect();
+        let results = self.batch("getmempoolentry", params)?;
+        Ok(results
+            .into_iter()
+            .map(|r| r.ok().and_then(|v| serde_json::from_value(v).ok()))
+            .collect())
+    }
+
     pub fn ping(&self) -> Result<()> {
         let _: serde_json::Value = self.call("getblockcount", serde_json::json!([]))?;
         Ok(())

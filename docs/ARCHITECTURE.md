@@ -113,11 +113,11 @@ gap that cannot be repaired from verified sources stops with a clear
 |---|---|---|---|
 | Headers / header subscription | yes | active-chain hashes | no |
 | Script history, balance, UTXOs | yes | no | no |
-| Mempool history/UTXOs/fees | overlay | `getrawmempool`, estimates | no |
+| Mempool history/UTXOs/fees | overlay | `getrawmempool false` + `getmempoolentry` for new txids, estimates | no |
 | Merkle and checkpoint proofs | yes + headers | no | no |
 | Broadcast | no | `sendrawtransaction` | no |
 | Raw tx, unpruned block | no | `blk*.dat` / RPC | no |
-| Raw tx, pruned block | optional cache | fails | P2P/Esplora, whole block by hash |
+| Raw tx, pruned block | transaction cache | fails | P2P/Esplora, whole block by hash |
 | Prune-gap repair | optional cache | fails | P2P/Esplora, whole block by hash |
 
 Electrum method list and status are in [`FEATURES.md`](FEATURES.md). Privacy and

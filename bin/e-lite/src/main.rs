@@ -3548,7 +3548,9 @@ impl Indexer {
         }
         let hashes_len = hashes.len();
 
-        let workers = self.tunables.readers();
+        // At the tip a call asks for one or two blocks every 500 ms: spawning
+        // the full reader pool for that was pure thread churn (AUD-146).
+        let workers = self.tunables.readers().min(hashes_len).max(1);
         let hashes = Arc::new(hashes);
         let next_index = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let (tx, rx) = std::sync::mpsc::sync_channel::<(usize, FetchResult)>(workers * 2);

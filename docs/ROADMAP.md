@@ -40,7 +40,7 @@ acceptance signal that would move it to `FEATURES.md`.
 | P2 | Periodic provider health/cooldown | startup readiness, latency and Tor→clearnet fallback are implemented (alpha.29.1). Add periodic re-probing, cooldown and per-source policy; still whole-block only. |
 | P2 | Tor stream isolation verification | Per-request SOCKS credentials for Esplora and P2P are delivered and unit-tested against a fake SOCKS server (unreleased); still missing: a test against a real Tor that checks distinct circuits, and provider rotation instead of last-good-first. |
 | P2 | Decoy scheduling improvements | avoid temporal correlation while keeping bandwidth bounded. |
-| P2 | Log/metric redaction audit | The known leaks are fixed (AUD-132, unreleased); still missing: a lint/test that checks every log format string. |
+| P3 | Log/metric redaction audit | Delivered (unreleased): leaks fixed (AUD-132) and `tests/log_redaction.rs` rejects log macros that print script hashes or txids. Still missing: the same check for `/status` and `/metrics` output. |
 
 ## Compatibility and operations
 

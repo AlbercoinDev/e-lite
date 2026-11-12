@@ -5,5 +5,5 @@ pub mod merkle;
 pub mod types;
 
 pub use codec::{CodecError, SCHEMA_VERSION};
-pub use merkle::{merkle_branch, merkle_root};
+pub use merkle::{merkle_branch, merkle_root, merkle_root_from_branch};
 pub use types::*;

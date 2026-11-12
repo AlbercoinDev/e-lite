@@ -115,8 +115,11 @@ Still open and needing an owner decision: AUD-128 (clearnet fallback
 default), AUD-130 (schema v2 for disk), AUD-134 (prefetch without decoys is
 an AGENTS invariant), AUD-135 provider rotation (last-good-first is an
 invariant), AUD-136 (route Core through Tor), AUD-143 (hash Core files by
-default), AUD-147 (bind 0.0.0.0). Plain engineering left: AUD-138
-(mempool diff), AUD-139 (per-transaction cache), AUD-146.
+default), AUD-147 (bind 0.0.0.0). - Third batch: AUD-138 (mempool by txid diff), AUD-139 (transaction
+  cache), AUD-146 (notifier wake-up, notification timeout, `listunspent`
+  order, readers at the tip), AUD-141 free-space checks, AUD-132 log lint.
+  Also needing a decision: AUD-140's gzip default and online export (needs a
+  control endpoint). Nothing in this batch is measured on mainnet yet.
 
 ## Last change (alpha.29.10.0)
 

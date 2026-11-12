@@ -67,6 +67,24 @@ pub fn merkle_branch(txids: &[Hash32], pos: usize) -> Option<(Hash32, Vec<Hash32
     Some((Hash32(level[0]).reversed(), branch))
 }
 
+/// Root reached from `leaf` at `pos` through `branch` (all in display order).
+/// The inverse of `merkle_branch`: a cached transaction is authenticated by
+/// comparing this with the indexed header's merkle root.
+pub fn merkle_root_from_branch(leaf: Hash32, branch: &[Hash32], pos: usize) -> Hash32 {
+    let mut cur = leaf.reversed().0;
+    let mut idx = pos;
+    for sib in branch {
+        let s = sib.reversed().0;
+        cur = if idx % 2 == 0 {
+            sha256d(&cur, &s)
+        } else {
+            sha256d(&s, &cur)
+        };
+        idx /= 2;
+    }
+    Hash32(cur).reversed()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -122,6 +140,14 @@ mod tests {
                     idx /= 2;
                 }
                 assert_eq!(Hash32(cur).reversed(), root);
+                assert_eq!(
+                    merkle_root_from_branch(
+                        txids[pos],
+                        &merkle_branch(&txids, pos).unwrap().1,
+                        pos
+                    ),
+                    root
+                );
             }
         }
     }

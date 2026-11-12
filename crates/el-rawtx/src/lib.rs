@@ -9,13 +9,14 @@ pub mod cache;
 pub mod core_source;
 pub mod esplora;
 pub mod p2p;
+pub mod txcache;
 pub mod verify;
 
 use el_model::{Chain, Hash32};
 use el_store::Store;
 use rand::seq::SliceRandom;
 use rand::thread_rng;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::panic::AssertUnwindSafe;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -34,6 +35,64 @@ pub const HTTP_USER_AGENT: &str = "Mozilla/5.0";
 pub const P2P_USER_AGENT: &[u8] = b"/Satoshi:29.0.0/";
 
 pub use cache::BlockCache;
+pub use txcache::TxCache;
+
+/// Verified external blocks kept in memory (a mainnet block decodes to a few
+/// MiB; 8 cover a wallet's burst of requests without a re-download).
+const RECENT_BLOCKS: usize = 8;
+
+/// Where a verified block came from; decoys follow external fetches only.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Origin {
+    Recent,
+    BlockCache,
+    Local,
+    External,
+}
+
+/// Split the `cache_mib` disk budget: `(block_mib, tx_mib)`. Whole blocks
+/// get a quarter, at least 1 and at most 64 MiB; transactions the rest.
+pub fn cache_split(cache_mib: u64) -> (u64, u64) {
+    if cache_mib == 0 {
+        return (0, 0);
+    }
+    let block = (cache_mib / 4).clamp(1, 64);
+    (block, cache_mib - block)
+}
+
+/// Full verification of a block against the indexed record.
+fn verify_full(bytes: &[u8], rec: &el_model::BlockRecord) -> Result<bitcoin::Block> {
+    let block = verify_block(bytes, &rec.hash, &rec.header)?;
+    verify_witness_commitment(&block)?;
+    Ok(block)
+}
+
+/// A cached transaction must reproduce the indexed header's merkle root.
+fn verify_cached_tx(
+    entry: &txcache::CachedTx,
+    rec: &el_model::BlockRecord,
+    txid: Hash32,
+) -> Result<()> {
+    if entry.height != rec.height || entry.tx_pos >= rec.tx_count {
+        return Err(RawtxError::Verify(
+            "cached position does not match the index".into(),
+        ));
+    }
+    let tx: bitcoin::Transaction = bitcoin::consensus::deserialize(&entry.raw)
+        .map_err(|e| RawtxError::Verify(format!("cannot decode cached tx: {e}")))?;
+    let computed = Hash32::from_hex(&tx.compute_txid().to_string())
+        .map_err(|e| RawtxError::Verify(format!("bad txid: {e}")))?;
+    if computed != txid {
+        return Err(RawtxError::Verify("cached txid mismatch".into()));
+    }
+    let header: bitcoin::block::Header = bitcoin::consensus::deserialize(&rec.header)
+        .map_err(|e| RawtxError::Verify(format!("bad indexed header: {e}")))?;
+    let root = el_model::merkle_root_from_branch(txid, &entry.branch, entry.tx_pos as usize);
+    if root.to_hex() != header.merkle_root.to_string() {
+        return Err(RawtxError::Verify("cached merkle branch mismatch".into()));
+    }
+    Ok(())
+}
 pub use core_source::CoreBlockSource;
 pub use esplora::EsploraSource;
 pub use p2p::P2pSource;
@@ -242,7 +301,12 @@ pub struct Resolver {
     /// P2P source, kept apart so its peer list can be refreshed (AUD-137).
     /// It counts as a source only while it has peers.
     p2p: Option<Arc<P2pSource>>,
+    /// Whole blocks: prune-gap repair, plus entries from older releases.
     cache: Option<BlockCache>,
+    /// Verified transactions for wallet requests (AUD-139).
+    txcache: Option<TxCache>,
+    /// Verified external blocks kept in memory for a burst of requests.
+    recent: Mutex<VecDeque<(Hash32, Arc<bitcoin::Block>)>>,
     cache_dir: std::path::PathBuf,
     decoys: u32,
     stats: Arc<RawtxStats>,
@@ -299,10 +363,21 @@ impl Resolver {
             .cache_dir
             .clone()
             .unwrap_or_else(|| store.path().join("rawtx-cache"));
-        let cache = if cfg.cache_mib > 0 {
+        // `cache_mib` is the total disk budget: a quarter (1..64 MiB) for
+        // whole blocks (repair, legacy entries), the rest for transactions.
+        let (block_mib, tx_mib) = cache_split(cfg.cache_mib);
+        let cache = if block_mib > 0 {
             Some(BlockCache::open(
                 &cache_dir,
-                cfg.cache_mib.saturating_mul(1024 * 1024),
+                block_mib.saturating_mul(1024 * 1024),
+            )?)
+        } else {
+            None
+        };
+        let txcache = if tx_mib > 0 {
+            Some(TxCache::open(
+                &cache_dir.join("tx"),
+                tx_mib.saturating_mul(1024 * 1024),
             )?)
         } else {
             None
@@ -314,6 +389,8 @@ impl Resolver {
             external,
             p2p,
             cache,
+            txcache,
+            recent: Mutex::new(VecDeque::new()),
             cache_dir,
             decoys: cfg.decoys,
             stats,
@@ -371,9 +448,15 @@ impl Resolver {
         &self.cache_dir
     }
 
-    /// Logical bytes stored in the rawtx cache.
+    /// Bytes stored in the rawtx caches (blocks + transactions).
     pub fn cache_size_bytes(&self) -> u64 {
         self.cache.as_ref().map(|c| c.size()).unwrap_or(0)
+            + self.txcache.as_ref().map(|c| c.size()).unwrap_or(0)
+    }
+
+    /// Transactions in the transaction cache.
+    pub fn cached_txs(&self) -> usize {
+        self.txcache.as_ref().map(|c| c.len()).unwrap_or(0)
     }
 
     /// Whether a pruned-index repair has any chance: a validated block cache
@@ -471,19 +554,130 @@ impl Resolver {
         self.raw_tx_inner(txid, height, false)
     }
 
-    fn raw_tx_inner(&self, txid: Hash32, height: u32, allow_decoys: bool) -> Result<String> {
-        let rec = self
-            .store
-            .get_block(height)?
-            .ok_or_else(|| RawtxError::Unavailable(format!("block {height} not indexed")))?;
+    /// Prefetch every listed transaction of one block with a single block
+    /// fetch and no decoys, caching each one. Returns how many were fetched
+    /// (0 when all were already cached).
+    pub fn prefetch_block_txs(&self, height: u32, txids: &[Hash32]) -> Result<usize> {
+        let rec = self.block_record(height)?;
+        let missing: Vec<Hash32> = txids
+            .iter()
+            .copied()
+            .filter(|txid| self.cached_tx(&rec, *txid).is_none())
+            .collect();
+        if missing.is_empty() {
+            return Ok(0);
+        }
+        let (block, _) = self.verified_block(&rec)?;
+        self.cache_txs(&rec, &block, &missing)?;
+        Ok(missing.len())
+    }
 
-        // 1) Validated cache first: repeated requests for the same block are free.
+    fn block_record(&self, height: u32) -> Result<el_model::BlockRecord> {
+        self.store
+            .get_block(height)?
+            .ok_or_else(|| RawtxError::Unavailable(format!("block {height} not indexed")))
+    }
+
+    fn raw_tx_inner(&self, txid: Hash32, height: u32, allow_decoys: bool) -> Result<String> {
+        let rec = self.block_record(height)?;
+        // 1) Transaction cache: one small file per transaction (AUD-139).
+        if let Some(hex) = self.cached_tx(&rec, txid) {
+            self.stats.cache_hits.fetch_add(1, Ordering::Relaxed);
+            return Ok(hex);
+        }
+        // 2) The block: recent blocks in memory, legacy block cache, local
+        //    Core, then external sources (shared across concurrent callers).
+        let (block, origin) = self.verified_block(&rec)?;
+        let hex = self
+            .cache_txs(&rec, &block, &[txid])?
+            .pop()
+            .ok_or_else(|| RawtxError::Verify("transaction is not in the block".into()))?;
+        if origin == Origin::External && allow_decoys {
+            self.spawn_decoys(rec.hash);
+        }
+        Ok(hex)
+    }
+
+    /// A cached transaction authenticated against the indexed header: txid,
+    /// position and merkle branch must reproduce the header's merkle root.
+    /// A mismatching entry is removed.
+    fn cached_tx(&self, rec: &el_model::BlockRecord, txid: Hash32) -> Option<String> {
+        let cache = self.txcache.as_ref()?;
+        let entry = cache.get(&txid)?;
+        match verify_cached_tx(&entry, rec, txid) {
+            Ok(()) => Some(hex::encode(&entry.raw)),
+            Err(e) => {
+                self.stats.verify_failures.fetch_add(1, Ordering::Relaxed);
+                eprintln!(
+                    "[e-lite] cached transaction at height {} rejected ({})",
+                    rec.height,
+                    e.kind()
+                );
+                cache.remove(&txid);
+                None
+            }
+        }
+    }
+
+    /// Store each requested transaction of a verified block in the
+    /// transaction cache and return their hex, in request order.
+    fn cache_txs(
+        &self,
+        rec: &el_model::BlockRecord,
+        block: &bitcoin::Block,
+        wanted: &[Hash32],
+    ) -> Result<Vec<String>> {
+        let txids = block
+            .txdata
+            .iter()
+            .map(|tx| {
+                Hash32::from_hex(&tx.compute_txid().to_string())
+                    .map_err(|e| RawtxError::Verify(format!("bad txid: {e}")))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let mut out = Vec::with_capacity(wanted.len());
+        for txid in wanted {
+            let pos = txids
+                .iter()
+                .position(|t| t == txid)
+                .ok_or_else(|| RawtxError::Verify("transaction is not in the block".into()))?;
+            let raw = bitcoin::consensus::serialize(&block.txdata[pos]);
+            if let Some(cache) = &self.txcache {
+                if let Some((_, branch)) = el_model::merkle_branch(&txids, pos) {
+                    let entry = txcache::CachedTx {
+                        height: rec.height,
+                        tx_pos: pos as u32,
+                        branch,
+                        raw: raw.clone(),
+                    };
+                    match cache.put(txid, &entry) {
+                        Ok(()) => {
+                            self.stats.cache_puts.fetch_add(1, Ordering::Relaxed);
+                        }
+                        Err(e) => eprintln!("[e-lite] tx cache put failed: {}", e.kind()),
+                    }
+                }
+            }
+            out.push(hex::encode(raw));
+        }
+        Ok(out)
+    }
+
+    /// A block fully verified against the indexed header (hash, header,
+    /// merkle root, BIP141 commitment), from the cheapest source that has it.
+    fn verified_block(&self, rec: &el_model::BlockRecord) -> Result<(Arc<bitcoin::Block>, Origin)> {
+        let height = rec.height;
+        if let Some(block) = self.recent_block(&rec.hash) {
+            self.stats.cache_hits.fetch_add(1, Ordering::Relaxed);
+            return Ok((block, Origin::Recent));
+        }
+        // Legacy whole-block cache (and repair blocks).
         if let Some(cache) = &self.cache {
             if let Some(bytes) = cache.get(&rec.hash) {
-                match self.verified_tx(&bytes, &rec, txid) {
-                    Ok(hex) => {
+                match verify_full(&bytes, rec) {
+                    Ok(block) => {
                         self.stats.cache_hits.fetch_add(1, Ordering::Relaxed);
-                        return Ok(hex);
+                        return Ok((self.remember(rec.hash, block), Origin::BlockCache));
                     }
                     Err(e) => {
                         self.stats.verify_failures.fetch_add(1, Ordering::Relaxed);
@@ -496,15 +690,11 @@ impl Resolver {
                 }
             }
         }
-
-        // 2) Local Core: zero external requests.
+        // Local Core: zero external requests.
         if let Some(local) = &self.local {
             if let Ok(bytes) = local.fetch_block(&rec.hash) {
-                match self.verified_tx(&bytes, &rec, txid) {
-                    Ok(hex) => {
-                        self.cache_store(&rec.hash, &bytes);
-                        return Ok(hex);
-                    }
+                match verify_full(&bytes, rec) {
+                    Ok(block) => return Ok((Arc::new(block), Origin::Local)),
                     Err(e) => {
                         self.stats.verify_failures.fetch_add(1, Ordering::Relaxed);
                         eprintln!("[e-lite] local rawtx rejected ({})", e.kind());
@@ -512,8 +702,6 @@ impl Resolver {
                 }
             }
         }
-
-        // 3) External sources, shared across concurrent callers.
         if self.sources().is_empty() {
             self.stats.unavailable.fetch_add(1, Ordering::Relaxed);
             return Err(RawtxError::Unavailable(
@@ -531,13 +719,8 @@ impl Resolver {
                 return Err(e);
             }
         };
-        match self.verified_tx(&bytes, &rec, txid) {
-            Ok(hex) => {
-                if allow_decoys {
-                    self.spawn_decoys(rec.hash);
-                }
-                Ok(hex)
-            }
+        match verify_full(&bytes, rec) {
+            Ok(block) => Ok((self.remember(rec.hash, block), Origin::External)),
             Err(e) => {
                 self.stats.verify_failures.fetch_add(1, Ordering::Relaxed);
                 eprintln!(
@@ -547,6 +730,28 @@ impl Resolver {
                 Err(e)
             }
         }
+    }
+
+    /// Recently fetched external blocks stay in memory so a wallet asking for
+    /// several transactions of one block does not download it again.
+    fn recent_block(&self, hash: &Hash32) -> Option<Arc<bitcoin::Block>> {
+        let recent = self.recent.lock().ok()?;
+        recent
+            .iter()
+            .find(|(h, _)| h == hash)
+            .map(|(_, b)| Arc::clone(b))
+    }
+
+    fn remember(&self, hash: Hash32, block: bitcoin::Block) -> Arc<bitcoin::Block> {
+        let block = Arc::new(block);
+        if let Ok(mut recent) = self.recent.lock() {
+            recent.retain(|(h, _)| *h != hash);
+            recent.push_back((hash, Arc::clone(&block)));
+            while recent.len() > RECENT_BLOCKS {
+                recent.pop_front();
+            }
+        }
+        block
     }
 
     /// Fetch one block from the external sources, deduplicating concurrent
@@ -648,10 +853,9 @@ impl Resolver {
                         verify_witness_commitment(&block)?;
                         Ok(block)
                     }) {
-                        Ok(_) => {
-                            self.cache_store(hash, &bytes);
-                            return Ok(bytes);
-                        }
+                        // Not written to the block cache: the caller keeps the
+                        // transactions it needs (AUD-139).
+                        Ok(_) => return Ok(bytes),
                         Err(e) => {
                             self.stats.verify_failures.fetch_add(1, Ordering::Relaxed);
                             eprintln!(
@@ -684,18 +888,6 @@ impl Resolver {
                 Err(e) => eprintln!("[e-lite] cache put failed: {e}"),
             }
         }
-    }
-
-    fn verified_tx(
-        &self,
-        bytes: &[u8],
-        rec: &el_model::BlockRecord,
-        txid: Hash32,
-    ) -> Result<String> {
-        let block = verify_block(bytes, &rec.hash, &rec.header)?;
-        verify_witness_commitment(&block)?;
-        let tx = extract_tx(&block, txid)?;
-        Ok(hex::encode(bitcoin::consensus::serialize(&tx)))
     }
 
     /// Fetch decoys in the background so the caller is not delayed.

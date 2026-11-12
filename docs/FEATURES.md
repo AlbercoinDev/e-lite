@@ -35,7 +35,7 @@ available**.
 | Headers and header subscription | experimental | checkpoint proof support |
 | Script history, balance, UTXOs | experimental | history capped at 100k entries/script |
 | Scripthash subscribe/unsubscribe | experimental | dirty-set notifications |
-| Mempool history/UTXOs/fees | experimental | overlay from Core; fee histogram |
+| Mempool history/UTXOs/fees | experimental | overlay from Core (txid-list polling, only new transactions fetched); fee histogram |
 | Merkle proofs, tx id-from-pos | experimental | local index |
 | Block stats | experimental | local |
 | Broadcast | experimental | via Core |
@@ -77,7 +77,7 @@ available**.
 | Managed Tor + onion service | experimental | network plain/TLS ports; `e-lite onion show/reset` |
 | Auto self-signed TLS cert | experimental | generated without Tor; SAN includes localhost, hostname and onion; reloaded on change |
 | Decoys and random source order | experimental | `decoys=1` default; max 2 in flight; prefetch spawns none |
-| Rawtx cache | experimental | 256 MiB default; `cache_dir` can point at tmpfs to avoid disk |
+| Rawtx cache | experimental | 256 MiB default; verified transactions with merkle branch (whole blocks only for prune repair, max 64 MiB); last 8 external blocks in memory; `cache_dir` can point at tmpfs to avoid disk |
 | Electrum rate limit | experimental | 200 req/s, burst 5000 for every client; over-budget requests wait, never error; `0` disables |
 | Block hash/header/Merkle/witness validation | experimental | before serving/caching |
 | Configurable Esplora endpoints | experimental | editable `public-servers.toml`; shipped defaults; fail-closed if no provider and `require_ready` |

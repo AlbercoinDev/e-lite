@@ -21,7 +21,7 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
-use std::sync::{mpsc, Arc, Mutex, RwLock, RwLockReadGuard};
+use std::sync::{mpsc, Arc, Condvar, Mutex, RwLock, RwLockReadGuard};
 use std::time::{Duration, Instant, SystemTime};
 
 mod version;
@@ -52,6 +52,8 @@ const CLIENT_READ_POLL: Duration = Duration::from_millis(250);
 /// A client that sends nothing for this long is disconnected.
 const CLIENT_IDLE_TIMEOUT: Duration = Duration::from_secs(600);
 const CLIENT_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
+/// Notifications are pushed from one thread for every client (AUD-146).
+const NOTIFY_WRITE_TIMEOUT: Duration = Duration::from_secs(2);
 /// A TLS client gets this long to finish the handshake.
 const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 /// How often the TLS listener checks the configured PEM files for renewal.
@@ -380,6 +382,9 @@ pub struct DbBytesCache {
 pub struct DirtyScripts {
     inner: Mutex<HashSet<ScriptHash>>,
     force_all: AtomicBool,
+    /// Wakes the notifier as soon as something is marked, instead of a
+    /// fixed 2 s poll (AUD-146).
+    changed: Condvar,
 }
 
 impl DirtyScripts {
@@ -391,18 +396,34 @@ impl DirtyScripts {
         if let Ok(mut set) = self.inner.lock() {
             set.insert(script);
         }
+        self.changed.notify_all();
     }
 
     pub fn mark_all(&self, scripts: impl IntoIterator<Item = ScriptHash>) {
         if let Ok(mut set) = self.inner.lock() {
             set.extend(scripts);
         }
+        self.changed.notify_all();
     }
 
     /// A reorg can change scripts that are not in the replayed blocks' dirty
     /// set yet (for example, while the index is between rewind and replay).
     pub fn mark_all_subscriptions(&self) {
         self.force_all.store(true, Ordering::SeqCst);
+        self.changed.notify_all();
+    }
+
+    /// Wait until something is marked, or `timeout`. Returns at once when
+    /// marks are already pending.
+    pub fn wait(&self, timeout: Duration) {
+        let Ok(set) = self.inner.lock() else {
+            std::thread::sleep(timeout);
+            return;
+        };
+        if !set.is_empty() || self.force_all.load(Ordering::SeqCst) {
+            return;
+        }
+        let _ = self.changed.wait_timeout(set, timeout);
     }
 
     pub fn take(&self) -> (HashSet<ScriptHash>, bool) {
@@ -439,6 +460,13 @@ impl Wire {
 
     pub fn is_tls(&self) -> bool {
         matches!(self, Wire::Tls(_))
+    }
+
+    fn socket(&self) -> &TcpStream {
+        match self {
+            Wire::Plain(s) => s,
+            Wire::Tls(s) => &s.sock,
+        }
     }
 
     /// Complete the TLS handshake with a bounded deadline. Plain connections
@@ -680,6 +708,41 @@ pub struct ClientState {
 }
 
 impl ClientState {
+    /// Push a notification. The write gets a short timeout: a client that
+    /// does not drain its socket must not hold the notifier thread (shared by
+    /// every client) for the 30 s response timeout. Such a client is
+    /// disconnected; the wallet reconnects and resubscribes (AUD-146).
+    pub fn notify(&self, value: &Value) -> bool {
+        if !self.alive.load(Ordering::Relaxed) {
+            return false;
+        }
+        let mut bytes = match serde_json::to_vec(value) {
+            Ok(b) => b,
+            Err(_) => return false,
+        };
+        bytes.push(b'\n');
+        let mut writer = match self.writer.lock() {
+            Ok(w) => w,
+            Err(_) => return false,
+        };
+        let _ = writer
+            .socket()
+            .set_write_timeout(Some(NOTIFY_WRITE_TIMEOUT));
+        let ok = writer
+            .write_all(&bytes)
+            .and_then(|_| writer.flush())
+            .is_ok();
+        let _ = writer
+            .socket()
+            .set_write_timeout(Some(CLIENT_WRITE_TIMEOUT));
+        if !ok {
+            // A partial frame may be on the wire: the stream is unusable.
+            self.alive.store(false, Ordering::SeqCst);
+            let _ = writer.socket().shutdown(std::net::Shutdown::Both);
+        }
+        ok
+    }
+
     pub fn send(&self, value: &Value) -> bool {
         if !self.alive.load(Ordering::Relaxed) {
             return false;
@@ -789,8 +852,11 @@ impl ClientRegistry {
 /// subsequent `blockchain.transaction.get` calls hit the block cache instead of
 /// waiting for a provider. Deduplicated by height, bounded queue, and only used
 /// when external sources exist.
+/// One queued prefetch: a block and the history transactions it contains.
+type PrefetchJob = (Hash32, u32, Vec<Hash32>);
+
 pub struct Prefetcher {
-    tx: Option<mpsc::SyncSender<(Hash32, Hash32, u32)>>,
+    tx: Option<mpsc::SyncSender<PrefetchJob>>,
     seen: Arc<Mutex<HashSet<Hash32>>>,
     queued: Arc<AtomicU64>,
     done: Arc<AtomicU64>,
@@ -812,7 +878,7 @@ impl Prefetcher {
         workers: usize,
         queue: usize,
     ) -> Self {
-        let (tx, rx) = mpsc::sync_channel::<(Hash32, Hash32, u32)>(queue.max(1));
+        let (tx, rx) = mpsc::sync_channel::<PrefetchJob>(queue.max(1));
         let rx = Arc::new(Mutex::new(rx));
         let done = Arc::new(AtomicU64::new(0));
         let seen = Arc::new(Mutex::new(HashSet::new()));
@@ -829,12 +895,14 @@ impl Prefetcher {
                     };
                     guard.recv()
                 };
-                let Ok((block_hash, txid, height)) = item else {
+                let Ok((block_hash, height, txids)) = item else {
                     return;
                 };
                 // No reader guard: prefetch is an optimisation and may resolve
-                // from external sources. It must never block pruning.
-                if resolver.raw_tx_prefetch(txid, height).is_err() {
+                // from external sources. It must never block pruning. All the
+                // history transactions of the block are cached from a single
+                // download (AUD-139), with no decoys.
+                if resolver.prefetch_block_txs(height, &txids).is_err() {
                     // Allow a later history request to retry this block.
                     if let Ok(mut seen) = seen.lock() {
                         seen.remove(&block_hash);
@@ -859,9 +927,10 @@ impl Prefetcher {
         )
     }
 
-    /// Enqueue one txid per block height. Duplicates and a full queue are
-    /// dropped silently: prefetch is an optimisation, never a correctness path.
-    pub fn enqueue(&self, block_hash: Hash32, txid: Hash32, height: u32) -> bool {
+    /// Enqueue one block with the history transactions it contains.
+    /// Duplicates and a full queue are dropped silently: prefetch is an
+    /// optimisation, never a correctness path.
+    pub fn enqueue(&self, block_hash: Hash32, height: u32, txids: Vec<Hash32>) -> bool {
         let Some(tx) = &self.tx else {
             return false;
         };
@@ -874,7 +943,7 @@ impl Prefetcher {
         if !seen.insert(block_hash) {
             return false;
         }
-        if tx.try_send((block_hash, txid, height)).is_err() {
+        if tx.try_send((block_hash, height, txids)).is_err() {
             // Queue full or worker gone: do not mark it as done.
             seen.remove(&block_hash);
             return false;
@@ -2041,7 +2110,8 @@ fn history_entries_with_code(
     }
     let mut blocks: HashMap<u32, el_model::BlockRecord> = HashMap::new();
     let mut out = Vec::with_capacity(entries.len());
-    let mut prefetched = 0usize;
+    // Blocks in history order with their transactions, for the prefetcher.
+    let mut prefetch_blocks: Vec<(Hash32, u32, Vec<Hash32>)> = Vec::new();
     for (height, tx_pos, effect) in entries {
         let rec = match blocks.get(&height) {
             Some(r) => *r,
@@ -2060,8 +2130,11 @@ fn history_entries_with_code(
             .store
             .txid_at(txnum)
             .map_err(|e| RpcError::server(e.to_string()))?;
-        if prefetch && prefetched < 16 && shared.prefetch.enqueue(rec.hash, txid, height) {
-            prefetched += 1;
+        if prefetch {
+            match prefetch_blocks.last_mut() {
+                Some((_, h, txids)) if *h == height => txids.push(txid),
+                _ => prefetch_blocks.push((rec.hash, height, vec![txid])),
+            }
         }
         out.push((
             height,
@@ -2070,6 +2143,15 @@ fn history_entries_with_code(
             effect.received_sat,
             effect.spent_sat,
         ));
+    }
+    let mut prefetched = 0usize;
+    for (hash, height, txids) in prefetch_blocks {
+        if prefetched >= 16 {
+            break;
+        }
+        if shared.prefetch.enqueue(hash, height, txids) {
+            prefetched += 1;
+        }
     }
     Ok(out)
 }
@@ -2123,19 +2205,40 @@ fn listunspent_value(shared: &Shared, script: ScriptHash) -> RpcResult<Value> {
         .mempool
         .read()
         .map_err(|_| RpcError::server("mempool lock poisoned"))?;
-    // Electrum expects confirmed UTXOs in blockchain order, even though the
-    // store index is keyed by (script, outpoint).
-    let mut rows: Vec<(u32, String, u32, u64)> = Vec::with_capacity(utxos.len());
+    // Electrum expects confirmed UTXOs in blockchain order: height, then the
+    // transaction's position in its block (AUD-146; it used to be txid
+    // order), then vout. The store is keyed by (script, outpoint), so the
+    // position is looked up only where it matters: heights holding several
+    // UTXOs of this script.
+    let mut per_height: HashMap<u32, usize> = HashMap::new();
+    for (op, _, height, _) in &utxos {
+        if !mem.is_spent(op) {
+            *per_height.entry(*height).or_default() += 1;
+        }
+    }
+    let mut rows: Vec<(u32, u32, String, u32, u64)> = Vec::with_capacity(utxos.len());
     for (op, value, height, _coinbase) in utxos {
         if mem.is_spent(&op) {
             continue;
         }
-        rows.push((height, op.txid.to_hex(), op.vout, value));
+        let block_pos = if per_height.get(&height).copied().unwrap_or(0) > 1 {
+            shared
+                .store
+                .occurrences(op.txid)
+                .map_err(|e| RpcError::server(e.to_string()))?
+                .into_iter()
+                .find(|(h, _)| *h == height)
+                .map(|(_, pos)| pos)
+                .unwrap_or(u32::MAX)
+        } else {
+            0
+        };
+        rows.push((height, block_pos, op.txid.to_hex(), op.vout, value));
     }
-    rows.sort_by(|a, b| (a.0, &a.1, a.2).cmp(&(b.0, &b.1, b.2)));
+    rows.sort_by(|a, b| (a.0, a.1, &a.2, a.3).cmp(&(b.0, b.1, &b.2, b.3)));
     let mut arr: Vec<Value> = rows
         .into_iter()
-        .map(|(height, tx_hash, tx_pos, value)| {
+        .map(|(height, _, tx_hash, tx_pos, value)| {
             json!({
                 "tx_hash": tx_hash,
                 "tx_pos": tx_pos,
@@ -3029,17 +3132,32 @@ pub fn start_mempool(shared: Arc<Shared>) -> std::thread::JoinHandle<()> {
             // Build the candidate outside the write lock: Core RPC and the
             // per-input UTXO lookups can take seconds on a large mempool, and
             // holding `mempool.write()` would block every history/balance read.
-            let mut candidate = match shared.mempool.read() {
-                Ok(m) => m.clone(),
-                Err(_) => break,
+            // Cheap check first: the txid list. The overlay is cloned (and
+            // only new transactions fetched) when it differs (AUD-138).
+            let result = el_mempool::mempool_ids(&shared.core).map(|ids| {
+                let unchanged = shared.mempool.read().map(|m| !m.differs_from(&ids)).ok();
+                (ids, unchanged)
+            });
+            let result = match result {
+                Ok((_, None)) => break, // lock poisoned
+                Ok((_, Some(true))) => Ok(None),
+                Ok((ids, Some(false))) => {
+                    let mut candidate = match shared.mempool.read() {
+                        Ok(m) => m.clone(),
+                        Err(_) => break,
+                    };
+                    candidate
+                        .refresh_with_ids(&ids, &shared.core, &shared.store)
+                        .map(|changed| changed.then_some(candidate))
+                }
+                Err(e) => Err(e),
             };
-            let result = candidate.refresh(&shared.core, &shared.store);
             last_tip = tip;
             last_refresh = Instant::now();
             match result {
-                Ok(changed) => {
+                Ok(updated) => {
                     ever_ok = true;
-                    if changed {
+                    if let Some(candidate) = updated {
                         let touched: Vec<ScriptHash> =
                             candidate.last_touched().iter().copied().collect();
                         if let Ok(mut mem) = shared.mempool.write() {
@@ -3152,7 +3270,7 @@ impl OutpointNotifier {
                         "method": "blockchain.outpoint.subscribe",
                         "params": [job.txid.to_hex(), job.vout, new],
                     });
-                    if job.client.send(&notification) {
+                    if job.client.notify(&notification) {
                         shared
                             .stats
                             .notifications_sent
@@ -3248,7 +3366,7 @@ pub fn start_notifications(shared: Arc<Shared>) -> std::thread::JoinHandle<()> {
             // new block arrived.
             outpoints.flush();
             if !new_block && !scan_scripts {
-                std::thread::sleep(Duration::from_secs(2));
+                notifier_pause(&shared);
                 continue;
             }
             for client in shared.clients.snapshot() {
@@ -3262,7 +3380,7 @@ pub fn start_notifications(shared: Arc<Shared>) -> std::thread::JoinHandle<()> {
                             "method": "blockchain.headers.subscribe",
                             "params": [{"height": height, "hex": h}],
                         });
-                        if client.send(&notification) {
+                        if client.notify(&notification) {
                             shared
                                 .stats
                                 .notifications_sent
@@ -3319,7 +3437,7 @@ pub fn start_notifications(shared: Arc<Shared>) -> std::thread::JoinHandle<()> {
                             "method": method,
                             "params": [script.to_electrum_hex(), new],
                         });
-                        if client.send(&notification) {
+                        if client.notify(&notification) {
                             shared
                                 .stats
                                 .notifications_sent
@@ -3359,9 +3477,17 @@ pub fn start_notifications(shared: Arc<Shared>) -> std::thread::JoinHandle<()> {
             }
             last_height = height;
             last_hash = hash;
-            std::thread::sleep(Duration::from_secs(2));
+            notifier_pause(&shared);
         }
     })
+}
+
+/// Sleep until the indexer or the mempool marks a script (a commit always
+/// does), at most 2 s; then coalesce briefly so a burst of marks is handled
+/// in one pass. Notifications used to wait up to a fixed 2 s.
+fn notifier_pause(shared: &Shared) {
+    shared.dirty_scripts.wait(Duration::from_secs(2));
+    std::thread::sleep(Duration::from_millis(100));
 }
 
 // ------------------------------------------------------------------- transports
@@ -4225,5 +4351,32 @@ mod tests {
         assert!(!Arc::ptr_eq(&third, &fourth));
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn notifier_wakes_on_a_mark_instead_of_polling() {
+        // AUD-146: a commit or mempool change wakes the notifier at once.
+        let dirty = Arc::new(DirtyScripts::new());
+        let marker = Arc::clone(&dirty);
+        let started = Instant::now();
+        let handle = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            marker.mark(ScriptHash(Hash32([1; 32])));
+        });
+        dirty.wait(Duration::from_secs(10));
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "woken by the mark"
+        );
+        handle.join().unwrap();
+        // Pending marks return immediately; an empty set waits the timeout.
+        let started = Instant::now();
+        dirty.wait(Duration::from_secs(10));
+        assert!(started.elapsed() < Duration::from_secs(1));
+        let (taken, _) = dirty.take();
+        assert_eq!(taken.len(), 1);
+        let started = Instant::now();
+        dirty.wait(Duration::from_millis(100));
+        assert!(started.elapsed() >= Duration::from_millis(90));
     }
 }

@@ -144,10 +144,19 @@ open_without_provider = false  # true: open with local data after ready_timeout_
   the provider's view is not a single “interesting” block. At most two decoy
   downloads run at once and the background prefetch never spawns decoys. Set
   `decoys = 0` to reduce bandwidth at the cost of privacy.
-- The validated block cache reduces repeated external fetches. It defaults to
-  256 MiB. Set `cache_mib = 0` to disable it, or point `cache_dir` at tmpfs
-  (`/dev/shm/e-lite-rawtx`) to keep blocks off persistent disk; repair still
-  works from P2P/Esplora when a source is available.
+- The validated cache reduces repeated external fetches, and every avoided
+  re-download is a block hash a provider does not see again. It defaults to
+  256 MiB and stores **transactions** (with their merkle branch, checked
+  against the indexed header on every read), not whole blocks: the same
+  budget holds tens of thousands of wallet transactions instead of ~170
+  blocks. A quarter (at most 64 MiB) keeps whole blocks for prune-gap repair.
+  A wallet's requests for several transactions of one block are served from
+  the last 8 blocks kept in memory, and the prefetcher caches every history
+  transaction of a block from one download. Set `cache_mib = 0` to disable the
+  disk cache, or point `cache_dir` at tmpfs (`/dev/shm/e-lite-rawtx`) to keep
+  it off persistent disk; repair still works from P2P/Esplora when a source
+  is available. The cache directory names the transactions you fetched: it
+  is as sensitive as the wallet.
 
 ## P2P details
 

@@ -69,11 +69,13 @@ EOF
   --banner-file "$DATA/banner.txt" \
   >"$RUN/serve.log" 2>&1 &
 echo $! >"$RUN/serve.pid"
-for _ in $(seq 1 100); do
+# `run` waits up to 30 s for a freshly created managed Tor to bootstrap before
+# opening the listeners; on a slow Tor network that exceeded the old 20 s.
+for _ in $(seq 1 250); do
   curl -sf "http://127.0.0.1:$METRICS_PORT/healthz" >/dev/null 2>&1 && break
   sleep 0.2
 done
-grep -q "started at" "$RUN/serve.log"
+grep -q "started at" "$RUN/serve.log" || { tail -40 "$RUN/serve.log"; exit 1; }
 if grep -qE "p2p discovery failed|Connection refused|memory pressure" "$RUN/serve.log"; then
   echo "unexpected startup error in serve.log:" >&2
   cat "$RUN/serve.log" >&2

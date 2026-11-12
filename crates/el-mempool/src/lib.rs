@@ -1,7 +1,10 @@
 //! Reconstructible mempool overlay.
 //!
-//! Core remains the source of truth. We poll `getrawmempool` (verbose) and fetch
-//! the raw transactions of new entries in batches, then build:
+//! Core remains the source of truth. We poll the txid list (`getrawmempool
+//! false`) and, only when it changed, fetch the entry and raw transaction of
+//! each **new** txid in batches (AUD-138: the verbose listing of the whole
+//! mempool every 3 s was tens of MB of JSON on mainnet). Confirmed prevouts
+//! are cached while the index tip is unchanged. Then we build:
 //! - per-script history and balance deltas,
 //! - mempool UTXOs and spent outpoints (including chained transactions),
 //! - a fee histogram for Electrum.
@@ -59,6 +62,11 @@ pub struct Mempool {
     txs: HashMap<Hash32, MempoolTx>,
     /// Raw transactions retained between polls so new entries are incremental.
     raw: HashMap<Hash32, bitcoin::Transaction>,
+    /// Core's per-transaction data, retained like `raw`: (vsize, fee, time).
+    meta: HashMap<Hash32, (u64, u64, u64)>,
+    /// Confirmed prevouts already read from the index, valid for `prevouts_tip`.
+    prevouts: HashMap<Outpoint, (ScriptHash, u64)>,
+    prevouts_tip: Option<(u32, Hash32)>,
     by_script: HashMap<ScriptHash, Vec<Hash32>>,
     spending: HashSet<Outpoint>,
     /// Reverse map for `blockchain.outpoint.*`: outpoint -> spending txid.
@@ -180,54 +188,79 @@ impl Mempool {
         out
     }
 
+    /// Whether Core's txid list differs from the current overlay. Cheap: no
+    /// clone, no RPC.
+    pub fn differs_from(&self, ids: &HashSet<Hash32>) -> bool {
+        ids.len() != self.txs.len() || ids.iter().any(|id| !self.txs.contains_key(id))
+    }
+
     /// Poll Core and rebuild the overlay if the mempool changed.
     pub fn refresh(&mut self, core: &CoreClient, store: &Store) -> Result<bool> {
-        let entries = core.raw_mempool_verbose()?;
-        let mut wanted: HashMap<Hash32, (u64, u64)> = HashMap::new();
-        let mut times: HashMap<Hash32, u64> = HashMap::new();
-        for (txid_hex, entry) in &entries {
-            let Ok(txid) = Hash32::from_hex(txid_hex) else {
-                continue;
-            };
-            let fee_sat = entry
-                .fees
-                .as_ref()
-                .map(|f| (f.base * 100_000_000.0).round() as u64)
-                .unwrap_or(0);
-            wanted.insert(txid, (entry.vsize, fee_sat));
-            times.insert(txid, entry.time);
-        }
+        let ids = mempool_ids(core)?;
+        self.refresh_with_ids(&ids, core, store)
+    }
 
-        let wanted_set: HashSet<Hash32> = wanted.keys().copied().collect();
-        let current: HashSet<Hash32> = self.txs.keys().copied().collect();
-        if current == wanted_set {
+    /// Like `refresh`, with the txid list already fetched by the caller.
+    pub fn refresh_with_ids(
+        &mut self,
+        ids: &HashSet<Hash32>,
+        core: &CoreClient,
+        store: &Store,
+    ) -> Result<bool> {
+        if !self.differs_from(ids) {
             self.last_touched.clear();
             return Ok(false);
         }
-
         // Drop vanished transactions, fetch only the new ones (in batches).
-        self.raw.retain(|txid, _| wanted_set.contains(txid));
-        let missing: Vec<String> = wanted
-            .keys()
+        self.raw.retain(|txid, _| ids.contains(txid));
+        self.meta.retain(|txid, _| ids.contains(txid));
+        let missing: Vec<String> = ids
+            .iter()
             .filter(|t| !self.raw.contains_key(*t))
             .map(|t| t.to_hex())
             .collect();
         for chunk in missing.chunks(100) {
+            let entries = core.batch_mempool_entries(chunk)?;
             let hexes = core.batch_raw_transactions(chunk)?;
-            for (txid_hex, maybe_hex) in chunk.iter().zip(hexes) {
-                let Some(hex) = maybe_hex else { continue };
+            for ((txid_hex, entry), maybe_hex) in chunk.iter().zip(entries).zip(hexes) {
+                // Left the mempool between the listing and this call.
+                let (Some(entry), Some(hex)) = (entry, maybe_hex) else {
+                    continue;
+                };
                 let Ok(bytes) = hex::decode(&hex) else {
                     continue;
                 };
                 let Ok(tx) = bitcoin::consensus::deserialize::<bitcoin::Transaction>(&bytes) else {
                     continue;
                 };
-                if let Ok(txid) = Hash32::from_hex(txid_hex) {
-                    self.raw.insert(txid, tx);
-                }
+                let Ok(txid) = Hash32::from_hex(txid_hex) else {
+                    continue;
+                };
+                let fee_sat = entry
+                    .fees
+                    .as_ref()
+                    .map(|f| (f.base * 100_000_000.0).round() as u64)
+                    .unwrap_or(0);
+                self.meta.insert(txid, (entry.vsize, fee_sat, entry.time));
+                self.raw.insert(txid, tx);
             }
         }
+        self.rebuild(store);
+        Ok(true)
+    }
 
+    /// Rebuild the derived views from `raw` + `meta`. Confirmed prevouts are
+    /// read from the index once and reused while its tip does not change.
+    fn rebuild(&mut self, store: &Store) {
+        let tip = store
+            .committed_tip()
+            .ok()
+            .flatten()
+            .map(|t| (t.height, t.block_hash));
+        if tip != self.prevouts_tip {
+            self.prevouts.clear();
+            self.prevouts_tip = tip;
+        }
         // All mempool outputs, so chained transactions resolve regardless of order.
         let mut outputs: HashMap<Outpoint, (ScriptHash, u64)> = HashMap::new();
         for (txid, tx) in &self.raw {
@@ -250,7 +283,7 @@ impl Mempool {
         let mut spent_by: HashMap<Outpoint, Hash32> = HashMap::new();
         let mut unresolved = 0u64;
         for (txid, tx) in &self.raw {
-            let (vsize, fee_sat) = wanted.get(txid).copied().unwrap_or((0, 0));
+            let (vsize, fee_sat, time) = self.meta.get(txid).copied().unwrap_or((0, 0, 0));
             let mut effects: HashMap<ScriptHash, (u64, u64)> = HashMap::new();
             let mut all_inputs_confirmed = true;
             for input in &tx.input {
@@ -264,13 +297,19 @@ impl Mempool {
                 };
                 spent_by.insert(op, *txid);
                 let from_mempool = outputs.get(&op).copied();
-                let prev = from_mempool.or_else(|| {
-                    store
-                        .get_utxo(&op)
-                        .ok()
-                        .flatten()
-                        .map(|u| (u.script_hash, u.value_sat))
-                });
+                let prev = from_mempool
+                    .or_else(|| self.prevouts.get(&op).copied())
+                    .or_else(|| {
+                        let found = store
+                            .get_utxo(&op)
+                            .ok()
+                            .flatten()
+                            .map(|u| (u.script_hash, u.value_sat));
+                        if let Some(v) = found {
+                            self.prevouts.insert(op, v);
+                        }
+                        found
+                    });
                 match prev {
                     Some((script, value)) => {
                         if from_mempool.is_some() {
@@ -304,7 +343,7 @@ impl Mempool {
                     txid: *txid,
                     fee_sat,
                     vsize,
-                    time: times.get(txid).copied().unwrap_or(0),
+                    time,
                     effects,
                     outputs: tx_outputs,
                     height: if all_inputs_confirmed { 0 } else { -1 },
@@ -324,6 +363,8 @@ impl Mempool {
         }
 
         self.last_touched = touched_scripts(&self.txs, &txs);
+        // Keep only prevouts still spent by a mempool transaction.
+        self.prevouts.retain(|op, _| spending.contains(op));
 
         self.txs = txs;
         self.by_script = by_script;
@@ -332,8 +373,16 @@ impl Mempool {
         self.unresolved_inputs = unresolved;
         self.histogram = build_histogram(&self.txs);
         self.version += 1;
-        Ok(true)
     }
+}
+
+/// Core's current mempool txids (`getrawmempool false`).
+pub fn mempool_ids(core: &CoreClient) -> Result<HashSet<Hash32>> {
+    Ok(core
+        .mempool_txids()?
+        .iter()
+        .filter_map(|t| Hash32::from_hex(t).ok())
+        .collect())
 }
 
 /// Scripts whose mempool view changed between two snapshots: transactions
@@ -537,89 +586,13 @@ mod tests {
         let child_id = Hash32::from_hex(&child.compute_txid().to_string()).unwrap();
 
         // Build the overlay through the same code path as refresh, injecting raw
-        // transactions instead of calling Core.
+        // transactions and Core's entry data instead of calling Core.
         let mut m = Mempool::new();
         m.raw = HashMap::from([(parent_id, parent), (child_id, child)]);
-        let mut wanted = HashMap::new();
-        wanted.insert(parent_id, (200u64, 100u64));
-        wanted.insert(child_id, (200, 100));
-
-        let mut outputs: HashMap<Outpoint, (ScriptHash, u64)> = HashMap::new();
-        for (txid, tx) in &m.raw {
-            for (vout, out) in tx.output.iter().enumerate() {
-                outputs.insert(
-                    Outpoint {
-                        txid: *txid,
-                        vout: vout as u32,
-                    },
-                    (
-                        ScriptHash::from_script(out.script_pubkey.as_bytes()),
-                        out.value.to_sat(),
-                    ),
-                );
-            }
-        }
-        let mut txs = HashMap::new();
-        let mut spending = HashSet::new();
-        for (txid, tx) in &m.raw {
-            let (vsize, fee_sat) = wanted[txid];
-            let mut effects: HashMap<ScriptHash, (u64, u64)> = HashMap::new();
-            let mut confirmed_parents = true;
-            for input in &tx.input {
-                let op = Outpoint {
-                    txid: Hash32::from_hex(&input.previous_output.txid.to_string()).unwrap(),
-                    vout: input.previous_output.vout,
-                };
-                if outputs.contains_key(&op) {
-                    confirmed_parents = false;
-                }
-                let (script, value) = outputs
-                    .get(&op)
-                    .copied()
-                    .or_else(|| {
-                        store
-                            .get_utxo(&op)
-                            .ok()
-                            .flatten()
-                            .map(|u| (u.script_hash, u.value_sat))
-                    })
-                    .unwrap();
-                effects.entry(script).or_default().1 += value;
-                spending.insert(op);
-            }
-            let mut outs = Vec::new();
-            for (vout, out) in tx.output.iter().enumerate() {
-                let script = ScriptHash::from_script(out.script_pubkey.as_bytes());
-                let op = Outpoint {
-                    txid: *txid,
-                    vout: vout as u32,
-                };
-                effects.entry(script).or_default().0 += out.value.to_sat();
-                outs.push((op, script, out.value.to_sat()));
-            }
-            txs.insert(
-                *txid,
-                MempoolTx {
-                    txid: *txid,
-                    fee_sat,
-                    vsize,
-                    time: 0,
-                    effects,
-                    outputs: outs,
-                    height: if confirmed_parents { 0 } else { -1 },
-                },
-            );
-        }
-        m.txs = txs;
-        m.spending = spending;
-        m.histogram = build_histogram(&m.txs);
-        let mut by_script: HashMap<ScriptHash, Vec<Hash32>> = HashMap::new();
-        for tx in m.txs.values() {
-            for s in tx.effects.keys() {
-                by_script.entry(*s).or_default().push(tx.txid);
-            }
-        }
-        m.by_script = by_script;
+        m.meta = HashMap::from([(parent_id, (200, 100, 0)), (child_id, (200, 100, 0))]);
+        m.rebuild(&store);
+        assert!(!m.differs_from(&HashSet::from([parent_id, child_id])));
+        assert!(m.differs_from(&HashSet::from([parent_id])));
 
         assert_eq!(m.len(), 2);
         assert!(m.is_spent(&confirmed));
@@ -633,6 +606,59 @@ mod tests {
         assert!(hist.iter().any(|(_, _, h)| *h == -1));
         assert!(hist.iter().any(|(_, _, h)| *h == 0));
         assert!(!m.fee_histogram().is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn confirmed_prevouts_are_cached_until_the_tip_moves() {
+        // AUD-138: a rebuild must not re-read every confirmed prevout from
+        // the index while the tip is unchanged, and must re-read after.
+        let dir = tmp("prevout-cache");
+        let store = Store::open(&dir).unwrap();
+        let script = ScriptHash::from_script(&[0xaa]);
+        let confirmed = Outpoint {
+            txid: Hash32([0x11; 32]),
+            vout: 0,
+        };
+        let value = UtxoValue {
+            value_sat: 1000,
+            script_hash: script,
+            creation_height: 1,
+            coinbase: false,
+        };
+        let tip = |h: u32| IndexedTip {
+            height: h,
+            block_hash: Hash32([h as u8; 32]),
+            schema_version: el_model::codec::SCHEMA_VERSION,
+            txnum: 0,
+        };
+        let mut batch = Store::batch();
+        store.put_utxo(&mut batch, &confirmed, &value).unwrap();
+        store.commit_tip_only(batch, &tip(1)).unwrap();
+
+        let tx = make_tx(&[("11".repeat(32), 0)], &[(900, 0xbb)]);
+        let txid = Hash32::from_hex(&tx.compute_txid().to_string()).unwrap();
+        let mut m = Mempool::new();
+        m.raw = HashMap::from([(txid, tx)]);
+        m.meta = HashMap::from([(txid, (150, 100, 7))]);
+        m.rebuild(&store);
+        assert_eq!(m.balance_delta(script), -1000);
+        assert_eq!(m.tx(&txid).unwrap().time, 7);
+
+        // Remove the UTXO from the index without moving the tip: the cached
+        // prevout still resolves, so the index was not read again.
+        let mut batch = Store::batch();
+        store.delete_utxo(&mut batch, &confirmed, script).unwrap();
+        store.commit_tip_only(batch, &tip(1)).unwrap();
+        m.rebuild(&store);
+        assert_eq!(m.balance_delta(script), -1000);
+        assert_eq!(m.unresolved_inputs(), 0);
+
+        // A new tip invalidates the cache: the prevout is read again.
+        store.commit_tip_only(Store::batch(), &tip(2)).unwrap();
+        m.rebuild(&store);
+        assert_eq!(m.unresolved_inputs(), 1);
+        assert_eq!(m.balance_delta(script), 0);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

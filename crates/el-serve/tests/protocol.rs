@@ -1021,3 +1021,45 @@ fn server_version_negotiation_and_connection_lifecycle() {
         "server must close after a fatal version mismatch"
     );
 }
+
+#[test]
+fn listunspent_follows_block_order_not_txid_order() {
+    // AUD-146: several UTXOs of one script in one block are listed by the
+    // transaction's position in the block, as Electrum expects.
+    let (fx, script, txid) = fixture();
+    let s = &fx.shared;
+    let late = Hash32::from_hex(&"01".repeat(32)).unwrap(); // smallest txid, last in block
+    let middle = Hash32::from_hex(&"ff".repeat(32)).unwrap(); // largest txid, middle
+    let mut batch = Store::batch();
+    for (id, pos) in [(late, 2u32), (middle, 1u32)] {
+        s.store.put_occurrence(&mut batch, id, 0, pos).unwrap();
+        s.store
+            .put_utxo(
+                &mut batch,
+                &Outpoint { txid: id, vout: 0 },
+                &UtxoValue {
+                    value_sat: 5,
+                    script_hash: script,
+                    creation_height: 0,
+                    coinbase: false,
+                },
+            )
+            .unwrap();
+    }
+    let tip = s.store.committed_tip().unwrap().unwrap();
+    s.store.commit_tip_only(batch, &tip).unwrap();
+
+    let r = call(
+        s,
+        1,
+        "blockchain.scripthash.listunspent",
+        json!([script.to_electrum_hex()]),
+    );
+    let order: Vec<String> = r["result"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|u| u["tx_hash"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(order, vec![txid.to_hex(), middle.to_hex(), late.to_hex()]);
+}

@@ -145,7 +145,9 @@ listen = ""
 
 [rawtx]
 enabled = true
-cache_mib = 256                     # validated LRU cache; 0 disables
+cache_mib = 256                     # verified LRU cache, total disk budget: transactions
+                                    # (+ a quarter, max 64 MiB, of whole blocks for
+                                    # prune-gap repair); 0 disables
 # cache_dir = "/dev/shm/e-lite-rawtx" # tmpfs keeps blocks off disk (counts as RAM)
 decoys = 1                          # extra blocks fetched per real fetch (max 2 in flight)
 tor_socks = "127.0.0.1:9050"        # empty requires allow_clearnet = true

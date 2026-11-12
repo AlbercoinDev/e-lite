@@ -226,12 +226,28 @@ Never treat a version number in this file as authoritative over the code/tag.
   (4) bounds total external downloads; concurrent requests for the same block
   share one download.
 - Decoys default to 1, at most 2 are in flight, and the prefetch never spawns
-  decoys. The prefetcher enqueues up to 16 confirmed history heights per
-  history response with one worker; it is an optimisation, never correctness.
-- The rawtx cache defaults to 256 MiB under `<data-dir>/rawtx-cache`; `cache_dir`
-  may point at tmpfs to keep blocks off disk, and the log rotates at 16 MiB.
-  Assume Core is pruned to the maximum: do not duplicate block data on disk
-  without a disk-pressure cap. Snapshots are manual only.
+  decoys. The prefetcher enqueues up to 16 confirmed history blocks per
+  history response, each with **all** of that history's txids in the block
+  (`prefetch_block_txs`: one download caches them all), with one worker; it is
+  an optimisation, never correctness.
+- The rawtx cache defaults to 256 MiB under `<data-dir>/rawtx-cache` and is a
+  **transaction** cache (AUD-139): wallet requests store the verified
+  transaction plus its merkle branch (`tx/<xx>/<txid>.tx`, accounted in 4 KiB
+  blocks), re-authenticated against the indexed header on every read; whole
+  blocks are kept only for prune-gap repair and legacy entries
+  (`cache_split`: a quarter of `cache_mib`, 1..64 MiB). The last 8 verified
+  external blocks stay in memory for a wallet's burst. `cache_dir` may point
+  at tmpfs to keep data off disk, and the log rotates at 16 MiB. Assume Core
+  is pruned to the maximum: do not duplicate block data on disk without a
+  disk-pressure cap. Snapshots are manual only.
+- The mempool poller lists txids (`getrawmempool false`) every 3 s and only
+  when the list changed clones the overlay and fetches `getmempoolentry` +
+  raw transaction for the **new** txids; confirmed prevouts are cached while
+  the index tip is unchanged (AUD-138). The notifier sleeps on
+  `DirtyScripts::wait` (woken by a commit or a mempool change, at most 2 s)
+  and pushes notifications with a 2 s write timeout; a client that cannot
+  take one is disconnected (AUD-146). `tests/log_redaction.rs` rejects log
+  macros that print script hashes or txids.
 - `run` probes the network's providers (`/block-height/0` plus the genesis raw
   block with a header-hash check) and does not open Electrum until at least one
   answers; `require_ready`/`ready_timeout_seconds` control the gate. The gate
