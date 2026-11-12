@@ -1,9 +1,15 @@
 # Session handoff
 
-**Updated:** 2026-11-11
-**Latest published release:** `0.1.0-alpha.29.10.0`
-**Release:** https://github.com/AlbercoinDev/e-lite/releases/tag/v0.1.0-alpha.29.10.0
-**Main commit at handoff:** tag `v0.1.0-alpha.29.10.0`
+**Updated:** 2026-11-12
+**Latest published release:** `0.1.0-alpha.29.11.0`
+**Release:** https://github.com/AlbercoinDev/e-lite/releases/tag/v0.1.0-alpha.29.11.0
+**Main commit at handoff:** tag `v0.1.0-alpha.29.11.0`
+
+alpha.29.11.0 was verified after publishing: `ci` and `release` workflows
+green, and both one-line installers (`--no-core` and `--with-core --yes`)
+installed it in a clean `debian:12` container (Core v32.1.0). Not measured on
+mainnet yet: AUD-129 (cold wallet scan), AUD-131 (IBD write volume), AUD-138
+(mempool cost), AUD-139 (cache hit rate).
 
 This file is the short “where we are” for a new session. The invariants live in
 [`AGENTS.md`](../AGENTS.md) and [`PROJECT_MEMORY.md`](PROJECT_MEMORY.md); the
