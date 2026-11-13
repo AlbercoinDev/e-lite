@@ -139,18 +139,24 @@ the dynamic ARC to work, e-lite needs write access to
 `/sys/module/zfs/parameters/zfs_arc_max` (root, group-writable parameter or a
 non-read-only mount).
 
-Open: AUD-130 (schema v2; the owner's mainnet index is 283 GiB with a 15 GiB
-Core, and the owner asked to do it after this batch), online export, decoy
-weighting, incremental backups. Measured by the owner on mainnet (version not
-stated, before this batch): an xpub wallet scan took 6 minutes. Each client
-connection is served serially, so `transaction.get` requests download blocks
-one after another; serving them concurrently per connection is the next
-candidate for that scan time.
+Open: the **2026-11-13 measured plan** is in `docs/ROADMAP.md` ("Planned
+work (2026-11-13)"): wallet-over-Tor corrections (parallel provider probes,
+`tx.get` failure causes, session-summary noise, opt-in prefetch with decoys,
+notifier timeout, docs) and the schema v2 decision (AUD-130: **from-zero
+reindex, no in-place migration**). Online export, decoy weighting and
+incremental backups stay deferred.
 
-Candidate raised by the signet log: `phase indexing X b/s` is the cumulative
-phase average (it only resets on a phase change), so it read 117 b/s while
-the real interval was 37; a recent-rate EWMA (~60 s) in the `height` line
-would make the instantaneous rate unambiguous.
+Measured on mainnet (2026-11-13, alpha.29.12.1): the server answers wallet
+requests in 0-5 ms; the same wallet scans in seconds over LAN and takes
+minutes over the onion because a v3 onion round trip is 1-7 s and the wallet
+issues serial requests (61 `get_history` in 425 s). There is no server-side
+fix for that latency; the corrections listed in the roadmap address the
+provider-gate window, the pruned-block `tx.get` failures during it, the
+noise, and the loading phase (prefetch with decoys, opt-in).
+
+Candidate raised by the signet log: `phase indexing X b/s` was the cumulative
+phase average (117 b/s while the real interval was 37). Fixed in 29.12.1:
+the `height` line now prints `recent X b/s` from a 60 s window plus `eta`.
 
 ## Last change (alpha.29.11.0)
 
