@@ -65,6 +65,36 @@ wallet xpub scan).
   covers log lines; extend it to status output when the wallet-session
   counters land.
 
+### Documentation and diagnostics checklist (open, AUD-148/AUD-149)
+
+Verify each claim against the code and fix the doc (no release needed):
+
+- `AGENTS.md:167` — 4C/8T plan gives `jobs=2`: stale. `MachinePlan::detect`
+  now uses `physical.clamp(2, jobs_cap)`: SSD/NVMe cap 8, ZFS/virtual 4, HDD
+  2 -> a 4C host gets 4.
+- `AGENTS.md:57-59` — prune bullet: add the caught-up bypass (29.9.0) and
+  `min_gain_live_blocks = 144` (29.9.2); the 20 GiB margin only applies while
+  Core downloads or the index drains.
+- `AGENTS.md` — missing bullets: `[logging] level` (alpha default `debug`,
+  `debug:`/`trace:` lines incl. `wallet session`), `zfs_arc_dynamic` /
+  `zfs_arc_max_mib` / `zfs_arc_min_mib` + `e-lite arc-setup` + the 10-minute
+  permission-probe retry, `recent`/`eta` in the height line.
+- `docs/TUNING.md:52`, `:58-64`, `:483` — the machine-plan example and table
+  repeat the old `jobs` formula; update to the per-disk rule.
+- `docs/CLI.md` — document `--apply` (arc-setup) and
+  `--hash-files`/`--no-hash-files` (snapshot export).
+- `docs/FEATURES.md` — add: plain listener loopback default (AUD-147),
+  prune-at-tip + `min_gain_live`, log levels, `recent`/`eta`, `wallet
+  session`, per-disk jobs plan.
+- `docs/HANDOFF.md:51` — "on 0.0.0.0 for Electrum": TLS is `0.0.0.0`, plain
+  is loopback by default (`plain_lan`/`--plain-lan`).
+
+Diagnostics cosmetics (AUD-149):
+
+- `wallet session`: print µs (or a 1 ms minimum) instead of `0 ms avg`.
+- `first tx.get N ms after get_history`: measure from the connection's first
+  history, not the last one (idle use reports minutes).
+
 ## Security and network compatibility
 
 | Priority | Item | Why / acceptance |

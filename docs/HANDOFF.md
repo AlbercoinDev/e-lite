@@ -146,6 +146,13 @@ notifier timeout, docs) and the schema v2 decision (AUD-130: **from-zero
 reindex, no in-place migration**). Online export, decoy weighting and
 incremental backups stay deferred.
 
+Also open: **AUD-148** (documentation vs code drift: AGENTS jobs/pruning/log
+levels/ARC/recent bullets, TUNING machine-plan table, CLI `--apply` and
+`--hash-files`, FEATURES rows, HANDOFF listener bullet) and **AUD-149**
+(wallet-session µs/1 ms and the first-tx marker semantics). The full
+checklist is in `docs/ROADMAP.md` ("Documentation and diagnostics checklist
+(open, AUD-148/AUD-149)"). Docs-only fixes, no release needed.
+
 Measured on mainnet (2026-11-13, alpha.29.12.1): the server answers wallet
 requests in 0-5 ms; the same wallet scans in seconds over LAN and takes
 minutes over the onion because a v3 onion round trip is 1-7 s and the wallet
