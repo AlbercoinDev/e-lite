@@ -32,12 +32,12 @@ Plan reviewed against the code on 2026-11-13. Order of work:
 
 | # | Priority | Change | Where | Status / acceptance |
 |---|---|---|---|---|
-| 2 | P1 | `transaction.get` failures counted by cause (`not_found`, `no_source`, `external_failed`, `verify_failed`, `internal`) in `/status.rawtx.tx_get_failures`, `debug:` line every 5 s per cause, no hashes (AUD-132). Fail-closed behaviour unchanged (AUD-045). | `el-serve`, `el-rawtx` (`RawtxError::NoSource`) | **Done (unreleased).** |
-| B | P1 | Separate timeout for Esplora requests through Tor (`tor_request_timeout_seconds`, 20 s; direct stays 8 s) and a 40 s budget per `fetch_block`. The 8 s total covered a new circuit plus a whole block, and a timeout cooled the provider for 30-300 s. | `crates/el-rawtx/src/esplora.rs` | **Done (unreleased), not measured.** Acceptance: on mainnet over Tor, `external_failed` stays near zero during a wallet load. |
-| 1 | P1 | Probe public providers **in parallel**, one request each (genesis raw block by its known hash; `/block-height/0` only when unknown), own Tor circuit per provider, Tor attempts get at least `tor_request_timeout_seconds`; the gate opens 2 s after the first healthy provider. | `bin/e-lite/src/public_servers.rs` (`probe_round`) | **Done (unreleased).** Test `gate_opens_with_the_first_healthy_provider`; the owner's mainnet log decides the real opening time. |
-| A | P1 | **JSON-RPC batch arrays** (answered in order; items in parallel up to 8; max 1000) plus opt-in `[server] advertise_electrumx_compat` so Sparrow recognises e-lite (banner `e-lite X (electrumx-compatible)`). **Done (unreleased).** Owner decision 2026-11-13: ElectrumX substring, banner keeps "e-lite" first. Next: measure a Sparrow scan over the onion with the option on; if it is fast and no other wallet misbehaves, make it the default and send Sparrow an upstream patch that recognises `e-lite` with the measured numbers. | `el-serve`, `docs/ELECTRUM_PROTOCOL.md` | A batched scan over the onion takes a few round trips. |
-| 3 | P2 | Session summary only on wallet requests (>= 3 `get_history`/`transaction.get`), with AUD-149. | `el-serve` | **Done (unreleased).** |
-| 5 | P2 | `NOTIFY_WRITE_TIMEOUT` 2 s -> 10 s **rejected**; instead `notify` queues behind the connection lock and the lock holder delivers on release, so the shared notifier never waits for one client's 30 s response write. | `el-serve` (`notify`, `flush_pending`) | **Done (unreleased)**, test `notify_never_waits_for_a_busy_connection`. |
+| 2 | P1 | `transaction.get` failures counted by cause (`not_found`, `no_source`, `external_failed`, `verify_failed`, `internal`) in `/status.rawtx.tx_get_failures`, `debug:` line every 5 s per cause, no hashes (AUD-132). Fail-closed behaviour unchanged (AUD-045). | `el-serve`, `el-rawtx` (`RawtxError::NoSource`) | **Done in alpha.29.12.2.** |
+| B | P1 | Separate timeout for Esplora requests through Tor (`tor_request_timeout_seconds`, 20 s; direct stays 8 s) and a 40 s budget per `fetch_block`. The 8 s total covered a new circuit plus a whole block, and a timeout cooled the provider for 30-300 s. | `crates/el-rawtx/src/esplora.rs` | **Done in alpha.29.12.2, not measured.** Acceptance: on mainnet over Tor, `external_failed` stays near zero during a wallet load. |
+| 1 | P1 | Probe public providers **in parallel**, one request each (genesis raw block by its known hash; `/block-height/0` only when unknown), own Tor circuit per provider, Tor attempts get at least `tor_request_timeout_seconds`; the gate opens 2 s after the first healthy provider. | `bin/e-lite/src/public_servers.rs` (`probe_round`) | **Done in alpha.29.12.2.** Test `gate_opens_with_the_first_healthy_provider`; the owner's mainnet log decides the real opening time. |
+| A | P1 | **JSON-RPC batch arrays** (answered in order; items in parallel up to 8; max 1000) plus opt-in `[server] advertise_electrumx_compat` so Sparrow recognises e-lite (banner `e-lite X (electrumx-compatible)`). **Done in alpha.29.12.2.** Owner decision 2026-11-13: ElectrumX substring, banner keeps "e-lite" first. Next: measure a Sparrow scan over the onion with the option on; if it is fast and no other wallet misbehaves, make it the default and send Sparrow an upstream patch that recognises `e-lite` with the measured numbers. | `el-serve`, `docs/ELECTRUM_PROTOCOL.md` | A batched scan over the onion takes a few round trips. |
+| 3 | P2 | Session summary only on wallet requests (>= 3 `get_history`/`transaction.get`), with AUD-149. | `el-serve` | **Done in alpha.29.12.2.** |
+| 5 | P2 | `NOTIFY_WRITE_TIMEOUT` 2 s -> 10 s **rejected**; instead `notify` queues behind the connection lock and the lock holder delivers on release, so the shared notifier never waits for one client's 30 s response write. | `el-serve` (`notify`, `flush_pending`) | **Done in alpha.29.12.2**, test `notify_never_waits_for_a_busy_connection`. |
 | 4 | P3 | Prefetch with decoys, opt-in. Lower priority: with batches the wallet asks for its transactions grouped and the server can resolve them in parallel without fetching blocks the wallet never asked for. Re-evaluate after A is measured. | `el-rawtx`, `el-serve` `Prefetcher` | Only if the loading phase is still slow with A. |
 | 6 | P2 | Document the Tor reality in `PRIVACY.md`/`TUNING.md` with the measured result of A and B. | `docs/` | With the same change. |
 
@@ -82,23 +82,24 @@ Design notes from the 2026-11-13 review:
   resistance, not by BIP158 (which uses 64-bit SipHash values).
 - Measure first: per-family SST sizes on a mainnet index
   (`/status.rocksdb.cf`) and the bottommost zstd experiment (Storage
-  savings, P2), which needs no schema change. Checklist before starting: collision rules (prefix ambiguity must
-fail conservatively), BIP30 duplicate-txid tests, `canonical_digest`
-equivalence (old vs new on the same chain), snapshot `schema` field and
-import refusal, and a measured size + read-latency benchmark (including a
-wallet xpub scan).
+  savings, P2), which needs no schema change. Before starting, also cover:
+  BIP30 duplicate-txid tests, `canonical_digest` equivalence (old vs new on
+  the same chain), the snapshot `schema` field and import refusal, and a
+  measured size + read-latency benchmark (including a wallet xpub scan).
 
 ### Deferred with rationale
 
 - **Online export / decoy weighting / incremental backups**: left for a later
   batch (owner decision).
 - **`/status` and `/metrics` redaction check**: the log macro scanner only
-  covers log lines; extend it to status output when the wallet-session
-  counters land.
+  covers log lines; extend it to status/metrics output now that the
+  wallet-session and `tx_get_failures` counters exist.
 
-### Documentation and diagnostics checklist (open, AUD-148/AUD-149)
+### Documentation and diagnostics checklist (closed in alpha.29.12.2)
 
-Verify each claim against the code and fix the doc (no release needed):
+Every item below was checked against the code and the doc was fixed in
+alpha.29.12.2 (AUD-148/AUD-149/AUD-150); kept as the record of what was
+verified:
 
 - `AGENTS.md:167` — 4C/8T plan gives `jobs=2`: stale. `MachinePlan::detect`
   now uses `physical.clamp(2, jobs_cap)`: SSD/NVMe cap 8, ZFS/virtual 4, HDD

@@ -1,9 +1,9 @@
 # Session handoff
 
-**Updated:** 2026-11-12
-**Latest published release:** `0.1.0-alpha.29.12.1`
-**Release:** https://github.com/AlbercoinDev/e-lite/releases/tag/v0.1.0-alpha.29.12.1
-**Main commit at handoff:** tag `v0.1.0-alpha.29.12.1`
+**Updated:** 2026-11-13
+**Latest published release:** `0.1.0-alpha.29.12.2`
+**Release:** https://github.com/AlbercoinDev/e-lite/releases/tag/v0.1.0-alpha.29.12.2
+**Main commit at handoff:** tag `v0.1.0-alpha.29.12.2`
 
 alpha.29.11.0 was verified after publishing: `ci` and `release` workflows
 green, and both one-line installers (`--no-core` and `--with-core --yes`)
@@ -140,8 +140,18 @@ the dynamic ARC to work, e-lite needs write access to
 `/sys/module/zfs/parameters/zfs_arc_max` (root, group-writable parameter or a
 non-read-only mount).
 
-## Unreleased on `main` (after alpha.29.12.1)
+## Last change (alpha.29.12.2)
 
+Owner decision of 2026-11-13 on the wallet-over-Tor plan: JSON-RPC batch
+arrays are the main lever, and Sparrow only sends them to servers it
+recognises by name, so `[server] advertise_electrumx_compat` (opt-in) makes
+the banner `e-lite X (electrumx-compatible)` without claiming another
+server. Measure a Sparrow scan over the onion with it on before making it
+the default.
+
+- **JSON-RPC batches** (max 1000 items, up to 8 in parallel, ordered when the
+  batch carries `server.version` or an unsubscribe). This turns one onion
+  round trip per address into one per page.
 - `[rawtx] tor_request_timeout_seconds = 20`: Esplora requests through Tor no
   longer share the 8 s direct timeout; one `fetch_block` spends at most 40 s.
   **Not measured**: the owner's mainnet-over-Tor run decides.
@@ -149,39 +159,32 @@ non-read-only mount).
   block by hash), own Tor circuit, opens 2 s after the first healthy one.
 - `/status.rawtx.tx_get_failures` + `debug: tx.get failed: <cause>`;
   `RawtxError::NoSource` is new.
-- The wallet-over-Tor plan in `docs/ROADMAP.md` was reviewed against the
-  code: JSON-RPC batches (item A) are now the main lever, the notifier
-  timeout change was rejected, prefetch-with-decoys was demoted.
-- JSON-RPC batches implemented. Sparrow uses them only with the opt-in
-  `[server] advertise_electrumx_compat = true` (banner `e-lite X
-  (electrumx-compatible)`; owner decision 2026-11-13). Measure a Sparrow
-  scan over the onion with it on before making it the default.
-- The notifier queues behind the connection lock instead of waiting for it.
-- AUD-148 (docs) and AUD-149 (wallet-session diagnostics) fixed.
-- Tests: fmt, clippy, `cargo test --workspace`. No e2e run; nothing
-  measured on mainnet.
+- The notifier queues behind the connection lock instead of waiting for it
+  (the planned 10 s timeout was rejected).
+- AUD-148 (docs vs code), AUD-149 (wallet-session diagnostics) and AUD-150
+  (help/docs defaults) fixed.
+- Gates run for this revision: `cargo fmt --check`, `clippy -D warnings`,
+  `cargo test --workspace` (288) and `tests/e2e_regtest.sh`. Nothing is
+  measured on mainnet yet.
 
 Open: the **2026-11-13 measured plan** is in `docs/ROADMAP.md` ("Planned
-work (2026-11-13)"): wallet-over-Tor corrections (parallel provider probes,
-`tx.get` failure causes, session-summary noise, opt-in prefetch with decoys,
-notifier timeout, docs) and the schema v2 decision (AUD-130: **from-zero
-reindex, no in-place migration**). Online export, decoy weighting and
-incremental backups stay deferred.
+work (2026-11-13)") and its table now carries the status of each item: done
+(batches, parallel probe, Tor timeout, failure causes, session noise,
+notifier) versus pending (prefetch with decoys, demoted to P3 until item A
+is measured; documentation of the measured result). The schema v2 decision
+(AUD-130: **from-zero reindex, no in-place migration**) is unchanged.
+Online export, decoy weighting and incremental backups stay deferred.
 
-Also open: **AUD-148** (documentation vs code drift: AGENTS jobs/pruning/log
-levels/ARC/recent bullets, TUNING machine-plan table, CLI `--apply` and
-`--hash-files`, FEATURES rows, HANDOFF listener bullet) and **AUD-149**
-(wallet-session µs/1 ms and the first-tx marker semantics). The full
-checklist is in `docs/ROADMAP.md` ("Documentation and diagnostics checklist
-(open, AUD-148/AUD-149)"). Docs-only fixes, no release needed.
+AUD-148, AUD-149 and AUD-150 are fixed in this revision; the roadmap's
+"Documentation and diagnostics checklist" is closed and kept only as a
+record of what was checked.
 
 Measured on mainnet (2026-11-13, alpha.29.12.1): the server answers wallet
-requests in 0-5 ms; the same wallet scans in seconds over LAN and takes
+requests in 0-5 ms; the same wallet scans in seconds over LAN and took
 minutes over the onion because a v3 onion round trip is 1-7 s and the wallet
-issues serial requests (61 `get_history` in 425 s). There is no server-side
-fix for that latency; the corrections listed in the roadmap address the
-provider-gate window, the pruned-block `tx.get` failures during it, the
-noise, and the loading phase (prefetch with decoys, opt-in).
+issued one serial request per address (61 `get_history` in 425 s). The
+server cannot shorten a round trip; it can reduce their number, which is
+what JSON-RPC batches do (opt-in banner until measured).
 
 Candidate raised by the signet log: `phase indexing X b/s` was the cumulative
 phase average (117 b/s while the real interval was 37). Fixed in 29.12.1:

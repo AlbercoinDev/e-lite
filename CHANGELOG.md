@@ -1,8 +1,8 @@
 # Changelog
 
-## Unreleased
+## 0.1.0-alpha.29.12.2 — 2026-11-13
 
-### Wallet over Tor: parallel provider probe, block timeout, `transaction.get` failure causes
+### Wallet over Tor: JSON-RPC batches, parallel provider probe, Tor timeout, failure causes
 
 - **JSON-RPC batches.** A line holding an array of requests is answered with
   one array of responses in request order (at most 1000 items; an empty or
