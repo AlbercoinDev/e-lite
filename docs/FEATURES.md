@@ -28,7 +28,7 @@ available**.
 | Adaptive profiles and hot reload | experimental | `auto/hdd/ssd/nvme/manual`, `SIGUSR1` |
 | Machine plan | experimental | physical cores + cgroup quota + disk class: readers and RocksDB jobs = physical cores clamped to 2..cap per disk (jobs: SSD/NVMe 8, ZFS/virtual 4, HDD 2) |
 | Dynamic ZFS ARC cap | experimental | grows during IBD/drain, shrinks to `zfs_arc_min_mib` when synced; needs write access to `zfs_arc_max` (`e-lite arc-setup`) |
-| Log levels and diagnostics | experimental | `info < debug < trace` (alpha default `debug`), hot-reloadable; height line with `recent` rate and `eta`; `debug:` wallet-session lines (counts/latencies only) |
+| Log levels and diagnostics | experimental | `info < debug < trace` (alpha default `debug`), hot-reloadable; height line with `recent` rate and `eta`; one startup line with the served banner, cache inventory and provider limits; per-connection `client "<name>" protocol <v>`, `first batch N items`, session/window summary with batches, cache hits/puts/fetch and `tx.get` failure causes (counts and latencies only, never hashes); one `rawtx summary` line at shutdown |
 | Global RocksDB memory budget | experimental | effective `MemAvailable` budget; memtables `effective/16`; opt-in adaptive memtables; adaptive cache; CPU-capped jobs |
 | Reorg recovery within undo window | experimental | deeper reorg fails clearly |
 | Snapshots export/import | experimental | optional; not required from zero |
@@ -93,6 +93,7 @@ available**.
 | Tor request timeout | experimental | `rawtx.tor_request_timeout_seconds` (20 s) for Esplora block requests through Tor, separate from the 8 s direct timeout; one wallet request spends at most 40 s across providers |
 | `transaction.get` failure causes | experimental | `/status.rawtx.tx_get_failures` counts `not_found`, `no_source`, `external_failed`, `verify_failed`, `internal`; a `debug: tx.get failed: <cause>` line at most every 5 s per cause (no txid or hash) |
 | In-flight block dedup | experimental | concurrent tx/prefetch of the same block share one download; `max_parallel_fetches=4` |
+| Rawtx cache maintenance | experimental | `e-lite cache status` / `cache clear [--yes]` (`--json` for the app): reports files/bytes/limits/free space and deletes only the memoised cache (`*.blk`, `tx/<xx>/*.tx`). Refuses the data dir, a RocksDB `CURRENT`, `index/`, `bitcoin/`, `tls/` or `tor/`; never touches the index, Core, TLS or the onion keys. Works while serving; restart releases the in-memory block cache |
 | History block prefetch | experimental, off by default (`rawtx.prefetch`) | background fetch of confirmed history blocks before `transaction.get`; 1 worker, 16 heights per history, bounded queue, no decoys |
 | P2P peers auto/config | experimental | `MSG_WITNESS_BLOCK`, `NODE_WITNESS` required, random order among discovered peers, failed-peer cooldown, total timeout; BIP324 v2 + v1 |
 | Prune-gap repair from verified sources | experimental | bounded by `repair_max_gap_blocks` |

@@ -1,5 +1,65 @@
 # Changelog
 
+## 0.1.0-alpha.29.12.3 — 2026-11-13
+
+### Rawtx cache maintenance and self-describing debug logs
+
+No schema, protocol or consensus change. The rawtx cache is the only piece of
+memoised data e-lite keeps on disk; this release makes it inspectable and
+clearable, and puts the numbers a wallet measurement needs in the log itself.
+
+- **`e-lite cache status|clear`** (`--json` for a supervisor/app).
+  `status` reports the directory, files and bytes (whole blocks and verified
+  transactions separately), the configured limits (`cache_split`: a quarter of
+  `rawtx.cache_mib` for blocks, 1-64 MiB, the rest for transactions) and the
+  free space of that filesystem. `clear` deletes **only** regular `*.blk` files
+  in the cache root and `*.tx` files under a two-hex `tx/<xx>/` shard, removes
+  the emptied shards and reports what was removed; without `--yes` it only says
+  what it would delete (`--dry-run` makes that explicit). Anything else in the
+  directory is counted as skipped and left untouched.
+- **The command cannot reach the rest of the data directory.** It refuses (and
+  deletes nothing) when the resolved path is the data directory, contains it,
+  is a filesystem root, holds a RocksDB `CURRENT`, or is/contains `index/`,
+  `bitcoin/`, `tls/` or `tor/` - the index, Core's chain data, the TLS identity
+  and the onion keys. `crates/el-rawtx/src/cachelayout.rs` owns the layout and
+  has the test that proves it (byte-identical index/Core/TLS/Tor files after a
+  clear, foreign files and symlinks untouched, idempotent second run).
+  It works with the daemon running (a vanished file is a cache miss) and warns
+  that the in-memory block cache is only released by a restart. It needs no
+  Core: `network = auto` resolves from the existing data directories.
+- **Self-describing `debug:` logs** (no extra commands, no per-request work):
+  - one startup line with the served banner and the state of
+    `advertise_electrumx_compat`, so a log proves whether the flag reached the
+    process;
+  - the cache inventory at startup (from the state each cache rebuilds at
+    open; no directory walk), which tells a cold run from a warm one;
+  - the provider limits in force (probe, Tor, ready, prefetch, decoys,
+    parallelism);
+  - per connection: the client name/version and protocol, and a one-time
+    `first batch, N items` line;
+  - the 60 s session summary now also prints batches (lines/items/max), cache
+    hits/puts/external fetches and `tx.get` failure causes, as deltas for that
+    window; the close line prints the whole session delta;
+  - one `rawtx summary` line at shutdown with the process totals.
+  Batches cost two relaxed counters **per line** (never per item); the rest is
+  read from counters that already existed. Everything is gated by the `debug`
+  level, so the INFO format is unchanged and `info` costs nothing.
+- **`/status`** gains `server` (banner, `electrumx_compat`, `lines_total`,
+  `batch_lines`, `batch_items`, `batch_max_items`) and `rawtx.cache_blocks`,
+  `cache_txs`, `cache_bytes`, `cache_dir`, so a panel can show the same numbers.
+
+### Fixes
+
+- **`core plan` reported `dbcache 0 MiB` when the operator set `-dbcache`**
+  (`core_plan.rs`): the field stayed at its default while the real Core reserve
+  was the operator value, and `machine plan` printed a third number (the fitted
+  one). The plan now reports the operator value it keeps, and the machine plan
+  reports the reserve it actually subtracts.
+- **The uncapped-ARC warning suggested a fixed `min(25 % RAM, 8 GiB)`** while
+  the dynamic manager caps at half of RAM during IBD/drain and
+  `zfs_arc_min_mib` when synced. The warning now points at `e-lite arc-setup`
+  and that policy; a fixed cap is still valid.
+
 ## 0.1.0-alpha.29.12.2 — 2026-11-13
 
 ### Wallet over Tor: JSON-RPC batches, parallel provider probe, Tor timeout, failure causes

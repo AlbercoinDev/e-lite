@@ -111,6 +111,10 @@ pub fn plan_core(cfg: &Config, chain: Chain) -> Result<CorePlan, String> {
     let rpcthreads = cpus.clamp(4, 16);
 
     if operator_sets(cfg, "-dbcache") {
+        // Keep the operator value, and report it: leaving the field at its
+        // default made the summary read "dbcache 0 MiB" while the real Core
+        // reserve was the operator's number.
+        plan.dbcache_mib = operator_dbcache_mib(cfg).unwrap_or(0);
         plan.notes
             .push("operator set -dbcache; keeping it".to_string());
     } else {
@@ -156,14 +160,22 @@ pub fn plan_core(cfg: &Config, chain: Chain) -> Result<CorePlan, String> {
     // other way around). Always state it.
     plan.args.push(format!("-prune={}", cfg.core.prune_mib));
 
+    let dbcache_text = if operator_sets(cfg, "-dbcache") {
+        match operator_dbcache_mib(cfg) {
+            Some(v) => format!("dbcache {v} MiB (operator)"),
+            None => "dbcache from -dbcache (operator)".to_string(),
+        }
+    } else {
+        format!("dbcache {} MiB", plan.dbcache_mib)
+    };
     plan.notes.push(format!(
-        "{} MiB total, {} MiB available, {} physical cores ({} logical) -> dbcache {} MiB, \
+        "{} MiB total, {} MiB available, {} physical cores ({} logical) -> {}, \
          par {}, rpcthreads {} ({} network)",
         total,
         available,
         cpu.physical_effective,
         cpu.logical,
-        plan.dbcache_mib,
+        dbcache_text,
         plan.par,
         plan.rpcthreads,
         chain.name()
@@ -390,7 +402,16 @@ mod tests {
         let plan = plan_core(&c, Chain::Mainnet).unwrap();
         assert!(plan.args.iter().any(|a| a == "-prune=1"));
         assert!(!plan.args.iter().any(|a| a.starts_with("-dbcache=")));
-        assert_eq!(plan.dbcache_mib, 0);
+        // The plan reports the operator value it keeps: printing 0 made the
+        // startup line read "dbcache 0 MiB" while Core really got 3000.
+        assert_eq!(plan.dbcache_mib, 3000);
+        assert!(
+            plan.notes
+                .iter()
+                .any(|n| n.contains("dbcache 3000 MiB (operator)")),
+            "{:?}",
+            plan.notes
+        );
         assert!(plan.args.iter().any(|a| a.starts_with("-par=")));
         assert_eq!(operator_dbcache_mib(&c), Some(3000));
     }

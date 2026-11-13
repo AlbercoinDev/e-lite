@@ -3,7 +3,7 @@
 //! Each request reads the index through a shared read lock; the indexer commits
 //! under the write lock, so no response mixes two tips.
 
-#![recursion_limit = "256"]
+#![recursion_limit = "512"]
 
 use el_chain::ReaderTracker;
 use el_mempool::Mempool;
@@ -63,6 +63,48 @@ fn banner(electrumx_compat: bool) -> String {
     } else {
         format!("e-lite {VERSION}")
     }
+}
+
+/// The banner this process serves, for the startup diagnostic line.
+pub fn banner_for_log() -> String {
+    server_banner()
+}
+
+/// Process totals at shutdown: the measurement a wallet-over-Tor run is read
+/// from. One line, `debug:` only, no identifiers.
+pub fn log_rawtx_summary(shared: &Shared) {
+    if !debug_logs() {
+        return;
+    }
+    let rawtx = shared.resolver.stats();
+    let load = |a: &AtomicU64| a.load(Ordering::Relaxed);
+    let failures: Vec<String> = TxGetFailure::ALL
+        .iter()
+        .filter(|c| shared.stats.tx_get_failures.get(**c) > 0)
+        .map(|c| format!("{} {}", c.label(), shared.stats.tx_get_failures.get(*c)))
+        .collect();
+    let failures = if failures.is_empty() {
+        "none".to_string()
+    } else {
+        failures.join(" ")
+    };
+    let cache = shared.resolver.cache_inventory();
+    eprintln!(
+        "[e-lite] debug: rawtx summary: fetch {} ({}), cache hits {} puts {}, decoys {}, \
+         tx.get failed {}, batches {} ({} items, max {}), cache now {} blocks / {} txs ({})",
+        load(&rawtx.fetches),
+        display_size(load(&rawtx.bytes)),
+        load(&rawtx.cache_hits),
+        load(&rawtx.cache_puts),
+        load(&rawtx.decoys),
+        failures,
+        load(&shared.stats.batch_lines),
+        load(&shared.stats.batch_items),
+        load(&shared.stats.batch_max_items),
+        cache.block_files,
+        cache.tx_files,
+        display_size(cache.bytes()),
+    );
 }
 
 /// Electrum clients ask for a script's full history. A script with millions of
@@ -194,6 +236,66 @@ impl TxGetFailures {
     }
 }
 
+/// Counters taken when a connection opens, so the `debug:` wallet lines can
+/// report what *that* session did: request counts alone cannot tell a cold
+/// run (external fetches) from a warm one (cache hits) when the process has
+/// been up for hours.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct CacheBaseline {
+    hits: u64,
+    puts: u64,
+    fetches: u64,
+    failures: [u64; 5],
+}
+
+/// Difference between two [`CacheBaseline`] snapshots.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct CacheDelta {
+    pub hits: u64,
+    pub puts: u64,
+    pub fetches: u64,
+    failures: [u64; 5],
+}
+
+impl CacheDelta {
+    /// `none` or `external_failed 2 no_source 1`: causes only, never hashes.
+    pub fn failures_text(&self) -> String {
+        let parts: Vec<String> = TxGetFailure::ALL
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| self.failures[*i] > 0)
+            .map(|(i, cause)| format!("{} {}", cause.label(), self.failures[i]))
+            .collect();
+        if parts.is_empty() {
+            "none".to_string()
+        } else {
+            parts.join(" ")
+        }
+    }
+}
+
+impl CacheBaseline {
+    pub fn capture(shared: &Shared) -> Self {
+        let rawtx = shared.resolver.stats();
+        CacheBaseline {
+            hits: rawtx.cache_hits.load(Ordering::Relaxed),
+            puts: rawtx.cache_puts.load(Ordering::Relaxed),
+            fetches: rawtx.fetches.load(Ordering::Relaxed),
+            failures: TxGetFailure::ALL.map(|c| shared.stats.tx_get_failures.get(c)),
+        }
+    }
+
+    pub fn since(self, shared: &Shared) -> CacheDelta {
+        let now = CacheBaseline::capture(shared);
+        CacheDelta {
+            hits: now.hits.saturating_sub(self.hits),
+            puts: now.puts.saturating_sub(self.puts),
+            fetches: now.fetches.saturating_sub(self.fetches),
+            failures: std::array::from_fn(|i| now.failures[i].saturating_sub(self.failures[i])),
+        }
+    }
+}
+
 pub struct Stats {
     pub indexed_height: AtomicU64,
     pub core_height: AtomicU64,
@@ -210,6 +312,13 @@ pub struct Stats {
     pub rate_limited: AtomicU64,
     /// `blockchain.transaction.get` failures by cause.
     pub tx_get_failures: TxGetFailures,
+    /// Lines read from clients (valid or not), so `lines_total - batch_lines`
+    /// is the number of single-request lines.
+    pub lines_total: AtomicU64,
+    /// Lines that carried a JSON-RPC batch array, and the items they held.
+    pub batch_lines: AtomicU64,
+    pub batch_items: AtomicU64,
+    pub batch_max_items: AtomicU64,
     pub clients: AtomicUsize,
     pub last_block_ms: AtomicU64,
     pub notifier_runs: AtomicU64,
@@ -342,6 +451,10 @@ impl Default for Stats {
             errors_total: AtomicU64::new(0),
             rate_limited: AtomicU64::new(0),
             tx_get_failures: TxGetFailures::default(),
+            lines_total: AtomicU64::new(0),
+            batch_lines: AtomicU64::new(0),
+            batch_items: AtomicU64::new(0),
+            batch_max_items: AtomicU64::new(0),
             clients: AtomicUsize::new(0),
             last_block_ms: AtomicU64::new(0),
             notifier_runs: AtomicU64::new(0),
@@ -845,6 +958,14 @@ pub struct ClientStats {
     pub tx_gets: u64,
     pub tx_us_total: u64,
     pub tx_us_max: u64,
+    /// JSON-RPC batches served on this connection (lines and items).
+    pub batch_lines: u64,
+    pub batch_items: u64,
+    pub batch_max_items: u64,
+    /// Cache and failure counters when the connection opened, for the
+    /// session deltas. Every 60 s summary also prints the window delta.
+    pub session_base: CacheBaseline,
+    pub window_base: CacheBaseline,
     /// Milliseconds between the connection's first `get_history` and its
     /// first `transaction.get`: how long the wallet scanned before it started
     /// loading transactions.
@@ -865,9 +986,30 @@ impl ClientStats {
             tx_gets: 0,
             tx_us_total: 0,
             tx_us_max: 0,
+            batch_lines: 0,
+            batch_items: 0,
+            batch_max_items: 0,
+            session_base: CacheBaseline::default(),
+            window_base: CacheBaseline::default(),
             first_tx_after_history: None,
             first_history_at: None,
         }
+    }
+}
+
+/// `512 B`, `3.4 KiB`, `12.1 MiB`, `1.2 GiB`.
+pub fn display_size(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit + 1 < UNITS.len() {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes} B")
+    } else {
+        format!("{value:.1} {}", UNITS[unit])
     }
 }
 
@@ -882,9 +1024,24 @@ fn fmt_latency(us: u64) -> String {
 }
 
 impl ClientState {
+    /// Snapshot the process-wide cache/failure counters when the connection
+    /// opens, so the session lines can report deltas instead of totals.
+    fn set_baseline(&self, shared: &Shared) {
+        if !debug_logs() {
+            return;
+        }
+        let Ok(mut s) = self.stats.lock() else {
+            return;
+        };
+        let base = CacheBaseline::capture(shared);
+        s.session_base = base;
+        s.window_base = base;
+    }
+
     /// Record one dispatched request for the wallet-session diagnostics and
-    /// print a summary every 60 s of activity. Counts and milliseconds only.
-    fn record_request(&self, method: &str, elapsed: Duration) {
+    /// print a summary every 60 s of activity. Counts, latencies and cache
+    /// deltas only: never a hash, script or txid (AUD-132).
+    fn record_request(&self, shared: &Shared, method: &str, elapsed: Duration) {
         if !debug_logs() {
             return;
         }
@@ -922,9 +1079,11 @@ impl ClientState {
         }
         if s.last_summary.elapsed() >= Duration::from_secs(60) && s.window_requests >= 3 {
             let avg = |total: u64, n: u64| total.checked_div(n).unwrap_or(0);
+            let delta = s.window_base.since(shared);
             eprintln!(
                 "[e-lite] debug: wallet session: {}s, history {} ({} avg, {} max), \
-                 tx.get {} ({} avg, {} max)",
+                 tx.get {} ({} avg, {} max), batches {} ({} items, max {}), cache hits {} \
+                 puts {} fetch {}, tx.get failed {}",
                 s.opened.elapsed().as_secs(),
                 s.history_requests,
                 fmt_latency(avg(s.history_us_total, s.history_requests)),
@@ -932,10 +1091,44 @@ impl ClientState {
                 s.tx_gets,
                 fmt_latency(avg(s.tx_us_total, s.tx_gets)),
                 fmt_latency(s.tx_us_max),
+                s.batch_lines,
+                s.batch_items,
+                s.batch_max_items,
+                delta.hits,
+                delta.puts,
+                delta.fetches,
+                delta.failures_text(),
             );
             s.last_summary = Instant::now();
             s.window_requests = 0;
+            s.window_base = CacheBaseline::capture(shared);
         }
+    }
+
+    /// One line at close with the whole session: counts, batches and the
+    /// cache delta since the connection opened (cold vs warm evidence).
+    fn log_close(&self, shared: &Shared) {
+        if !debug_logs() {
+            return;
+        }
+        let Ok(s) = self.stats.lock() else {
+            return;
+        };
+        let delta = s.session_base.since(shared);
+        eprintln!(
+            "[e-lite] debug: wallet: closed after {}s (history {}, tx.get {}; batches {} \
+             ({} items, max {}); cache hits {} puts {} fetch {}; tx.get failed {})",
+            s.opened.elapsed().as_secs(),
+            s.history_requests,
+            s.tx_gets,
+            s.batch_lines,
+            s.batch_items,
+            s.batch_max_items,
+            delta.hits,
+            delta.puts,
+            delta.fetches,
+            delta.failures_text(),
+        );
     }
 
     /// Push a notification. It is queued and written by whoever holds the
@@ -1433,6 +1626,14 @@ impl Shared {
         json!({
             "version": VERSION,
             "network": id.chain.name(),
+            "server": {
+                "banner": server_banner(),
+                "electrumx_compat": ELECTRUMX_COMPAT.load(Ordering::Relaxed),
+                "lines_total": self.stats.lines_total.load(Ordering::Relaxed),
+                "batch_lines": self.stats.batch_lines.load(Ordering::Relaxed),
+                "batch_items": self.stats.batch_items.load(Ordering::Relaxed),
+                "batch_max_items": self.stats.batch_max_items.load(Ordering::Relaxed),
+            },
             "machine": machine,
             "genesis": id.genesis.to_hex(),
             "state": state::name(self.get_state()),
@@ -1640,6 +1841,10 @@ impl Shared {
             "rawtx": {
                 "cache_hits": rawtx.cache_hits.load(Ordering::Relaxed),
                 "cache_puts": rawtx.cache_puts.load(Ordering::Relaxed),
+                "cache_blocks": self.resolver.cached_blocks(),
+                "cache_txs": self.resolver.cached_txs(),
+                "cache_bytes": self.resolver.cache_size_bytes(),
+                "cache_dir": self.resolver.cache_dir().display().to_string(),
                 "fetches": rawtx.fetches.load(Ordering::Relaxed),
                 "bytes": rawtx.bytes.load(Ordering::Relaxed),
                 "verify_failures": rawtx.verify_failures.load(Ordering::Relaxed),
@@ -1950,6 +2155,27 @@ fn server_version(params: &Value, client: Option<&Arc<ClientState>>) -> RpcResul
             ));
         }
         *slot = Some(negotiated);
+    }
+    if debug_logs() {
+        // Which wallet and protocol this connection speaks. The name is the
+        // client's own string (`Sparrow 2.3.0`); it carries no wallet data and
+        // is sanitised so it cannot forge or break a log line.
+        let name = arr.first().and_then(Value::as_str).unwrap_or("-");
+        let shown: String = name
+            .chars()
+            .take(40)
+            .map(|c| {
+                if c.is_ascii_graphic() || c == ' ' {
+                    c
+                } else {
+                    '?'
+                }
+            })
+            .collect();
+        eprintln!(
+            "[e-lite] debug: wallet: client {shown:?} protocol {negotiated} (banner {})",
+            server_banner()
+        );
     }
     Ok(json!([server_banner(), negotiated.to_string()]))
 }
@@ -3955,6 +4181,7 @@ fn read_line_limited<R: BufRead>(
 }
 
 fn handle_client(shared: &Shared, client: Arc<ClientState>) -> std::io::Result<()> {
+    client.set_baseline(shared);
     if debug_logs() {
         eprintln!(
             "[e-lite] debug: wallet: connection {} (tls {})",
@@ -3964,16 +4191,7 @@ fn handle_client(shared: &Shared, client: Arc<ClientState>) -> std::io::Result<(
     let result = client_loop(shared, &client);
     client.alive.store(false, Ordering::SeqCst);
     shared.clients.unregister(client.id);
-    if debug_logs() {
-        if let Ok(s) = client.stats.lock() {
-            eprintln!(
-                "[e-lite] debug: wallet: closed after {}s (history {}, tx.get {})",
-                s.opened.elapsed().as_secs(),
-                s.history_requests,
-                s.tx_gets
-            );
-        }
-    }
+    client.log_close(shared);
     result
 }
 
@@ -4060,13 +4278,14 @@ pub const MAX_BATCH_REQUESTS: usize = 1000;
 
 /// Requests of one batch resolved at the same time. External block
 /// downloads stay bounded by `rawtx.max_parallel_fetches` underneath.
-const BATCH_WORKERS: usize = 8;
+pub const BATCH_WORKERS: usize = 8;
 
 pub fn process_line_for(
     shared: &Shared,
     client: Option<&Arc<ClientState>>,
     line: &str,
 ) -> LineOutcome {
+    shared.stats.lines_total.fetch_add(1, Ordering::Relaxed);
     let request: Value = match serde_json::from_str(line) {
         Ok(v) => v,
         Err(e) => {
@@ -4121,6 +4340,30 @@ fn process_batch(
         return invalid(&format!(
             "invalid request: batch larger than {MAX_BATCH_REQUESTS} requests"
         ));
+    }
+    // Measurement, not behaviour: two relaxed counters per line (never per
+    // item) so a debug log says whether a wallet is really batching.
+    let items_len = items.len() as u64;
+    shared.stats.batch_lines.fetch_add(1, Ordering::Relaxed);
+    shared
+        .stats
+        .batch_items
+        .fetch_add(items_len, Ordering::Relaxed);
+    shared
+        .stats
+        .batch_max_items
+        .fetch_max(items_len, Ordering::Relaxed);
+    let mut first_batch = false;
+    if let Some(c) = client {
+        if let Ok(mut s) = c.stats.lock() {
+            first_batch = s.batch_lines == 0;
+            s.batch_lines += 1;
+            s.batch_items += items_len;
+            s.batch_max_items = s.batch_max_items.max(items_len);
+        }
+    }
+    if first_batch && debug_logs() {
+        eprintln!("[e-lite] debug: wallet: first batch, {items_len} items (parallel JSON-RPC)");
     }
     let ordered = items.iter().any(|item| {
         item.get("method")
@@ -4227,7 +4470,7 @@ fn process_request(
     let started = Instant::now();
     let outcome = dispatch_for(shared, client, version, method, &params);
     if let Some(c) = client {
-        c.record_request(method, started.elapsed());
+        c.record_request(shared, method, started.elapsed());
     }
     match outcome {
         Ok(result) => LineOutcome {

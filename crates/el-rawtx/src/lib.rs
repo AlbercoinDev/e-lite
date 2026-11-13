@@ -6,6 +6,7 @@
 //! operator explicitly allows clearnet.
 
 pub mod cache;
+pub mod cachelayout;
 pub mod core_source;
 pub mod esplora;
 pub mod p2p;
@@ -35,6 +36,7 @@ pub const HTTP_USER_AGENT: &str = "Mozilla/5.0";
 pub const P2P_USER_AGENT: &[u8] = b"/Satoshi:29.0.0/";
 
 pub use cache::BlockCache;
+pub use cachelayout::{CacheInventory, CACHE_DIR_NAME};
 pub use txcache::TxCache;
 
 /// Verified external blocks kept in memory (a mainnet block decodes to a few
@@ -467,6 +469,23 @@ impl Resolver {
     /// Transactions in the transaction cache.
     pub fn cached_txs(&self) -> usize {
         self.txcache.as_ref().map(|c| c.len()).unwrap_or(0)
+    }
+
+    /// Whole blocks in the block cache.
+    pub fn cached_blocks(&self) -> usize {
+        self.cache.as_ref().map(|c| c.len()).unwrap_or(0)
+    }
+
+    /// Cache inventory from the in-memory state each cache rebuilt at open.
+    /// O(1): never walks the directory (that is `cachelayout::inventory`).
+    pub fn cache_inventory(&self) -> CacheInventory {
+        CacheInventory {
+            block_files: self.cached_blocks() as u64,
+            block_bytes: self.cache.as_ref().map(|c| c.size()).unwrap_or(0),
+            tx_files: self.cached_txs() as u64,
+            tx_bytes: self.txcache.as_ref().map(|c| c.size()).unwrap_or(0),
+            skipped: 0,
+        }
     }
 
     /// Whether a pruned-index repair has any chance: a validated block cache

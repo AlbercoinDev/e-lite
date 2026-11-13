@@ -266,7 +266,14 @@ Never treat a version number in this file as authoritative over the code/tag.
   external blocks stay in memory for a wallet's burst. `cache_dir` may point
   at tmpfs to keep data off disk, and the log rotates at 16 MiB. Assume Core
   is pruned to the maximum: do not duplicate block data on disk without a
-  disk-pressure cap. Snapshots are manual only.
+  disk-pressure cap. Snapshots are manual only. The layout belongs to
+  `crates/el-rawtx/src/cachelayout.rs` (`*.blk` at the cache root,
+  `tx/<xx>/<txid>.tx`); `e-lite cache status|clear` is the only code allowed to
+  delete it and refuses the data directory, a RocksDB `CURRENT`, `index/`,
+  `bitcoin/`, `tls/` or `tor/`, so the index, Core's chain data, the TLS
+  identity and the onion keys are never touched (a test proves the files stay
+  byte-identical). It is safe while serving; only a restart frees the in-memory
+  block cache.
 - The mempool poller lists txids (`getrawmempool false`) every 3 s and only
   when the list changed clones the overlay and fetches `getmempoolentry` +
   raw transaction for the **new** txids; confirmed prevouts are cached while
@@ -418,7 +425,16 @@ Never treat a version number in this file as authoritative over the code/tag.
   prints as `[e-lite] debug:`/`trace:`. The `debug:` wallet lines (`wallet:`,
   `wallet session:`, `tx.get failed:`) carry counts, latencies and heights
   only. A session summary prints only after >= 3 `get_history`/`transaction.get`
-  in 60 s (pings do not count); sub-millisecond latencies print in µs.
+  in 60 s (pings do not count); sub-millisecond latencies print in µs. The same
+  level prints one startup block (served banner and `advertise_electrumx_compat`,
+  cache inventory from the in-memory state - never a directory walk - and the
+  provider limits), the client name/version and protocol per connection, a
+  one-time `first batch, N items`, and one `rawtx summary` at shutdown. Session
+  and close lines carry batches (lines/items/max) plus the cache hits/puts/
+  external-fetch and `tx.get` failure deltas of the session or window, which is
+  how one log proves whether the wallet batched, whether the run was cold or
+  warm and where the time went. Keep it aggregate (two relaxed counters per
+  line, never per item) and never print hashes, scripts or txids.
 - The height line prints `phase X b/s` (average since the phase changed),
   `recent X b/s` (60 s window over full commit groups) and `eta` =
   `lag / recent`. `recent` is the honest current rate.

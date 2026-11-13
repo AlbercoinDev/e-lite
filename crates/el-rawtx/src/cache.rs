@@ -165,6 +165,11 @@ impl BlockCache {
     pub fn size(&self) -> u64 {
         self.state.lock().map(|s| s.size).unwrap_or(0)
     }
+
+    /// Entries held (whole blocks). Cheap: reads the map rebuilt at open.
+    pub fn len(&self) -> usize {
+        self.state.lock().map(|s| s.entries.len()).unwrap_or(0)
+    }
 }
 
 /// Remove the oldest entry (by mtime). Returns false when empty.

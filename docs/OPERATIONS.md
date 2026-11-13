@@ -408,6 +408,48 @@ Core's own log is separate: `<data-dir>/bitcoind.log` (or `[core] log_file`), an
 file is created with the default `[indexing]`/`[ready]` sections if missing.
 The protocol has no banner push, so a connected wallet may need to reconnect.
 
+### Reading a debug log for a wallet measurement
+
+With `[logging] level = "debug"` (the alpha default) a log is self-describing;
+no command is needed to interpret a wallet run:
+
+```text
+debug: server: banner "e-lite X (electrumx-compatible)" | electrumx compat on (opt-in) | ...
+debug: rawtx cache: /data/.../rawtx-cache | blocks 3 files 2.0 MiB / 64 MiB | txs 812 files 4.1 MiB / 192 MiB
+debug: rawtx: probe 5s (tor >= 20s), ready 60s, prefetch off, decoys 1, max_parallel 4, ...
+debug: wallet: client "Sparrow 2.x" protocol 1.7 (banner e-lite X (electrumx-compatible))
+debug: wallet: first batch, 100 items (parallel JSON-RPC)
+debug: wallet session: 60s, history 80 (497 us avg, 6 ms max), tx.get 377 (31 ms avg, 109 ms max), batches 12 (1200 items, max 100), cache hits 348 puts 29 fetch 0, tx.get failed none
+debug: wallet: closed after 140s (history 120, tx.get 654; batches 12 (1200 items, max 100); cache hits 640 puts 12 fetch 2; tx.get failed none)
+debug: rawtx summary: fetch 2 (0.3 MiB), cache hits 640 puts 12, decoys 2, tx.get failed none, batches 12 (1200 items, max 100), cache now 3 blocks / 812 txs (4.1 MiB)
+```
+
+How to read it: the banner line proves whether `advertise_electrumx_compat`
+reached the process; `batches 0` during a scan means the wallet is not batching
+(it sends one request per line) regardless of the banner; the startup cache
+inventory plus the per-session `cache hits`/`fetch` tell a cold run (fetches,
+no hits) from a warm one. `first tx.get … after the first get_history` is the
+scan phase; server-side latencies are the `avg`/`max` figures.
+
+### A cold run for measurements
+
+`get_history` has no cache (it is computed from the index every time); what can
+hide the cost of a first load is the on-disk transaction cache. To measure the
+first load of a wallet honestly:
+
+```bash
+# stop the network first
+e-lite cache status --network mainnet
+e-lite cache clear  --network mainnet --yes
+# optional: also drop the OS page cache (root) for a colder disk
+# then start and restore the wallet from the xpub
+```
+
+Restarting e-lite also releases the in-memory block cache; clearing the disk
+cache alone does not reduce RAM. Never delete the data directory: the index,
+Core, TLS and the onion keys live there. `e-lite cache clear` only removes the
+rawtx cache and refuses any other path.
+
 ## Monitoring
 
 ```bash

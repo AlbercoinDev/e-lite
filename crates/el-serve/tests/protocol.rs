@@ -843,6 +843,26 @@ fn batches_are_answered_in_order() {
     let r = process_line(s, &Value::Array(items).to_string());
     let arr = r.as_array().expect("batch answer is an array");
     assert_eq!(arr.len(), 22, "the notification gets no response");
+    // Measurement counters: one line, one counter per item (never per line).
+    assert_eq!(
+        s.stats
+            .batch_lines
+            .load(std::sync::atomic::Ordering::Relaxed),
+        1
+    );
+    // Every item counts, including the notification that gets no response.
+    assert_eq!(
+        s.stats
+            .batch_items
+            .load(std::sync::atomic::Ordering::Relaxed),
+        23
+    );
+    assert_eq!(
+        s.stats
+            .batch_max_items
+            .load(std::sync::atomic::Ordering::Relaxed),
+        23
+    );
     for (i, item) in arr.iter().take(20).enumerate() {
         assert_eq!(item["id"], i as u64);
         assert!(item["result"].is_array(), "{item}");

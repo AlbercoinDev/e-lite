@@ -21,7 +21,7 @@ use el_mempool::Mempool;
 use el_model::{Chain, Hash32, IndexedTip, NetworkIdentity, ScriptHash};
 use el_rawtx::{CoreBlockSource, RawtxConfig, Resolver};
 use el_rpc::{BlockchainInfo, CoreClient, CoreConfig};
-use el_serve::{state, Shared, Stats, VERSION};
+use el_serve::{display_size, state, Shared, Stats, VERSION};
 use el_store::Store;
 use rocksdb::WriteBatch;
 use serde_json::json;
@@ -188,6 +188,7 @@ enum Command {
     ImportSnapshot,
     Core,
     Onion,
+    Cache,
     ArcSetup,
 }
 
@@ -288,6 +289,7 @@ struct Args {
     no_tor: bool,
     purge: bool,
     yes: bool,
+    dry_run: bool,
     stop_on_exit: Option<bool>,
     restart: Option<bool>,
     log_file: Option<String>,
@@ -461,6 +463,7 @@ fn parse_args() -> R<Args> {
             "--no-tor" => args.no_tor = true,
             "--purge" => args.purge = true,
             "--yes" | "-y" => args.yes = true,
+            "--dry-run" => args.dry_run = true,
             "--adaptive" => args.adaptive = Some(true),
             "--no-adaptive" => args.adaptive = Some(false),
             "--no-p2p" => args.no_p2p = true,
@@ -481,8 +484,10 @@ fn parse_args() -> R<Args> {
             "--no-follow" => args.no_follow = true,
             other if other.starts_with('-') => return fail(format!("unknown flag: {other}")),
             other => {
-                if matches!(args.command, Some(Command::Core) | Some(Command::Onion))
-                    && args.subcommand.is_none()
+                if matches!(
+                    args.command,
+                    Some(Command::Core) | Some(Command::Onion) | Some(Command::Cache)
+                ) && args.subcommand.is_none()
                 {
                     args.subcommand = Some(other.to_string());
                     continue;
@@ -499,6 +504,7 @@ fn parse_args() -> R<Args> {
                     "status" => Command::Status,
                     "core" => Command::Core,
                     "onion" => Command::Onion,
+                    "cache" => Command::Cache,
                     "export-snapshot" => Command::ExportSnapshot,
                     "import-snapshot" => Command::ImportSnapshot,
                     "arc-setup" => Command::ArcSetup,
@@ -513,6 +519,13 @@ fn parse_args() -> R<Args> {
 }
 
 fn effective_config(args: &Args) -> R<(Config, Chain)> {
+    effective_config_with(args, true)
+}
+
+/// `probe_core = false` is for maintenance commands that only need the data
+/// directory (`cache`): resolving `network = auto` must not wait on Core or
+/// open the database (which a running daemon holds locked).
+fn effective_config_with(args: &Args, probe_core: bool) -> R<(Config, Chain)> {
     let mut cfg = Config::load_with_overrides(args.config.as_deref(), &args.set)?;
     if let Some(n) = &args.network {
         cfg.network.name = n.clone();
@@ -788,7 +801,11 @@ fn effective_config(args: &Args) -> R<(Config, Chain)> {
             cfg.index.block_source
         ));
     }
-    let chain = resolve_chain(&cfg)?;
+    let chain = if probe_core {
+        resolve_chain(&cfg)?
+    } else {
+        resolve_chain_offline(&cfg)?
+    };
     // Listener/metrics/TLS defaults depend on the network; resolve them before
     // validation and binding.
     cfg.apply_network_defaults(chain);
@@ -893,6 +910,44 @@ fn resolve_chain(cfg: &Config) -> R<Chain> {
         "network = auto: Bitcoin Core is unavailable and no initialized database was found; \
          pass --network <mainnet|testnet4|signet|regtest> or start Core",
     )
+}
+
+fn resolve_chain_offline(cfg: &Config) -> R<Chain> {
+    if cfg.network.name != "auto" {
+        return Ok(cfg.chain()?);
+    }
+    if cfg.network.data_dir.is_some() {
+        return fail(
+            "network = auto with an explicit data dir: pass \
+             --network <mainnet|testnet4|signet|regtest>",
+        );
+    }
+    // No Core probe and no database open: a running daemon holds the RocksDB
+    // lock, and maintenance commands only need to find the directory.
+    let found: Vec<Chain> = [
+        Chain::Mainnet,
+        Chain::Testnet4,
+        Chain::Signet,
+        Chain::Regtest,
+    ]
+    .into_iter()
+    .filter(|chain| {
+        let dir = cfg.data_dir(*chain);
+        dir.join("CURRENT").is_file() || dir.join(el_rawtx::CACHE_DIR_NAME).is_dir()
+    })
+    .collect();
+    match found.as_slice() {
+        [only] => Ok(*only),
+        [] => fail(
+            "network = auto: no initialised e-lite data directory was found; \
+             pass --network <mainnet|testnet4|signet|regtest>",
+        ),
+        many => fail(format!(
+            "network = auto matches several data directories ({}); \
+             pass --network <mainnet|testnet4|signet|regtest>",
+            many.iter().map(|c| c.name()).collect::<Vec<_>>().join(", ")
+        )),
+    }
 }
 
 fn detect_chain_from_db(cfg: &Config) -> R<Option<Chain>> {
@@ -1224,7 +1279,13 @@ fn run() -> R<()> {
         return cmd_arc_setup(args.apply);
     }
 
-    let (cfg, chain) = effective_config(&args)?;
+    let (cfg, chain) = if cmd == Command::Cache {
+        // Maintenance: no Core probe and no database open (a running daemon
+        // holds the RocksDB lock).
+        effective_config_with(&args, false)?
+    } else {
+        effective_config(&args)?
+    };
     if let Some(level) = logging::parse(&cfg.logging.level) {
         logging::set_level(level);
     }
@@ -1254,6 +1315,14 @@ fn run() -> R<()> {
             args.subcommand.as_deref(),
             args.purge,
             args.yes,
+        ),
+        Command::Cache => cmd_cache(
+            &cfg,
+            chain,
+            args.subcommand.as_deref(),
+            args.yes,
+            args.dry_run,
+            args.json,
         ),
         Command::ExportSnapshot => cmd_export(
             &cfg,
@@ -1395,6 +1464,9 @@ COMMANDS:
     core logs        print the last 50 lines of a Core launched by e-lite
     onion show       print the Tor onion address and managed-Tor state
     onion reset      generate a new onion address (stop e-lite first)
+    cache status     size and limits of the rawtx cache (the only on-disk cache)
+    cache clear      delete the rawtx cache (needs --yes; never touches the index,
+                     Core, TLS or Tor); restart e-lite to release RAM as well
     export-snapshot  print the canonical digest, or write a backup with --output
                      (--with-core bundles the network's Core chain data with a
                      SHA-256 per file; gzip: index stored, Core level 3,
@@ -1516,7 +1588,8 @@ TOR / ONION:
     --tor-target-plain <addr> loopback target for the plain onion port
     --tor-target-tls <addr> loopback target for the TLS onion port
     --purge                 onion reset: delete keys instead of keeping onion.prev
-    --yes, -y               onion reset: do not ask for confirmation
+    --yes, -y               onion reset and cache clear: do not ask for confirmation
+    --dry-run               cache clear: report what would be removed and stop
 
 LOGGING:
     --log-file <path>       application log (default <data-dir>/e-lite.log)
@@ -2211,6 +2284,210 @@ fn cmd_onion(cfg: &Config, chain: Chain, action: Option<&str>, purge: bool, yes:
         }
         other => fail(format!(
             "unknown onion action \"{other}\": use show or reset"
+        )),
+    }
+}
+
+/// Free space on the filesystem holding `path` (walks up when it does not
+/// exist yet). `None` when statvfs fails.
+fn free_bytes(path: &std::path::Path) -> Option<u64> {
+    use std::os::unix::ffi::OsStrExt;
+    let mut probe = path.to_path_buf();
+    loop {
+        let c = std::ffi::CString::new(probe.as_os_str().as_bytes()).ok()?;
+        let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
+        if unsafe { libc::statvfs(c.as_ptr(), &mut stat) } == 0 {
+            return Some((stat.f_bavail as u64).saturating_mul(stat.f_frsize as u64));
+        }
+        if !probe.pop() {
+            return None;
+        }
+    }
+}
+
+/// `e-lite cache status|clear`: the only command that deletes files, and it
+/// only deletes the memoised rawtx cache. The index, Core, TLS and Tor share
+/// the data directory and are never touched (see `el_rawtx::cachelayout`).
+fn cmd_cache(
+    cfg: &Config,
+    chain: Chain,
+    action: Option<&str>,
+    yes: bool,
+    dry_run: bool,
+    json: bool,
+) -> R<()> {
+    use el_rawtx::cachelayout;
+    let data_dir = cfg.data_dir(chain);
+    let dir = cachelayout::resolve_dir(&data_dir, &cfg.rawtx.cache_dir);
+    let (block_limit_mib, tx_limit_mib) = el_rawtx::cache_split(cfg.rawtx.cache_mib);
+    let action = action.unwrap_or("status");
+    match action {
+        "status" => {
+            let inv = cachelayout::inventory(&dir)?;
+            let free = free_bytes(&dir).or_else(|| free_bytes(&data_dir));
+            let refused = cachelayout::refuse_reason(&dir, &data_dir);
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&json!({
+                        "network": chain.name(),
+                        "path": dir.display().to_string(),
+                        "enabled": cfg.rawtx.cache_mib > 0,
+                        "capacity_bytes": cfg.rawtx.cache_mib * 1024 * 1024,
+                        "blocks": {
+                            "files": inv.block_files,
+                            "bytes": inv.block_bytes,
+                            "limit_bytes": block_limit_mib * 1024 * 1024,
+                        },
+                        "txs": {
+                            "files": inv.tx_files,
+                            "bytes": inv.tx_bytes,
+                            "limit_bytes": tx_limit_mib * 1024 * 1024,
+                        },
+                        "total": {"files": inv.files(), "bytes": inv.bytes()},
+                        "skipped": inv.skipped,
+                        "free_bytes": free,
+                        "refused": refused,
+                    }))?
+                );
+            } else {
+                println!("network: {}", chain.name());
+                println!("cache:   {}", dir.display());
+                if cfg.rawtx.cache_mib == 0 {
+                    println!("state:   disabled ([rawtx] cache_mib = 0)");
+                }
+                println!(
+                    "blocks:  {} files, {} (limit {})",
+                    inv.block_files,
+                    display_size(inv.block_bytes),
+                    display_size(block_limit_mib * 1024 * 1024)
+                );
+                println!(
+                    "txs:     {} files, {} (limit {})",
+                    inv.tx_files,
+                    display_size(inv.tx_bytes),
+                    display_size(tx_limit_mib * 1024 * 1024)
+                );
+                println!(
+                    "total:   {} files, {} of {}",
+                    inv.files(),
+                    display_size(inv.bytes()),
+                    display_size(cfg.rawtx.cache_mib * 1024 * 1024)
+                );
+                if let Some(free) = free {
+                    println!("free:    {} on that filesystem", display_size(free));
+                }
+                if inv.skipped > 0 {
+                    println!(
+                        "skipped: {} entries that are not cache files (never touched)",
+                        inv.skipped
+                    );
+                }
+                if let Some(reason) = &refused {
+                    println!(
+                        "WARNING: this path is not a rawtx cache ({reason}); \
+                         `cache clear` would refuse it"
+                    );
+                }
+                println!(
+                    "note:    the in-memory block cache is not affected; restart e-lite to \
+                     release RAM"
+                );
+            }
+            Ok(())
+        }
+        "clear" => {
+            if let Some(reason) = cachelayout::refuse_reason(&dir, &data_dir) {
+                return fail(format!(
+                    "refusing to clear {}: {reason}. Nothing was deleted; pass an explicit \
+                     [rawtx] cache_dir or --data-dir if this is really the cache",
+                    dir.display()
+                ));
+            }
+            if cfg.rawtx.cache_mib == 0 {
+                if json {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&json!({
+                            "network": chain.name(),
+                            "path": dir.display().to_string(),
+                            "enabled": false,
+                            "removed": {"files": 0, "bytes": 0},
+                        }))?
+                    );
+                } else {
+                    println!("rawtx cache is disabled ([rawtx] cache_mib = 0); nothing to clear");
+                }
+                return Ok(());
+            }
+            let before = cachelayout::inventory(&dir)?;
+            let free_before = free_bytes(&dir);
+            if !yes || dry_run {
+                if json {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&json!({
+                            "network": chain.name(),
+                            "path": dir.display().to_string(),
+                            "dry_run": true,
+                            "would_remove": {"files": before.files(), "bytes": before.bytes()},
+                        }))?
+                    );
+                } else {
+                    println!(
+                        "would remove {} files ({}) from {}",
+                        before.files(),
+                        display_size(before.bytes()),
+                        dir.display()
+                    );
+                    println!("nothing was deleted; re-run with --yes to clear the cache");
+                }
+                return Ok(());
+            }
+            let removed = cachelayout::clear(&dir, false)?;
+            let after = cachelayout::inventory(&dir)?;
+            let free_after = free_bytes(&dir);
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&json!({
+                        "network": chain.name(),
+                        "path": dir.display().to_string(),
+                        "removed": {"files": removed.files(), "bytes": removed.bytes()},
+                        "remaining": {"files": after.files(), "bytes": after.bytes()},
+                        "skipped": after.skipped,
+                        "free_bytes_before": free_before,
+                        "free_bytes_after": free_after,
+                    }))?
+                );
+            } else {
+                println!(
+                    "removed {} files ({}) from {}",
+                    removed.files(),
+                    display_size(removed.bytes()),
+                    dir.display()
+                );
+                println!(
+                    "remaining: {} files, {}",
+                    after.files(),
+                    display_size(after.bytes())
+                );
+                if let (Some(before), Some(after)) = (free_before, free_after) {
+                    println!(
+                        "free space: {} -> {}",
+                        display_size(before),
+                        display_size(after)
+                    );
+                }
+                if after.skipped > 0 {
+                    println!("kept {} entries that are not cache files", after.skipped);
+                }
+                println!("the in-memory block cache is freed by restarting e-lite");
+            }
+            Ok(())
+        }
+        other => fail(format!(
+            "unknown cache action \"{other}\": use status or clear"
         )),
     }
 }
@@ -5867,6 +6144,65 @@ fn effective_rate_limit(cfg: &Config) -> (u64, u64) {
     )
 }
 
+/// One-time `debug:` lines that make a log self-describing: which banner is
+/// served (so a run proves whether `advertise_electrumx_compat` reached the
+/// process), what the rawtx cache held at startup (cold vs warm) and the
+/// effective provider limits. No per-request cost.
+fn log_startup_diagnostics(cfg: &Config, chain: Chain, shared: &Shared) {
+    if !logging::debug_enabled() {
+        return;
+    }
+    eprintln!(
+        "[e-lite] debug: server: banner {:?} | electrumx compat {} | batches max {} items, \
+         {} workers | plain {} | tls {}",
+        el_serve::banner_for_log(),
+        if cfg.server.advertise_electrumx_compat {
+            "on (opt-in)"
+        } else {
+            "off"
+        },
+        el_serve::MAX_BATCH_REQUESTS,
+        el_serve::BATCH_WORKERS,
+        cfg.server.listen,
+        if cfg.server.tls_enabled() {
+            cfg.server.tls_listen.as_str()
+        } else {
+            "disabled"
+        },
+    );
+    let (block_mib, tx_mib) = el_rawtx::cache_split(cfg.rawtx.cache_mib);
+    let inv = shared.resolver.cache_inventory();
+    eprintln!(
+        "[e-lite] debug: rawtx cache: {} | blocks {} files {} / {} MiB | txs {} files {} / {} MiB",
+        shared.resolver.cache_dir().display(),
+        inv.block_files,
+        display_size(inv.block_bytes),
+        block_mib,
+        inv.tx_files,
+        display_size(inv.tx_bytes),
+        tx_mib,
+    );
+    eprintln!(
+        "[e-lite] debug: rawtx: probe {}s (tor >= {}s), ready {}s, prefetch {}, decoys {}, \
+         max_parallel {}, clearnet fallback {}",
+        cfg.public_servers.probe_timeout_seconds,
+        cfg.rawtx.tor_request_timeout_seconds,
+        cfg.public_servers.ready_timeout_seconds,
+        if cfg.rawtx.prefetch { "on" } else { "off" },
+        cfg.rawtx.decoys,
+        cfg.rawtx.max_parallel_fetches,
+        if cfg.rawtx.tor_fallback_clearnet {
+            "on"
+        } else {
+            "off"
+        },
+    );
+    eprintln!(
+        "[e-lite] debug: network: {} (same data dir and Core per network)",
+        chain.name()
+    );
+}
+
 fn build_shared(
     cfg: &Config,
     chain: Chain,
@@ -6164,6 +6500,7 @@ fn cmd_serve(cfg: &Config, chain: Chain) -> R<()> {
         return Ok(());
     };
     let shared = build_shared(cfg, chain, Arc::clone(&store), identity)?;
+    log_startup_diagnostics(cfg, chain, &shared);
     {
         let plan = tuning::MachinePlan::detect_with_core_reserve(cfg, chain, 0);
         if let Ok(mut p) = shared.stats.plan.lock() {
@@ -6301,6 +6638,7 @@ fn cmd_serve(cfg: &Config, chain: Chain) -> R<()> {
     let _ = transports.notifications.join();
     let _ = transports.memory.join();
     core_sup.stop();
+    el_serve::log_rawtx_summary(&shared);
     println!(
         "[e-lite] stopped at {} (uptime {})",
         format_local_time(SystemTime::now()),
@@ -6374,6 +6712,7 @@ fn cmd_run(cfg: &Config, chain: Chain) -> R<()> {
         return Ok(());
     };
     let shared = build_shared(cfg, chain, Arc::clone(&store), live)?;
+    log_startup_diagnostics(cfg, chain, &shared);
     if let Ok(mut p) = shared.stats.plan.lock() {
         *p = plan.to_json();
     }
@@ -6546,6 +6885,7 @@ fn cmd_run(cfg: &Config, chain: Chain) -> R<()> {
     let result = index_thread
         .join()
         .unwrap_or_else(|_| fail("index thread panicked"));
+    el_serve::log_rawtx_summary(&shared);
     println!(
         "[e-lite] stopped at {} (uptime {})",
         format_local_time(SystemTime::now()),

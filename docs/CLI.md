@@ -24,6 +24,11 @@ core status      show the Core supervisor state and RPC reachability
 core logs        print the last 50 lines of a Core launched by e-lite
 onion show       show the Tor onion address, ports and managed-Tor state
 onion reset      generate a new onion address (stop e-lite first)
+cache status     size, limits and free space of the rawtx cache (the only
+                 on-disk cache: verified transactions and repair blocks)
+cache clear      delete the rawtx cache (needs --yes; --dry-run previews it).
+                 Never touches the index, Core, TLS or Tor; restart e-lite to
+                 release the in-memory block cache as well
 export-snapshot  print the canonical digest or write --output
                  (--with-core bundles the network's Core chain data with a
                  SHA-256 per file; index stored, Core gzip 3; --compress-level sets both)
@@ -57,6 +62,9 @@ version          print version
 | `--with-core`, `--no-hash-files`, `--compress-level <n>` | export-snapshot: bundle the Core chain data (`blocks/`, `chainstate/`, `indexes/` only; never wallets, keys or `bitcoin.conf`), with a SHA-256 per file unless `--no-hash-files` (gzip: index 0, Core 3; the flag sets both) |
 | `--verify [basic\|full]` | import-snapshot: per-file hash check, or open the restored Core and `verifychain` |
 | `--expect-digest <hex>` | import-snapshot: refuse unless the recomputed index digest equals the `logical_snapshot_hash` printed by your export |
+| `--yes`, `-y` | onion reset / cache clear: do not ask for confirmation (required by `cache clear`) |
+| `--dry-run` | cache clear: report what would be removed and delete nothing |
+| `--json` | machine-readable output (`status`, `cache status`, `cache clear`) |
 | `--min-free-gib <n>`, `--critical-free-gib <n>` | disk guards |
 | `--listen <addr>`, `--metrics <addr>` | Electrum plain / metrics listeners |
 | `--tls` / `--no-tls` | enable (default) or disable Electrum TLS |
@@ -304,6 +312,49 @@ e-lite run --network mainnet --allow-mainnet --no-tor
 
 See [`TOR.md`](TOR.md) for installation, ports, the self-signed TLS certificate,
 reset semantics and security.
+
+## Rawtx cache maintenance (`cache`)
+
+The rawtx cache is the **only** memoised data e-lite keeps on disk: verified
+transactions with their merkle branch (`tx/<xx>/<txid>.tx`) and whole validated
+blocks kept for prune-gap repair (`*.blk`). It lives in
+`<data-dir>/rawtx-cache` unless `[rawtx] cache_dir` points elsewhere (tmpfs is a
+supported choice), and it is bounded by `[rawtx] cache_mib` (256 MiB: a quarter
+for whole blocks, 1-64 MiB, the rest for transactions).
+
+```bash
+e-lite cache status [--json] [--network <n>]
+e-lite cache clear  [--yes] [--dry-run] [--json] [--network <n>]
+```
+
+- `status` prints the directory, the files/bytes held, the configured limits and
+  the free space of that filesystem. The directory walk is explicit (it is the
+  only command that reads the cache on demand).
+- `clear` deletes **only** regular `*.blk` files in the cache root and `*.tx`
+  files under a two-hex `tx/<xx>/` shard. Empty shards are removed; anything
+  else is reported as skipped and left in place. Without `--yes` it only says
+  what it would delete; `--dry-run` does the same explicitly.
+- It refuses (non-zero exit, nothing deleted) when the resolved path is the data
+  directory, contains it, is a filesystem root, holds a RocksDB `CURRENT`, or
+  is/contains `index/`, `bitcoin/`, `tls/` or `tor/`. The index, Core's datadir,
+  the TLS identity and the onion keys are never touched.
+- It works with the daemon running (a vanished file is a cache miss), but the
+  in-memory block cache is only released by restarting e-lite.
+- It does not need Core: `network = auto` resolves from the existing data
+  directories; pass `--network` when several exist.
+
+JSON contract (used by the Umbrel app):
+
+```json
+{"network":"mainnet","path":"/data/networks/mainnet/e-lite/rawtx-cache",
+ "enabled":true,"capacity_bytes":268435456,
+ "blocks":{"files":3,"bytes":2097152,"limit_bytes":67108864},
+ "txs":{"files":812,"bytes":4308992,"limit_bytes":201326592},
+ "total":{"files":815,"bytes":6406144},"skipped":0,"free_bytes":13316915200}
+```
+
+`clear --yes --json` returns `removed` and `remaining` (same shape as `total`),
+`skipped` and `free_bytes_before`/`free_bytes_after`.
 
 ## Wallet banner
 

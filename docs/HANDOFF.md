@@ -1,9 +1,9 @@
 # Session handoff
 
 **Updated:** 2026-11-13
-**Latest published release:** `0.1.0-alpha.29.12.2`
-**Release:** https://github.com/AlbercoinDev/e-lite/releases/tag/v0.1.0-alpha.29.12.2
-**Main commit at handoff:** tag `v0.1.0-alpha.29.12.2`
+**Latest published release:** `0.1.0-alpha.29.12.3`
+**Release:** https://github.com/AlbercoinDev/e-lite/releases/tag/v0.1.0-alpha.29.12.3
+**Main commit at handoff:** tag `v0.1.0-alpha.29.12.3`
 
 alpha.29.11.0 was verified after publishing: `ci` and `release` workflows
 green, and both one-line installers (`--no-core` and `--with-core --yes`)
@@ -140,7 +140,38 @@ the dynamic ARC to work, e-lite needs write access to
 `/sys/module/zfs/parameters/zfs_arc_max` (root, group-writable parameter or a
 non-read-only mount).
 
-## Last change (alpha.29.12.2)
+## Last change (alpha.29.12.3)
+
+Requested by the owner (2026-11-13): a way to empty the memoised cache so a
+wallet measurement is honest, and the measurement data in the log instead of
+extra commands. Only the rawtx cache is touched: the index, Core, TLS and the
+onion keys share the data directory and are never deleted.
+
+- **`e-lite cache status|clear [--yes] [--dry-run] [--json]`**. `status`
+  reports files/bytes for whole blocks and verified transactions, the limits
+  from `cache_split` and the free space. `clear` removes only `*.blk` at the
+  cache root and `tx/<xx>/*.tx`, drops the emptied shards, and counts anything
+  else as skipped. It refuses the data directory, an ancestor/descendant, a
+  filesystem root, a RocksDB `CURRENT` and `index/`, `bitcoin/`, `tls/` or
+  `tor/`. Works while serving (a vanished file is a miss); restarting releases
+  the in-memory block cache. No Core needed (`network = auto` resolves from the
+  existing data directories).
+- **Self-describing `debug:` logs**: startup banner + `electrumx_compat` state,
+  cache inventory at open (no directory walk), provider limits; per connection
+  the client name/version and protocol and a one-time `first batch, N items`;
+  session/window summary and close line with batches, cache hits/puts/fetches
+  and `tx.get` failure deltas; one `rawtx summary` at shutdown. Two relaxed
+  counters per line, nothing per item; `info` costs nothing.
+- `/status.server` (banner, compat, lines/batches) and
+  `/status.rawtx.cache_*` for panels.
+- AUD-151 (`dbcache 0 MiB` while the operator value was in force) and AUD-152
+  (fixed 25 % ARC advice against the dynamic policy) fixed.
+- Gates: fmt, clippy -D warnings, `cargo test --workspace` (294),
+  `tests/e2e_regtest.sh` (now includes cache status/clear and asserts the index
+  and Core survive it), `tests/e2e_defaults.sh`. Nothing measured on mainnet
+  yet.
+
+## Previous change (alpha.29.12.2)
 
 Owner decision of 2026-11-13 on the wallet-over-Tor plan: JSON-RPC batch
 arrays are the main lever, and Sparrow only sends them to servers it

@@ -203,6 +203,10 @@ echo "shutdown exit=$RC"
 grep -q "stopped at" "$RUN/serve.log" || { cat "$RUN/serve.log"; exit 1; }
 grep -q "started at" "$DATA/e-lite.log" || { tail -40 "$DATA/e-lite.log"; exit 1; }
 grep -q "stopped at" "$DATA/e-lite.log" || { tail -40 "$DATA/e-lite.log"; exit 1; }
+# The debug lines that make a log self-describing (no commands needed).
+grep -q "debug: server: banner" "$DATA/e-lite.log" || { tail -40 "$DATA/e-lite.log"; exit 1; }
+grep -q "debug: rawtx cache:" "$DATA/e-lite.log" || { tail -40 "$DATA/e-lite.log"; exit 1; }
+grep -q "debug: rawtx summary:" "$DATA/e-lite.log" || { tail -40 "$DATA/e-lite.log"; exit 1; }
 grep -qE "READY|FULLY SYNCED" "$DATA/e-lite.log" || { tail -40 "$DATA/e-lite.log"; exit 1; }
 if tail -n 5 "$RUN/serve.log" | grep -qE "Connection refused|mempool refresh"; then
   echo "unexpected shutdown error in serve.log:" >&2
@@ -211,6 +215,33 @@ if tail -n 5 "$RUN/serve.log" | grep -qE "Connection refused|mempool refresh"; t
 fi
 "$BIN" status --network regtest --data-dir "$DATA" --metrics "127.0.0.1:$METRICS_PORT" --json \
   | grep -q '"state": "STOPPED"'
+
+echo "== rawtx cache status/clear =="
+"$BIN" cache status --network regtest --data-dir "$DATA" --json > "$RUN/cache-before.json"
+python3 - "$RUN/cache-before.json" <<'PY'
+import json, sys
+st = json.load(open(sys.argv[1]))
+assert st["network"] == "regtest", st
+assert st["total"]["files"] >= 1, st
+assert st["total"]["bytes"] > 0, st
+print("cache status:", st["total"], "at", st["path"])
+PY
+# Without --yes nothing is deleted.
+"$BIN" cache clear --network regtest --data-dir "$DATA" > "$RUN/cache-dry.txt"
+grep -q "nothing was deleted" "$RUN/cache-dry.txt"
+"$BIN" cache status --network regtest --data-dir "$DATA" --json | grep -qE '"files": [1-9]'
+# With --yes the cache goes and the index stays.
+"$BIN" cache clear --network regtest --data-dir "$DATA" --yes --json > "$RUN/cache-clear.json"
+python3 - "$RUN/cache-clear.json" <<'PY'
+import json, sys
+st = json.load(open(sys.argv[1]))
+assert st["removed"]["files"] >= 1, st
+assert st["remaining"]["files"] == 0, st
+print("cache cleared:", st["removed"])
+PY
+[ -f "$DATA/CURRENT" ] || { echo "cache clear removed the index" >&2; exit 1; }
+[ -d "$CORE/regtest/blocks" ] || { echo "cache clear removed the Core datadir" >&2; exit 1; }
+"$BIN" cache clear --network regtest --data-dir "$DATA" --yes --json | grep -q '"files": 0'
 
 echo "== snapshot export/import =="
 SNAP="$RUN/snapshot.tar.gz"

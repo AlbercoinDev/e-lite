@@ -683,8 +683,15 @@ impl MachinePlan {
             // compaction thread and the compaction debt grew at drain rates.
             physical.clamp(2, data_disk.kind.jobs_cap())
         };
-        let core_dbcache_mib = fitted_dbcache_mib(ram_mib, mem.available_mib);
         let core_reserve_mib = core_reserve_mib.min(mem.available_mib.saturating_sub(128));
+        // Report the Core cache this plan actually reserves: the caller already
+        // resolved it (operator `-dbcache` or fitted). Reporting the fitted
+        // value made the same log show two different `dbcache` numbers.
+        let core_dbcache_mib = if cfg.core.manage == crate::config::CoreManage::External {
+            0
+        } else {
+            core_reserve_mib
+        };
         // The startup budget is fitted to what the OS can give now, minus the
         // Core cache if e-lite is about to start Core. Installed RAM only caps
         // the result; it is not the allocation basis.
@@ -2785,9 +2792,10 @@ fn parse_zfs_arc_counters(text: &str) -> Option<(u64, u64)> {
     Some((zfs_arc_field(text, "hits")?, zfs_arc_field(text, "misses")?))
 }
 
-/// Warn about an apparently uncapped ZFS ARC. A cap at the recommended 25%
-/// never triggers: `arc * 4 <= total` at exactly 25%. Returns true when it
-/// printed, so callers can rate-limit. `prefix` is the log prefix.
+/// Warn about an apparently uncapped ZFS ARC (more than a quarter of RAM).
+/// Returns true when it printed, so callers can rate-limit. `prefix` is the
+/// log prefix. The advice points at `e-lite arc-setup`, which is the only way
+/// the dynamic manager can raise/lower the cap; a fixed cap stays valid.
 pub fn warn_uncapped_arc(mem: &MemoryInfo, prefix: &str) -> bool {
     let (Some(arc), Some(total)) = (mem.arc_mib, mem.total_mib) else {
         return false;
@@ -2796,12 +2804,13 @@ pub fn warn_uncapped_arc(mem: &MemoryInfo, prefix: &str) -> bool {
         return false;
     }
     let pct = arc * 100 / total;
-    let suggest = (total / 4).min(8192);
     eprintln!(
-        "{prefix} ZFS ARC is using {arc} MiB ({pct}% of RAM) without an apparent cap; it is \
-         invisible to MemAvailable and squeezes the cache plan. Cap it, e.g. \
-         zfs_arc_max={suggest} MiB (min(25% RAM, 8 GiB)) in /sys/module/zfs/parameters/\
-         zfs_arc_max and /etc/modprobe.d",
+        "{prefix} ZFS ARC is using {arc} MiB ({pct}% of RAM) and no cap was found; it is \
+         invisible to MemAvailable and squeezes the cache plan. Let e-lite manage it: \
+         `e-lite arc-setup` (as root) makes zfs_arc_max writable and installs \
+         e-lite-arc-cap.service, so the cap follows half of RAM while Core downloads or the \
+         index drains and zfs_arc_min_mib (1024) once fully synced. A fixed cap also works: \
+         zfs_arc_max=<bytes> in /etc/modprobe.d",
     );
     true
 }
