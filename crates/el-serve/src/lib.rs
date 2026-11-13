@@ -1,4 +1,4 @@
-//! Electrum JSON-RPC 1.4 server and local metrics.
+//! Electrum JSON-RPC 1.4-1.7 server and local metrics.
 //!
 //! Each request reads the index through a shared read lock; the indexer commits
 //! under the write lock, so no response mixes two tips.
@@ -16,7 +16,7 @@ use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::{ServerConfig, ServerConnection, StreamOwned};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
@@ -40,6 +40,29 @@ pub fn set_debug_logs(on: bool) {
 
 fn debug_logs() -> bool {
     DEBUG_LOGS.load(Ordering::Relaxed)
+}
+
+/// `[server] advertise_electrumx_compat`: add "(electrumx-compatible)" to the
+/// `server.version` banner. Sparrow enables JSON-RPC batching only for banner
+/// names it recognises and matches ElectrumX by substring; the banner still
+/// starts with "e-lite", so it does not claim to be another server.
+static ELECTRUMX_COMPAT: AtomicBool = AtomicBool::new(false);
+
+pub fn set_electrumx_compat(on: bool) {
+    ELECTRUMX_COMPAT.store(on, Ordering::Relaxed);
+}
+
+/// The software name sent in `server.version` and `server.features`.
+fn server_banner() -> String {
+    banner(ELECTRUMX_COMPAT.load(Ordering::Relaxed))
+}
+
+fn banner(electrumx_compat: bool) -> String {
+    if electrumx_compat {
+        format!("e-lite {VERSION} (electrumx-compatible)")
+    } else {
+        format!("e-lite {VERSION}")
+    }
 }
 
 /// Electrum clients ask for a script's full history. A script with millions of
@@ -101,6 +124,76 @@ pub mod state {
     }
 }
 
+/// Why a `blockchain.transaction.get` could not be answered. Counters only:
+/// no txid, script or block hash is kept (AUD-132).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TxGetFailure {
+    /// Not in the index and unknown to Core (mempool included).
+    NotFound,
+    /// Confirmed, Core pruned the block, and no external source can be
+    /// asked: none configured, or Tor is required and unavailable.
+    NoSource,
+    /// Confirmed, Core pruned the block, and every source that was asked
+    /// failed (timeout, HTTP error, cooling down).
+    ExternalFailed,
+    /// A source answered with data that did not verify.
+    VerifyFailed,
+    /// Store, cache or Core decode error.
+    Internal,
+}
+
+impl TxGetFailure {
+    pub const ALL: [TxGetFailure; 5] = [
+        TxGetFailure::NotFound,
+        TxGetFailure::NoSource,
+        TxGetFailure::ExternalFailed,
+        TxGetFailure::VerifyFailed,
+        TxGetFailure::Internal,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            TxGetFailure::NotFound => "not_found",
+            TxGetFailure::NoSource => "no_source",
+            TxGetFailure::ExternalFailed => "external_failed",
+            TxGetFailure::VerifyFailed => "verify_failed",
+            TxGetFailure::Internal => "internal",
+        }
+    }
+
+    fn of(error: &el_rawtx::RawtxError) -> Self {
+        use el_rawtx::RawtxError;
+        match error {
+            RawtxError::NoSource(_) => TxGetFailure::NoSource,
+            RawtxError::Unavailable(_) => TxGetFailure::ExternalFailed,
+            RawtxError::Verify(_) => TxGetFailure::VerifyFailed,
+            RawtxError::Config(_) | RawtxError::Io(_) => TxGetFailure::Internal,
+        }
+    }
+}
+
+#[derive(Default)]
+pub struct TxGetFailures([AtomicU64; 5]);
+
+impl TxGetFailures {
+    fn add(&self, cause: TxGetFailure) -> u64 {
+        self.0[cause as usize].fetch_add(1, Ordering::Relaxed) + 1
+    }
+
+    pub fn get(&self, cause: TxGetFailure) -> u64 {
+        self.0[cause as usize].load(Ordering::Relaxed)
+    }
+
+    pub fn to_json(&self) -> Value {
+        Value::Object(
+            TxGetFailure::ALL
+                .iter()
+                .map(|c| (c.label().to_string(), json!(self.get(*c))))
+                .collect(),
+        )
+    }
+}
+
 pub struct Stats {
     pub indexed_height: AtomicU64,
     pub core_height: AtomicU64,
@@ -115,6 +208,8 @@ pub struct Stats {
     pub requests_total: AtomicU64,
     pub errors_total: AtomicU64,
     pub rate_limited: AtomicU64,
+    /// `blockchain.transaction.get` failures by cause.
+    pub tx_get_failures: TxGetFailures,
     pub clients: AtomicUsize,
     pub last_block_ms: AtomicU64,
     pub notifier_runs: AtomicU64,
@@ -246,6 +341,7 @@ impl Default for Stats {
             requests_total: AtomicU64::new(0),
             errors_total: AtomicU64::new(0),
             rate_limited: AtomicU64::new(0),
+            tx_get_failures: TxGetFailures::default(),
             clients: AtomicUsize::new(0),
             last_block_ms: AtomicU64::new(0),
             notifier_runs: AtomicU64::new(0),
@@ -721,7 +817,16 @@ pub struct ClientState {
     /// Aggregate counters for the `debug:` wallet-session line. Counts and
     /// milliseconds only: never a hash, script or txid (AUD-132/133).
     pub stats: Mutex<ClientStats>,
+    /// Notifications waiting for the connection lock. The notifier never
+    /// waits for it: the client's own thread may hold it while it writes a
+    /// large response (30 s write timeout) or polls the socket. Whoever holds
+    /// the lock delivers the queue when it releases it.
+    pub pending_notes: Mutex<VecDeque<Vec<u8>>>,
 }
+
+/// Notifications a client may have queued behind its own traffic before it
+/// is considered stuck and disconnected.
+const MAX_PENDING_NOTES: usize = 4096;
 
 /// Per-connection aggregates for the wallet reconstruction diagnostics. No
 /// identifiers are stored: a wallet scan shows up as counts and latencies.
@@ -729,7 +834,9 @@ pub struct ClientState {
 pub struct ClientStats {
     pub opened: Instant,
     pub last_summary: Instant,
-    /// Requests recorded since the last summary line (rate limit only).
+    /// Wallet requests (`get_history`, `transaction.get`) since the last
+    /// summary line. Pings and subscriptions do not count: an idle wallet
+    /// prints nothing.
     pub window_requests: u32,
     /// Lifetime counters, printed every 60 s of activity and on close.
     pub history_requests: u64,
@@ -738,10 +845,11 @@ pub struct ClientStats {
     pub tx_gets: u64,
     pub tx_us_total: u64,
     pub tx_us_max: u64,
-    /// Milliseconds between the last `get_history` reply and the first
-    /// `transaction.get`: the moment a wallet starts reconstructing.
+    /// Milliseconds between the connection's first `get_history` and its
+    /// first `transaction.get`: how long the wallet scanned before it started
+    /// loading transactions.
     pub first_tx_after_history: Option<u64>,
-    pub last_history_at: Option<Instant>,
+    pub first_history_at: Option<Instant>,
 }
 
 impl ClientStats {
@@ -758,8 +866,18 @@ impl ClientStats {
             tx_us_total: 0,
             tx_us_max: 0,
             first_tx_after_history: None,
-            last_history_at: None,
+            first_history_at: None,
         }
+    }
+}
+
+/// Latency for the wallet-session line: microseconds below 1 ms, so a fast
+/// server does not read as `0 ms` (AUD-149).
+fn fmt_latency(us: u64) -> String {
+    if us < 1000 {
+        format!("{us} us")
+    } else {
+        format!("{} ms", us / 1000)
     }
 }
 
@@ -773,23 +891,26 @@ impl ClientState {
         let Ok(mut s) = self.stats.lock() else {
             return;
         };
-        s.window_requests = s.window_requests.saturating_add(1);
         let us = elapsed.as_micros() as u64;
         match method {
             "blockchain.scripthash.get_history" | "blockchain.scriptpubkey.get_history" => {
+                s.window_requests = s.window_requests.saturating_add(1);
                 s.history_requests += 1;
                 s.history_us_total += us;
                 s.history_us_max = s.history_us_max.max(us);
-                s.last_history_at = Some(Instant::now());
+                if s.first_history_at.is_none() {
+                    s.first_history_at = Some(Instant::now());
+                }
             }
             "blockchain.transaction.get" => {
+                s.window_requests = s.window_requests.saturating_add(1);
                 if s.first_tx_after_history.is_none() {
-                    if let Some(at) = s.last_history_at {
+                    if let Some(at) = s.first_history_at {
                         let ms = at.elapsed().as_millis() as u64;
                         s.first_tx_after_history = Some(ms);
                         eprintln!(
-                            "[e-lite] debug: wallet: first tx.get {ms} ms after get_history \
-                             (reconstruction phase)"
+                            "[e-lite] debug: wallet: first tx.get {ms} ms after the first \
+                             get_history (history scan -> loading transactions)"
                         );
                     }
                 }
@@ -797,30 +918,32 @@ impl ClientState {
                 s.tx_us_total += us;
                 s.tx_us_max = s.tx_us_max.max(us);
             }
-            _ => {}
+            _ => return,
         }
-        if s.last_summary.elapsed() >= Duration::from_secs(60) && s.window_requests > 0 {
+        if s.last_summary.elapsed() >= Duration::from_secs(60) && s.window_requests >= 3 {
             let avg = |total: u64, n: u64| total.checked_div(n).unwrap_or(0);
             eprintln!(
-                "[e-lite] debug: wallet session: {}s, history {} ({} ms avg, {} ms max), \
-                 tx.get {} ({} ms avg, {} ms max)",
+                "[e-lite] debug: wallet session: {}s, history {} ({} avg, {} max), \
+                 tx.get {} ({} avg, {} max)",
                 s.opened.elapsed().as_secs(),
                 s.history_requests,
-                avg(s.history_us_total, s.history_requests) / 1000,
-                s.history_us_max / 1000,
+                fmt_latency(avg(s.history_us_total, s.history_requests)),
+                fmt_latency(s.history_us_max),
                 s.tx_gets,
-                avg(s.tx_us_total, s.tx_gets) / 1000,
-                s.tx_us_max / 1000,
+                fmt_latency(avg(s.tx_us_total, s.tx_gets)),
+                fmt_latency(s.tx_us_max),
             );
             s.last_summary = Instant::now();
             s.window_requests = 0;
         }
     }
 
-    /// Push a notification. The write gets a short timeout: a client that
-    /// does not drain its socket must not hold the notifier thread (shared by
-    /// every client) for the 30 s response timeout. Such a client is
-    /// disconnected; the wallet reconnects and resubscribes (AUD-146).
+    /// Push a notification. It is queued and written by whoever holds the
+    /// connection lock, so the notifier thread (shared by every client)
+    /// never waits behind one client's response or socket poll. The write
+    /// itself gets a short timeout: a client that does not drain its socket
+    /// is disconnected and the wallet reconnects and resubscribes (AUD-146).
+    /// `true` means accepted for delivery.
     pub fn notify(&self, value: &Value) -> bool {
         if !self.alive.load(Ordering::Relaxed) {
             return false;
@@ -830,26 +953,67 @@ impl ClientState {
             Err(_) => return false,
         };
         bytes.push(b'\n');
-        let mut writer = match self.writer.lock() {
-            Ok(w) => w,
-            Err(_) => return false,
-        };
-        let _ = writer
-            .socket()
-            .set_write_timeout(Some(NOTIFY_WRITE_TIMEOUT));
-        let ok = writer
-            .write_all(&bytes)
-            .and_then(|_| writer.flush())
-            .is_ok();
-        let _ = writer
-            .socket()
-            .set_write_timeout(Some(CLIENT_WRITE_TIMEOUT));
-        if !ok {
-            // A partial frame may be on the wire: the stream is unusable.
-            self.alive.store(false, Ordering::SeqCst);
+        {
+            let Ok(mut pending) = self.pending_notes.lock() else {
+                return false;
+            };
+            if pending.len() >= MAX_PENDING_NOTES {
+                drop(pending);
+                self.kill();
+                return false;
+            }
+            pending.push_back(bytes);
+        }
+        self.flush_pending();
+        self.alive.load(Ordering::Relaxed)
+    }
+
+    /// Deliver queued notifications if the connection lock is free. Every
+    /// holder of the lock calls this after releasing it, so a notification
+    /// queued while the lock was busy is never stranded.
+    fn flush_pending(&self) {
+        loop {
+            let has_pending = self
+                .pending_notes
+                .lock()
+                .map(|p| !p.is_empty())
+                .unwrap_or(false);
+            if !has_pending || !self.alive.load(Ordering::Relaxed) {
+                return;
+            }
+            let Ok(mut writer) = self.writer.try_lock() else {
+                // The holder flushes after it releases the lock.
+                return;
+            };
+            let batch: Vec<Vec<u8>> = match self.pending_notes.lock() {
+                Ok(mut p) => p.drain(..).collect(),
+                Err(_) => return,
+            };
+            let _ = writer
+                .socket()
+                .set_write_timeout(Some(NOTIFY_WRITE_TIMEOUT));
+            let ok = batch
+                .iter()
+                .try_for_each(|bytes| writer.write_all(bytes))
+                .and_then(|_| writer.flush())
+                .is_ok();
+            let _ = writer
+                .socket()
+                .set_write_timeout(Some(CLIENT_WRITE_TIMEOUT));
+            if !ok {
+                // A partial frame may be on the wire: the stream is unusable.
+                self.alive.store(false, Ordering::SeqCst);
+                let _ = writer.socket().shutdown(std::net::Shutdown::Both);
+                return;
+            }
+        }
+    }
+
+    fn kill(&self) {
+        self.alive.store(false, Ordering::SeqCst);
+        if let Ok(writer) = self.writer.try_lock() {
             let _ = writer.socket().shutdown(std::net::Shutdown::Both);
         }
-        ok
     }
 
     pub fn send(&self, value: &Value) -> bool {
@@ -873,6 +1037,8 @@ impl ClientState {
             self.alive.store(false, Ordering::SeqCst);
             return false;
         }
+        drop(writer);
+        self.flush_pending();
         true
     }
 }
@@ -924,6 +1090,7 @@ impl ClientRegistry {
             protocol: Mutex::new(None),
             saw_message: AtomicBool::new(false),
             stats: Mutex::new(ClientStats::empty()),
+            pending_notes: Mutex::new(VecDeque::new()),
         });
         if let Ok(mut c) = self.clients.lock() {
             c.insert(id, Arc::clone(&state));
@@ -1479,6 +1646,7 @@ impl Shared {
                 "decoys": rawtx.decoys.load(Ordering::Relaxed),
                 "decoys_inflight": self.resolver.decoys_inflight(),
                 "unavailable": rawtx.unavailable.load(Ordering::Relaxed),
+                "tx_get_failures": self.stats.tx_get_failures.to_json(),
                 "external_sources": self.resolver.external_sources(),
                 "p2p_attempts": rawtx.p2p_attempts.load(Ordering::Relaxed),
                 "p2p_failures": rawtx.p2p_failures.load(Ordering::Relaxed),
@@ -1564,6 +1732,39 @@ fn log_rpc_error(shared: &Shared, method: &str, code: i64) {
     }
     seen.insert(key, Instant::now());
     eprintln!("[e-lite] rpc error: method={method} code={code}");
+}
+
+/// Count a failed `blockchain.transaction.get` by cause and say so in a
+/// `debug:` line, at most one per cause every 5 s (the INFO `rpc error` line
+/// is one per minute and has no cause). The line carries the cause, the
+/// height and the running total: never a txid or a block hash (AUD-132).
+fn note_tx_get_failure(shared: &Shared, cause: TxGetFailure, height: Option<u32>) {
+    let total = shared.stats.tx_get_failures.add(cause);
+    if !debug_logs() {
+        return;
+    }
+    let key = format!("tx.get:{}", cause.label());
+    let Ok(mut seen) = shared.error_log.lock() else {
+        return;
+    };
+    if seen
+        .get(&key)
+        .is_some_and(|at| at.elapsed() < Duration::from_secs(5))
+    {
+        return;
+    }
+    seen.insert(key, Instant::now());
+    drop(seen);
+    let at = height.map_or_else(|| "unconfirmed".to_string(), |h| format!("height {h}"));
+    eprintln!(
+        "[e-lite] debug: tx.get failed: {} ({at}, {total} so far)",
+        cause.label()
+    );
+}
+
+fn rawtx_failure(shared: &Shared, height: u32, e: el_rawtx::RawtxError) -> RpcError {
+    note_tx_get_failure(shared, TxGetFailure::of(&e), Some(height));
+    RpcError::server(e.to_string())
 }
 
 pub fn dispatch(shared: &Shared, method: &str, params: &Value) -> RpcResult<Value> {
@@ -1750,7 +1951,7 @@ fn server_version(params: &Value, client: Option<&Arc<ClientState>>) -> RpcResul
         }
         *slot = Some(negotiated);
     }
-    Ok(json!([format!("e-lite {VERSION}"), negotiated.to_string()]))
+    Ok(json!([server_banner(), negotiated.to_string()]))
 }
 
 /// Resolve the requested client range against the versions this build serves.
@@ -2043,7 +2244,7 @@ fn server_features(shared: &Shared, version: ProtocolVersion) -> RpcResult<Value
     let mut features = json!({
         "genesis_hash": id.genesis.to_hex(),
         "hash_function": "sha256",
-        "server_version": format!("e-lite {VERSION}"),
+        "server_version": server_banner(),
         "protocol_min": PROTOCOL_MIN,
         "protocol_max": PROTOCOL_MAX,
         "pruning": Value::Null,
@@ -2830,12 +3031,12 @@ fn transaction_get(shared: &Shared, params: &Value) -> RpcResult<Value> {
                 shared
                     .resolver
                     .raw_tx(txid_hash, height)
-                    .map_err(|e| RpcError::server(e.to_string()))?
+                    .map_err(|e| rawtx_failure(shared, height, e))?
             };
-            let mut decoded = shared
-                .core
-                .decode_raw_transaction(&raw)
-                .map_err(|e| RpcError::server(format!("rawtx decode: {e}")))?;
+            let mut decoded = shared.core.decode_raw_transaction(&raw).map_err(|e| {
+                note_tx_get_failure(shared, TxGetFailure::Internal, Some(height));
+                RpcError::server(format!("rawtx decode: {e}"))
+            })?;
             let (block, tip) = {
                 let _g = read_guard(shared)?;
                 let block = shared
@@ -2857,7 +3058,10 @@ fn transaction_get(shared: &Shared, params: &Value) -> RpcResult<Value> {
         let mut value = shared
             .core
             .raw_transaction_json(txid, blockhash.as_deref())
-            .map_err(|e| RpcError::server(format!("rawtx unavailable: {e}")))?;
+            .map_err(|e| {
+                note_tx_get_failure(shared, TxGetFailure::NotFound, None);
+                RpcError::server(format!("rawtx unavailable: {e}"))
+            })?;
         if let Some(obj) = value.as_object_mut() {
             if !obj.contains_key("confirmations") {
                 obj.insert("confirmations".to_string(), json!(0));
@@ -2875,13 +3079,16 @@ fn transaction_get(shared: &Shared, params: &Value) -> RpcResult<Value> {
                 .resolver
                 .raw_tx(txid_hash, height)
                 .map(|raw| json!(raw))
-                .map_err(|e| RpcError::server(e.to_string()))
+                .map_err(|e| rawtx_failure(shared, height, e))
         }
         None => shared
             .core
             .raw_transaction_hex_opt(txid, None)
             .map(|raw| json!(raw))
-            .map_err(|e| RpcError::server(format!("transaction not found: {e}"))),
+            .map_err(|e| {
+                note_tx_get_failure(shared, TxGetFailure::NotFound, None);
+                RpcError::server(format!("transaction not found: {e}"))
+            }),
     }
 }
 
@@ -3683,7 +3890,11 @@ impl Read for WireReader {
                     .writer
                     .lock()
                     .map_err(|_| std::io::Error::other("connection lock poisoned"))?;
-                match wire.read(buf) {
+                let read = wire.read(buf);
+                drop(wire);
+                // Notifications queued while this poll held the lock.
+                self.client.flush_pending();
+                match read {
                     Ok(n) => {
                         self.idle_deadline = Instant::now() + CLIENT_IDLE_TIMEOUT;
                         return Ok(n);
@@ -3843,15 +4054,23 @@ fn negotiated_client_version(client: Option<&Arc<ClientState>>) -> ProtocolVersi
     SERVER_MIN
 }
 
+/// Most requests one JSON-RPC batch may carry. A batch line is also bounded
+/// by `MAX_REQUEST_BYTES`.
+pub const MAX_BATCH_REQUESTS: usize = 1000;
+
+/// Requests of one batch resolved at the same time. External block
+/// downloads stay bounded by `rawtx.max_parallel_fetches` underneath.
+const BATCH_WORKERS: usize = 8;
+
 pub fn process_line_for(
     shared: &Shared,
     client: Option<&Arc<ClientState>>,
     line: &str,
 ) -> LineOutcome {
-    shared.stats.requests_total.fetch_add(1, Ordering::Relaxed);
     let request: Value = match serde_json::from_str(line) {
         Ok(v) => v,
         Err(e) => {
+            shared.stats.requests_total.fetch_add(1, Ordering::Relaxed);
             shared.stats.errors_total.fetch_add(1, Ordering::Relaxed);
             return LineOutcome {
                 response: Some(json!({
@@ -3863,6 +4082,108 @@ pub fn process_line_for(
             };
         }
     };
+    match request {
+        Value::Array(items) => process_batch(shared, client, items),
+        request => process_request(shared, client, &request),
+    }
+}
+
+/// A JSON-RPC 2.0 batch: one array of requests on one line, answered with one
+/// array of responses (notifications get none; an all-notification batch gets
+/// no reply at all). Wallets that batch (Sparrow, Electrum) send a whole page
+/// of `get_history`/`transaction.get` at once, which turns one network round
+/// trip per address into one per page: the difference between minutes and
+/// seconds over an onion service.
+///
+/// Items run in parallel unless the batch carries `server.version` or an
+/// unsubscribe, whose order relative to the other items matters.
+fn process_batch(
+    shared: &Shared,
+    client: Option<&Arc<ClientState>>,
+    items: Vec<Value>,
+) -> LineOutcome {
+    let invalid = |message: &str| {
+        shared.stats.requests_total.fetch_add(1, Ordering::Relaxed);
+        shared.stats.errors_total.fetch_add(1, Ordering::Relaxed);
+        LineOutcome {
+            response: Some(json!({
+                "jsonrpc": "2.0",
+                "id": Value::Null,
+                "error": {"code": -32600, "message": message},
+            })),
+            close: false,
+        }
+    };
+    if items.is_empty() {
+        return invalid("invalid request: empty batch");
+    }
+    if items.len() > MAX_BATCH_REQUESTS {
+        return invalid(&format!(
+            "invalid request: batch larger than {MAX_BATCH_REQUESTS} requests"
+        ));
+    }
+    let ordered = items.iter().any(|item| {
+        item.get("method")
+            .and_then(Value::as_str)
+            .is_some_and(|m| m == "server.version" || m.ends_with(".unsubscribe"))
+    });
+    let workers = if ordered {
+        1
+    } else {
+        items.len().min(BATCH_WORKERS)
+    };
+    let outcomes: Vec<LineOutcome> = if workers <= 1 {
+        items
+            .iter()
+            .map(|item| process_request(shared, client, item))
+            .collect()
+    } else {
+        let next = AtomicUsize::new(0);
+        let slots: Vec<Mutex<Option<LineOutcome>>> =
+            items.iter().map(|_| Mutex::new(None)).collect();
+        std::thread::scope(|scope| {
+            for _ in 0..workers {
+                scope.spawn(|| loop {
+                    let idx = next.fetch_add(1, Ordering::Relaxed);
+                    let Some(item) = items.get(idx) else {
+                        return;
+                    };
+                    let outcome = process_request(shared, client, item);
+                    if let Ok(mut slot) = slots[idx].lock() {
+                        *slot = Some(outcome);
+                    }
+                });
+            }
+        });
+        slots
+            .into_iter()
+            .map(|slot| {
+                slot.into_inner().ok().flatten().unwrap_or(LineOutcome {
+                    response: Some(json!({
+                        "jsonrpc": "2.0",
+                        "id": Value::Null,
+                        "error": {"code": -32603, "message": "internal error"},
+                    })),
+                    close: false,
+                })
+            })
+            .collect()
+    };
+    let close = outcomes.iter().any(|o| o.close);
+    let responses: Vec<Value> = outcomes.into_iter().filter_map(|o| o.response).collect();
+    LineOutcome {
+        response: (!responses.is_empty()).then_some(Value::Array(responses)),
+        close,
+    }
+}
+
+/// One JSON-RPC request object, alone on its line or inside a batch.
+fn process_request(
+    shared: &Shared,
+    client: Option<&Arc<ClientState>>,
+    request: &Value,
+) -> LineOutcome {
+    shared.stats.requests_total.fetch_add(1, Ordering::Relaxed);
     let is_notification = request
         .as_object()
         .map(|obj| !obj.contains_key("id"))
@@ -4247,6 +4568,16 @@ mod tests {
     use super::*;
 
     #[test]
+    fn electrumx_compat_banner_still_names_e_lite() {
+        assert_eq!(banner(false), format!("e-lite {VERSION}"));
+        let compat = banner(true);
+        // Sparrow lowercases the banner and enables batching when it
+        // contains "electrumx"; prefix checks still see e-lite.
+        assert!(compat.starts_with("e-lite "), "{compat}");
+        assert!(compat.to_lowercase().contains("electrumx"), "{compat}");
+    }
+
+    #[test]
     fn version_negotiation() {
         assert_eq!(
             server_version(&json!(["client", "1.4"]), None).unwrap(),
@@ -4482,6 +4813,57 @@ mod tests {
         assert!(!Arc::ptr_eq(&third, &fourth));
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn tx_get_failures_are_counted_by_cause() {
+        use el_rawtx::RawtxError;
+        let of = |e: RawtxError| TxGetFailure::of(&e);
+        assert_eq!(of(RawtxError::NoSource("x".into())), TxGetFailure::NoSource);
+        assert_eq!(
+            of(RawtxError::Unavailable("x".into())),
+            TxGetFailure::ExternalFailed
+        );
+        assert_eq!(
+            of(RawtxError::Verify("x".into())),
+            TxGetFailure::VerifyFailed
+        );
+        let counters = TxGetFailures::default();
+        counters.add(TxGetFailure::ExternalFailed);
+        assert_eq!(counters.add(TxGetFailure::ExternalFailed), 2);
+        let json = counters.to_json();
+        assert_eq!(json["external_failed"], 2);
+        assert_eq!(json["no_source"], 0);
+        assert_eq!(json.as_object().unwrap().len(), TxGetFailure::ALL.len());
+    }
+
+    #[test]
+    fn notify_never_waits_for_a_busy_connection() {
+        use std::io::BufRead;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let peer = std::net::TcpStream::connect(addr).unwrap();
+        let (server_side, _) = listener.accept().unwrap();
+        let registry = ClientRegistry::new();
+        let client = registry.register(Wire::plain(server_side).unwrap());
+
+        // The client's own thread holds the lock (a long response or poll).
+        let busy = client.writer.lock().unwrap();
+        let started = Instant::now();
+        assert!(client.notify(&json!({"method": "blockchain.headers.subscribe"})));
+        assert!(started.elapsed() < Duration::from_millis(200));
+        drop(busy);
+        // Releasing through `send` delivers the queued notification after
+        // the response, on its own line.
+        assert!(client.send(&json!({"id": 1, "result": null})));
+
+        let mut reader = std::io::BufReader::new(peer);
+        let mut first = String::new();
+        let mut second = String::new();
+        reader.read_line(&mut first).unwrap();
+        reader.read_line(&mut second).unwrap();
+        assert!(first.contains("\"id\":1"), "{first}");
+        assert!(second.contains("headers.subscribe"), "{second}");
     }
 
     #[test]

@@ -94,12 +94,16 @@ fn verify_cached_tx(
     Ok(())
 }
 pub use core_source::CoreBlockSource;
-pub use esplora::EsploraSource;
+pub use esplora::{isolated_tor_client, EsploraSource};
 pub use p2p::P2pSource;
 pub use verify::{extract_tx, verify_block, verify_block_by_hash, verify_witness_commitment};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RawtxError {
+    /// No source could even be asked: none is configured, or Tor is required
+    /// and unavailable.
+    NoSource(String),
+    /// Every source that was asked failed.
     Unavailable(String),
     Verify(String),
     Config(String),
@@ -109,7 +113,9 @@ pub enum RawtxError {
 impl fmt::Display for RawtxError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            RawtxError::Unavailable(m) => write!(f, "rawtx unavailable: {m}"),
+            RawtxError::NoSource(m) | RawtxError::Unavailable(m) => {
+                write!(f, "rawtx unavailable: {m}")
+            }
             RawtxError::Verify(m) => write!(f, "rawtx verification failed: {m}"),
             RawtxError::Config(m) => write!(f, "rawtx config: {m}"),
             RawtxError::Io(m) => write!(f, "rawtx io: {m}"),
@@ -125,6 +131,7 @@ impl RawtxError {
     /// the wallet still receives the full message in its RPC error.
     pub fn kind(&self) -> &'static str {
         match self {
+            RawtxError::NoSource(_) => "no source",
             RawtxError::Unavailable(_) => "unavailable",
             RawtxError::Verify(_) => "verification failed",
             RawtxError::Config(_) => "config",
@@ -209,8 +216,10 @@ pub struct RawtxConfig {
     /// If Tor is configured but a request fails, retry the clearnet endpoint
     /// directly. This exposes the operator's IP to the provider.
     pub fallback_clearnet: bool,
-    /// Timeout for a single Esplora block request.
+    /// Timeout for a single direct (clearnet) Esplora block request.
     pub request_timeout_seconds: u64,
+    /// Timeout for a single Esplora block request through Tor.
+    pub tor_request_timeout_seconds: u64,
     /// Skip a provider (Tor or direct) after a failed attempt.
     pub provider_cooldown_seconds: u64,
     /// Maximum concurrent external block downloads.
@@ -345,12 +354,13 @@ impl Resolver {
                 }
             }
             if cfg.use_esplora && !cfg.esplora_urls.is_empty() {
-                match EsploraSource::new(
+                match EsploraSource::with_budget(
                     cfg.esplora_urls.clone(),
                     tor.clone(),
                     cfg.allow_clearnet,
                     cfg.fallback_clearnet,
                     Duration::from_secs(cfg.request_timeout_seconds.max(1)),
+                    Duration::from_secs(cfg.tor_request_timeout_seconds.max(1)),
                     Duration::from_secs(cfg.provider_cooldown_seconds.max(1)),
                 ) {
                     Ok(s) => external.push(Arc::new(s)),
@@ -704,7 +714,7 @@ impl Resolver {
         }
         if self.sources().is_empty() {
             self.stats.unavailable.fetch_add(1, Ordering::Relaxed);
-            return Err(RawtxError::Unavailable(
+            return Err(RawtxError::NoSource(
                 "no external source configured (or Tor is required and unavailable)".to_string(),
             ));
         }

@@ -50,7 +50,7 @@ the per-client rate limiter are implemented; client authentication is not.
 - Core RPC is HTTP; use SSH/VPN for LAN/WAN.
 - CPU and disk defaults come from the detected machine: physical cores (not
   logical SMT), cgroup CPU quota, and the data/Core disk class
-  (NVMe/SATA/HDD/virtual/network). A 4C/8T box gets `readers=4`, `jobs=2`,
+  (NVMe/SATA/HDD/virtual/network). A 4C/8T SATA/ZFS box gets `readers=4`, `jobs=4`,
   Core `par=3`, `rpcthreads=4`. Explicit config wins.
 - The memory budget uses **available** RAM, not installed RAM:
   `effective = min(total, MemAvailable - core_reserve)`. Memtables use a global

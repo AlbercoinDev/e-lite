@@ -121,6 +121,7 @@ fn fixture() -> (Fixture, ScriptHash, Hash32) {
                 allow_clearnet: true,
                 fallback_clearnet: false,
                 request_timeout_seconds: 15,
+                tor_request_timeout_seconds: 15,
                 provider_cooldown_seconds: 120,
                 max_parallel_fetches: 4,
                 cache_dir: None,
@@ -456,6 +457,7 @@ fn slow_transaction_get_does_not_hold_the_index_lock() {
                 allow_clearnet: true,
                 fallback_clearnet: false,
                 request_timeout_seconds: 15,
+                tor_request_timeout_seconds: 15,
                 provider_cooldown_seconds: 120,
                 max_parallel_fetches: 4,
                 cache_dir: None,
@@ -819,6 +821,50 @@ fn scriptpubkey_subscription_returns_a_status() {
     assert_eq!(r["result"], json!(true), "{r}");
     let r = call(4, "blockchain.scriptpubkey.unsubscribe", json!(["51"]));
     assert_eq!(r["result"], json!(false), "{r}");
+}
+
+#[test]
+fn batches_are_answered_in_order() {
+    let (fx, script, _txid) = fixture();
+    let s = &fx.shared;
+    // A page of history requests (run in parallel), a notification, an
+    // invalid item and a method error: one array back, in request order.
+    let mut items: Vec<Value> = (0..20)
+        .map(|i| {
+            json!({"jsonrpc":"2.0","id":i,"method":"blockchain.scripthash.get_history",
+                   "params":[script.to_electrum_hex()]})
+        })
+        .collect();
+    items.push(json!({"jsonrpc":"2.0","method":"server.ping","params":[]}));
+    items.push(json!(7));
+    items.push(
+        json!({"jsonrpc":"2.0","id":"bad","method":"blockchain.block.header","params":["x"]}),
+    );
+    let r = process_line(s, &Value::Array(items).to_string());
+    let arr = r.as_array().expect("batch answer is an array");
+    assert_eq!(arr.len(), 22, "the notification gets no response");
+    for (i, item) in arr.iter().take(20).enumerate() {
+        assert_eq!(item["id"], i as u64);
+        assert!(item["result"].is_array(), "{item}");
+    }
+    assert_eq!(arr[20]["error"]["code"], -32600);
+    assert_eq!(arr[21]["id"], "bad");
+    assert_eq!(arr[21]["error"]["code"], -32602);
+
+    let r = process_line(s, "[]");
+    assert_eq!(r["error"]["code"], -32600);
+    let only_notes = el_serve::process_line_for(
+        s,
+        None,
+        r#"[{"jsonrpc":"2.0","method":"server.ping","params":[]}]"#,
+    );
+    assert!(only_notes.response.is_none());
+    let huge = Value::Array(vec![
+        json!({"jsonrpc":"2.0","id":1,"method":"server.ping"});
+        el_serve::MAX_BATCH_REQUESTS + 1
+    ]);
+    let r = process_line(s, &huge.to_string());
+    assert_eq!(r["error"]["code"], -32600);
 }
 
 #[test]

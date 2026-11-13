@@ -88,6 +88,7 @@ allow_clearnet = false
 tor_fallback_clearnet = false
 prefetch = false
 request_timeout_seconds = 8
+tor_request_timeout_seconds = 20
 provider_cooldown_seconds = 300
 max_parallel_fetches = 4
 p2p_timeout_seconds = 8
@@ -121,6 +122,17 @@ open_without_provider = false  # true: open with local data after ready_timeout_
   random order among the healthy ones, so no single provider is preferred and
   the blocks of one wallet are spread over all of them. Timing can still
   correlate requests.
+- A block request through Tor gets `tor_request_timeout_seconds` (20 s): it
+  builds a new circuit and downloads a whole block, which the 8 s direct
+  timeout did not cover. One wallet request spends at most 40 s across
+  providers. `/status.rawtx.tx_get_failures` says why a `transaction.get`
+  failed (`no_source`, `external_failed`, ...), without any hash.
+- Wallets reaching e-lite **through its onion service** pay a v3 onion round
+  trip (1-7 s) per request. A wallet that sends one request per address scans
+  for minutes; with JSON-RPC batches it is a few round trips per page. e-lite
+  answers batches; Sparrow sends them only with
+  `[server] advertise_electrumx_compat = true` (opt-in, see
+  `docs/ELECTRUM_PROTOCOL.md`). Over the LAN, TLS is the fast path.
 - e-lite runs its own Tor by default (`[tor] mode = "managed"`) and uses that
   SOCKS proxy for external rawtx/repair requests. There is no dependency on a
   system Tor daemon.
@@ -131,9 +143,9 @@ open_without_provider = false  # true: open with local data after ready_timeout_
   the address can query it: e-lite does not authenticate clients; rate limiting
   is only a throttle, not access control. Treat the address as a secret; use
   `[tor] mode = "off"` to disable the onion.
-- With a **pruned** Core, `run` waits for at least one provider to answer
-  `/block-height/0` and serve the genesis raw block with a matching header hash
-  before opening the Electrum listeners (`require_ready = true` by default).
+- With a **pruned** Core, `run` waits for at least one provider to serve the
+  genesis raw block (requested by its known hash, the same constant request
+  for every user) with a matching header hash before opening the Electrum listeners (`require_ready = true` by default).
   This prevents a wallet from receiving a history it cannot fully resolve
   (Sparrow stores a failed `transaction.get` as an unfetchable transaction).
   An unpruned Core serves every raw transaction locally, so the listeners open

@@ -175,6 +175,7 @@ fn config(decoys: u32, cache_mib: u64) -> RawtxConfig {
         allow_clearnet: true,
         fallback_clearnet: false,
         request_timeout_seconds: 15,
+        tor_request_timeout_seconds: 15,
         provider_cooldown_seconds: 120,
         max_parallel_fetches: 4,
         cache_dir: None,
@@ -344,7 +345,8 @@ fn no_sources_means_explicit_error() {
     let (store, _hash, txid, _bytes) = setup(&dir, 0);
     let resolver = Resolver::new(Arc::clone(&store), &config(0, 0)).unwrap();
     let err = resolver.raw_tx(txid, 0).unwrap_err();
-    assert!(matches!(err, RawtxError::Unavailable(_)), "{err}");
+    // Distinct from "every source failed": nothing could be asked.
+    assert!(matches!(err, RawtxError::NoSource(_)), "{err}");
     let _ = std::fs::remove_dir_all(&dir);
 }
 

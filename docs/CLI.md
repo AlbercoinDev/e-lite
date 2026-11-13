@@ -31,6 +31,9 @@ import-snapshot  restore --input into an empty target (atomic: staged, then rena
                  (--verify checks per-file hashes; --verify=full opens the
                  restored Core and runs a bounded verifychain;
                  --expect-digest <hex> refuses an archive that is not yours)
+arc-setup        print the steps that let e-lite manage the ZFS ARC cap
+                 without root (group-writable zfs_arc_max + the
+                 e-lite-arc-cap.service oneshot); --apply runs them (root)
 version          print version
 ```
 
@@ -85,6 +88,9 @@ version          print version
 | `--reorg-window <n>` | `index.reorg_window` | `288` |
 | `--milestone-blocks <n>` | `index.milestone_blocks` | `10000` |
 | `--milestone-seconds <n>` | `index.milestone_seconds` | `21600` |
+| `--set index.zfs_arc_dynamic=false` | dynamic ZFS ARC cap (grow during IBD/drain, shrink when synced; see `arc-setup`) | `true` |
+| `--set index.zfs_arc_max_mib=<n>` | ARC cap during IBD/drain (0 = half of RAM) | `0` |
+| `--set index.zfs_arc_min_mib=<n>` | ARC cap once fully synced (floor 512) | `1024` |
 
 `auto` uses the disk `rotational` hint. Virtual disks and some RAID/USB devices
 report it incorrectly; set `--profile ssd` or `--profile nvme` when you know the
@@ -156,6 +162,9 @@ e-lite import-snapshot --network mainnet --allow-mainnet \
 | `--scheduler <mode>` | `pruning.scheduler` | `overlap` |
 | `--prune-defer-free-gib <n>` | `pruning.prune_defer_free_gib` | `20` |
 | `--min-gain-blocks <n>` | `pruning.min_gain_blocks` | `5000` |
+| `--set pruning.min_gain_live_blocks=<n>` | once fully synced, prune every N safe blocks (0 = `min_gain_blocks`) | `144` |
+| `--min-free-gib <n>` | `pruning.min_free_gib` (pause Core downloads below it) | `10` |
+| `--critical-free-gib <n>` | `pruning.critical_free_gib` (pause indexing below it) | `1` |
 | `--prune-interval-seconds <n>` | `pruning.prune_interval_seconds` | `30` |
 | `--poll-seconds <n>` | `pruning.poll_seconds` | `10` |
 | `--repair-max-gap-blocks <n>` | `pruning.repair_max_gap_blocks` | `2048` |
@@ -217,14 +226,18 @@ e-lite run --network mainnet --allow-mainnet \
 | `--set rawtx.tor_fallback_clearnet=true` | use clearnet when Tor fails (exposes your IP to the provider) | `false` |
 | `--set rawtx.prefetch=true` | download a wallet's history blocks in the background (faster first load, no decoys) | `false` |
 | `--plain-lan` / `--set server.plain_lan=true` | plain Electrum on `0.0.0.0` | `false` |
+| `--set server.advertise_electrumx_compat=true` | `server.version` banner `e-lite X (electrumx-compatible)`, so Sparrow uses JSON-RPC batches; hot-reloadable | `false` |
 | `--set core.network=auto\|private\|clearnet` | P2P networks of a Core started by e-lite | `auto` |
 | `--set core.private_broadcast=true` | broadcast wallet transactions over short-lived Tor/I2P connections (experimental in Core) | `false` |
 | `--set core.i2p_sam=auto\|host:port` , `--set core.cjdns=true` | extra private networks for Core | `auto`, `false` |
-| `--set rawtx.request_timeout_seconds=<n>` | per-provider block timeout | `8` |
+| `--set rawtx.request_timeout_seconds=<n>` | per-provider block timeout, direct (clearnet) | `8` |
+| `--set rawtx.tor_request_timeout_seconds=<n>` | per-provider block timeout through Tor (new circuit + whole block) | `20` |
 | `--set rawtx.provider_cooldown_seconds=<n>` | cool down a failed provider (Tor or direct) | `300` |
 | `--set rawtx.max_parallel_fetches=<n>` | concurrent external block downloads | `4` |
 | `--set rawtx.p2p_timeout_seconds=<n>` | P2P connect/handshake/block timeout | `8` |
 | `--set public_servers.require_ready=false` | start without a ready provider | `true` |
+| `--set public_servers.probe_timeout_seconds=<n>` | per-provider probe timeout (parallel probe; Tor attempts get at least `rawtx.tor_request_timeout_seconds`) | `5` |
+| `--set public_servers.ready_timeout_seconds=<n>` | one readiness round before it is logged and retried | `60` |
 | `--set public_servers.open_without_provider=true` | pruned Core: open Electrum with local data after `ready_timeout_seconds` if no provider answered | `false` |
 | `--no-rawtx` | `rawtx.enabled=false` | enabled |
 | `--tls` / `--no-tls` | `server.tls` | `true` |

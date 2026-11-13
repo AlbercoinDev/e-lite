@@ -258,7 +258,7 @@ pub struct IndexCfg {
     #[serde(default)]
     pub max_open_files: u32,
     /// RAM left for the OS, Core and page cache, in MiB. 0 = auto
-    /// (`max(1024, RAM/8)`).
+    /// (`clamp(effective/8, 2048, 4096)`; `effective/4` at 2 GiB or less).
     #[serde(default)]
     pub memory_reserve_mib: u64,
     /// Maximum share of total RAM e-lite may target (0 = 0.75).
@@ -339,6 +339,12 @@ pub struct ServerCfg {
     /// default: with TLS available, cleartext on the network is opt-in.
     #[serde(default)]
     pub plain_lan: bool,
+    /// Add "(electrumx-compatible)" to the `server.version` banner so
+    /// Sparrow sends JSON-RPC batches (it recognises ElectrumX by substring).
+    /// Off by default: other wallets that look for "electrumx" may change
+    /// their behaviour too. Hot-reloadable.
+    #[serde(default)]
+    pub advertise_electrumx_compat: bool,
     /// Serve TLS as well. Enabled by default; `false` disables it.
     #[serde(default = "d_true")]
     pub tls: bool,
@@ -381,6 +387,7 @@ impl Default for ServerCfg {
         ServerCfg {
             listen: String::new(),
             plain_lan: false,
+            advertise_electrumx_compat: false,
             tls: true,
             tls_listen: String::new(),
             tls_cert: String::new(),
@@ -658,9 +665,14 @@ pub struct RawtxCfg {
     /// fetches blocks the wallet may never ask for, without decoys.
     #[serde(default)]
     pub prefetch: bool,
-    /// Timeout for each Esplora raw-block request.
+    /// Timeout for each direct (clearnet) Esplora raw-block request.
     #[serde(default = "d_rawtx_timeout")]
     pub request_timeout_seconds: u64,
+    /// Timeout for each Esplora raw-block request through Tor. Every request
+    /// builds its own circuit (AUD-135) and downloads a whole block, so the
+    /// clearnet value is too short for it.
+    #[serde(default = "d_rawtx_tor_timeout")]
+    pub tor_request_timeout_seconds: u64,
     /// Skip a provider (Tor and/or direct) after a failed request.
     #[serde(default = "d_provider_cooldown")]
     pub provider_cooldown_seconds: u64,
@@ -698,6 +710,7 @@ impl Default for RawtxCfg {
             tor_fallback_clearnet: false,
             prefetch: false,
             request_timeout_seconds: d_rawtx_timeout(),
+            tor_request_timeout_seconds: d_rawtx_tor_timeout(),
             provider_cooldown_seconds: d_provider_cooldown(),
             max_parallel_fetches: d_max_parallel_fetches(),
             cache_dir: String::new(),
@@ -768,6 +781,9 @@ fn d_ready_timeout() -> u64 {
 }
 fn d_rawtx_timeout() -> u64 {
     8
+}
+fn d_rawtx_tor_timeout() -> u64 {
+    20
 }
 fn d_provider_cooldown() -> u64 {
     300

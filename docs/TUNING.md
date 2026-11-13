@@ -49,7 +49,7 @@ Example on a 4C/8T i7-6700T with 32 GiB, 18 GiB available and a SATA SSD:
 cpu 4C/8T (eff 8, cpuinfo, smt) | mem total 32 GiB avail 18 GiB effective 14 GiB
 (core reserve 4 GiB, reserve 2 GiB, page floor 0.9 GiB)
 data disk sata-ssd (same=yes) | core par=3 rpcthreads=4 dbcache=4096
-index readers=4 jobs=2 cache 3.5..8 GiB memtables=880MiB commit=30000ms batch=512
+index readers=4 jobs=4 cache 3.5..8 GiB memtables=880MiB commit=30000ms batch=512
 ```
 
 The same line is printed at startup and stored in `/status.machine`. Explicit
@@ -57,12 +57,16 @@ settings in `[index]`/`[core]` still win; the plan is the automatic default.
 
 | Machine | readers | jobs | core par | core rpcthreads | cache ceiling (32 GiB) |
 |---|---:|---:|---:|---:|---:|
-| 4C/8T SATA SSD | 4 | 2 | 3 | 4 | 8 GiB |
-| 4C/8T NVMe | 4 | 2 | 3 | 4 | 8 GiB |
-| 8C/16T NVMe | 8 | 4 | 7 | 8 | 8 GiB |
+| 4C/8T SATA SSD | 4 | 4 | 3 | 4 | 8 GiB |
+| 4C/8T NVMe | 4 | 4 | 3 | 4 | 8 GiB |
+| 8C/16T NVMe | 8 | 8 | 7 | 8 | 8 GiB |
+| 4C/8T ZFS | 4 | 4 | 3 | 4 | 8 GiB |
 | 2C/4T HDD | 2 | 2 | 1 | 4 | 4 GiB |
 
-Virtual/unknown/ZFS/overlay devices use the SATA values and a warning. Network
+Readers and jobs are `physical cores, clamped to 2..cap` with the cap by data
+disk: readers NVMe 8, SATA/ZFS/virtual/overlay/unknown 4, HDD/network 2; jobs
+NVMe/SATA 8, ZFS/virtual/overlay/unknown 4, HDD/network 2. Virtual/unknown/
+ZFS/overlay devices print a warning. Network
 filesystems are treated as the slowest class.
 
 ## Memory budget (fitted to available RAM)
@@ -480,7 +484,7 @@ needed to attribute slow commits:
 |---|---|
 | `pending_compaction` | `estimate-pending-compaction-bytes` summed over every family. It is an **estimate** that inflates while ingest continues; use its *trend*, not its absolute value |
 | `l0` | summed level-0 file count. A growing `l0` with `running 1` is the real flush/compaction stall signal |
-| `running` | compactions in flight. `max_background_jobs` splits the pool between flushes and compactions, so the default plan (`physical/2`, 2..4) gives one of each on a 4-core host |
+| `running` | compactions in flight. `max_background_jobs` splits the pool between flushes and compactions, and the default plan (physical cores, 2..cap by disk class: 4 jobs on a 4-core SSD/ZFS host) leaves several compaction threads |
 | `block_cache` | real bytes charged to the shared cache, read once (with a shared cache every family reports the whole-cache usage, so it is not summed); expected ≈ the configured ceiling in the `memory:` line |
 | `memtable` / `table_readers` | actual memtable bytes and index/filter reader memory |
 
@@ -493,9 +497,9 @@ not warn.
 RocksDB falls back to slow/stop writes when L0 accumulates faster than a
 single compaction thread can drain it; that shows up as long commits with
 `running 1` and rising `l0`. Since 0.1.0-alpha.29.8.8 the plan gives SSD/NVMe
-disks `background_jobs = physical cores` clamped to 2..8 (two flush plus half
-the physical cores as compaction threads on a 4-core host; HDD keeps 2 and
-virtual/unknown keeps `physical/2`), because the old `physical/2` default let
+disks `background_jobs = physical cores` clamped to 2..8 (since 29.9.1 the
+same rule at startup: ZFS/virtual/overlay/unknown are capped at 4 and
+HDD/network at 2), because the old `physical/2` default let
 the debt grow ~70 GiB/h at drain rates. `[index] background_jobs` still
 overrides the plan for A/B; compare the `pending_compaction` trend and
 commit/blk in the same phase before changing it back.

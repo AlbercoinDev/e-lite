@@ -49,9 +49,19 @@ pub struct ProbeOutcome {
     pub clearnet_fallback: bool,
 }
 
+/// After the first healthy provider, the gate waits this long for the rest
+/// of the round before opening; slower providers are reported as such.
+const GATE_GRACE: Duration = Duration::from_secs(2);
+
 /// Probe the providers and wait (up to `cfg.public_servers.ready_timeout_seconds`)
-/// until at least one answers. Uses `/block-height/0`: a constant, public query
-/// that never contains wallet data.
+/// until at least one answers. With a known genesis each provider gets one
+/// constant request, `/block/<genesis>/raw`, checked against the header hash;
+/// otherwise `/block-height/0` first. Neither contains wallet data.
+///
+/// Providers are probed in parallel, each through its own Tor circuit, so a
+/// round lasts one timeout instead of one per provider. A Tor attempt gets at
+/// least `rawtx.tor_request_timeout_seconds` (a cold circuit to an onion
+/// service routinely takes longer than the 5 s probe timeout).
 pub fn probe(
     cfg: &Config,
     urls: &[String],
@@ -62,39 +72,32 @@ pub fn probe(
         return ProbeOutcome::default();
     }
     let timeout = Duration::from_secs(cfg.public_servers.probe_timeout_seconds.max(1));
-    let tor = cfg
-        .rawtx
-        .tor_socks
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .and_then(|proxy| {
-            reqwest::blocking::Client::builder()
-                .timeout(timeout)
-                .user_agent(el_rawtx::HTTP_USER_AGENT)
-                .proxy(reqwest::Proxy::all(format!("socks5h://{proxy}")).ok()?)
-                .build()
-                .ok()
-        });
-    let direct = reqwest::blocking::Client::builder()
-        .timeout(timeout)
-        .user_agent(el_rawtx::HTTP_USER_AGENT)
-        .build()
-        .ok();
-    let fallback = cfg.rawtx.tor_fallback_clearnet;
-    let allow_clearnet = cfg.rawtx.allow_clearnet;
+    let plan = ProbePlan {
+        tor_socks: cfg
+            .rawtx
+            .tor_socks
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string),
+        tor_timeout: timeout.max(Duration::from_secs(cfg.rawtx.tor_request_timeout_seconds)),
+        direct: reqwest::blocking::Client::builder()
+            .timeout(timeout)
+            .user_agent(el_rawtx::HTTP_USER_AGENT)
+            .build()
+            .ok(),
+        allow_clearnet: cfg.rawtx.allow_clearnet,
+        fallback: cfg.rawtx.tor_fallback_clearnet,
+        expected_genesis: expected_genesis.map(str::to_ascii_lowercase),
+    };
+    // `doctor` (no wait) reports every provider; the gate opens shortly
+    // after the first healthy one.
+    let grace = wait_for_ready.then_some(GATE_GRACE);
 
     let deadline =
         Instant::now() + Duration::from_secs(cfg.public_servers.ready_timeout_seconds.max(1));
     loop {
-        let outcome = probe_once(
-            urls,
-            tor.as_ref(),
-            direct.as_ref(),
-            allow_clearnet,
-            fallback,
-            expected_genesis,
-        );
+        let outcome = probe_round(urls, &plan, grace);
         if outcome.ready || !wait_for_ready || Instant::now() >= deadline {
             if !outcome.ready && wait_for_ready {
                 eprintln!(
@@ -112,103 +115,159 @@ pub fn probe(
     }
 }
 
-fn probe_once(
-    urls: &[String],
-    tor: Option<&reqwest::blocking::Client>,
-    direct: Option<&reqwest::blocking::Client>,
+/// Everything one provider probe needs, shareable with its thread.
+#[derive(Clone)]
+struct ProbePlan {
+    tor_socks: Option<String>,
+    tor_timeout: Duration,
+    direct: Option<reqwest::blocking::Client>,
     allow_clearnet: bool,
     fallback: bool,
-    expected_genesis: Option<&str>,
-) -> ProbeOutcome {
-    let mut outcome = ProbeOutcome::default();
-    for url in urls {
-        let base = url.trim_end_matches('/');
-        let is_onion = base.to_ascii_lowercase().contains(".onion");
-        let target = format!("{base}/block-height/0");
-        let started = Instant::now();
-        let mut status = ProviderStatus {
-            url: base.to_string(),
-            ..Default::default()
-        };
+    expected_genesis: Option<String>,
+}
 
-        let attempt = |client: Option<&reqwest::blocking::Client>,
-                       via: &str|
-         -> Result<(), String> {
-            let Some(client) = client else {
-                return Err(format!("no {via} client"));
-            };
-            let response = client.get(&target).send().map_err(|e| e.to_string())?;
-            let status_code = response.status();
-            if !status_code.is_success() {
-                return Err(format!("HTTP {status_code}"));
+/// Result of one provider probe; `clearnet_fallback` marks a provider that
+/// was only reachable directly although Tor should have been used.
+struct ProbeResult {
+    status: ProviderStatus,
+    via_tor: bool,
+    clearnet_fallback: bool,
+}
+
+/// Probe every provider in parallel. Statuses keep the configured order.
+/// With `grace`, providers still running `grace` after the first healthy
+/// answer are reported as slow and left to finish in the background (their
+/// requests are bounded by the client timeouts).
+fn probe_round(urls: &[String], plan: &ProbePlan, grace: Option<Duration>) -> ProbeOutcome {
+    let started = Instant::now();
+    let (tx, rx) = std::sync::mpsc::channel::<(usize, ProbeResult)>();
+    let mut spawned = 0;
+    let mut results: Vec<Option<ProbeResult>> = urls.iter().map(|_| None).collect();
+    for (idx, url) in urls.iter().enumerate() {
+        let tx = tx.clone();
+        let url = url.clone();
+        let plan = plan.clone();
+        let thread = std::thread::Builder::new()
+            .name("el-probe".to_string())
+            .spawn(move || {
+                let _ = tx.send((idx, probe_provider(&url, &plan)));
+            });
+        match thread {
+            Ok(_) => spawned += 1,
+            Err(e) => {
+                results[idx] = Some(ProbeResult {
+                    status: ProviderStatus {
+                        url: url_base(urls[idx].as_str()).to_string(),
+                        error: Some(format!("cannot start probe thread: {e}")),
+                        ..Default::default()
+                    },
+                    via_tor: false,
+                    clearnet_fallback: false,
+                })
             }
-            let body = response.text().map_err(|e| e.to_string())?;
-            let hash = body.trim();
-            if hash.len() != 64 || !hash.bytes().all(|b| b.is_ascii_hexdigit()) {
-                return Err("unexpected block-height response".to_string());
-            }
-            if let Some(expected) = expected_genesis {
-                if !hash.eq_ignore_ascii_case(expected) {
-                    return Err(format!(
-                        "genesis mismatch: provider serves {hash}, expected {expected} \
-                             (wrong network)"
-                    ));
+        }
+    }
+    drop(tx);
+
+    let mut received = 0;
+    let mut cutoff: Option<Instant> = None;
+    while received < spawned {
+        let next = match cutoff {
+            Some(at) => {
+                let left = at.saturating_duration_since(Instant::now());
+                if left.is_zero() {
+                    break;
                 }
+                rx.recv_timeout(left).map_err(|_| ())
             }
-            // A provider that cannot serve the genesis block cannot serve
-            // old transactions either. This is a real rawtx probe, not just
-            // an index lookup.
-            let raw_response = client
-                .get(format!("{base}/block/{hash}/raw"))
-                .send()
-                .map_err(|e| format!("raw block: {e}"))?;
-            let status_code = raw_response.status();
-            if !status_code.is_success() {
-                return Err(format!("raw block: HTTP {status_code}"));
-            }
-            let bytes = raw_response
-                .bytes()
-                .map_err(|e| format!("raw block: {e}"))?;
-            if bytes.len() < 80 {
-                return Err("raw block: too short".to_string());
-            }
-            use bitcoin::hashes::Hash as _;
-            let mut computed = bitcoin::hashes::sha256d::Hash::hash(&bytes[..80]).to_byte_array();
-            computed.reverse();
-            if hex::encode(computed) != hash.to_ascii_lowercase() {
-                return Err("raw block: header hash mismatch".to_string());
-            }
-            Ok(())
+            None => rx.recv().map_err(|_| ()),
         };
+        let Ok((idx, result)) = next else {
+            break;
+        };
+        if result.status.healthy && cutoff.is_none() {
+            cutoff = grace.map(|g| Instant::now() + g);
+        }
+        results[idx] = Some(result);
+        received += 1;
+    }
 
-        if is_onion {
-            match attempt(tor, "tor") {
+    let mut outcome = ProbeOutcome::default();
+    for (idx, result) in results.into_iter().enumerate() {
+        let result = result.unwrap_or_else(|| ProbeResult {
+            status: ProviderStatus {
+                url: url_base(&urls[idx]).to_string(),
+                latency_ms: started.elapsed().as_millis() as u64,
+                error: Some("no answer yet when another provider was ready".to_string()),
+                ..Default::default()
+            },
+            via_tor: false,
+            clearnet_fallback: false,
+        });
+        if result.status.healthy {
+            outcome.ready = true;
+            outcome.tor_ready |= result.via_tor;
+        }
+        outcome.clearnet_fallback |= result.clearnet_fallback;
+        outcome.statuses.push(result.status);
+    }
+    outcome
+}
+
+fn url_base(url: &str) -> &str {
+    url.trim_end_matches('/')
+}
+
+/// Probe one provider: Tor first (its own circuit), then clearnet when
+/// allowed. `.onion` providers are Tor-only.
+fn probe_provider(url: &str, plan: &ProbePlan) -> ProbeResult {
+    let base = url_base(url);
+    let is_onion = base.to_ascii_lowercase().contains(".onion");
+    let started = Instant::now();
+    let mut status = ProviderStatus {
+        url: base.to_string(),
+        ..Default::default()
+    };
+    let mut via_tor = false;
+    let mut clearnet_fallback = false;
+    let tor = plan
+        .tor_socks
+        .as_deref()
+        .and_then(|socks| el_rawtx::isolated_tor_client(socks, plan.tor_timeout));
+    let expected = plan.expected_genesis.as_deref();
+
+    if is_onion {
+        match tor.as_ref() {
+            Some(client) => match probe_with(client, base, expected) {
                 Ok(()) => {
                     status.healthy = true;
                     status.via = "tor".to_string();
-                    outcome.tor_ready = true;
+                    via_tor = true;
                 }
                 Err(e) => status.error = Some(e),
-            }
-        } else {
-            let mut tor_error = None;
-            if tor.is_some() {
-                match attempt(tor, "tor") {
-                    Ok(()) => {
-                        status.healthy = true;
-                        status.via = "tor".to_string();
-                        outcome.tor_ready = true;
-                    }
-                    Err(e) => tor_error = Some(e),
+            },
+            None => status.error = Some("no tor client".to_string()),
+        }
+    } else {
+        let mut tor_error = None;
+        if let Some(client) = tor.as_ref() {
+            match probe_with(client, base, expected) {
+                Ok(()) => {
+                    status.healthy = true;
+                    status.via = "tor".to_string();
+                    via_tor = true;
                 }
+                Err(e) => tor_error = Some(e),
             }
-            if !status.healthy && (fallback || allow_clearnet) {
-                match attempt(direct, "clearnet") {
+        }
+        if !status.healthy && (plan.fallback || plan.allow_clearnet) {
+            match plan.direct.as_ref() {
+                Some(client) => match probe_with(client, base, expected) {
                     Ok(()) => {
                         status.healthy = true;
                         status.via = "clearnet".to_string();
-                        if (tor_error.is_some() || tor.is_none()) && !allow_clearnet {
-                            outcome.clearnet_fallback = true;
+                        if (tor_error.is_some() || tor.is_none()) && !plan.allow_clearnet {
+                            clearnet_fallback = true;
                         }
                     }
                     Err(e) => {
@@ -217,22 +276,82 @@ fn probe_once(
                             None => e,
                         });
                     }
-                }
-            } else if !status.healthy {
-                status.error = Some(match tor_error {
-                    Some(t) => format!("tor: {t}; clearnet fallback disabled"),
-                    None => "no Tor and clearnet disabled".to_string(),
-                });
+                },
+                None => status.error = Some("no clearnet client".to_string()),
             }
+        } else if !status.healthy {
+            status.error = Some(match tor_error {
+                Some(t) => format!("tor: {t}; clearnet fallback disabled"),
+                None => "no Tor and clearnet disabled".to_string(),
+            });
         }
-
-        status.latency_ms = started.elapsed().as_millis() as u64;
-        if status.healthy {
-            outcome.ready = true;
-        }
-        outcome.statuses.push(status);
     }
-    outcome
+    status.latency_ms = started.elapsed().as_millis() as u64;
+    ProbeResult {
+        status,
+        via_tor,
+        clearnet_fallback,
+    }
+}
+
+/// One provider check through one client. With a known genesis this is a
+/// single request; a provider of another network does not have that block.
+fn probe_with(
+    client: &reqwest::blocking::Client,
+    base: &str,
+    expected_genesis: Option<&str>,
+) -> Result<(), String> {
+    let hash = match expected_genesis {
+        Some(hash) => hash.to_string(),
+        None => {
+            let response = client
+                .get(format!("{base}/block-height/0"))
+                .send()
+                .map_err(|e| e.without_url().to_string())?;
+            let status_code = response.status();
+            if !status_code.is_success() {
+                return Err(format!("HTTP {status_code}"));
+            }
+            let body = response.text().map_err(|e| e.to_string())?;
+            let hash = body.trim().to_ascii_lowercase();
+            if hash.len() != 64 || !hash.bytes().all(|b| b.is_ascii_hexdigit()) {
+                return Err("unexpected block-height response".to_string());
+            }
+            hash
+        }
+    };
+    // A provider that cannot serve the genesis block cannot serve old
+    // transactions either: this is a real raw-block probe.
+    let raw_response = client
+        .get(format!("{base}/block/{hash}/raw"))
+        .send()
+        .map_err(|e| format!("raw block: {}", e.without_url()))?;
+    let status_code = raw_response.status();
+    if !status_code.is_success() {
+        return Err(if expected_genesis.is_some() {
+            format!("genesis block not served: HTTP {status_code} (wrong network?)")
+        } else {
+            format!("raw block: HTTP {status_code}")
+        });
+    }
+    let bytes = raw_response
+        .bytes()
+        .map_err(|e| format!("raw block: {e}"))?;
+    if bytes.len() < 80 {
+        return Err("raw block: too short".to_string());
+    }
+    use bitcoin::hashes::Hash as _;
+    let mut computed = bitcoin::hashes::sha256d::Hash::hash(&bytes[..80]).to_byte_array();
+    computed.reverse();
+    if hex::encode(computed) != hash {
+        return Err(if expected_genesis.is_some() {
+            "genesis mismatch: the served block is not this network's genesis (wrong network)"
+                .to_string()
+        } else {
+            "raw block: header hash mismatch".to_string()
+        });
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Default)]
@@ -469,24 +588,17 @@ mod tests {
         let hash = block.block_hash().to_string();
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
-        let served_hash = hash.clone();
         let handle = std::thread::spawn(move || {
-            for i in 0..2 {
-                let (mut sock, _) = listener.accept().unwrap();
-                let mut buf = [0u8; 4096];
-                let _ = sock.read(&mut buf);
-                let body = if i == 0 {
-                    served_hash.as_bytes().to_vec()
-                } else {
-                    raw_block.clone()
-                };
-                let response = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                    body.len()
-                );
-                sock.write_all(response.as_bytes()).unwrap();
-                sock.write_all(&body).unwrap();
-            }
+            // A known genesis needs one request: the raw genesis block.
+            let (mut sock, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 4096];
+            let _ = sock.read(&mut buf);
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                raw_block.len()
+            );
+            sock.write_all(response.as_bytes()).unwrap();
+            sock.write_all(&raw_block).unwrap();
         });
 
         let mut cfg = Config::default();
@@ -509,19 +621,23 @@ mod tests {
         use std::io::{Read, Write};
         use std::net::TcpListener;
 
+        // The provider answers with a real block that is not the expected
+        // genesis (another network).
+        let raw_block = bitcoin::consensus::serialize(
+            &bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest),
+        );
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         let handle = std::thread::spawn(move || {
             let (mut sock, _) = listener.accept().unwrap();
             let mut buf = [0u8; 4096];
             let _ = sock.read(&mut buf);
-            let body = "11".repeat(32);
             let response = format!(
-                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                body.len(),
-                body
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                raw_block.len()
             );
             sock.write_all(response.as_bytes()).unwrap();
+            sock.write_all(&raw_block).unwrap();
         });
 
         let mut cfg = Config::default();
@@ -542,6 +658,57 @@ mod tests {
             .unwrap_or("")
             .contains("genesis mismatch"));
         handle.join().unwrap();
+    }
+
+    #[test]
+    fn gate_opens_with_the_first_healthy_provider() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let block = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+        let raw_block = bitcoin::consensus::serialize(&block);
+        let hash = block.block_hash().to_string();
+        let serve = |delay: Duration| {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap();
+            let body = raw_block.clone();
+            std::thread::spawn(move || {
+                if let Ok((mut sock, _)) = listener.accept() {
+                    let mut buf = [0u8; 4096];
+                    let _ = sock.read(&mut buf);
+                    std::thread::sleep(delay);
+                    let head = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    let _ = sock.write_all(head.as_bytes());
+                    let _ = sock.write_all(&body);
+                }
+            });
+            format!("http://{addr}")
+        };
+        // The slow provider is listed first: a serial probe would wait for it.
+        let urls = [serve(Duration::from_secs(8)), serve(Duration::ZERO)];
+
+        let mut cfg = Config::default();
+        cfg.rawtx.tor_socks = None;
+        cfg.rawtx.allow_clearnet = true;
+        cfg.public_servers.probe_timeout_seconds = 10;
+        let started = Instant::now();
+        let outcome = probe(&cfg, &urls, true, Some(&hash));
+        let elapsed = started.elapsed();
+        assert!(outcome.ready, "{outcome:?}");
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "gate waited {elapsed:?} for the slow provider"
+        );
+        assert!(outcome.statuses[1].healthy);
+        assert!(!outcome.statuses[0].healthy);
+        assert!(outcome.statuses[0]
+            .error
+            .as_deref()
+            .unwrap_or("")
+            .contains("no answer yet"));
     }
 
     #[test]

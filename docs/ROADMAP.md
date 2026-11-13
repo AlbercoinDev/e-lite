@@ -13,35 +13,53 @@ Measured on mainnet with alpha.29.12.1 (owner logs):
   session: ... history 39 (0 ms avg, 5 ms max)`).
 - The same wallet over LAN: 277 `tx.get` in 67 s. Over the onion: 61
   `get_history` in 425 s (~7 s each), serial.
-- The provider gate needed **>60 s** to open: `probe_once` probes the
+- The provider gate needed **>60 s** to open: `probe_once` probed the
   providers **serially** (two HTTP requests each, 30 s timeout per request).
 - `rpc error: method=blockchain.transaction.get code=-32000` during that
   window (throttled to one line per minute, so the real count is hidden).
 - `wallet session:` printed every 60 s on idle connections: `server.ping`
   counted as activity.
 
-**Physics that cannot be fixed server-side:** a v3 onion round trip is
-1-7 s, Electrum is one round trip per request, and wallets issue 1-3 serial
-requests per scanned address. A 61-address scan over Tor is minutes; the
-fast path is TLS over LAN.
+**What the server cannot change:** a v3 onion round trip is 1-7 s. **What it
+can change** is the number of round trips: Sparrow starts every connection
+with one request per line and upgrades to JSON-RPC batches only for servers
+it recognises by the `server.version` name (`electrumx`, `electrs/` >= 0.9.0,
+`fulcrum` >= 1.6.0, `mempool-electrs`, `frigate`, `cormorant`). `e-lite X` is
+not recognised and e-lite rejects batch arrays, so a 61-address scan is 61
+serial round trips. See item A.
 
-The actionable corrections, in order:
+Plan reviewed against the code on 2026-11-13. Order of work:
 
-| # | Priority | Change | Where | Acceptance |
+| # | Priority | Change | Where | Status / acceptance |
 |---|---|---|---|---|
-| 1 | P1 | Probe public providers **in parallel** (bounded threads, per-provider timeout, first genesis-validated answer wins; statuses still collected). | `bin/e-lite/src/public_servers.rs` (`probe_once`) | Gate opens within one probe timeout instead of 3x; unit test with local slow/fast servers. |
-| 2 | P1 | Tag `transaction.get` failures by cause (`external unavailable` / `not found` / `pruned gap`), `debug:` line with a 5 s throttle (INFO stays at 60 s), counter in `/status`. No hashes in logs (AUD-132). Behaviour stays fail-closed (AUD-045). | `crates/el-serve/src/lib.rs`, `el-rawtx` | A pruned-block `tx.get` without a provider logs the cause and increments the counter. |
-| 3 | P2 | Session summary only on interesting activity: count only `get_history`/`transaction.get` (>=3 to print); `server.ping` no longer triggers it. | `el-serve` `ClientStats` | Idle connection with pings prints no `wallet session:`. |
-| 4 | P2 | Prefetch with **decoys**, still opt-in (`[rawtx] prefetch = true`): one decoy per prefetched block through the same resolver (`raw_tx_prefetch` is currently decoy-less). This warms the blocks of the served history while the wallet keeps scanning, so the "Loading transactions" phase hits the cache. Privacy trade-off documented; default stays off (AUD-134). | `crates/el-rawtx/src/lib.rs:552`, `el-serve` `Prefetcher` | With prefetch on, a second `tx.get` of the same block does not fetch; decoy counter rises; with prefetch off no extra traffic. |
-| 5 | P2 | `NOTIFY_WRITE_TIMEOUT` 2 s -> 10 s so a slow Tor client is not disconnected between notifications (each reconnect costs a new onion circuit). Trade-off: the notifier is shared, a stuck client can delay others up to 10 s. | `el-serve` | No behaviour change on LAN; test with a client that does not read. |
-| 6 | P2 | Document the Tor reality and the opt-in prefetch in `PRIVACY.md`, `TUNING.md`; log/CHANGELOG/HANDOFF entries. | `docs/` | Docs updated with the same change. |
+| 2 | P1 | `transaction.get` failures counted by cause (`not_found`, `no_source`, `external_failed`, `verify_failed`, `internal`) in `/status.rawtx.tx_get_failures`, `debug:` line every 5 s per cause, no hashes (AUD-132). Fail-closed behaviour unchanged (AUD-045). | `el-serve`, `el-rawtx` (`RawtxError::NoSource`) | **Done (unreleased).** |
+| B | P1 | Separate timeout for Esplora requests through Tor (`tor_request_timeout_seconds`, 20 s; direct stays 8 s) and a 40 s budget per `fetch_block`. The 8 s total covered a new circuit plus a whole block, and a timeout cooled the provider for 30-300 s. | `crates/el-rawtx/src/esplora.rs` | **Done (unreleased), not measured.** Acceptance: on mainnet over Tor, `external_failed` stays near zero during a wallet load. |
+| 1 | P1 | Probe public providers **in parallel**, one request each (genesis raw block by its known hash; `/block-height/0` only when unknown), own Tor circuit per provider, Tor attempts get at least `tor_request_timeout_seconds`; the gate opens 2 s after the first healthy provider. | `bin/e-lite/src/public_servers.rs` (`probe_round`) | **Done (unreleased).** Test `gate_opens_with_the_first_healthy_provider`; the owner's mainnet log decides the real opening time. |
+| A | P1 | **JSON-RPC batch arrays** (answered in order; items in parallel up to 8; max 1000) plus opt-in `[server] advertise_electrumx_compat` so Sparrow recognises e-lite (banner `e-lite X (electrumx-compatible)`). **Done (unreleased).** Owner decision 2026-11-13: ElectrumX substring, banner keeps "e-lite" first. Next: measure a Sparrow scan over the onion with the option on; if it is fast and no other wallet misbehaves, make it the default and send Sparrow an upstream patch that recognises `e-lite` with the measured numbers. | `el-serve`, `docs/ELECTRUM_PROTOCOL.md` | A batched scan over the onion takes a few round trips. |
+| 3 | P2 | Session summary only on wallet requests (>= 3 `get_history`/`transaction.get`), with AUD-149. | `el-serve` | **Done (unreleased).** |
+| 5 | P2 | `NOTIFY_WRITE_TIMEOUT` 2 s -> 10 s **rejected**; instead `notify` queues behind the connection lock and the lock holder delivers on release, so the shared notifier never waits for one client's 30 s response write. | `el-serve` (`notify`, `flush_pending`) | **Done (unreleased)**, test `notify_never_waits_for_a_busy_connection`. |
+| 4 | P3 | Prefetch with decoys, opt-in. Lower priority: with batches the wallet asks for its transactions grouped and the server can resolve them in parallel without fetching blocks the wallet never asked for. Re-evaluate after A is measured. | `el-rawtx`, `el-serve` `Prefetcher` | Only if the loading phase is still slow with A. |
+| 6 | P2 | Document the Tor reality in `PRIVACY.md`/`TUNING.md` with the measured result of A and B. | `docs/` | With the same change. |
 
-Out of scope (with a reason, do not reintroduce blindly): pipelining per
-connection (no effect with serial wallets — this log shows one request every
-~7 s and zero `tx.get` during the finding phase), request batching (the
-wallet decides), a second Tor instance for the outbound/Core `-onion` side
-(revisit only with measured contention), and any change that hints at
-clearnet fetches.
+**Note on item A (Sparrow, read 2026-11-13 from its `master` sources):**
+Sparrow never probes a capability; it maps the `server.version` banner to
+fixed flags (`ServerCapability`). An unrecognised banner gets batching
+**off**, but still `unsubscribe` and `server.features` on, which e-lite
+already serves. A recognised name (e.g. `electrumx`, `fulcrum 1.6`) turns
+batching on and keeps the same expectations; `cormorant` additionally
+turns on block stats, `mempool-electrs` caps fee targets at 25. Batches are
+paged at 100 requests (`PagedBatchRequestBuilder.DEFAULT_PAGE_SIZE`, halved
+after timeouts), responses are matched **by id**, and one item error makes
+`execute()` discard the page (`executeTolerant()` keeps the rest). Not
+verified: the wire framing in the JSON-RPC library and the
+`isResponseTooLarge` retry. Decision: (a) now, with the honest banner
+`e-lite X (electrumx-compatible)` (Sparrow matches "electrumx" by
+substring), to measure; (b) the upstream patch afterwards, with the
+measurement.
+
+Out of scope (with a reason, do not reintroduce blindly): a second Tor
+instance for the outbound/Core `-onion` side (revisit only with measured
+contention), and any change that hints at clearnet fetches.
 
 ### Schema v2 / history compaction (AUD-130) — from-zero reindex
 
@@ -50,8 +68,21 @@ delivered as a from-zero reindex with a from-zero Core; the migrator and its
 double-disk requirement are cancelled.
 
 Scope: 1-byte `history` value, 8-12 byte txid prefix verified against
-`txids.dat`, 16-byte scripthash prefix (BIP158 standard); estimated 30-40 %
-smaller. Checklist before starting: collision rules (prefix ambiguity must
+`txids.dat`, 16-byte scripthash prefix; estimated 30-40 % smaller (not
+measured).
+
+Design notes from the 2026-11-13 review:
+
+- A txid prefix is **not unique**: with ~1.2e9 transactions an 8-byte prefix
+  already has a few-percent chance of an accidental collision, and a
+  colliding pair costs ~2^32 work to craft. The lookup must accept several
+  candidates per prefix and verify each against `txids.dat`; "fail
+  conservatively" is not enough.
+- The 16-byte scripthash prefix is justified by 128-bit second-preimage
+  resistance, not by BIP158 (which uses 64-bit SipHash values).
+- Measure first: per-family SST sizes on a mainnet index
+  (`/status.rocksdb.cf`) and the bottommost zstd experiment (Storage
+  savings, P2), which needs no schema change. Checklist before starting: collision rules (prefix ambiguity must
 fail conservatively), BIP30 duplicate-txid tests, `canonical_digest`
 equivalence (old vs new on the same chain), snapshot `schema` field and
 import refusal, and a measured size + read-latency benchmark (including a

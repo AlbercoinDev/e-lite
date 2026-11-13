@@ -2,6 +2,82 @@
 
 ## Unreleased
 
+### Wallet over Tor: parallel provider probe, block timeout, `transaction.get` failure causes
+
+- **JSON-RPC batches.** A line holding an array of requests is answered with
+  one array of responses in request order (at most 1000 items; an empty or
+  larger batch gets `-32600`; notifications inside get no entry; an
+  all-notification batch gets no reply). Items run on up to 8 threads unless
+  the batch carries `server.version` or an unsubscribe. A batch turns one
+  network round trip per address into one per page, which over an onion
+  service is the difference between minutes and seconds. Sparrow batches
+  only with servers it recognises by the `server.version` name; see
+  `advertise_electrumx_compat` below. Test: `batches_are_answered_in_order`.
+- **`[server] advertise_electrumx_compat`** (opt-in, default `false`,
+  hot-reloadable): the `server.version`/`server.features` banner becomes
+  `e-lite <version> (electrumx-compatible)`. Sparrow lowercases the banner,
+  matches "electrumx" by substring and then uses JSON-RPC batches (pages of
+  100). The banner still starts with e-lite; electrs/Fulcrum were not used
+  because Sparrow matches them by prefix with a minimum version, which would
+  mean advertising a false name and version. Off by default until measured
+  with other wallets that may also look for "electrumx". Test:
+  `electrumx_compat_banner_still_names_e_lite`.
+- **The notifier no longer waits for a client's connection lock.** A
+  notification is queued and written by whoever holds the lock when it
+  releases it (the client's own response, its socket poll, or the notifier).
+  Before, the shared notifier thread waited up to 30 s behind one client's
+  large response, delaying every other wallet. A client that accumulates 4096
+  undelivered notifications is disconnected. The planned change of
+  `NOTIFY_WRITE_TIMEOUT` to 10 s was dropped: a notification is ~150 bytes
+  and only a stuck client fills the socket buffer. Test:
+  `notify_never_waits_for_a_busy_connection`.
+- **Wallet-session diagnostics (AUD-149).** `wallet session:` prints only
+  after >= 3 `get_history`/`transaction.get` in the window (pings and
+  subscriptions no longer trigger it), latencies below 1 ms print in µs
+  instead of `0 ms`, and the first-`tx.get` marker measures from the
+  connection's **first** `get_history` (it reported minutes of idle time).
+- **Docs and help vs code (AUD-150).** `e-lite help` printed stale
+  defaults (prune deferral 50 GiB instead of 20, prune gain 10000 instead of
+  5000, the old memtable/reserve formulas, "Electrum 1.4"); the protocol
+  matrix now lists the non-standard `blockchain.block.stats`; CLI.md gains
+  `min_gain_live_blocks`, the disk guards, the ZFS ARC knobs and the probe
+  timeouts; TUNING/PROJECT_MEMORY no longer say `jobs=2`. Checked
+  systematically: example config == defaults, every flag documented.
+- **Docs (AUD-148).** `AGENTS.md`, `TUNING.md`, `CLI.md`, `FEATURES.md` and
+  `HANDOFF.md` now match the code: per-disk jobs plan, prune at the tip and
+  `min_gain_live_blocks`, log levels, `recent`/`eta`, dynamic ARC and
+  `arc-setup`, plain listener on loopback, uniform rate limit.
+
+- **The provider gate no longer probes serially.** Every provider is probed
+  in parallel, each on its own Tor circuit, with **one** request: the genesis
+  raw block by its known hash, checked against the header hash
+  (`/block-height/0` is still asked first when the genesis is unknown). The
+  old round was up to providers x 2 requests x timeout; the owner's mainnet
+  log needed more than 60 s to open the gate. A Tor attempt gets at least
+  `tor_request_timeout_seconds` (a cold onion circuit often exceeds the 5 s
+  probe timeout). The gate opens 2 s after the first healthy provider; slower
+  ones appear in `/status` as "no answer yet". `doctor` still waits for every
+  provider. A provider of another network is reported as "genesis block not
+  served (wrong network?)" or "genesis mismatch". Test:
+  `gate_opens_with_the_first_healthy_provider`.
+
+- **`[rawtx] tor_request_timeout_seconds = 20`** (new). An Esplora block
+  request through Tor used the 8 s `request_timeout_seconds`, which covers
+  building a new circuit (every request has its own, AUD-135) **and**
+  downloading a whole block; a timeout then cooled the provider for 30-300 s.
+  Tor requests now have their own timeout; direct requests keep 8 s. One
+  wallet request spends at most 40 s across providers (each attempt is capped
+  by the time left). Not measured on mainnet yet: the counters below are the
+  measurement.
+- **`transaction.get` failures are counted by cause** in
+  `/status.rawtx.tx_get_failures`: `not_found`, `no_source` (no provider can
+  be asked: none configured or Tor unavailable), `external_failed` (every
+  provider asked failed), `verify_failed`, `internal`. With the `debug` log
+  level, `debug: tx.get failed: <cause> (height N, M so far)` prints at most
+  once per cause every 5 s; the INFO `rpc error` line (one per minute, no
+  cause) is unchanged. No txid, script or block hash is logged. Behaviour is
+  unchanged: the wallet still gets the explicit error (AUD-045).
+
 ### Fixes found reviewing 29.12.0 / 29.12.1
 
 - **CI was red on `main` for both releases.** The `stable` toolchain the CI

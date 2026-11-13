@@ -44,12 +44,13 @@ no repitas contexto ni rehagas decisiones ya documentadas.
 - `prune_mib >= 550` requires `[pruning] allow_auto_prune = true`.
 - Snapshots are optional and are not needed for the from-zero flow.
   `export-snapshot` is per-network; `--with-core` bundles the network's Core
-  datadir with an index archive (manifest format 2, coherence-checked,
+  datadir with an index archive (manifest format 3, coherence-checked,
   `--verify=full` opens the restored Core). `AGENTS.md` has the details.
 - Electrum binds per-network defaults: plain/TLS/metrics are
   `55011/55022/55084` (mainnet), `55111/55122/55184` (testnet4),
-  `55211/55222/55284` (signet) and `55311/55322/55384` (regtest), on `0.0.0.0`
-  for Electrum. TLS is on by default with a generated self-signed certificate
+  `55211/55222/55284` (signet) and `55311/55322/55384` (regtest). TLS binds
+  `0.0.0.0`; plain binds loopback by default (`plain_lan`/`--plain-lan` to
+  expose it, AUD-147); metrics stay on loopback. TLS is on by default with a generated self-signed certificate
   (`<data-dir>/tls/`) and does not depend on Tor; `tls = false` / `--no-tls`
   disables it. `[tor] mode = "managed"` (default) publishes the same plain/TLS
   ports as a v3 onion. Data defaults to `~/e-lite/<network>` and Core to
@@ -138,6 +139,27 @@ warn-only as designed (ARC 17.7 GiB, e-lite cache squeezed to 205 MiB). For
 the dynamic ARC to work, e-lite needs write access to
 `/sys/module/zfs/parameters/zfs_arc_max` (root, group-writable parameter or a
 non-read-only mount).
+
+## Unreleased on `main` (after alpha.29.12.1)
+
+- `[rawtx] tor_request_timeout_seconds = 20`: Esplora requests through Tor no
+  longer share the 8 s direct timeout; one `fetch_block` spends at most 40 s.
+  **Not measured**: the owner's mainnet-over-Tor run decides.
+- Provider gate: parallel probe, one request per provider (genesis raw
+  block by hash), own Tor circuit, opens 2 s after the first healthy one.
+- `/status.rawtx.tx_get_failures` + `debug: tx.get failed: <cause>`;
+  `RawtxError::NoSource` is new.
+- The wallet-over-Tor plan in `docs/ROADMAP.md` was reviewed against the
+  code: JSON-RPC batches (item A) are now the main lever, the notifier
+  timeout change was rejected, prefetch-with-decoys was demoted.
+- JSON-RPC batches implemented. Sparrow uses them only with the opt-in
+  `[server] advertise_electrumx_compat = true` (banner `e-lite X
+  (electrumx-compatible)`; owner decision 2026-11-13). Measure a Sparrow
+  scan over the onion with it on before making it the default.
+- The notifier queues behind the connection lock instead of waiting for it.
+- AUD-148 (docs) and AUD-149 (wallet-session diagnostics) fixed.
+- Tests: fmt, clippy, `cargo test --workspace`. No e2e run; nothing
+  measured on mainnet.
 
 Open: the **2026-11-13 measured plan** is in `docs/ROADMAP.md` ("Planned
 work (2026-11-13)"): wallet-over-Tor corrections (parallel provider probes,

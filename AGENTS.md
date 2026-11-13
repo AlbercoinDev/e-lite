@@ -54,7 +54,11 @@ Never treat a version number in this file as authoritative over the code/tag.
 
 - From-zero pruned IBD uses `prune_mib = 1` (manual pruning). Core never prunes
   on its own; the prune gate keeps the cut below `index - 288` and evaluates
-  pruning every 5,000 safe blocks by default (low disk bypasses it).
+  pruning every 5,000 safe blocks by default (low disk bypasses it). The
+  20 GiB free-space deferral applies only while Core downloads or the index
+  drains: once Core is out of IBD and the index matches its tip, the gate
+  prunes to the safe maximum once (AUD-122), then every
+  `min_gain_live_blocks` (144, ~1 day; 0 = use `min_gain_blocks`).
 - `prune_mib >= 550` requires `[pruning] allow_auto_prune = true`.
 - Snapshots are optional; they are never required by the from-zero flow.
   `export-snapshot` writes one archive per network (manifest **format 3**:
@@ -164,8 +168,11 @@ Never treat a version number in this file as authoritative over the code/tag.
   120 s RPC timeout; the apply thread continues.
 - Machine defaults come from `MachinePlan` (`tuning.rs`): physical cores
   (not logical SMT), cgroup CPU quota, data/Core disk class and the memory
-  hierarchy. A 4C/8T machine gets `readers=4`, `jobs=2`, Core `par=3`,
-  `rpcthreads=4`. Explicit config still wins. `/status.machine` and `doctor`
+  hierarchy. Readers and background jobs are `physical.clamp(2, cap)` by
+  data-disk class (readers: NVMe 8, SATA/ZFS/virtual 4, HDD/network 2; jobs:
+  NVMe/SATA 8, ZFS/virtual/overlay/unknown 4, HDD/network 2), so a 4C/8T SATA
+  host gets `readers=4`, `jobs=4`, Core `par=3`, `rpcthreads=4`. Explicit
+  config still wins. `/status.machine` and `doctor`
   print the plan; unknown/virtual disks use the SATA profile.
 - Bulk commits are bounded by transactions (250k), blocks (512), raw bytes
   (`clamp(RAM/128, 64-256 MiB)`) and time (20 s NVMe, 30 s SATA/virtual, 45 s
@@ -236,7 +243,14 @@ Never treat a version number in this file as authoritative over the code/tag.
   most 30 s after a failure; if every provider is cooling down, e-lite forces
   one attempt rather than failing the wallet request. `max_parallel_fetches`
   (4) bounds total external downloads; concurrent requests for the same block
-  share one download.
+  share one download. A request through Tor has its own timeout
+  (`tor_request_timeout_seconds`, 20 s; direct stays at
+  `request_timeout_seconds`, 8 s) because each one builds a new circuit and
+  downloads a whole block; one `fetch_block` call spends at most 40 s across
+  providers, below the 45 s that followers wait for a shared download.
+  `RawtxError::NoSource` (nothing could be asked) is distinct from
+  `Unavailable` (every source failed); `/status.rawtx.tx_get_failures` counts
+  `transaction.get` failures by cause.
 - Decoys default to 1, at most 2 are in flight, and the prefetch never spawns
   decoys. For that reason the history prefetch is **off by default**
   (`[rawtx] prefetch`, AUD-134). When enabled, the prefetcher enqueues up to 16 confirmed history blocks per
@@ -261,9 +275,13 @@ Never treat a version number in this file as authoritative over the code/tag.
   and pushes notifications with a 2 s write timeout; a client that cannot
   take one is disconnected (AUD-146). `tests/log_redaction.rs` rejects log
   macros that print script hashes or txids.
-- `run` probes the network's providers (`/block-height/0` plus the genesis raw
-  block with a header-hash check) and does not open Electrum until at least one
-  answers; `require_ready`/`ready_timeout_seconds` control the gate. The gate
+- `run` probes the network's providers **in parallel**, each on its own Tor
+  circuit, with one request each (the genesis raw block by its known hash,
+  header-hash checked; `/block-height/0` first only when the genesis is
+  unknown) and does not open Electrum until at least one answers. A Tor
+  attempt gets at least `tor_request_timeout_seconds`; the gate opens 2 s
+  after the first healthy provider and reports slower ones as "no answer
+  yet" (`doctor` waits for all); `require_ready`/`ready_timeout_seconds` control the gate. The gate
   applies only to a **pruned** Core (or one that did not answer): an unpruned
   Core serves every raw transaction locally, so Electrum opens at once. It is
   fail-closed by default because Sparrow persists an unfetchable transaction
@@ -276,6 +294,14 @@ Never treat a version number in this file as authoritative over the code/tag.
   clearnet when Tor is unavailable or a request fails (log + `/status`),
   while `.onion` still needs Tor. Do not turn the default back on: it ties
   the operator IP to the blocks of the wallet.
+- JSON-RPC batches are served (max 1000 items, 8 in parallel, ordered when
+  the batch has `server.version`/unsubscribe). Sparrow batches only for
+  banner names it knows; `[server] advertise_electrumx_compat` (opt-in,
+  hot-reloadable) appends "(electrumx-compatible)" to the banner. The banner
+  must always **start with "e-lite"**: never advertise another server's name
+  (electrs/Fulcrum need a prefix and a fake version), and keep everything
+  Sparrow expects from ElectrumX (batches, `unsubscribe`, `server.features`)
+  implemented.
 - Electrum protocol versions are negotiated per connection. This build serves
   1.4–1.7 (`server.version` returns the negotiated version). A request for a
   future or skipped version falls back to the newest implemented version at or
@@ -386,7 +412,24 @@ Never treat a version number in this file as authoritative over the code/tag.
   compactions`, shared block cache) are read once. `/status.rocksdb.
   properties_ok=false` means a zero is unknown, not empty.
 - `run`/`index`/`serve` tee console output to `<data-dir>/e-lite.log`
-  (`--log-file`, `--log-max-mib`, `--no-log-file`).
+  (`--log-file`, `--log-max-mib`, `--no-log-file`). `[logging] level` /
+  `--log-level` is `info < debug < trace` (alpha default `debug`, stable will
+  be `info`), hot-reloadable; INFO lines never change format, extra detail
+  prints as `[e-lite] debug:`/`trace:`. The `debug:` wallet lines (`wallet:`,
+  `wallet session:`, `tx.get failed:`) carry counts, latencies and heights
+  only. A session summary prints only after >= 3 `get_history`/`transaction.get`
+  in 60 s (pings do not count); sub-millisecond latencies print in µs.
+- The height line prints `phase X b/s` (average since the phase changed),
+  `recent X b/s` (60 s window over full commit groups) and `eta` =
+  `lag / recent`. `recent` is the honest current rate.
+- Dynamic ZFS ARC (`[index] zfs_arc_dynamic = true`): the cap grows to
+  `zfs_arc_max_mib` (0 = half of RAM) while Core is in IBD or the index
+  drains, and drops to `zfs_arc_min_mib` (1024) once fully synced, with a 5 s
+  tick and 5 min dwell. It writes `zfs_arc_max` only when it can; without
+  permission it stays warn-only and retries the permission probe every 10 min.
+  `e-lite arc-setup` prints (and `--apply` as root runs) the group-writable
+  parameter plus the `e-lite-arc-cap.service` oneshot; `install.sh` adds it on
+  ZFS hosts.
 - The adaptive controller is its own thread (`el-tune`): a 5 s tick with a 30 s
   minimum between changes, and one `adapt_gate` mutex covering the check and
   the mutation. It is the only caller of `maybe_adapt`. `commit/blk` is

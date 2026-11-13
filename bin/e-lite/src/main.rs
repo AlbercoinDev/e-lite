@@ -1229,6 +1229,7 @@ fn run() -> R<()> {
         logging::set_level(level);
     }
     el_serve::set_debug_logs(logging::debug_enabled());
+    el_serve::set_electrumx_compat(cfg.server.advertise_electrumx_compat);
     if matches!(cmd, Command::Index | Command::Serve | Command::Run) && !args.no_log_file {
         let path = cfg.app_log_file(chain);
         if let Err(e) = logging::init(&path, cfg.logging.max_mib) {
@@ -1378,7 +1379,7 @@ fn group_of_user(user: &str) -> Option<String> {
 
 fn print_help() {
     println!(
-        r#"e-lite {VERSION} — Electrum 1.4 server for Bitcoin Core
+        r#"e-lite {VERSION} — Electrum 1.4-1.7 server for Bitcoin Core
 
 USAGE:
     e-lite <command> [options]
@@ -1454,8 +1455,8 @@ TUNING (all networks):
     --adaptive              enable the controller (default)
     --no-adaptive           freeze the configured/derived values
     --cache-mib <n>         RocksDB block cache (0 = profile/RAM)
-    --write-buffer-mib <n>  total RocksDB memtable budget (0 = RAM/8)
-    --memory-reserve-mib <n> RAM left for OS/Core/page cache (0 = max(1024, RAM/8))
+    --write-buffer-mib <n>  total RocksDB memtable budget (0 = effective RAM/16, 512..2048)
+    --memory-reserve-mib <n> RAM left for OS/Core/page cache (0 = effective RAM/8, 2048..4096)
     --memory-fraction <f>   e-lite ceiling as a share of total RAM (0 = 0.75)
     --allow-low-memory      skip the minimum-RAM check (unsupported)
     --background-jobs <n>   RocksDB jobs (0 = profile, capped by CPUs)
@@ -1478,8 +1479,8 @@ PRUNING AND CORE:
     --core-resume-ahead-blocks <n> legacy resume margin in blocks
     --core-resume-ahead-gib <n> resume Core below this backlog (default 7)
     --scheduler <mode>          overlap (default) | alternate (opt-in test)
-    --prune-defer-free-gib <n>  skip normal prune above this free space (default 50)
-    --min-gain-blocks <n>       minimum safe-height gain between prunes (default 10000)
+    --prune-defer-free-gib <n>  skip normal prune above this free space (default 20)
+    --min-gain-blocks <n>       minimum safe-height gain between prunes (default 5000)
     --prune-interval-seconds <n> minimum time between prunes
     --poll-seconds <n>          supervisor poll interval
     --repair-max-gap-blocks <n> largest external prune-gap repair
@@ -5183,6 +5184,11 @@ fn reload_hot(
                     changed.push("logging.level");
                 }
             }
+            if new.server.advertise_electrumx_compat != old.server.advertise_electrumx_compat {
+                // New connections get the new banner; open ones keep theirs.
+                el_serve::set_electrumx_compat(new.server.advertise_electrumx_compat);
+                changed.push("server.advertise_electrumx_compat");
+            }
             if changed.contains(&"profile") {
                 if let Err(e) = idx
                     .store
@@ -5686,6 +5692,7 @@ fn build_resolver(
         allow_clearnet: cfg.rawtx.allow_clearnet,
         fallback_clearnet: cfg.rawtx.tor_fallback_clearnet,
         request_timeout_seconds: cfg.rawtx.request_timeout_seconds,
+        tor_request_timeout_seconds: cfg.rawtx.tor_request_timeout_seconds,
         provider_cooldown_seconds: cfg.rawtx.provider_cooldown_seconds,
         max_parallel_fetches: cfg.rawtx.max_parallel_fetches,
         cache_dir: if cfg.rawtx.cache_dir.trim().is_empty() {

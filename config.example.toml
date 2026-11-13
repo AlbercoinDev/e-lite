@@ -114,6 +114,10 @@ poll_seconds = 10
 # An explicit address is used as given (and TLS then follows its host).
 listen = ""
 plain_lan = false                   # true = plain on 0.0.0.0 as well (cleartext on the LAN)
+advertise_electrumx_compat = false  # true: server.version says "e-lite X (electrumx-compatible)"
+                                    # so Sparrow sends JSON-RPC batches (far fewer round
+                                    # trips over Tor); other wallets that look for
+                                    # "electrumx" may react too. Hot-reloadable (SIGUSR1).
 # TLS is on by default. A local CA (ca.crt) plus a server certificate signed by
 # it are generated on first start in <data-dir>/tls (SANs: localhost, 127.0.0.1,
 # ::1, hostname, LAN IPs and the onion address once known). Trust ca.crt in the
@@ -176,7 +180,10 @@ tor_fallback_clearnet = false       # true: if Tor fails, use clearnet (your IP 
                                     # to the blocks of your wallet)
 prefetch = false                    # true: download a wallet's history blocks in the
                                     # background (faster first load; no decoys)
-request_timeout_seconds = 8         # per Esplora block request
+request_timeout_seconds = 8         # per direct (clearnet) Esplora block request
+tor_request_timeout_seconds = 20    # per Esplora block request through Tor: each one
+                                    # builds a new circuit and downloads a whole block;
+                                    # one wallet request spends at most 40 s on providers
 provider_cooldown_seconds = 300     # cool down a failed provider (Tor or direct)
 max_parallel_fetches = 4            # total external block downloads in flight
 p2p_timeout_seconds = 8             # P2P connect/handshake/block timeout
@@ -196,7 +203,9 @@ p2p_peers = []                      # empty: discover from local Core
 generate = true                     # create it from the template when missing
 require_ready = true                # run + pruned Core: keep wallets out until a provider answers
                                     # (an unpruned Core serves every raw tx locally: no gate)
-probe_timeout_seconds = 5           # per-provider probe timeout
+probe_timeout_seconds = 5           # per-provider probe timeout (providers are probed in
+                                    # parallel; a Tor attempt gets at least
+                                    # rawtx.tor_request_timeout_seconds)
 ready_timeout_seconds = 60          # one readiness round; logged, then probed again
 open_without_provider = false       # true: open Electrum with local data after
                                     # ready_timeout_seconds; raw txs of pruned blocks

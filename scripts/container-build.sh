@@ -39,7 +39,7 @@ Architecture: amd64
 Depends: libc6 (>= 2.36)
 Maintainer: AlbercoinDev <albercoin@users.noreply.github.com>
 Homepage: https://github.com/AlbercoinDev/e-lite
-Description: Electrum 1.4 server for Bitcoin Core
+Description: Electrum 1.4-1.7 server for Bitcoin Core
  Query history, balance and UTXOs of any scriptPubKey without wallet
  registration. Confirmed chain only. No systemd unit is installed.
 EOF

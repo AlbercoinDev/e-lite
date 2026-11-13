@@ -63,6 +63,7 @@ refused. The negotiated version is returned by `server.version`.
 | `blockchain.outpoint.get_status` | no | no | yes | funder/spender status |
 | `blockchain.outpoint.subscribe` | no | no | yes | notifications; resolved by bounded workers |
 | `blockchain.outpoint.unsubscribe` | no | no | yes | boolean result |
+| `blockchain.block.stats` | ext. | ext. | ext. | non-standard extension (Cormorant-style), not in the Electrum spec: Core `getblockstats(height)` passed through; fails for heights a pruned Core no longer has |
 
 `blockchain.silentpayments.subscribe/unsubscribe` exists only as an explicit
 opt-in error until a BIP352 indexer is wired; it is not advertised as available.
@@ -100,8 +101,18 @@ opt-in error until a BIP352 indexer is wired; it is not advertised as available.
   closing the connection. The negotiated version is returned.
 - **`blockchain.estimatefee` never returns `-1`**: Core's relay/mempool fee is
   used as a fallback because some wallets treat `-1` as a send failure.
-- **JSON-RPC batches are not implemented**: Electrum clients send one request
-  per line; a batch array is answered with an invalid-request error.
+- **JSON-RPC batches** are answered in order with one array (max
+  `MAX_BATCH_REQUESTS` = 1000 items; empty or larger batches get `-32600`;
+  notifications inside get no entry). Items run on up to 8 threads unless the
+  batch contains `server.version` or an unsubscribe. Sparrow upgrades to
+  batches only for servers it recognises by the `server.version` name
+  (ElectrumX, electrs >= 0.9, Fulcrum >= 1.6, mempool-electrs, Frigate,
+  Cormorant), so by default it sends one request per line to e-lite. With
+  `[server] advertise_electrumx_compat = true` the banner becomes
+  `e-lite <version> (electrumx-compatible)`: Sparrow matches "electrumx" by
+  substring and switches to batches (pages of 100, matched by id), while the
+  banner still starts with e-lite. Off by default until measured with other
+  wallets.
 - **No client authentication**: rate limiting is a throttle, not access
   control. Use firewall/VPN/Tor/onion.
 

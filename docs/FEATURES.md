@@ -21,11 +21,14 @@ available**.
 | Parallel decode/txid/Merkle | experimental | readers prepare blocks; apply does UTXO/batch |
 | Commit sync policy | experimental | `auto` (txids in bulk, strict live), `always`, `txids` |
 | Per-network defaults | experimental | plain/TLS/metrics ports and `<data-dir>/bitcoin` per chain; multiple instances |
-| Prune cadence and deferral | experimental | every 5k safe blocks; 20 GiB free-space deferral |
+| Prune cadence and deferral | experimental | every 5k safe blocks; 20 GiB free-space deferral while Core downloads or the index drains; once caught up, one prune to the safe maximum then every `min_gain_live_blocks` (144, ~1 day) |
 | Core bulk pause + peer warm-up | experimental | pause above 30 GiB backlog; resume at 7 GiB; legacy 5k-block fallback |
 | Overlap/alternate scheduler | experimental | `overlap` default; `alternate` opt-in (Core and e-lite take turns) |
 | Disk guard with download/index split | experimental | cgroup/LXC aware |
 | Adaptive profiles and hot reload | experimental | `auto/hdd/ssd/nvme/manual`, `SIGUSR1` |
+| Machine plan | experimental | physical cores + cgroup quota + disk class: readers and RocksDB jobs = physical cores clamped to 2..cap per disk (jobs: SSD/NVMe 8, ZFS/virtual 4, HDD 2) |
+| Dynamic ZFS ARC cap | experimental | grows during IBD/drain, shrinks to `zfs_arc_min_mib` when synced; needs write access to `zfs_arc_max` (`e-lite arc-setup`) |
+| Log levels and diagnostics | experimental | `info < debug < trace` (alpha default `debug`), hot-reloadable; height line with `recent` rate and `eta`; `debug:` wallet-session lines (counts/latencies only) |
 | Global RocksDB memory budget | experimental | effective `MemAvailable` budget; memtables `effective/16`; opt-in adaptive memtables; adaptive cache; CPU-capped jobs |
 | Reorg recovery within undo window | experimental | deeper reorg fails clearly |
 | Snapshots export/import | experimental | optional; not required from zero |
@@ -47,7 +50,9 @@ available**.
 | Outpoint status/subscriptions | experimental | protocol 1.7; on-demand history scan, no extra index writes |
 | Scriptpubkey methods | experimental | protocol 1.7; scripthash logic with dict results and `10001` |
 | TLS Electrum | experimental | on by default (`server.tls`); auto self-signed cert or operator PEM; reload on change; no client auth |
-| Rate limiting | experimental | per-client token bucket; auto for non-loopback; no client auth |
+| Rate limiting | experimental | per-client token bucket, 200 req/s burst 5000 for every client; over-budget requests wait instead of failing; no client auth |
+| Plain listener on loopback | experimental | plain Electrum binds `127.0.0.1` by default (same-host wallets, onion target); `plain_lan`/`--plain-lan` or an explicit `listen` exposes it; TLS binds `0.0.0.0` (AUD-147) |
+| JSON-RPC batches | experimental | an array of requests on one line gets one array of responses in order (max 1000 per batch); items run in parallel (8) unless the batch has `server.version` or an unsubscribe. Sparrow only sends batches to servers it recognises by name: `[server] advertise_electrumx_compat = true` (opt-in) makes the banner `e-lite X (electrumx-compatible)`, which Sparrow recognises |
 | Silent payments BIP352 | **gate** | explicit error; no indexer |
 
 ### Electrum methods currently implemented
@@ -83,8 +88,10 @@ available**.
 | Electrum rate limit | experimental | 200 req/s, burst 5000 for every client; over-budget requests wait, never error; `0` disables |
 | Block hash/header/Merkle/witness validation | experimental | before serving/caching |
 | Configurable Esplora endpoints | experimental | editable `public-servers.toml`; shipped defaults; fail-closed if no provider and `require_ready` |
-| Provider readiness gate | experimental | probes `/block-height/0` + genesis raw block before opening Electrum when Core is pruned (an unpruned Core skips it); `require_ready`, opt-in `open_without_provider` after `ready_timeout_seconds`, 60 s re-probe, latency/state in `/status` |
+| Provider readiness gate | experimental | probes every provider in parallel (own Tor circuit, one request: the genesis raw block by hash) and opens 2 s after the first healthy one when Core is pruned (an unpruned Core skips it); `require_ready`, opt-in `open_without_provider` after `ready_timeout_seconds`, 60 s re-probe, latency/state in `/status` |
 | Provider health cooldown | experimental | failed Tor/direct provider skipped for `provider_cooldown_seconds` (300 s); random order among healthy providers (none preferred), a provider that answered before is cooled for max 30 s; forced attempt when all are cooling |
+| Tor request timeout | experimental | `rawtx.tor_request_timeout_seconds` (20 s) for Esplora block requests through Tor, separate from the 8 s direct timeout; one wallet request spends at most 40 s across providers |
+| `transaction.get` failure causes | experimental | `/status.rawtx.tx_get_failures` counts `not_found`, `no_source`, `external_failed`, `verify_failed`, `internal`; a `debug: tx.get failed: <cause>` line at most every 5 s per cause (no txid or hash) |
 | In-flight block dedup | experimental | concurrent tx/prefetch of the same block share one download; `max_parallel_fetches=4` |
 | History block prefetch | experimental, off by default (`rawtx.prefetch`) | background fetch of confirmed history blocks before `transaction.get`; 1 worker, 16 heights per history, bounded queue, no decoys |
 | P2P peers auto/config | experimental | `MSG_WITNESS_BLOCK`, `NODE_WITNESS` required, random order among discovered peers, failed-peer cooldown, total timeout; BIP324 v2 + v1 |

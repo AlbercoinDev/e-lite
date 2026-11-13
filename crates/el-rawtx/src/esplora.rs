@@ -21,7 +21,11 @@ pub struct EsploraSource {
     /// (`IsolateSOCKSAuth`, on by default): providers cannot link the blocks
     /// of one wallet by exit IP (AUD-135).
     tor_proxy: Option<String>,
+    /// Per-attempt timeout of a direct (clearnet) request.
     timeout: Duration,
+    /// Per-attempt timeout of a request through Tor. Larger than `timeout`:
+    /// every request builds a new circuit and then downloads a whole block.
+    tor_timeout: Duration,
     direct_client: Option<reqwest::blocking::Client>,
     fallback_clearnet: bool,
     allow_clearnet: bool,
@@ -36,9 +40,15 @@ pub struct EsploraSource {
 
 const MAX_BLOCK_BYTES: u64 = 8 * 1024 * 1024;
 
+/// Total time one `fetch_block` call may spend across providers. It stays
+/// below the 45 s that concurrent callers wait for a shared download.
+const FETCH_BUDGET: Duration = Duration::from_secs(40);
+/// An attempt with less time left than this is not started.
+const MIN_ATTEMPT: Duration = Duration::from_secs(2);
+
 /// A client whose SOCKS username is random. Tor isolates streams with
 /// different SOCKS credentials onto different circuits.
-fn isolated_tor_client(socks: &str, timeout: Duration) -> Option<reqwest::blocking::Client> {
+pub fn isolated_tor_client(socks: &str, timeout: Duration) -> Option<reqwest::blocking::Client> {
     let user = format!("el{:016x}", rand::random::<u64>());
     reqwest::blocking::Client::builder()
         .timeout(timeout)
@@ -57,8 +67,31 @@ impl EsploraSource {
         timeout: Duration,
         cooldown: Duration,
     ) -> Result<Self> {
+        Self::with_budget(
+            bases,
+            tor_socks,
+            allow_clearnet,
+            fallback_clearnet,
+            timeout,
+            timeout,
+            cooldown,
+        )
+    }
+
+    /// Like `new`, with a separate per-attempt timeout for requests that go
+    /// through Tor.
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_budget(
+        bases: Vec<String>,
+        tor_socks: Option<String>,
+        allow_clearnet: bool,
+        fallback_clearnet: bool,
+        timeout: Duration,
+        tor_timeout: Duration,
+        cooldown: Duration,
+    ) -> Result<Self> {
         // Keep the proxy only if a client can actually be built with it.
-        let tor_proxy = tor_socks.filter(|socks| isolated_tor_client(socks, timeout).is_some());
+        let tor_proxy = tor_socks.filter(|socks| isolated_tor_client(socks, tor_timeout).is_some());
         let direct_client = if allow_clearnet || fallback_clearnet {
             reqwest::blocking::Client::builder()
                 .timeout(timeout)
@@ -100,6 +133,7 @@ impl EsploraSource {
             bases: clean,
             tor_proxy,
             timeout,
+            tor_timeout,
             direct_client,
             fallback_clearnet,
             allow_clearnet,
@@ -115,12 +149,14 @@ impl EsploraSource {
         client: &reqwest::blocking::Client,
         base: &str,
         hash: &Hash32,
+        timeout: Duration,
     ) -> Result<Vec<u8>> {
         let url = format!("{}/block/{}/raw", base, hash.to_hex());
         // `without_url`: reqwest errors print the request URL, which carries
         // the block hash of a wallet transaction (AUD-132).
         let resp = client
             .get(&url)
+            .timeout(timeout)
             .send()
             .map_err(|e| RawtxError::Unavailable(format!("{base}: {}", e.without_url())))?;
         let status = resp.status();
@@ -232,20 +268,26 @@ impl BlockSource for EsploraSource {
             self.force_one(&order);
         }
 
+        let started = Instant::now();
+        // Time left for one attempt, or `None` once the call's budget is spent.
+        let attempt_timeout = |limit: Duration| -> Option<Duration> {
+            let left = FETCH_BUDGET.saturating_sub(started.elapsed());
+            (left >= MIN_ATTEMPT.min(limit)).then(|| limit.min(left))
+        };
         let mut errors = Vec::new();
         for idx in order {
             let base = &self.bases[idx];
             let is_onion = base.to_ascii_lowercase().contains(".onion");
 
-            if let Some(client) = self
-                .tor_proxy
-                .as_deref()
-                .and_then(|socks| isolated_tor_client(socks, self.timeout))
-            {
+            if let Some(socks) = self.tor_proxy.as_deref() {
                 if Self::cooled(&self.tor_failures, base) {
                     errors.push(format!("tor {base}: cooling down"));
-                } else {
-                    match Self::fetch_with(&client, base, hash) {
+                } else if let Some(timeout) = attempt_timeout(self.tor_timeout) {
+                    let Some(client) = isolated_tor_client(socks, timeout) else {
+                        errors.push(format!("tor {base}: client unavailable"));
+                        continue;
+                    };
+                    match Self::fetch_with(&client, base, hash, timeout) {
                         Ok(bytes) => {
                             self.mark_good(base, true);
                             return Ok(bytes);
@@ -256,6 +298,9 @@ impl BlockSource for EsploraSource {
                             errors.push(format!("tor {e}"));
                         }
                     }
+                } else {
+                    errors.push("fetch budget exceeded".to_string());
+                    break;
                 }
             }
 
@@ -265,8 +310,12 @@ impl BlockSource for EsploraSource {
                         errors.push(format!("direct {base}: cooling down"));
                         continue;
                     }
+                    let Some(timeout) = attempt_timeout(self.timeout) else {
+                        errors.push("fetch budget exceeded".to_string());
+                        break;
+                    };
                     let via_fallback = self.fallback_clearnet && !self.allow_clearnet;
-                    match Self::fetch_with(client, base, hash) {
+                    match Self::fetch_with(client, base, hash, timeout) {
                         Ok(bytes) => {
                             self.mark_good(base, false);
                             if via_fallback && !self.fallback_warned.swap(true, Ordering::Relaxed) {
