@@ -90,13 +90,15 @@ pub fn log_rawtx_summary(shared: &Shared) {
     };
     let cache = shared.resolver.cache_inventory();
     eprintln!(
-        "[e-lite] debug: rawtx summary: fetch {} ({}), cache hits {} puts {}, decoys {}, \
-         tx.get failed {}, batches {} ({} items, max {}), cache now {} blocks / {} txs ({})",
+        "[e-lite] debug: rawtx summary: fetch {} ({}), cache hits {} puts {}, decoys {} \
+         (pending {}), tx.get failed {}, batches {} ({} items, max {}), cache now {} blocks / {} \
+         txs ({})",
         load(&rawtx.fetches),
         display_size(load(&rawtx.bytes)),
         load(&rawtx.cache_hits),
         load(&rawtx.cache_puts),
         load(&rawtx.decoys),
+        shared.resolver.decoys_pending(),
         failures,
         load(&shared.stats.batch_lines),
         load(&shared.stats.batch_items),
@@ -1371,7 +1373,8 @@ impl Prefetcher {
                 // No reader guard: prefetch is an optimisation and may resolve
                 // from external sources. It must never block pruning. All the
                 // history transactions of the block are cached from a single
-                // download (AUD-139), with no decoys.
+                // download (AUD-139); an external download owes decoys and
+                // leaves a download slot free for wallet requests (AUD-159).
                 if resolver.prefetch_block_txs(height, &txids).is_err() {
                     // Allow a later history request to retry this block.
                     if let Ok(mut seen) = seen.lock() {
@@ -1849,7 +1852,7 @@ impl Shared {
                 "bytes": rawtx.bytes.load(Ordering::Relaxed),
                 "verify_failures": rawtx.verify_failures.load(Ordering::Relaxed),
                 "decoys": rawtx.decoys.load(Ordering::Relaxed),
-                "decoys_inflight": self.resolver.decoys_inflight(),
+                "decoys_pending": self.resolver.decoys_pending(),
                 "unavailable": rawtx.unavailable.load(Ordering::Relaxed),
                 "tx_get_failures": self.stats.tx_get_failures.to_json(),
                 "external_sources": self.resolver.external_sources(),
@@ -4634,10 +4637,10 @@ fn metrics_text(shared: &Shared) -> String {
         st["rawtx"]["unavailable"].as_u64().unwrap_or(0),
     );
     line(
-        "e_lite_rawtx_decoys_inflight",
-        "Decoy block downloads currently in flight",
+        "e_lite_rawtx_decoys_pending",
+        "Decoy block downloads owed for real external downloads",
         "gauge",
-        st["rawtx"]["decoys_inflight"].as_u64().unwrap_or(0),
+        st["rawtx"]["decoys_pending"].as_u64().unwrap_or(0),
     );
     line(
         "e_lite_rawtx_p2p_failures",

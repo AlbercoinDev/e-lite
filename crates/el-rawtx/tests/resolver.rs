@@ -184,7 +184,10 @@ fn config(decoys: u32, cache_mib: u64) -> RawtxConfig {
         p2p_v2: false,
         esplora_urls: Vec::new(),
         p2p_peers: Vec::new(),
+        tor_connect_timeout_seconds: 15,
+        tor_stall_timeout_seconds: 15,
         p2p_timeout: Duration::from_secs(1),
+        p2p_tor_timeout: Duration::from_secs(1),
         chain: el_model::Chain::Regtest,
     }
 }
@@ -328,7 +331,8 @@ fn decoys_are_fetched_in_background() {
         .unwrap()
         .with_external(src.clone());
     resolver.raw_tx(txid, 3).unwrap();
-    let deadline = Instant::now() + Duration::from_secs(3);
+    // The decoy thread spreads decoys out (up to 1.5 s apart).
+    let deadline = Instant::now() + Duration::from_secs(10);
     while resolver.stats().decoys.load(Ordering::SeqCst) < 2 && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(20));
     }
@@ -700,4 +704,68 @@ fn cache_budget_is_split_between_blocks_and_transactions() {
     assert_eq!(el_rawtx::cache_split(8), (2, 6));
     assert_eq!(el_rawtx::cache_split(256), (64, 192));
     assert_eq!(el_rawtx::cache_split(1024), (64, 960));
+}
+
+struct FailingSource {
+    calls: AtomicU64,
+}
+
+impl BlockSource for FailingSource {
+    fn name(&self) -> &str {
+        "failing"
+    }
+    fn fetch_block(&self, _hash: &Hash32) -> Result<Vec<u8>> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Err(RawtxError::Unavailable("provider down".into()))
+    }
+}
+
+#[test]
+fn a_block_that_just_failed_is_not_asked_for_again_at_once() {
+    // AUD-158: a wallet retrying the same transaction within seconds gets the
+    // recent failure, not another round over every source.
+    let dir = tmp("failure-memory");
+    let (store, _hash, txid, _bytes) = setup(&dir, 0);
+    let src = Arc::new(FailingSource {
+        calls: AtomicU64::new(0),
+    });
+    let resolver = Resolver::new(Arc::clone(&store), &config(0, 1))
+        .unwrap()
+        .with_external(src.clone());
+    let first = resolver.raw_tx(txid, 0).unwrap_err();
+    let second = resolver.raw_tx(txid, 0).unwrap_err();
+    assert_eq!(first, second);
+    assert_eq!(src.calls.load(Ordering::SeqCst), 1);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_prefetch_download_owes_decoys_too() {
+    // AUD-159: the prefetch is on by default because its downloads are
+    // covered by decoys like a wallet request.
+    let dir = tmp("prefetch-decoys");
+    let block = multi_tx_block(2);
+    let ids: Vec<Hash32> = block.txdata.iter().map(txid_of).collect();
+    let (store, _hash, _txid, bytes) = setup_with(&dir, 3, block);
+    let src = MockSource::new("mock", bytes, false);
+    let resolver = Resolver::new(Arc::clone(&store), &config(1, 8))
+        .unwrap()
+        .with_external(src.clone());
+    assert_eq!(resolver.prefetch_block_txs(3, &ids[1..]).unwrap(), 2);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while resolver.stats().decoys.load(Ordering::SeqCst) < 1 && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(resolver.stats().decoys.load(Ordering::SeqCst) >= 1);
+    assert_eq!(resolver.decoys_pending(), 0);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn the_shared_download_budget_outlives_every_attempt() {
+    // AUD-156: followers wait past the leader's deadline, and one Esplora or
+    // P2P attempt fits inside the leader's budget.
+    assert!(el_rawtx::FOLLOWER_GRACE > Duration::ZERO);
+    assert!(el_rawtx::EXTERNAL_BUDGET >= Duration::from_secs(60));
+    assert!(el_rawtx::FAILURE_MEMORY < el_rawtx::EXTERNAL_BUDGET);
 }

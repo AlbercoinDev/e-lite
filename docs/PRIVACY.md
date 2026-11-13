@@ -86,12 +86,15 @@ decoys = 1
 tor_socks = "127.0.0.1:9050"
 allow_clearnet = false
 tor_fallback_clearnet = false
-prefetch = false
+prefetch = true
 request_timeout_seconds = 8
-tor_request_timeout_seconds = 20
+tor_connect_timeout_seconds = 20
+tor_stall_timeout_seconds = 25
+tor_request_timeout_seconds = 60
 provider_cooldown_seconds = 300
 max_parallel_fetches = 4
 p2p_timeout_seconds = 8
+p2p_tor_timeout_seconds = 30
 use_p2p = true
 use_esplora = true
 p2p_v2 = true
@@ -122,11 +125,20 @@ open_without_provider = false  # true: open with local data after ready_timeout_
   random order among the healthy ones, so no single provider is preferred and
   the blocks of one wallet are spread over all of them. Timing can still
   correlate requests.
-- A block request through Tor gets `tor_request_timeout_seconds` (20 s): it
-  builds a new circuit and downloads a whole block, which the 8 s direct
-  timeout did not cover. One wallet request spends at most 40 s across
-  providers. `/status.rawtx.tx_get_failures` says why a `transaction.get`
-  failed (`no_source`, `external_failed`, ...), without any hash.
+- A block request through Tor builds a new circuit and downloads a whole
+  block. It gets `tor_connect_timeout_seconds` (20 s) for the circuit and the
+  connection, then fails only when nothing arrives for
+  `tor_stall_timeout_seconds` (25 s): a slow transfer that keeps receiving
+  bytes continues up to `tor_request_timeout_seconds` (60 s). A stalled
+  attempt moves on to the next provider on a new circuit within the same
+  request. One block download has one budget of 60 s for every source,
+  queue included; requests that share it wait 65 s, so they never give up
+  before it (AUD-155/156). `/status.rawtx.tx_get_failures` says why a
+  `transaction.get` failed (`no_source`, `external_failed`, ...), without any
+  hash.
+- A block that just failed is answered with that failure for 10 s instead
+  of being asked for again: a wallet retrying it does not repeat its block
+  hash to every source (AUD-158).
 - Wallets reaching e-lite **through its onion service** pay a v3 onion round
   trip (1-7 s) per request. A wallet that sends one request per address scans
   for minutes; with JSON-RPC batches it is a few round trips per page. e-lite
@@ -152,15 +164,22 @@ open_without_provider = false  # true: open with local data after ready_timeout_
   at once. `open_without_provider = true` opens them with local data after
   `ready_timeout_seconds`; e-lite then re-probes every 60 s with the same
   wallet-free requests until a provider answers.
-- A provider that fails a Tor or direct request is skipped temporarily (one
-  that answered before, for at most 30 s). If
-  every provider is cooling down, one request is still attempted rather than
-  failing the wallet's history/tx load.
+- A provider that fails is skipped for a time that depends on the failure
+  (AUD-155): a timeout, a stalled or truncated body or a 5xx is usually the
+  circuit, so it backs off 5 s, doubling up to 60 s; a 429/503 honours
+  `Retry-After` (15 s doubling, at most 120 s) - over Tor the limit is per
+  exit, and the next request uses another one; only a wrong answer gets the
+  full `provider_cooldown_seconds` (300 s). A success clears the history. If
+  every provider is cooling down, the one whose pause ends first is still
+  attempted rather than failing the wallet's history/tx load.
 - `allow_clearnet = true` permits direct clearnet access if you explicitly
   accept the privacy trade-off. It is not the default.
-- `decoys = 1` fetches one extra random block after a real external fetch, so
-  the provider's view is not a single “interesting” block. At most two decoy
-  downloads run at once. Set
+- `decoys = 1` owes one random indexed block per real external download
+  (wallet or prefetch), so the provider's view is not a set of “interesting”
+  blocks. One background thread downloads the owed decoys one at a time,
+  spread 0.25-1.5 s apart, outside the wallet's download slots, and waits
+  while a provider rate-limits; a decoy's failure never cools a provider or
+  peer that real requests need (AUD-157). At most 32 are owed. Set
   `decoys = 0` to reduce bandwidth at the cost of privacy.
 - The validated cache reduces repeated external fetches, and every avoided
   re-download is a block hash a provider does not see again. It defaults to
@@ -176,15 +195,23 @@ open_without_provider = false  # true: open with local data after ready_timeout_
   is available. The cache directory names the transactions you fetched: it
   is as sensitive as the wallet.
 
-## History prefetch (off by default)
+## History prefetch (on by default)
 
-`[rawtx] prefetch = true` downloads the blocks of a wallet's confirmed history
-in the background as soon as the wallet asks for the history, so the
-transactions are already cached when it asks for them. It makes the first load
-of a wallet faster, but it fetches up to 16 blocks per history request with
-**no decoys**, including blocks the wallet would never have asked for (a
-wallet that already has its transactions). Leave it off unless that first load
-matters more to you than what a provider can observe.
+`[rawtx] prefetch = true` (the default since alpha.29.13.0) downloads the
+blocks of a wallet's confirmed history in the background as soon as the
+wallet asks for the history, so the transactions are already cached when it
+asks for them. Without it, a pruned node makes every `transaction.get` wait
+for a whole block over Tor, which is what made wallet loads slow after
+alpha.29.12.0 (AUD-159).
+
+What a provider can observe is the same as for the wallet's own requests:
+each block goes to a random provider on its own circuit, and each external
+download owes decoys exactly like a wallet request (AUD-134 is superseded).
+It fetches up to 16 blocks per history response, one at a time, and never
+takes the last free download slot, so a wallet request is never queued
+behind it. Blocks whose transactions are already in the transaction cache are
+not downloaded, so a wallet that loaded once costs nothing on reconnect. Set
+`prefetch = false` if you prefer the wallet to fetch only what it asks for.
 
 ## Bitcoin Core's own network
 
@@ -223,18 +250,30 @@ An external Core is never changed: set these flags in its `bitcoin.conf`.
 - Minimal Bitcoin P2P client: `version`/`verack`, `ping`/`pong`, `getdata` for
   `MSG_WITNESS_BLOCK` only (BIP144). Peers must advertise `NODE_WITNESS`;
   stripped legacy blocks are rejected and the peer is cooled down.
-- BIP324 v2 is attempted first; v1 is the fallback within the same per-peer
-  timeout budget.
-- Peers are discovered from Core's current connections first, then from
+- BIP324 v2 is attempted first, unless Core reports that it talks v1 to that
+  peer. v1 is tried only when the v2 connection was established and the v2
+  handshake failed; a connection that could not be made is not paid for twice.
+  Each protocol attempt has its own budget: `p2p_tor_timeout_seconds` (30 s)
+  through Tor, `p2p_timeout_seconds` (8 s) direct; reads stall after 20 s
+  without data.
+- Peers are discovered from Core's **outbound** connections first, then from
   addrman, and the list is refreshed every 10 minutes (every 60 s while it is
-  empty, for example right after Core starts). Pinned `p2p_peers` are never
-  replaced. Up to three peers are tried per fetch, with a total 2× timeout cap.
-- Peers are tried in random order. A failed peer is skipped for
-  `provider_cooldown_seconds` (300 s by default), so every block does not pay
-  the same dead peer's timeout.
-- If a Tor SOCKS connect fails, P2P uses clearnet for non-onion peers for the
-  cooldown window (only when `tor_fallback_clearnet = true`); `.onion` peers still
-  require Tor.
+  empty, for example right after Core starts). Inbound peers (their address
+  is an ephemeral port), I2P/CJDNS peers (unreachable through Tor) and peers
+  without `NODE_NETWORK` + `NODE_WITNESS` are skipped, and onion peers go
+  first: they need no exit node, whose policy often rejects port 8333
+  (AUD-154). Pinned `p2p_peers` are never replaced. Up to three peers are
+  tried per fetch, within two attempt budgets.
+- Peers are tried in random order. A peer that times out or refuses backs off
+  30 s, doubling up to `provider_cooldown_seconds` (300 s); a peer that
+  answers wrongly (no full blocks, `notfound`, invalid block) gets the full
+  cooldown. A success clears it. When P2P is the only external source and
+  every peer is cooling down, the one whose pause ends first is tried.
+- Only a failure of the local Tor proxy itself (no connection, failed
+  handshake) pauses P2P over Tor, for 15 s. A SOCKS reply about one peer
+  (refused, unreachable, exit policy) affects that peer only (AUD-153). With
+  `tor_fallback_clearnet = true`, a Tor failure uses clearnet for that
+  non-onion peer; `.onion` peers still require Tor.
 - Tor is used for P2P when configured; otherwise clearnet requires
   `allow_clearnet = true`.
 

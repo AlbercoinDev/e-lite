@@ -5103,9 +5103,16 @@ fn preflight(cfg: &Config, chain: Chain, require_min_ram: bool, core_running: bo
         mplan.data_disk.kind,
         tuning::DiskKind::Unknown | tuning::DiskKind::Zfs | tuning::DiskKind::Overlay
     ) {
+        let advice = match mplan.data_disk.kind {
+            tuning::DiskKind::Zfs => "keep the ZFS ARC capped (e-lite warns below if it is not)",
+            tuning::DiskKind::Overlay => {
+                "set [index] profile explicitly for the disk under the overlay"
+            }
+            _ => "set [index] profile explicitly if the disk is not a local SSD",
+        };
         eprintln!(
             "[e-lite] WARNING: data disk at {} is {} (fstype {:?}, source {}); using the local-SSD \
-             profile. If it is ZFS, cap the ARC; if it is an overlay, set [index] profile explicitly.",
+             profile; {advice}.",
             mplan.data_disk.mount,
             mplan.data_disk.kind.name(),
             mplan.data_disk.fstype,
@@ -5949,16 +5956,18 @@ fn build_resolver(
     esplora_urls: Vec<String>,
 ) -> R<Arc<Resolver>> {
     let mut peers = cfg.rawtx.p2p_peers.clone();
+    let mut hints = Vec::new();
     if p2p_discovery_enabled(cfg) {
         let (found, connected) = discover_p2p_peers(core);
-        peers = found;
-        if !peers.is_empty() {
+        peers = found.iter().map(|p| p.addr.clone()).collect();
+        if !found.is_empty() {
             println!(
                 "p2p peers discovered from Core: {} ({} connected)",
-                peers.len(),
-                connected.min(peers.len())
+                found.len(),
+                connected
             );
         }
+        hints = found;
     }
     let tor = cfg.rawtx.tor_socks.clone().filter(|s| !s.trim().is_empty());
     let rc = RawtxConfig {
@@ -5970,6 +5979,8 @@ fn build_resolver(
         fallback_clearnet: cfg.rawtx.tor_fallback_clearnet,
         request_timeout_seconds: cfg.rawtx.request_timeout_seconds,
         tor_request_timeout_seconds: cfg.rawtx.tor_request_timeout_seconds,
+        tor_connect_timeout_seconds: cfg.rawtx.tor_connect_timeout_seconds,
+        tor_stall_timeout_seconds: cfg.rawtx.tor_stall_timeout_seconds,
         provider_cooldown_seconds: cfg.rawtx.provider_cooldown_seconds,
         max_parallel_fetches: cfg.rawtx.max_parallel_fetches,
         cache_dir: if cfg.rawtx.cache_dir.trim().is_empty() {
@@ -5983,9 +5994,14 @@ fn build_resolver(
         esplora_urls: esplora_urls.clone(),
         p2p_peers: peers,
         p2p_timeout: Duration::from_secs(cfg.rawtx.p2p_timeout_seconds.max(1)),
+        p2p_tor_timeout: Duration::from_secs(cfg.rawtx.p2p_tor_timeout_seconds.max(1)),
         chain,
     };
     let resolver = Resolver::new(Arc::clone(store), &rc)?;
+    if !hints.is_empty() {
+        // Same peers, plus Core's view of their transport (v1/v2).
+        resolver.refresh_p2p_peers(hints);
+    }
     Ok(Arc::new(
         resolver.with_local(Arc::new(CoreBlockSource::new(core.clone()))),
     ))
@@ -5997,43 +6013,85 @@ fn p2p_discovery_enabled(cfg: &Config) -> bool {
     cfg.rawtx.enabled && cfg.rawtx.use_p2p && cfg.rawtx.p2p_peers.is_empty()
 }
 
-/// Up to 8 full-node (`NODE_NETWORK`) peers from Core: its current
-/// connections first (addrman holds many stale addresses and each dead peer
-/// costs a timeout), then addrman. Returns `(peers, connected)`.
-fn discover_p2p_peers(core: &CoreClient) -> (Vec<String>, usize) {
-    let mut peers = Vec::new();
-    let mut connected = 0usize;
-    if let Ok(list) = core.connected_peers() {
-        for peer in list {
-            if peer.services & 1 == 0 {
-                continue;
-            }
-            peers.push(peer.addr);
-        }
-        connected = peers.len();
-    }
-    if peers.len() < 8 {
-        if let Ok(addrs) = core.node_addresses(64) {
-            for a in addrs {
-                if a.services & 1 == 0 {
-                    continue;
-                }
-                let host = if a.address.contains(':') && !a.address.starts_with('[') {
-                    format!("[{}]", a.address)
-                } else {
-                    a.address.clone()
-                };
-                peers.push(format!("{host}:{}", a.port));
-                if peers.len() >= 8 {
-                    break;
-                }
-            }
-        }
-    }
+/// Up to 8 peers from Core that can serve old witness blocks: its current
+/// **outbound** connections first (addrman holds many stale addresses and
+/// each dead peer costs a timeout), then addrman. Returns `(peers,
+/// connected)`.
+fn discover_p2p_peers(core: &CoreClient) -> (Vec<el_rawtx::PeerHint>, usize) {
+    let connected = core.connected_peers().unwrap_or_default();
+    let need_addrman = select_p2p_peers(&connected, &[]).0.len() < P2P_PEERS;
+    let addrman = if need_addrman {
+        core.node_addresses(64).unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    select_p2p_peers(&connected, &addrman)
+}
+
+const P2P_PEERS: usize = 8;
+
+/// Whether e-lite can reach a peer of this Core network: through Tor or
+/// directly, never I2P/CJDNS (`""` = an old Core that does not say).
+fn p2p_network_reachable(network: &str) -> bool {
+    matches!(network, "" | "ipv4" | "ipv6" | "onion")
+}
+
+/// Filter and order Core's peers for block fetches (AUD-154):
+/// - inbound peers are skipped: their `addr` is an ephemeral source port, a
+///   connection to it is refused (and used to trip the Tor breaker);
+/// - `NODE_NETWORK` and `NODE_WITNESS` are required (old witness blocks);
+/// - I2P/CJDNS are unreachable through Tor;
+/// - onion peers go first so they survive the cap: they need no exit node,
+///   and exit policies often reject port 8333.
+fn select_p2p_peers(
+    connected: &[el_rpc::PeerInfo],
+    addrman: &[el_rpc::NodeAddress],
+) -> (Vec<el_rawtx::PeerHint>, usize) {
+    const NETWORK_AND_WITNESS: u64 = 1 | (1 << 3);
+    let full = |services: u64| services & NETWORK_AND_WITNESS == NETWORK_AND_WITNESS;
+    let mut live: Vec<(bool, el_rawtx::PeerHint)> = connected
+        .iter()
+        .filter(|p| !p.inbound && full(p.services) && p2p_network_reachable(&p.network))
+        .map(|p| {
+            let v2 = match p.transport_protocol_type.as_str() {
+                "v2" => Some(true),
+                "v1" => Some(false),
+                _ => None,
+            };
+            (
+                p.network == "onion" || p.addr.contains(".onion"),
+                el_rawtx::PeerHint {
+                    addr: p.addr.clone(),
+                    v2,
+                },
+            )
+        })
+        .collect();
+    live.sort_by_key(|(onion, _)| !onion);
+    let mut peers: Vec<el_rawtx::PeerHint> = live.into_iter().map(|(_, p)| p).collect();
+    let connected_count = peers.len();
+    let mut known: Vec<(bool, el_rawtx::PeerHint)> = addrman
+        .iter()
+        .filter(|a| full(a.services) && p2p_network_reachable(&a.network))
+        .map(|a| {
+            let host = if a.address.contains(':') && !a.address.starts_with('[') {
+                format!("[{}]", a.address)
+            } else {
+                a.address.clone()
+            };
+            (
+                a.network == "onion" || a.address.ends_with(".onion"),
+                el_rawtx::PeerHint::from(format!("{host}:{}", a.port)),
+            )
+        })
+        .collect();
+    known.sort_by_key(|(onion, _)| !onion);
+    peers.extend(known.into_iter().map(|(_, p)| p));
     let mut seen = std::collections::HashSet::new();
-    peers.retain(|peer| seen.insert(peer.clone()));
-    peers.truncate(8);
-    (peers, connected)
+    peers.retain(|peer| seen.insert(peer.addr.clone()));
+    peers.truncate(P2P_PEERS);
+    let connected_count = connected_count.min(peers.len());
+    (peers, connected_count)
 }
 
 /// How long until the next peer refresh: soon while the list is empty (Core
@@ -6183,11 +6241,16 @@ fn log_startup_diagnostics(cfg: &Config, chain: Chain, shared: &Shared) {
         tx_mib,
     );
     eprintln!(
-        "[e-lite] debug: rawtx: probe {}s (tor >= {}s), ready {}s, prefetch {}, decoys {}, \
-         max_parallel {}, clearnet fallback {}",
+        "[e-lite] debug: rawtx: probe {}s (tor >= {}s), ready {}s, tor connect/stall/attempt \
+         {}/{}/{}s, p2p {}s (tor {}s), prefetch {}, decoys {}, max_parallel {}, clearnet fallback {}",
         cfg.public_servers.probe_timeout_seconds,
-        cfg.rawtx.tor_request_timeout_seconds,
+        cfg.rawtx.tor_stall_timeout_seconds,
         cfg.public_servers.ready_timeout_seconds,
+        cfg.rawtx.tor_connect_timeout_seconds,
+        cfg.rawtx.tor_stall_timeout_seconds,
+        cfg.rawtx.tor_request_timeout_seconds,
+        cfg.rawtx.p2p_timeout_seconds,
+        cfg.rawtx.p2p_tor_timeout_seconds,
         if cfg.rawtx.prefetch { "on" } else { "off" },
         cfg.rawtx.decoys,
         cfg.rawtx.max_parallel_fetches,
@@ -7532,15 +7595,60 @@ mod tests {
 
     #[test]
     fn external_fetches_are_private_by_default() {
-        // AUD-128 / AUD-134: no clearnet fallback and no speculative prefetch
-        // unless the operator opts in.
+        // AUD-128: no clearnet fallback unless the operator opts in.
+        // AUD-159: the prefetch is on, with decoys (see el-rawtx tests).
         let cfg = Config::default();
         assert!(!cfg.rawtx.tor_fallback_clearnet);
         assert!(!cfg.rawtx.allow_clearnet);
-        assert!(!cfg.rawtx.prefetch);
+        assert!(cfg.rawtx.prefetch);
+        assert!(cfg.rawtx.decoys >= 1);
         let parsed: Config = toml::from_str("[rawtx]\nenabled = true\n").unwrap();
         assert!(!parsed.rawtx.tor_fallback_clearnet);
-        assert!(!parsed.rawtx.prefetch);
+        assert!(parsed.rawtx.prefetch);
+        // AUD-155: a whole block over a fresh circuit gets an inactivity
+        // timeout and a long absolute limit, not a short total one.
+        assert!(cfg.rawtx.tor_request_timeout_seconds >= 60);
+        assert!(cfg.rawtx.tor_stall_timeout_seconds < cfg.rawtx.tor_request_timeout_seconds);
+        assert!(cfg.rawtx.p2p_tor_timeout_seconds > cfg.rawtx.p2p_timeout_seconds);
+    }
+
+    #[test]
+    fn p2p_peers_from_core_are_outbound_full_witness_and_onion_first() {
+        // AUD-154: inbound peers (ephemeral ports), I2P/CJDNS and peers that
+        // cannot serve old witness blocks are never used.
+        let peers: Vec<el_rpc::PeerInfo> = serde_json::from_str(
+            r#"[
+              {"addr":"198.51.100.1:51234","inbound":true,"services":1033,"network":"ipv4"},
+              {"addr":"198.51.100.2:8333","inbound":false,"services":1033,"network":"ipv4","transport_protocol_type":"v1"},
+              {"addr":"198.51.100.3:8333","inbound":false,"services":1032,"network":"ipv4"},
+              {"addr":"198.51.100.4:8333","inbound":false,"services":1,"network":"ipv4"},
+              {"addr":"abc.b32.i2p:0","inbound":false,"services":1033,"network":"i2p"},
+              {"addr":"exampleonionaddress.onion:8333","inbound":false,"services":1033,"network":"onion","transport_protocol_type":"v2"}
+            ]"#,
+        )
+        .unwrap();
+        let addrman: Vec<el_rpc::NodeAddress> = serde_json::from_str(
+            r#"[
+              {"address":"2001:db8::1","port":8333,"services":1033,"network":"ipv6"},
+              {"address":"fc00::1","port":8333,"services":1033,"network":"cjdns"},
+              {"address":"198.51.100.2","port":8333,"services":1033,"network":"ipv4"}
+            ]"#,
+        )
+        .unwrap();
+        let (list, connected) = select_p2p_peers(&peers, &addrman);
+        let addrs: Vec<&str> = list.iter().map(|p| p.addr.as_str()).collect();
+        assert_eq!(
+            addrs,
+            vec![
+                "exampleonionaddress.onion:8333",
+                "198.51.100.2:8333",
+                "[2001:db8::1]:8333"
+            ]
+        );
+        assert_eq!(connected, 2);
+        assert_eq!(list[0].v2, Some(true));
+        assert_eq!(list[1].v2, Some(false));
+        assert_eq!(list[2].v2, None);
     }
 
     #[test]

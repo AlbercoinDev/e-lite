@@ -5,14 +5,16 @@
 //! blocks. BIP324 v2 is tried first and falls back to v1. Use Tor for network
 //! privacy.
 
-use crate::{BlockSource, RawtxError, RawtxStats, Result};
+use crate::health::{Blame, HealthMap};
+use crate::{BlockSource, FetchMode, RawtxError, RawtxStats, Result};
 use bip324::io::{Payload, Protocol};
 use bip324::{PacketType, Role};
 use el_model::{Chain, Hash32};
 use rand::seq::SliceRandom;
 use rand::thread_rng;
 use sha2::{Digest, Sha256};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
+use std::fmt;
 use std::io::{self, BufReader, Read, Write};
 use std::net::{IpAddr, TcpStream, ToSocketAddrs};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -27,23 +29,144 @@ const NODE_WITNESS: u64 = 1 << 3;
 /// BIP144: request the witness serialization explicitly.
 const MSG_WITNESS_BLOCK: u32 = 2 | (1 << 30);
 
+/// A peer to fetch blocks from, with what Core knows about its transport.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PeerHint {
+    pub addr: String,
+    /// `Some(false)`: Core talks BIP324 v1 to it, so the v2 attempt (a whole
+    /// extra connection over Tor) is skipped. `None`: unknown, try v2 first.
+    pub v2: Option<bool>,
+}
+
+impl From<String> for PeerHint {
+    fn from(addr: String) -> Self {
+        PeerHint { addr, v2: None }
+    }
+}
+
+impl From<&str> for PeerHint {
+    fn from(addr: &str) -> Self {
+        PeerHint::from(addr.to_string())
+    }
+}
+
+/// A transient peer failure backs off from this (doubling up to the
+/// provider cooldown): every dead peer costs a whole connection attempt.
+const PEER_TRANSIENT_BASE: Duration = Duration::from_secs(30);
+/// The local Tor SOCKS proxy refused a connection or its handshake: P2P over
+/// Tor stops for this long. A peer-side failure never trips it (AUD-153).
+const PROXY_PAUSE: Duration = Duration::from_secs(15);
+/// Peers tried per call.
+const PEERS_PER_CALL: usize = 3;
+/// A bulk read stalls when no byte arrives for this long (P2P over Tor).
+const P2P_STALL: Duration = Duration::from_secs(20);
+
 pub struct P2pSource {
     /// Replaced at runtime by `set_peers` (AUD-137): a list discovered once
     /// at start goes stale, or is empty if Core had no peers yet.
-    peers: RwLock<Vec<String>>,
+    peers: RwLock<Vec<PeerHint>>,
     tor_socks: Option<String>,
+    /// Per-attempt limit of a direct connection.
     timeout: Duration,
+    /// Per-attempt limit through Tor: a circuit to the peer plus a whole
+    /// block, so it is longer than the direct one.
+    tor_timeout: Duration,
     magic: [u8; 4],
     v2: bool,
     fallback_clearnet: bool,
     fallback_warned: AtomicBool,
+    /// Cooldown after a hard failure (and cap of the transient backoff).
     cooldown: Duration,
-    total_timeout: Duration,
-    peer_failures: Mutex<HashMap<String, Instant>>,
+    health: HealthMap,
     /// Peers that have served a block (statistics only; no priority).
     good: Mutex<HashSet<String>>,
-    tor_cooldown_until: Mutex<Option<Instant>>,
+    /// Set only when the local SOCKS proxy itself fails (AUD-153).
+    proxy_down_until: Mutex<Option<Instant>>,
+    /// Force one attempt when every peer is cooling down. The resolver sets
+    /// it when P2P is the only external source; otherwise Esplora already
+    /// forces its own attempt and a dead peer list is not paid for again.
+    force_when_cooling: AtomicBool,
     stats: Option<Arc<RawtxStats>>,
+}
+
+/// Why one attempt on one peer failed.
+struct Failure {
+    err: RawtxError,
+    /// `None`: the local proxy failed, not the peer.
+    blame: Option<Blame>,
+    /// The TCP (or SOCKS) connection to the peer was established.
+    connected: bool,
+}
+
+impl Failure {
+    fn transient(err: RawtxError) -> Self {
+        Failure {
+            err,
+            blame: Some(Blame::Transient),
+            connected: true,
+        }
+    }
+
+    fn hard(err: RawtxError) -> Self {
+        Failure {
+            err,
+            blame: Some(Blame::Hard),
+            connected: true,
+        }
+    }
+}
+
+/// A peer socket whose every read and write is bounded by the stall time
+/// and by the attempt deadline: a slow but live transfer is not cut short,
+/// and a peer that trickles bytes cannot hold the call past its budget.
+struct DeadlineIo {
+    stream: TcpStream,
+    deadline: Instant,
+    stall: Duration,
+}
+
+impl DeadlineIo {
+    fn arm(&self, write: bool) -> io::Result<()> {
+        let left = self.deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "attempt deadline reached",
+            ));
+        }
+        let limit = Some(left.min(self.stall));
+        if write {
+            self.stream.set_write_timeout(limit)
+        } else {
+            self.stream.set_read_timeout(limit)
+        }
+    }
+
+    fn try_clone(&self) -> io::Result<Self> {
+        Ok(DeadlineIo {
+            stream: self.stream.try_clone()?,
+            deadline: self.deadline,
+            stall: self.stall,
+        })
+    }
+}
+
+impl Read for DeadlineIo {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        self.arm(false)?;
+        self.stream.read(buf)
+    }
+}
+
+impl Write for DeadlineIo {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.arm(true)?;
+        self.stream.write(buf)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.stream.flush()
+    }
 }
 
 fn sha256d(data: &[u8]) -> [u8; 32] {
@@ -268,12 +391,63 @@ fn split_host_port(peer: &str) -> io::Result<(&str, u16)> {
     Ok((host, port))
 }
 
+/// Why a SOCKS5 CONNECT failed. Only `Proxy` means the local Tor is unusable;
+/// a reply code or a CONNECT that never completes is about the peer or the
+/// circuit, and must not stop P2P for every other peer (AUD-153).
+#[derive(Debug)]
+pub(crate) enum SocksError {
+    /// TCP to the proxy, its greeting or its authentication failed.
+    Proxy(io::Error),
+    /// The proxy answered the CONNECT with a non-zero reply code.
+    Reply(u8),
+    /// The CONNECT was sent but its reply did not complete (slow circuit).
+    Stream(io::Error),
+}
+
+impl fmt::Display for SocksError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            SocksError::Proxy(e) => write!(f, "socks proxy: {e}"),
+            SocksError::Reply(code) => {
+                write!(f, "socks reply {code} ({})", socks_reply_name(*code))
+            }
+            SocksError::Stream(e) => write!(f, "socks connect: {e}"),
+        }
+    }
+}
+
+fn socks_reply_name(code: u8) -> &'static str {
+    match code {
+        1 => "general failure",
+        2 => "not allowed by ruleset",
+        3 => "network unreachable",
+        4 => "host unreachable",
+        5 => "connection refused",
+        6 => "TTL expired",
+        7 => "command not supported",
+        8 => "address type not supported",
+        _ => "unknown",
+    }
+}
+
 /// Minimal SOCKS5 CONNECT with bounded connect/read/write timeouts.
 ///
 /// The `socks` crate does not expose timeouts, so a stalled Tor SOCKS proxy
 /// could block a P2P fetch indefinitely. This performs the same handshake with
 /// the P2P timeout applied to every step.
-fn socks_connect(proxy: &str, peer: &str, timeout: Duration) -> io::Result<TcpStream> {
+fn socks_connect(
+    proxy: &str,
+    peer: &str,
+    timeout: Duration,
+) -> std::result::Result<TcpStream, SocksError> {
+    let mut stream = socks_greet(proxy, timeout).map_err(SocksError::Proxy)?;
+    socks_request(&mut stream, peer)?;
+    Ok(stream)
+}
+
+/// Connect to the proxy and complete the method negotiation (with a random
+/// username: Tor isolates streams with different credentials).
+fn socks_greet(proxy: &str, timeout: Duration) -> io::Result<TcpStream> {
     let proxy_addrs: Vec<_> = proxy.to_socket_addrs()?.collect();
     let mut stream = None;
     for addr in proxy_addrs {
@@ -337,8 +511,12 @@ fn socks_connect(proxy: &str, peer: &str, timeout: Duration) -> io::Result<TcpSt
             ))
         }
     }
+    Ok(stream)
+}
 
-    let (host, port) = split_host_port(peer)?;
+/// Send the CONNECT for `peer` and read the reply.
+fn socks_request(stream: &mut TcpStream, peer: &str) -> std::result::Result<(), SocksError> {
+    let (host, port) = split_host_port(peer).map_err(SocksError::Stream)?;
     let mut request = vec![5, 1, 0];
     if let Ok(ip) = host.parse::<IpAddr>() {
         match ip {
@@ -354,51 +532,50 @@ fn socks_connect(proxy: &str, peer: &str, timeout: Duration) -> io::Result<TcpSt
     } else {
         let host = host.as_bytes();
         if host.len() > 255 {
-            return Err(io::Error::new(
+            return Err(SocksError::Stream(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "peer host too long",
-            ));
+            )));
         }
         request.push(3);
         request.push(host.len() as u8);
         request.extend_from_slice(host);
     }
     request.extend_from_slice(&port.to_be_bytes());
-    stream.write_all(&request)?;
+    stream.write_all(&request).map_err(SocksError::Proxy)?;
 
+    // From here on Tor is building a circuit to the peer: a timeout is the
+    // circuit's (or the peer's), not the proxy's.
     let mut head = [0u8; 4];
-    stream.read_exact(&mut head)?;
-    if head[0] != 5 || head[1] != 0 {
-        return Err(io::Error::new(
-            io::ErrorKind::ConnectionRefused,
-            format!("SOCKS connect failed (reply {})", head[1]),
-        ));
+    stream.read_exact(&mut head).map_err(SocksError::Stream)?;
+    if head[0] != 5 {
+        return Err(SocksError::Proxy(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "bad SOCKS reply version",
+        )));
     }
-    match head[3] {
-        1 => {
-            let mut skip = [0u8; 4];
-            stream.read_exact(&mut skip)?;
-        }
-        4 => {
-            let mut skip = [0u8; 16];
-            stream.read_exact(&mut skip)?;
-        }
+    if head[1] != 0 {
+        return Err(SocksError::Reply(head[1]));
+    }
+    let skip = match head[3] {
+        1 => 4,
+        4 => 16,
         3 => {
             let mut len = [0u8; 1];
-            stream.read_exact(&mut len)?;
-            let mut skip = vec![0u8; len[0] as usize];
-            stream.read_exact(&mut skip)?;
+            stream.read_exact(&mut len).map_err(SocksError::Stream)?;
+            len[0] as usize
         }
         _ => {
-            return Err(io::Error::new(
+            return Err(SocksError::Proxy(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "bad SOCKS reply address type",
-            ))
+            )))
         }
-    }
-    let mut port = [0u8; 2];
-    stream.read_exact(&mut port)?;
-    Ok(stream)
+    };
+    // Bound address and port.
+    let mut rest = vec![0u8; skip + 2];
+    stream.read_exact(&mut rest).map_err(SocksError::Stream)?;
+    Ok(())
 }
 
 impl P2pSource {
@@ -412,36 +589,48 @@ impl P2pSource {
         cooldown: Duration,
     ) -> Self {
         P2pSource {
-            peers: RwLock::new(peers),
+            peers: RwLock::new(peers.into_iter().map(PeerHint::from).collect()),
             tor_socks,
             timeout,
+            tor_timeout: timeout,
             magic: chain.magic(),
             v2,
             fallback_clearnet,
             fallback_warned: AtomicBool::new(false),
             cooldown,
-            total_timeout: timeout.saturating_mul(2),
-            peer_failures: Mutex::new(HashMap::new()),
+            health: HealthMap::new(),
             good: Mutex::new(HashSet::new()),
-            tor_cooldown_until: Mutex::new(None),
+            proxy_down_until: Mutex::new(None),
+            force_when_cooling: AtomicBool::new(false),
             stats: None,
         }
     }
 
-    /// Replace the peer list. Cooldowns and the last good peer are kept for
-    /// peers that are still listed. Returns the new peer count.
-    pub fn set_peers(&self, mut peers: Vec<String>) -> usize {
+    /// Per-attempt limit for connections made through Tor (default: the
+    /// direct `timeout`).
+    pub fn with_tor_timeout(mut self, tor_timeout: Duration) -> Self {
+        self.tor_timeout = tor_timeout.max(Duration::from_secs(1));
+        self
+    }
+
+    /// Force one attempt when every peer is cooling down (P2P is the only
+    /// external source).
+    pub fn set_force_when_cooling(&self, force: bool) {
+        self.force_when_cooling.store(force, Ordering::Relaxed);
+    }
+
+    /// Replace the peer list. Cooldowns and statistics are kept for peers
+    /// that are still listed. Returns the new peer count.
+    pub fn set_peers(&self, mut list: Vec<PeerHint>) -> usize {
         let mut seen = HashSet::new();
-        peers.retain(|p| seen.insert(p.clone()));
-        let count = peers.len();
-        if let Ok(mut failures) = self.peer_failures.lock() {
-            failures.retain(|peer, _| seen.contains(peer));
-        }
+        list.retain(|p| seen.insert(p.addr.clone()));
+        let count = list.len();
+        self.health.retain(|peer| seen.contains(peer));
         if let Ok(mut good) = self.good.lock() {
             good.retain(|peer| seen.contains(peer));
         }
         if let Ok(mut current) = self.peers.write() {
-            *current = peers;
+            *current = list;
         }
         count
     }
@@ -460,6 +649,45 @@ impl P2pSource {
         if let Some(stats) = &self.stats {
             f(stats);
         }
+    }
+
+    fn proxy_down(&self) -> bool {
+        self.proxy_down_until
+            .lock()
+            .map(|until| until.is_some_and(|t| t > Instant::now()))
+            .unwrap_or(false)
+    }
+
+    fn set_proxy_down(&self, down: bool) {
+        if let Ok(mut until) = self.proxy_down_until.lock() {
+            *until = down.then(|| Instant::now() + PROXY_PAUSE);
+        }
+    }
+
+    /// Whether the next connection goes through Tor.
+    fn via_tor(&self) -> bool {
+        self.tor_socks.is_some() && !self.proxy_down()
+    }
+
+    /// Per-attempt limit of the next connection (Tor or direct).
+    fn per_attempt(&self) -> Duration {
+        if self.via_tor() {
+            self.tor_timeout
+        } else {
+            self.timeout
+        }
+    }
+
+    /// An attempt with less time left than this is not started.
+    fn min_attempt(&self) -> Duration {
+        crate::MIN_ATTEMPT.min(self.per_attempt())
+    }
+
+    /// Deadline and stall time of one protocol attempt inside a call.
+    fn attempt(&self, call_deadline: Instant) -> (Instant, Duration) {
+        let limit = self.per_attempt();
+        let deadline = call_deadline.min(Instant::now() + limit);
+        (deadline, limit.min(P2P_STALL))
     }
 
     fn direct_connect(&self, peer: &str, timeout: Duration) -> Result<TcpStream> {
@@ -481,107 +709,154 @@ impl P2pSource {
         )))
     }
 
-    fn connect_raw(&self, peer: &str, timeout: Duration) -> Result<TcpStream> {
-        let tor_cooled = self
-            .tor_cooldown_until
-            .lock()
-            .map(|until| until.is_some_and(|t| t > Instant::now()))
-            .unwrap_or(false);
-        let stream = if let Some(proxy) = &self.tor_socks {
-            if tor_cooled {
-                if self.fallback_clearnet {
-                    self.direct_connect(peer, timeout)?
-                } else {
-                    return Err(RawtxError::Unavailable(format!(
-                        "tor cooling down for {peer}; clearnet fallback disabled"
-                    )));
-                }
-            } else {
-                match socks_connect(proxy, peer, timeout) {
-                    Ok(s) => {
-                        if let Ok(mut until) = self.tor_cooldown_until.lock() {
-                            *until = None;
-                        }
-                        s
-                    }
-                    Err(e) => {
-                        self.bump(|stats| {
-                            stats.p2p_tor_failures.fetch_add(1, Ordering::Relaxed);
+    /// Clearnet connection used only when the operator enabled the fallback.
+    fn fallback_connect(
+        &self,
+        peer: &str,
+        timeout: Duration,
+        why: &str,
+    ) -> std::result::Result<TcpStream, Failure> {
+        if !self.fallback_warned.swap(true, Ordering::Relaxed) {
+            eprintln!(
+                "[e-lite] WARNING: Tor failed for a P2P peer ({why}); using clearnet (operator IP exposed)"
+            );
+        }
+        self.direct_connect(peer, timeout).map_err(|err| Failure {
+            err,
+            blame: Some(Blame::Transient),
+            connected: false,
+        })
+    }
+
+    fn connect_raw(
+        &self,
+        peer: &str,
+        deadline: Instant,
+        stall: Duration,
+    ) -> std::result::Result<DeadlineIo, Failure> {
+        let timeout = deadline
+            .saturating_duration_since(Instant::now())
+            .max(Duration::from_millis(100));
+        let stream = match &self.tor_socks {
+            Some(proxy) if !self.proxy_down() => match socks_connect(proxy, peer, timeout) {
+                Ok(s) => s,
+                Err(SocksError::Proxy(e)) => {
+                    // The local Tor itself failed: every peer would fail the
+                    // same way, so pause P2P over Tor briefly.
+                    self.bump(|stats| {
+                        stats.p2p_tor_failures.fetch_add(1, Ordering::Relaxed);
+                    });
+                    self.set_proxy_down(true);
+                    if self.fallback_clearnet {
+                        self.fallback_connect(peer, timeout, "proxy")?
+                    } else {
+                        return Err(Failure {
+                            err: RawtxError::Unavailable(format!("tor proxy: {e}")),
+                            blame: None,
+                            connected: false,
                         });
-                        if let Ok(mut until) = self.tor_cooldown_until.lock() {
-                            *until = Some(Instant::now() + self.cooldown);
-                        }
-                        if self.fallback_clearnet {
-                            if !self.fallback_warned.swap(true, Ordering::Relaxed) {
-                                eprintln!(
-                                    "[e-lite] WARNING: Tor connect failed for P2P peer {peer} ({e}); using clearnet (operator IP exposed)"
-                                );
-                            }
-                            self.direct_connect(peer, timeout)?
-                        } else {
-                            return Err(RawtxError::Unavailable(format!(
-                                "tor connect {peer}: {e}"
-                            )));
-                        }
                     }
                 }
-            }
-        } else {
-            self.direct_connect(peer, timeout)?
-        };
-        stream
-            .set_nodelay(true)
-            .map_err(|e| RawtxError::Io(e.to_string()))?;
-        stream
-            .set_read_timeout(Some(timeout))
-            .map_err(|e| RawtxError::Io(e.to_string()))?;
-        stream
-            .set_write_timeout(Some(timeout))
-            .map_err(|e| RawtxError::Io(e.to_string()))?;
-        Ok(stream)
-    }
-
-    fn fetch_from(&self, peer: &str, hash: &Hash32, budget: Duration) -> Result<Vec<u8>> {
-        let deadline = Instant::now() + budget;
-        let mut v2_error = None;
-        if self.v2 {
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
-                return Err(RawtxError::Unavailable(format!("{peer} p2p timeout")));
-            }
-            match self.fetch_from_v2(peer, hash, remaining) {
-                Ok(bytes) => return Ok(bytes),
-                Err(e) => v2_error = Some(e),
-            }
-        }
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            return Err(RawtxError::Unavailable(format!("{peer} p2p timeout")));
-        }
-        match self.fetch_from_v1(peer, hash, remaining) {
-            Ok(bytes) => Ok(bytes),
-            Err(e) => match v2_error {
-                Some(v2) => Err(RawtxError::Unavailable(format!("{v2}; v1: {e}"))),
-                None => Err(e),
+                // The proxy works; this peer (or this circuit) does not.
+                Err(e) => {
+                    if self.fallback_clearnet {
+                        self.fallback_connect(peer, timeout, "circuit")?
+                    } else {
+                        return Err(Failure {
+                            err: RawtxError::Unavailable(format!("tor {peer}: {e}")),
+                            blame: Some(Blame::Transient),
+                            connected: false,
+                        });
+                    }
+                }
             },
+            Some(_) => {
+                if self.fallback_clearnet {
+                    self.fallback_connect(peer, timeout, "proxy paused")?
+                } else {
+                    return Err(Failure {
+                        err: RawtxError::Unavailable(
+                            "tor proxy unavailable; clearnet fallback disabled".into(),
+                        ),
+                        blame: None,
+                        connected: false,
+                    });
+                }
+            }
+            None => self.direct_connect(peer, timeout).map_err(|err| Failure {
+                err,
+                blame: Some(Blame::Transient),
+                connected: false,
+            })?,
+        };
+        let setup = |e: io::Error| Failure::transient(RawtxError::Io(e.to_string()));
+        stream.set_nodelay(true).map_err(setup)?;
+        Ok(DeadlineIo {
+            stream,
+            deadline,
+            stall,
+        })
+    }
+
+    fn fetch_from(
+        &self,
+        hint: &PeerHint,
+        hash: &Hash32,
+        call_deadline: Instant,
+    ) -> std::result::Result<Vec<u8>, Failure> {
+        let peer = hint.addr.as_str();
+        let mut v2_error = None;
+        if self.v2 && hint.v2 != Some(false) {
+            match self.fetch_from_v2(peer, hash, call_deadline) {
+                Ok(bytes) => return Ok(bytes),
+                // No connection (dead peer, slow circuit, Tor down), or a
+                // peer that answered with wrong services or a bad block: a
+                // v1 attempt would pay another connection for the same
+                // result (AUD-153).
+                Err(f) if !f.connected || f.blame != Some(Blame::Transient) => return Err(f),
+                Err(f) => v2_error = Some(f),
+            }
+        }
+        if call_deadline.saturating_duration_since(Instant::now()) < self.min_attempt() {
+            return Err(v2_error.unwrap_or_else(|| {
+                Failure::transient(RawtxError::Unavailable(format!("{peer} p2p timeout")))
+            }));
+        }
+        match self.fetch_from_v1(peer, hash, call_deadline) {
+            Ok(bytes) => Ok(bytes),
+            Err(mut f) => {
+                if let Some(v2) = v2_error {
+                    f.err = RawtxError::Unavailable(format!("{}; v1: {}", v2.err, f.err));
+                }
+                Err(f)
+            }
         }
     }
 
-    fn fetch_from_v1(&self, peer: &str, hash: &Hash32, timeout: Duration) -> Result<Vec<u8>> {
-        let mut stream = self.connect_raw(peer, timeout)?;
+    fn fetch_from_v1(
+        &self,
+        peer: &str,
+        hash: &Hash32,
+        call_deadline: Instant,
+    ) -> std::result::Result<Vec<u8>, Failure> {
+        let (deadline, stall) = self.attempt(call_deadline);
+        let mut stream = self.connect_raw(peer, deadline, stall)?;
+        let fail = |what: &str, e: io::Error| {
+            Failure::transient(RawtxError::Unavailable(format!("{peer} {what}: {e}")))
+        };
         send_message(
             &mut stream,
             self.magic,
             "version",
             &version_payload(NODE_WITNESS, 0),
         )
-        .map_err(|e| RawtxError::Unavailable(format!("{peer} version: {e}")))?;
+        .map_err(|e| fail("version", e))?;
 
         let mut got_version = false;
         let mut services = 0u64;
         loop {
             let (cmd, payload) = read_message(&mut stream, self.magic, MAX_MESSAGE)
-                .map_err(|e| RawtxError::Unavailable(format!("{peer} handshake: {e}")))?;
+                .map_err(|e| fail("handshake", e))?;
             match cmd.as_str() {
                 "version" => {
                     got_version = true;
@@ -589,7 +864,7 @@ impl P2pSource {
                         services = u64::from_le_bytes(payload[4..12].try_into().unwrap());
                     }
                     send_message(&mut stream, self.magic, "verack", &[])
-                        .map_err(|e| RawtxError::Unavailable(format!("{peer} verack: {e}")))?;
+                        .map_err(|e| fail("verack", e))?;
                 }
                 "verack" => {
                     if got_version {
@@ -605,19 +880,19 @@ impl P2pSource {
         self.require_network(peer, services)?;
 
         send_message(&mut stream, self.magic, "getdata", &getdata_payload(hash))
-            .map_err(|e| RawtxError::Unavailable(format!("{peer} getdata: {e}")))?;
+            .map_err(|e| fail("getdata", e))?;
         loop {
-            let (cmd, payload) = read_message(&mut stream, self.magic, MAX_MESSAGE)
-                .map_err(|e| RawtxError::Unavailable(format!("{peer} block: {e}")))?;
+            let (cmd, payload) =
+                read_message(&mut stream, self.magic, MAX_MESSAGE).map_err(|e| fail("block", e))?;
             match cmd.as_str() {
                 "block" => {
-                    check_block(&payload, hash, peer)?;
+                    check_block(&payload, hash, peer).map_err(Failure::hard)?;
                     return Ok(payload);
                 }
                 "notfound" => {
-                    return Err(RawtxError::Unavailable(format!(
+                    return Err(Failure::hard(RawtxError::Unavailable(format!(
                         "{peer} notfound for {hash}"
-                    )))
+                    ))))
                 }
                 "ping" => {
                     let _ = send_message(&mut stream, self.magic, "pong", &pong_payload(&payload));
@@ -627,17 +902,24 @@ impl P2pSource {
         }
     }
 
-    fn fetch_from_v2(&self, peer: &str, hash: &Hash32, timeout: Duration) -> Result<Vec<u8>> {
-        let stream = self.connect_raw(peer, timeout)?;
+    fn fetch_from_v2(
+        &self,
+        peer: &str,
+        hash: &Hash32,
+        call_deadline: Instant,
+    ) -> std::result::Result<Vec<u8>, Failure> {
+        let (deadline, stall) = self.attempt(call_deadline);
+        let stream = self.connect_raw(peer, deadline, stall)?;
         let reader = BufReader::new(
             stream
                 .try_clone()
-                .map_err(|e| RawtxError::Io(e.to_string()))?,
+                .map_err(|e| Failure::transient(RawtxError::Io(e.to_string())))?,
         );
         let writer = stream;
-        let mut protocol =
-            Protocol::new(self.magic, Role::Initiator, None, None, reader, writer)
-                .map_err(|e| RawtxError::Unavailable(format!("{peer} v2 handshake: {e}")))?;
+        let mut protocol = Protocol::new(self.magic, Role::Initiator, None, None, reader, writer)
+            .map_err(|e| {
+            Failure::transient(RawtxError::Unavailable(format!("{peer} v2 handshake: {e}")))
+        })?;
 
         self.v2_send(&mut protocol, "version", &version_payload(NODE_WITNESS, 0))?;
         let mut got_version = false;
@@ -670,13 +952,13 @@ impl P2pSource {
             let (cmd, payload) = self.v2_read(&mut protocol, peer)?;
             match cmd.as_str() {
                 "block" => {
-                    check_block(&payload, hash, peer)?;
+                    check_block(&payload, hash, peer).map_err(Failure::hard)?;
                     return Ok(payload);
                 }
                 "notfound" => {
-                    return Err(RawtxError::Unavailable(format!(
+                    return Err(Failure::hard(RawtxError::Unavailable(format!(
                         "{peer} notfound for {hash}"
-                    )))
+                    ))))
                 }
                 "ping" => {
                     let _ = self.v2_send(&mut protocol, "pong", &pong_payload(&payload));
@@ -688,44 +970,45 @@ impl P2pSource {
 
     fn v2_send(
         &self,
-        protocol: &mut Protocol<BufReader<TcpStream>, TcpStream>,
+        protocol: &mut Protocol<BufReader<DeadlineIo>, DeadlineIo>,
         command: &str,
         payload: &[u8],
-    ) -> Result<()> {
+    ) -> std::result::Result<(), Failure> {
         protocol
             .write(&Payload::genuine(v2_message(command, payload)))
-            .map_err(|e| RawtxError::Unavailable(format!("v2 write: {e}")))
+            .map_err(|e| Failure::transient(RawtxError::Unavailable(format!("v2 write: {e}"))))
     }
 
     fn v2_read(
         &self,
-        protocol: &mut Protocol<BufReader<TcpStream>, TcpStream>,
+        protocol: &mut Protocol<BufReader<DeadlineIo>, DeadlineIo>,
         peer: &str,
-    ) -> Result<(String, Vec<u8>)> {
+    ) -> std::result::Result<(String, Vec<u8>), Failure> {
         loop {
-            let packet = protocol
-                .read()
-                .map_err(|e| RawtxError::Unavailable(format!("{peer} v2 read: {e}")))?;
+            let packet = protocol.read().map_err(|e| {
+                Failure::transient(RawtxError::Unavailable(format!("{peer} v2 read: {e}")))
+            })?;
             if matches!(packet.packet_type(), PacketType::Decoy) {
                 continue;
             }
-            return v2_parse(packet.contents())
-                .map_err(|e| RawtxError::Unavailable(format!("{peer} v2 message: {e}")));
+            return v2_parse(packet.contents()).map_err(|e| {
+                Failure::transient(RawtxError::Unavailable(format!("{peer} v2 message: {e}")))
+            });
         }
     }
 
-    fn require_network(&self, peer: &str, services: u64) -> Result<()> {
+    fn require_network(&self, peer: &str, services: u64) -> std::result::Result<(), Failure> {
         if services & NODE_NETWORK == 0 {
             let limited = services & NODE_NETWORK_LIMITED != 0;
-            return Err(RawtxError::Unavailable(format!(
+            return Err(Failure::hard(RawtxError::Unavailable(format!(
                 "{peer} does not serve full blocks (services={services:#x}{})",
                 if limited { ", limited" } else { "" }
-            )));
+            ))));
         }
         if services & NODE_WITNESS == 0 {
-            return Err(RawtxError::Unavailable(format!(
+            return Err(Failure::hard(RawtxError::Unavailable(format!(
                 "{peer} does not serve witness blocks (services={services:#x})"
-            )));
+            ))));
         }
         Ok(())
     }
@@ -737,29 +1020,47 @@ impl BlockSource for P2pSource {
     }
 
     fn fetch_block(&self, hash: &Hash32) -> Result<Vec<u8>> {
+        self.fetch_block_until(
+            hash,
+            Instant::now() + crate::EXTERNAL_BUDGET,
+            FetchMode::Normal,
+        )
+    }
+
+    fn fetch_block_until(
+        &self,
+        hash: &Hash32,
+        deadline: Instant,
+        mode: FetchMode,
+    ) -> Result<Vec<u8>> {
         let mut peers = self.peers.read().map(|p| p.clone()).unwrap_or_default();
         if peers.is_empty() {
             return Err(RawtxError::Unavailable("no p2p peers".into()));
         }
+        if self.tor_socks.is_some() && self.proxy_down() && !self.fallback_clearnet {
+            return Err(RawtxError::Unavailable(
+                "tor proxy unavailable; clearnet fallback disabled".into(),
+            ));
+        }
         peers.shuffle(&mut thread_rng());
         // Purely random order (AUD-135): no peer is preferred because it
         // answered last; failed peers are skipped while they cool down.
-
-        let now = Instant::now();
-        let cooling: HashSet<String> = self
-            .peer_failures
-            .lock()
-            .map(|m| {
-                m.iter()
-                    .filter(|(_, until)| **until > now)
-                    .map(|(peer, _)| peer.clone())
-                    .collect()
-            })
-            .unwrap_or_default();
-        let candidates: Vec<String> = peers
-            .into_iter()
-            .filter(|peer| !cooling.contains(peer))
+        let mut candidates: Vec<PeerHint> = peers
+            .iter()
+            .filter(|p| !self.health.cooling(&p.addr))
+            .cloned()
             .collect();
+        if candidates.is_empty()
+            && mode == FetchMode::Normal
+            && self.force_when_cooling.load(Ordering::Relaxed)
+        {
+            // P2P is the only external source: try the peer whose cooldown
+            // ends first rather than failing without touching the network.
+            if let Some(peer) = peers.iter().min_by_key(|p| self.health.until(&p.addr)) {
+                self.health.release(&peer.addr);
+                candidates.push(peer.clone());
+            }
+        }
         if candidates.is_empty() {
             self.bump(|stats| {
                 stats.p2p_skipped.fetch_add(1, Ordering::Relaxed);
@@ -769,36 +1070,46 @@ impl BlockSource for P2pSource {
             ));
         }
 
-        let started = Instant::now();
+        // One call gets at most two attempt budgets, so a slow peer list
+        // leaves time for the other sources.
+        let call_deadline = deadline.min(Instant::now() + self.per_attempt().saturating_mul(2));
         let mut errors = Vec::new();
-        for peer in candidates.into_iter().take(3) {
-            let remaining = self.total_timeout.saturating_sub(started.elapsed());
-            if remaining.is_zero() {
-                errors.push("p2p total timeout".to_string());
+        for hint in candidates.into_iter().take(PEERS_PER_CALL) {
+            if call_deadline.saturating_duration_since(Instant::now()) < self.min_attempt() {
+                errors.push("p2p deadline reached".to_string());
                 break;
             }
-            let budget = remaining.min(self.timeout);
             self.bump(|stats| {
                 stats.p2p_attempts.fetch_add(1, Ordering::Relaxed);
             });
-            match self.fetch_from(&peer, hash, budget) {
+            match self.fetch_from(&hint, hash, call_deadline) {
                 Ok(bytes) => {
                     if let Ok(mut good) = self.good.lock() {
-                        good.insert(peer.clone());
+                        good.insert(hint.addr.clone());
                     }
-                    if let Ok(mut failures) = self.peer_failures.lock() {
-                        failures.remove(&peer);
-                    }
+                    self.health.succeed(&hint.addr);
                     return Ok(bytes);
                 }
-                Err(e) => {
+                Err(f) => {
                     self.bump(|stats| {
                         stats.p2p_failures.fetch_add(1, Ordering::Relaxed);
                     });
-                    if let Ok(mut failures) = self.peer_failures.lock() {
-                        failures.insert(peer.clone(), Instant::now() + self.cooldown);
+                    errors.push(format!("{}: {}", hint.addr, f.err));
+                    match f.blame {
+                        // A decoy never cools a peer down (AUD-157).
+                        Some(blame) if mode == FetchMode::Normal => {
+                            self.health.fail(
+                                &hint.addr,
+                                blame,
+                                PEER_TRANSIENT_BASE,
+                                self.cooldown,
+                                self.cooldown,
+                            );
+                        }
+                        Some(_) => {}
+                        // The local proxy failed: no other peer can work now.
+                        None => break,
                     }
-                    errors.push(format!("{peer}: {e}"));
                 }
             }
         }
@@ -818,6 +1129,7 @@ mod tests {
         TxMerkleNode, TxOut, Witness,
     };
     use std::net::TcpListener;
+    use std::sync::Arc;
 
     #[test]
     fn socks_connect_is_bounded_by_timeout() {
@@ -1149,5 +1461,190 @@ mod tests {
             Duration::from_secs(5),
         );
         assert!(src.fetch_block(&hash).is_err());
+    }
+
+    /// SOCKS5 proxy that completes the greeting and answers every CONNECT
+    /// with `reply` (5 = connection refused). Counts connections.
+    fn refusing_socks(reply: u8) -> (String, Arc<std::sync::atomic::AtomicUsize>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = Arc::clone(&count);
+        std::thread::spawn(move || {
+            while let Ok((mut sock, _)) = listener.accept() {
+                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let mut greeting = [0u8; 4];
+                if sock.read_exact(&mut greeting).is_err() {
+                    continue;
+                }
+                let _ = sock.write_all(&[5, 2]);
+                let mut head = [0u8; 2];
+                let _ = sock.read_exact(&mut head);
+                let mut user = vec![0u8; head[1] as usize];
+                let _ = sock.read_exact(&mut user);
+                let mut plen = [0u8; 1];
+                let _ = sock.read_exact(&mut plen);
+                let mut pass = vec![0u8; plen[0] as usize];
+                let _ = sock.read_exact(&mut pass);
+                let _ = sock.write_all(&[1, 0]);
+                // CONNECT to an IPv4 peer: 4 + 4 + 2 bytes.
+                let mut request = [0u8; 10];
+                let _ = sock.read_exact(&mut request);
+                let _ = sock.write_all(&[5, reply, 0, 1, 0, 0, 0, 0, 0, 0]);
+            }
+        });
+        (addr, count)
+    }
+
+    #[test]
+    fn a_refusing_peer_does_not_stop_the_others() {
+        // AUD-153: a SOCKS reply about one peer (refused, exit policy) must
+        // not trip the Tor breaker, and the v2 attempt that could not even
+        // connect is not repeated as v1.
+        let (socks, connections) = refusing_socks(5);
+        let peers = vec![
+            "192.0.2.1:18444".to_string(),
+            "192.0.2.2:18444".to_string(),
+            "192.0.2.3:18444".to_string(),
+        ];
+        let src = P2pSource::new(
+            peers.clone(),
+            Some(socks),
+            Duration::from_secs(2),
+            Chain::Regtest,
+            true,
+            false,
+            Duration::from_secs(60),
+        );
+        let err = src.fetch_block(&Hash32([0x51; 32])).unwrap_err();
+        assert!(format!("{err}").contains("connection refused"), "{err}");
+        assert_eq!(
+            connections.load(std::sync::atomic::Ordering::SeqCst),
+            3,
+            "every peer tried once, no v1 retry after a failed connection"
+        );
+        assert!(!src.proxy_down(), "a peer refusal is not a Tor failure");
+        assert!(peers.iter().all(|p| src.health.cooling(p)));
+    }
+
+    #[test]
+    fn a_dead_proxy_pauses_tor_without_blaming_peers() {
+        let closed = TcpListener::bind("127.0.0.1:0").unwrap();
+        let socks = closed.local_addr().unwrap().to_string();
+        drop(closed);
+        let stats = Arc::new(RawtxStats::default());
+        let peers = vec!["192.0.2.1:18444".to_string(), "192.0.2.2:18444".to_string()];
+        let src = P2pSource::new(
+            peers.clone(),
+            Some(socks),
+            Duration::from_secs(2),
+            Chain::Regtest,
+            false,
+            false,
+            Duration::from_secs(60),
+        )
+        .with_stats(Arc::clone(&stats));
+        assert!(src.fetch_block(&Hash32([0x52; 32])).is_err());
+        assert!(src.proxy_down());
+        assert_eq!(
+            stats.p2p_attempts.load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+        assert!(peers.iter().all(|p| !src.health.cooling(p)));
+    }
+
+    #[test]
+    fn the_only_source_forces_one_attempt_while_cooling() {
+        use std::sync::atomic::AtomicUsize;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let accepts = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&accepts);
+        std::thread::spawn(move || {
+            while let Ok((sock, _)) = listener.accept() {
+                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                drop(sock);
+            }
+        });
+        let src = P2pSource::new(
+            vec![addr],
+            None,
+            Duration::from_millis(500),
+            Chain::Regtest,
+            false,
+            false,
+            Duration::from_secs(60),
+        );
+        src.set_force_when_cooling(true);
+        assert!(src.fetch_block(&Hash32([0x53; 32])).is_err());
+        assert!(src.fetch_block(&Hash32([0x54; 32])).is_err());
+        assert_eq!(accepts.load(std::sync::atomic::Ordering::SeqCst), 2);
+        // A decoy never forces anything.
+        assert!(src
+            .fetch_block_until(
+                &Hash32([0x55; 32]),
+                Instant::now() + Duration::from_secs(2),
+                FetchMode::Quiet
+            )
+            .is_err());
+        assert_eq!(accepts.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn a_v1_peer_hint_skips_the_v2_attempt() {
+        let block = test_block();
+        let bytes = bitcoin::consensus::serialize(&block);
+        let hash = Hash32::from_hex(&block.block_hash().to_string()).unwrap();
+        // The mock answers one connection only, in v1: a v2 attempt would use
+        // it up and fail.
+        let addr = mock_peer_v1(NODE_NETWORK | NODE_WITNESS, bytes.clone(), false);
+        let src = P2pSource::new(
+            Vec::new(),
+            None,
+            Duration::from_secs(5),
+            Chain::Regtest,
+            true,
+            false,
+            Duration::from_secs(5),
+        );
+        src.set_peers(vec![PeerHint {
+            addr,
+            v2: Some(false),
+        }]);
+        assert_eq!(src.fetch_block(&hash).unwrap(), bytes);
+    }
+
+    #[test]
+    fn a_trickling_peer_is_bounded_by_the_attempt() {
+        // The read deadline bounds a peer that sends a byte per second.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        std::thread::spawn(move || {
+            if let Ok((mut sock, _)) = listener.accept() {
+                for _ in 0..30 {
+                    if sock.write_all(&[0]).is_err() {
+                        return;
+                    }
+                    std::thread::sleep(Duration::from_millis(300));
+                }
+            }
+        });
+        let src = P2pSource::new(
+            vec![addr],
+            None,
+            Duration::from_secs(1),
+            Chain::Regtest,
+            false,
+            false,
+            Duration::from_secs(5),
+        );
+        let started = Instant::now();
+        assert!(src.fetch_block(&Hash32([0x56; 32])).is_err());
+        assert!(
+            started.elapsed() < Duration::from_secs(4),
+            "{:?}",
+            started.elapsed()
+        );
     }
 }

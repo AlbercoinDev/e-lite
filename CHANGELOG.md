@@ -1,5 +1,70 @@
 # Changelog
 
+## 0.1.0-alpha.29.13.0 — 2026-11-14
+
+### Fast wallet loads over Tor again, without the clearnet fallback
+
+No schema, protocol or consensus change. On a pruned node a wallet's
+`transaction.get` needs a whole block from outside. Up to 29.9.x that was
+fast because the history prefetch was always on and a failed Tor request was
+silently repeated over clearnet. 29.12.0 made both private (AUD-128, AUD-134)
+and exposed bugs the fallback had hidden: mainnet logs of 29.12.3 showed
+`tx.get` at 16-28 s on average, up to 85 s, and 25 failures in one Sparrow
+load (`all p2p peers are cooling down`, `body read failed (other error)`,
+`inflight block download timed out`, HTTP 429). The private defaults stay
+(Tor only, a new circuit per request, random provider order); the bugs are
+fixed.
+
+- **P2P over Tor (AUD-153).** The Tor breaker now trips only when the local
+  SOCKS proxy itself fails (15 s). A SOCKS reply about one peer (refused,
+  unreachable, exit policy on 8333) is that peer's failure; before, one dead
+  peer refused every other peer for 300 s and marked them all as failed
+  without contacting them. Peers back off 30 s doubling to the cooldown (a
+  wrong answer gets the full cooldown); v1 is tried only after an established
+  v2 connection; every read/write is bounded by a 20 s stall and the attempt
+  deadline. New `[rawtx] p2p_tor_timeout_seconds = 30` (the 8 s
+  `p2p_timeout_seconds` stays for direct connections). When P2P is the only
+  external source, one attempt is forced while every peer is cooling down.
+- **Peers from Core (AUD-154).** Only outbound peers with `NODE_NETWORK` and
+  `NODE_WITNESS`, on ipv4/ipv6/onion, onion first. Inbound peers (an ephemeral
+  port), I2P and CJDNS are skipped. Core's v1/v2 transport skips a useless v2
+  attempt.
+- **Esplora over Tor (AUD-155).** `tor_connect_timeout_seconds = 20` (circuit +
+  connection), `tor_stall_timeout_seconds = 25` (no header or byte) and
+  `tor_request_timeout_seconds` now **60** as the absolute limit of one
+  attempt: a slow transfer that keeps receiving bytes is not cut. Provider
+  cooldowns depend on the failure: timeout/stall/5xx 5 s doubling to 60 s,
+  429/503 honour `Retry-After` (15 s doubling, max 120 s), a wrong answer the
+  full `provider_cooldown_seconds`; a success clears it. Errors say
+  `timeout`, `stalled` or `HTTP 429` instead of `other error`.
+- **One budget per block download (AUD-156).** 60 s from the moment the
+  download is registered, queue wait included, shared by every source;
+  requests that share the download wait 65 s, so they never give up before it.
+- **Decoys (AUD-157).** One decoy is owed per real external download (wallet or
+  prefetch) and served by a single background thread, one at a time, outside
+  the wallet's download slots; a decoy failure never cools a provider or peer,
+  and decoys wait while a provider rate-limits. `/status.rawtx.decoys_pending`
+  (metric `e_lite_rawtx_decoys_pending`) replaces `decoys_inflight`.
+- **Retry storm (AUD-158).** A block whose download failed is answered from that
+  failure for 10 s instead of asking every source again.
+- **History prefetch on by default (AUD-159, supersedes AUD-134).** Its
+  downloads now owe decoys like a wallet request, it never takes the last
+  free download slot, and transactions already cached are not downloaded
+  again. `prefetch = false` restores the previous behaviour.
+
+### Fixes
+
+- `starting Core:` printed `-prune` twice (the plan already carries it).
+- The data-disk warning said "If it is ZFS, cap the ARC" right after saying
+  the disk is ZFS; it now gives the advice for the detected kind.
+
+### Upgrade notes
+
+- `tor_request_timeout_seconds = 20` in an existing `config.toml` is now the
+  **absolute** limit of an attempt; remove it (default 60) or raise it.
+- The debug startup line prints the new timeouts; the shutdown `rawtx
+  summary` prints pending decoys.
+
 ## 0.1.0-alpha.29.12.3 — 2026-11-13
 
 ### Rawtx cache maintenance and self-describing debug logs

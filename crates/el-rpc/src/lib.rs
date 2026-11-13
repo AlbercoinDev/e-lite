@@ -548,13 +548,24 @@ pub struct NodeAddress {
     pub port: u16,
     #[serde(default)]
     pub services: u64,
+    /// `ipv4`, `ipv6`, `onion`, `i2p` or `cjdns` (Core 22+; empty if absent).
+    #[serde(default)]
+    pub network: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct PeerInfo {
     pub addr: String,
+    /// An inbound peer's `addr` carries its ephemeral source port: it
+    /// cannot be connected to.
     #[serde(default)]
     pub inbound: bool,
+    /// `ipv4`, `ipv6`, `onion`, `i2p`, `cjdns` or `not_publicly_routable`.
+    #[serde(default)]
+    pub network: String,
+    /// `v1` or `v2` (BIP324), Core 26+; empty if absent.
+    #[serde(default)]
+    pub transport_protocol_type: String,
     /// Core returns this as a number in `getpeerinfo` and may format it as a
     /// hex string in other versions; accept both.
     #[serde(default, deserialize_with = "de_services")]

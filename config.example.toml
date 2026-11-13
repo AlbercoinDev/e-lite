@@ -175,24 +175,37 @@ cache_mib = 256                     # verified LRU cache, total disk budget: tra
                                     # with `e-lite cache status` / `e-lite cache clear --yes`
                                     # (never touches the index, Core, TLS or Tor)
 # cache_dir = "/dev/shm/e-lite-rawtx" # tmpfs keeps blocks off disk (counts as RAM)
-decoys = 1                          # extra blocks fetched per real fetch (max 2 in flight)
+decoys = 1                          # random indexed blocks downloaded per real external
+                                    # download (wallet or prefetch), one at a time in
+                                    # the background, paused while a provider rate-limits
 tor_socks = "127.0.0.1:9050"        # empty requires allow_clearnet = true
 allow_clearnet = false              # fail closed without Tor; also gates repair
 tor_fallback_clearnet = false       # true: if Tor fails, use clearnet (your IP is tied
                                     # to the blocks of your wallet)
-prefetch = false                    # true: download a wallet's history blocks in the
-                                    # background (faster first load; no decoys)
-request_timeout_seconds = 8         # per direct (clearnet) Esplora block request
-tor_request_timeout_seconds = 20    # per Esplora block request through Tor: each one
-                                    # builds a new circuit and downloads a whole block;
-                                    # one wallet request spends at most 40 s on providers
-provider_cooldown_seconds = 300     # cool down a failed provider (Tor or direct)
-max_parallel_fetches = 4            # total external block downloads in flight
-p2p_timeout_seconds = 8             # P2P connect/handshake/block timeout
+prefetch = true                     # download a wallet's history blocks in the background
+                                    # (faster first load); owes decoys like a wallet
+                                    # request and leaves a download slot free for it
+request_timeout_seconds = 8         # direct (clearnet) Esplora: connect/header/stall limit
+tor_connect_timeout_seconds = 20    # Esplora through Tor: circuit + connection
+tor_stall_timeout_seconds = 25      # Esplora through Tor: no header/byte for this long
+                                    # = stalled, try the next provider (new circuit)
+tor_request_timeout_seconds = 60    # absolute limit of one Esplora attempt; a transfer
+                                    # that keeps receiving bytes may use all of it.
+                                    # One block download (all sources, queue included)
+                                    # has 60 s; requests sharing it wait 65 s
+provider_cooldown_seconds = 300     # cooldown after a hard failure (bad answer, wrong
+                                    # services). Timeouts back off 5 s doubling to 60 s
+                                    # (P2P peers: 30 s doubling to this value); a 429/503
+                                    # honours Retry-After (15 s doubling, max 120 s)
+max_parallel_fetches = 4            # total external block downloads in flight (the
+                                    # prefetch never takes the last free one)
+p2p_timeout_seconds = 8             # direct P2P connect/handshake/block attempt
+p2p_tor_timeout_seconds = 30        # P2P attempt through Tor (circuit + whole block)
 use_p2p = true                      # minimal P2P client; used for prune-gap repair
 use_esplora = true                  # Esplora block endpoints; used for repair too
 p2p_v2 = true                       # BIP324 encrypted transport, fallback to v1
-p2p_peers = []                      # empty: discover from local Core
+p2p_peers = []                      # empty: discover from local Core (outbound full
+                                    # witness peers only, onion first, refreshed 10 min)
 # esplora_urls = []                 # one-off override; normally leave empty and
 #                                   # edit public-servers.toml instead (see below)
 

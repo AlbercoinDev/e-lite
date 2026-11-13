@@ -1,9 +1,10 @@
 # Session handoff
 
-**Updated:** 2026-11-13
+**Updated:** 2026-11-14
 **Latest published release:** `0.1.0-alpha.29.12.3`
 **Release:** https://github.com/AlbercoinDev/e-lite/releases/tag/v0.1.0-alpha.29.12.3
 **Main commit at handoff:** tag `v0.1.0-alpha.29.12.3`
+**In the working tree, not tagged:** `0.1.0-alpha.29.13.0` (wallet loads over Tor, AUD-153..159)
 
 alpha.29.11.0 was verified after publishing: `ci` and `release` workflows
 green, and both one-line installers (`--no-core` and `--with-core --yes`)
@@ -140,7 +141,21 @@ the dynamic ARC to work, e-lite needs write access to
 `/sys/module/zfs/parameters/zfs_arc_max` (root, group-writable parameter or a
 non-read-only mount).
 
-## Last change (alpha.29.12.3)
+## Last change (alpha.29.13.0, not published)
+
+Requested by the owner (2026-11-14) after Sparrow loads on a pruned mainnet
+and testnet4 node took 16-28 s per `transaction.get` (85 s max, 25 failures)
+where 29.9.x was fast. Cause: 29.12.0 turned off the clearnet fallback
+(AUD-128) and the prefetch (AUD-134); the fallback had hidden a P2P breaker
+that blocked every peer after one refusal, timeouts that cut live downloads
+and cooled providers for minutes, mismatched budgets and decoys competing
+with the wallet. Owner decision: keep the private defaults, fix the bugs,
+prefetch on with decoys. See CHANGELOG and AUD-153..159.
+
+**Open:** measure Sparrow over Tor on the owner's pruned mainnet node with
+`[logging] level = debug` (acceptance in ROADMAP item 4). Not measured yet.
+
+## Previous change (alpha.29.12.3)
 
 Requested by the owner (2026-11-13): a way to empty the memoised cache so a
 wallet measurement is honest, and the measurement data in the log instead of
@@ -185,7 +200,7 @@ the default.
   round trip per address into one per page.
 - `[rawtx] tor_request_timeout_seconds = 20`: Esplora requests through Tor no
   longer share the 8 s direct timeout; one `fetch_block` spends at most 40 s.
-  **Not measured**: the owner's mainnet-over-Tor run decides.
+  Measured 2026-11-13: not enough; replaced in alpha.29.13.0 (AUD-155/156).
 - Provider gate: parallel probe, one request per provider (genesis raw
   block by hash), own Tor circuit, opens 2 s after the first healthy one.
 - `/status.rawtx.tx_get_failures` + `debug: tx.get failed: <cause>`;

@@ -323,12 +323,17 @@ impl CoreSupervisor {
         cmd.stdout(log.try_clone().map_err(|e| e.to_string())?);
         cmd.stderr(log);
 
+        // The plan already carries an explicit `-prune`; print it once.
+        let prune = if self.plan_args.iter().any(|a| a.starts_with("-prune=")) {
+            String::new()
+        } else {
+            format!(" -prune={}", self.prune_mib)
+        };
         eprintln!(
-            "[e-lite] starting Core: {} -datadir={} -chain={} -prune={} {}",
+            "[e-lite] starting Core: {} -datadir={} -chain={}{prune} {}",
             self.bitcoind,
             self.datadir.display(),
             chain_arg,
-            self.prune_mib,
             self.plan_args.join(" ")
         );
         let child = cmd

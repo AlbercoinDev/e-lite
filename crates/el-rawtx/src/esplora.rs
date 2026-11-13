@@ -4,14 +4,13 @@
 //! SOCKS5h proxy and `.onion` endpoints are allowed; without Tor, external
 //! clearnet is refused unless `allow_clearnet` is explicitly enabled.
 
-use crate::{BlockSource, RawtxError, Result};
+use crate::health::{Blame, HealthMap, TRANSIENT_BASE, TRANSIENT_CAP};
+use crate::{BlockSource, FetchMode, RawtxError, Result};
 use el_model::Hash32;
 use rand::seq::SliceRandom;
 use rand::thread_rng;
-use std::collections::{HashMap, HashSet};
 use std::io::Read;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 pub struct EsploraSource {
@@ -21,42 +20,111 @@ pub struct EsploraSource {
     /// (`IsolateSOCKSAuth`, on by default): providers cannot link the blocks
     /// of one wallet by exit IP (AUD-135).
     tor_proxy: Option<String>,
-    /// Per-attempt timeout of a direct (clearnet) request.
-    timeout: Duration,
-    /// Per-attempt timeout of a request through Tor. Larger than `timeout`:
-    /// every request builds a new circuit and then downloads a whole block.
-    tor_timeout: Duration,
+    /// Absolute limit of one attempt (Tor or direct). A slow transfer that
+    /// keeps receiving bytes may use all of it (AUD-155).
+    attempt_limit: Duration,
+    /// Time to build the circuit and connect to the provider through Tor.
+    tor_connect: Duration,
+    /// No byte (or no response header) for this long through Tor: stalled.
+    tor_stall: Duration,
+    /// Direct (clearnet) client; its `timeout` is the stall/header timeout
+    /// (`request_timeout_seconds`).
     direct_client: Option<reqwest::blocking::Client>,
     fallback_clearnet: bool,
     allow_clearnet: bool,
     fallback_warned: AtomicBool,
+    /// Cooldown after a hard failure (wrong answer from the provider).
     cooldown: Duration,
-    tor_failures: Mutex<HashMap<String, Instant>>,
-    direct_failures: Mutex<HashMap<String, Instant>>,
-    /// Providers that have answered at least once: after a failure they are
-    /// cooled for a short time only. They get no priority in the order.
-    good: Mutex<HashSet<String>>,
+    tor_health: HealthMap,
+    direct_health: HealthMap,
 }
 
 const MAX_BLOCK_BYTES: u64 = 8 * 1024 * 1024;
-
-/// Total time one `fetch_block` call may spend across providers. It stays
-/// below the 45 s that concurrent callers wait for a shared download.
-const FETCH_BUDGET: Duration = Duration::from_secs(40);
-/// An attempt with less time left than this is not started.
-const MIN_ATTEMPT: Duration = Duration::from_secs(2);
+const READ_CHUNK: usize = 64 * 1024;
+/// Defaults of the Tor connect and stall timeouts (`[rawtx]
+/// tor_connect_timeout_seconds` / `tor_stall_timeout_seconds`).
+pub const DEFAULT_TOR_CONNECT: Duration = Duration::from_secs(20);
+pub const DEFAULT_TOR_STALL: Duration = Duration::from_secs(25);
 
 /// A client whose SOCKS username is random. Tor isolates streams with
 /// different SOCKS credentials onto different circuits.
 pub fn isolated_tor_client(socks: &str, timeout: Duration) -> Option<reqwest::blocking::Client> {
+    isolated_tor_client_with(socks, timeout, timeout)
+}
+
+/// `isolated_tor_client` with separate limits. In the blocking client the
+/// client `timeout` bounds the wait for the response headers **and each body
+/// read**, so it is an inactivity timeout, not a total one; `connect` bounds
+/// the circuit plus the TCP/TLS connection.
+pub fn isolated_tor_client_with(
+    socks: &str,
+    connect: Duration,
+    stall: Duration,
+) -> Option<reqwest::blocking::Client> {
     let user = format!("el{:016x}", rand::random::<u64>());
     reqwest::blocking::Client::builder()
-        .timeout(timeout)
+        .connect_timeout(connect.min(stall))
+        .timeout(stall)
         .user_agent(crate::HTTP_USER_AGENT)
         .proxy(reqwest::Proxy::all(format!("socks5h://{user}:x@{socks}")).ok()?)
         .build()
         .ok()
 }
+
+/// What went wrong with a request, without the URL (it carries the block
+/// hash of a wallet transaction, AUD-132).
+fn describe_reqwest(e: &reqwest::Error) -> String {
+    let what = if e.is_timeout() {
+        "timeout"
+    } else if e.is_connect() {
+        "connect failed"
+    } else if e.is_body() || e.is_decode() {
+        "body read failed"
+    } else if e.is_request() {
+        "error sending request"
+    } else {
+        "request failed"
+    };
+    // The innermost cause (an io or SOCKS error) says why; it never carries
+    // the URL.
+    let mut source: Option<&dyn std::error::Error> = std::error::Error::source(e);
+    let mut last = None;
+    while let Some(s) = source {
+        last = Some(s.to_string());
+        source = s.source();
+    }
+    match last {
+        Some(cause) if !cause.is_empty() && !e.is_timeout() => {
+            crate::redact_hashes(&format!("{what} ({cause})"))
+        }
+        _ => what.to_string(),
+    }
+}
+
+/// A body read error: reqwest wraps its own timeout in an `io::Error`.
+fn describe_io(e: &std::io::Error) -> String {
+    if let Some(inner) = e.get_ref().and_then(|i| i.downcast_ref::<reqwest::Error>()) {
+        return describe_reqwest(inner);
+    }
+    match e.kind() {
+        std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock => "stalled".into(),
+        kind => format!("body read failed ({kind})"),
+    }
+}
+
+/// `Retry-After` in seconds (the HTTP-date form is ignored).
+fn retry_after(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
+    headers
+        .get(reqwest::header::RETRY_AFTER)?
+        .to_str()
+        .ok()?
+        .trim()
+        .parse::<u64>()
+        .ok()
+        .map(Duration::from_secs)
+}
+
+type Attempt = std::result::Result<Vec<u8>, (RawtxError, Blame)>;
 
 impl EsploraSource {
     pub fn new(
@@ -78,8 +146,9 @@ impl EsploraSource {
         )
     }
 
-    /// Like `new`, with a separate per-attempt timeout for requests that go
-    /// through Tor.
+    /// Like `new`, with `attempt_limit` as the absolute limit of one attempt
+    /// (`[rawtx] tor_request_timeout_seconds`). The Tor connect/stall limits
+    /// default to `DEFAULT_TOR_CONNECT`/`DEFAULT_TOR_STALL`, never above it.
     #[allow(clippy::too_many_arguments)]
     pub fn with_budget(
         bases: Vec<String>,
@@ -87,13 +156,15 @@ impl EsploraSource {
         allow_clearnet: bool,
         fallback_clearnet: bool,
         timeout: Duration,
-        tor_timeout: Duration,
+        attempt_limit: Duration,
         cooldown: Duration,
     ) -> Result<Self> {
         // Keep the proxy only if a client can actually be built with it.
-        let tor_proxy = tor_socks.filter(|socks| isolated_tor_client(socks, tor_timeout).is_some());
+        let tor_proxy =
+            tor_socks.filter(|socks| isolated_tor_client(socks, attempt_limit).is_some());
         let direct_client = if allow_clearnet || fallback_clearnet {
             reqwest::blocking::Client::builder()
+                .connect_timeout(timeout)
                 .timeout(timeout)
                 .user_agent(crate::HTTP_USER_AGENT)
                 .build()
@@ -129,127 +200,145 @@ impl EsploraSource {
             ));
         }
 
+        let attempt_limit = attempt_limit.max(Duration::from_secs(1));
         Ok(EsploraSource {
             bases: clean,
             tor_proxy,
-            timeout,
-            tor_timeout,
+            attempt_limit,
+            tor_connect: DEFAULT_TOR_CONNECT.min(attempt_limit),
+            tor_stall: DEFAULT_TOR_STALL.min(attempt_limit),
             direct_client,
             fallback_clearnet,
             allow_clearnet,
             fallback_warned: AtomicBool::new(false),
             cooldown,
-            tor_failures: Mutex::new(HashMap::new()),
-            direct_failures: Mutex::new(HashMap::new()),
-            good: Mutex::new(HashSet::new()),
+            tor_health: HealthMap::new(),
+            direct_health: HealthMap::new(),
         })
     }
 
+    /// Set the Tor circuit/connect and stall timeouts (capped by the attempt
+    /// limit).
+    pub fn with_tor_timeouts(mut self, connect: Duration, stall: Duration) -> Self {
+        self.tor_connect = connect.max(Duration::from_secs(1)).min(self.attempt_limit);
+        self.tor_stall = stall.max(Duration::from_secs(1)).min(self.attempt_limit);
+        self
+    }
+
+    /// One attempt: headers within the client's stall timeout, then the body
+    /// in chunks while bytes keep arriving, up to `deadline`.
     fn fetch_with(
         client: &reqwest::blocking::Client,
         base: &str,
         hash: &Hash32,
-        timeout: Duration,
-    ) -> Result<Vec<u8>> {
+        deadline: Instant,
+    ) -> Attempt {
         let url = format!("{}/block/{}/raw", base, hash.to_hex());
-        // `without_url`: reqwest errors print the request URL, which carries
-        // the block hash of a wallet transaction (AUD-132).
-        let resp = client
+        let unavailable = |msg: String| RawtxError::Unavailable(format!("{base}: {msg}"));
+        let mut resp = client
             .get(&url)
-            .timeout(timeout)
             .send()
-            .map_err(|e| RawtxError::Unavailable(format!("{base}: {}", e.without_url())))?;
+            .map_err(|e| (unavailable(describe_reqwest(&e)), Blame::Transient))?;
         let status = resp.status();
+        if status == reqwest::StatusCode::TOO_MANY_REQUESTS
+            || status == reqwest::StatusCode::SERVICE_UNAVAILABLE
+        {
+            let wait = retry_after(resp.headers());
+            return Err((
+                unavailable(format!("HTTP {status}")),
+                Blame::RateLimited(wait),
+            ));
+        }
+        if status.is_server_error() {
+            return Err((unavailable(format!("HTTP {status}")), Blame::Transient));
+        }
         if !status.is_success() {
-            return Err(RawtxError::Unavailable(format!("{base}: HTTP {status}")));
+            return Err((unavailable(format!("HTTP {status}")), Blame::Hard));
         }
-        if resp.content_length().unwrap_or(0) > MAX_BLOCK_BYTES {
-            return Err(RawtxError::Unavailable(format!("{base}: block too large")));
+        let expected = resp.content_length();
+        if expected.unwrap_or(0) > MAX_BLOCK_BYTES {
+            return Err((unavailable("block too large".into()), Blame::Hard));
         }
-        // Bounded read: without Content-Length (chunked) the body must not be
-        // buffered past the limit before it is checked (AUD-144).
-        let mut bytes = Vec::new();
-        resp.take(MAX_BLOCK_BYTES + 1)
-            .read_to_end(&mut bytes)
-            .map_err(|e| {
-                RawtxError::Unavailable(format!("{base}: body read failed ({})", e.kind()))
-            })?;
-        if bytes.len() as u64 > MAX_BLOCK_BYTES {
-            return Err(RawtxError::Unavailable(format!("{base}: block too large")));
+        // Bounded, chunked read: without Content-Length (chunked) the body
+        // must not be buffered past the limit (AUD-144), and a transfer that
+        // keeps receiving bytes is not cut by a total timeout (AUD-155).
+        let mut bytes = Vec::with_capacity(expected.unwrap_or(0).min(MAX_BLOCK_BYTES) as usize);
+        let mut buf = vec![0u8; READ_CHUNK];
+        loop {
+            if Instant::now() >= deadline {
+                return Err((
+                    unavailable(format!(
+                        "timeout (attempt limit, {} KiB received)",
+                        bytes.len() / 1024
+                    )),
+                    Blame::Transient,
+                ));
+            }
+            match resp.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    bytes.extend_from_slice(&buf[..n]);
+                    if bytes.len() as u64 > MAX_BLOCK_BYTES {
+                        return Err((unavailable("block too large".into()), Blame::Hard));
+                    }
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(e) => {
+                    return Err((
+                        unavailable(format!(
+                            "{} after {} KiB",
+                            describe_io(&e),
+                            bytes.len() / 1024
+                        )),
+                        Blame::Transient,
+                    ))
+                }
+            }
+        }
+        if expected.is_some_and(|n| n != bytes.len() as u64) {
+            return Err((unavailable("truncated body".into()), Blame::Transient));
         }
         Ok(bytes)
     }
 
-    fn cooled(failures: &Mutex<HashMap<String, Instant>>, base: &str) -> bool {
-        failures
-            .lock()
-            .map(|m| m.get(base).is_some_and(|until| *until > Instant::now()))
-            .unwrap_or(false)
-    }
-
-    fn mark_failed(failures: &Mutex<HashMap<String, Instant>>, base: &str, cooldown: Duration) {
-        if let Ok(mut m) = failures.lock() {
-            m.insert(base.to_string(), Instant::now() + cooldown);
-        }
-    }
-
-    fn mark_good(&self, base: &str, tor: bool) {
-        if let Ok(mut good) = self.good.lock() {
-            good.insert(base.to_string());
-        }
-        let map = if tor {
-            &self.tor_failures
-        } else {
-            &self.direct_failures
-        };
-        if let Ok(mut m) = map.lock() {
-            m.remove(base);
-        }
-    }
-
-    fn is_known_good(&self, base: &str) -> bool {
-        self.good
-            .lock()
-            .map(|good| good.contains(base))
-            .unwrap_or(false)
-    }
-
-    /// A provider that answered recently should not be disabled for the full
-    /// cooldown after one transient error; retry it soon.
-    fn failure_cooldown(&self, base: &str) -> Duration {
-        if self.is_known_good(base) {
-            self.cooldown.min(Duration::from_secs(30))
-        } else {
-            self.cooldown
-        }
+    fn fail(&self, map: &HealthMap, base: &str, blame: Blame) {
+        map.fail(base, blame, TRANSIENT_BASE, TRANSIENT_CAP, self.cooldown);
     }
 
     fn attemptable(&self, base: &str) -> bool {
         let is_onion = base.to_ascii_lowercase().contains(".onion");
-        let tor_ok = self.tor_proxy.is_some() && !Self::cooled(&self.tor_failures, base);
+        let tor_ok = self.tor_proxy.is_some() && !self.tor_health.cooling(base);
         let direct_ok =
-            !is_onion && self.direct_client.is_some() && !Self::cooled(&self.direct_failures, base);
+            !is_onion && self.direct_client.is_some() && !self.direct_health.cooling(base);
         tor_ok || direct_ok
     }
 
-    /// When every provider is cooling down, force one attempt instead of
-    /// failing the wallet request without touching the network.
+    /// When every provider is cooling down, release the one whose cooldown
+    /// ends first instead of failing the wallet request without touching the
+    /// network. Its failure streak is kept, so it backs off further if it
+    /// fails again.
     fn force_one(&self, order: &[usize]) {
-        let idx = order
-            .iter()
-            .copied()
-            .find(|&i| self.is_known_good(&self.bases[i]))
-            .or_else(|| order.first().copied());
-        let Some(idx) = idx else {
+        let ends = |i: usize| {
+            let base = &self.bases[i];
+            let tor = self.tor_health.until(base);
+            let direct = self.direct_health.until(base);
+            tor.into_iter().chain(direct).min()
+        };
+        let Some(idx) = order.iter().copied().min_by_key(|&i| ends(i)) else {
             return;
         };
         let base = &self.bases[idx];
-        if let Ok(mut m) = self.tor_failures.lock() {
-            m.remove(base);
-        }
-        if let Ok(mut m) = self.direct_failures.lock() {
-            m.remove(base);
-        }
+        self.tor_health.release(base);
+        self.direct_health.release(base);
+    }
+
+    /// The deadline of the next attempt, or `None` once the call's deadline
+    /// leaves too little time.
+    fn attempt_deadline(&self, deadline: Instant) -> Option<Instant> {
+        let now = Instant::now();
+        let left = deadline.saturating_duration_since(now);
+        (left >= crate::MIN_ATTEMPT.min(self.attempt_limit))
+            .then(|| now + left.min(self.attempt_limit))
     }
 }
 
@@ -259,65 +348,86 @@ impl BlockSource for EsploraSource {
     }
 
     fn fetch_block(&self, hash: &Hash32) -> Result<Vec<u8>> {
+        self.fetch_block_until(
+            hash,
+            Instant::now() + crate::EXTERNAL_BUDGET,
+            FetchMode::Normal,
+        )
+    }
+
+    fn under_pressure(&self) -> bool {
+        self.tor_health.any_limited() || self.direct_health.any_limited()
+    }
+
+    fn fetch_block_until(
+        &self,
+        hash: &Hash32,
+        deadline: Instant,
+        mode: FetchMode,
+    ) -> Result<Vec<u8>> {
         let mut order: Vec<usize> = (0..self.bases.len()).collect();
         order.shuffle(&mut thread_rng());
         // Purely random order (AUD-135): preferring the provider that answered
         // last sent every block of a wallet to the same one. A dead provider
         // is not paid for on every block because a failure cools it down.
         if !order.iter().any(|&i| self.attemptable(&self.bases[i])) {
+            if mode == FetchMode::Quiet {
+                return Err(RawtxError::Unavailable(
+                    "all providers are cooling down".into(),
+                ));
+            }
             self.force_one(&order);
         }
+        let quiet = mode == FetchMode::Quiet;
 
-        let started = Instant::now();
-        // Time left for one attempt, or `None` once the call's budget is spent.
-        let attempt_timeout = |limit: Duration| -> Option<Duration> {
-            let left = FETCH_BUDGET.saturating_sub(started.elapsed());
-            (left >= MIN_ATTEMPT.min(limit)).then(|| limit.min(left))
-        };
         let mut errors = Vec::new();
         for idx in order {
             let base = &self.bases[idx];
             let is_onion = base.to_ascii_lowercase().contains(".onion");
 
             if let Some(socks) = self.tor_proxy.as_deref() {
-                if Self::cooled(&self.tor_failures, base) {
+                if self.tor_health.cooling(base) {
                     errors.push(format!("tor {base}: cooling down"));
-                } else if let Some(timeout) = attempt_timeout(self.tor_timeout) {
-                    let Some(client) = isolated_tor_client(socks, timeout) else {
+                } else if let Some(attempt) = self.attempt_deadline(deadline) {
+                    let Some(client) =
+                        isolated_tor_client_with(socks, self.tor_connect, self.tor_stall)
+                    else {
                         errors.push(format!("tor {base}: client unavailable"));
                         continue;
                     };
-                    match Self::fetch_with(&client, base, hash, timeout) {
+                    match Self::fetch_with(&client, base, hash, attempt) {
                         Ok(bytes) => {
-                            self.mark_good(base, true);
+                            self.tor_health.succeed(base);
                             return Ok(bytes);
                         }
-                        Err(e) => {
-                            let cooldown = self.failure_cooldown(base);
-                            Self::mark_failed(&self.tor_failures, base, cooldown);
+                        Err((e, blame)) => {
+                            // A decoy never cools a provider down (AUD-157).
+                            if !quiet {
+                                self.fail(&self.tor_health, base, blame);
+                            }
                             errors.push(format!("tor {e}"));
                         }
                     }
                 } else {
-                    errors.push("fetch budget exceeded".to_string());
+                    errors.push("deadline reached".to_string());
                     break;
                 }
             }
 
             if !is_onion {
                 if let Some(client) = &self.direct_client {
-                    if Self::cooled(&self.direct_failures, base) {
+                    if self.direct_health.cooling(base) {
                         errors.push(format!("direct {base}: cooling down"));
                         continue;
                     }
-                    let Some(timeout) = attempt_timeout(self.timeout) else {
-                        errors.push("fetch budget exceeded".to_string());
+                    let Some(attempt) = self.attempt_deadline(deadline) else {
+                        errors.push("deadline reached".to_string());
                         break;
                     };
                     let via_fallback = self.fallback_clearnet && !self.allow_clearnet;
-                    match Self::fetch_with(client, base, hash, timeout) {
+                    match Self::fetch_with(client, base, hash, attempt) {
                         Ok(bytes) => {
-                            self.mark_good(base, false);
+                            self.direct_health.succeed(base);
                             if via_fallback && !self.fallback_warned.swap(true, Ordering::Relaxed) {
                                 eprintln!(
                                     "[e-lite] WARNING: Tor request failed; using clearnet for {base} (operator IP exposed)"
@@ -325,9 +435,10 @@ impl BlockSource for EsploraSource {
                             }
                             return Ok(bytes);
                         }
-                        Err(e) => {
-                            let cooldown = self.failure_cooldown(base);
-                            Self::mark_failed(&self.direct_failures, base, cooldown);
+                        Err((e, blame)) => {
+                            if !quiet {
+                                self.fail(&self.direct_health, base, blame);
+                            }
                             errors.push(format!("direct {e}"));
                         }
                     }
@@ -697,5 +808,161 @@ mod tests {
             Duration::from_secs(5),
         );
         assert!(err.is_err());
+    }
+
+    /// Serves `body` after the headers in `pieces` chunks, `gap` apart, then
+    /// keeps the connection open for `hang`.
+    fn serve_paced(body: Vec<u8>, pieces: usize, gap: Duration, hang: Duration) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            while let Ok((mut sock, _)) = listener.accept() {
+                let mut buf = [0u8; 4096];
+                let _ = sock.read(&mut buf);
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = sock.write_all(head.as_bytes());
+                let step = body.len().div_ceil(pieces);
+                for chunk in body.chunks(step) {
+                    std::thread::sleep(gap);
+                    if sock.write_all(chunk).is_err() {
+                        break;
+                    }
+                }
+                std::thread::sleep(hang);
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    #[test]
+    fn a_slow_but_live_body_is_not_cut_short() {
+        // AUD-155: 2 s of steady transfer with a 1 s stall timeout.
+        let body = vec![7u8; 64 * 1024];
+        let base = serve_paced(body.clone(), 8, Duration::from_millis(250), Duration::ZERO);
+        let src = EsploraSource::with_budget(
+            vec![base],
+            None,
+            true,
+            false,
+            Duration::from_secs(1),
+            Duration::from_secs(10),
+            Duration::from_secs(60),
+        )
+        .unwrap();
+        assert_eq!(src.fetch_block(&Hash32([0x61; 32])).unwrap(), body);
+    }
+
+    #[test]
+    fn a_stalled_body_is_a_short_transient_failure() {
+        let body = vec![7u8; 64 * 1024];
+        // Half the body arrives, then nothing.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let half = body.len() / 2;
+        std::thread::spawn(move || {
+            if let Ok((mut sock, _)) = listener.accept() {
+                let mut buf = [0u8; 4096];
+                let _ = sock.read(&mut buf);
+                let head = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n", body.len());
+                let _ = sock.write_all(head.as_bytes());
+                let _ = sock.write_all(&body[..half]);
+                std::thread::sleep(Duration::from_secs(5));
+            }
+        });
+        let base = format!("http://{addr}");
+        let src = EsploraSource::with_budget(
+            vec![base.clone()],
+            None,
+            true,
+            false,
+            Duration::from_secs(1),
+            Duration::from_secs(10),
+            Duration::from_secs(300),
+        )
+        .unwrap();
+        let started = Instant::now();
+        let err = src
+            .fetch_block(&Hash32([0x62; 32]))
+            .unwrap_err()
+            .to_string();
+        assert!(started.elapsed() < Duration::from_secs(4));
+        assert!(err.contains("timeout") || err.contains("stalled"), "{err}");
+        assert!(!err.contains("other error"), "{err}");
+        // Transient: the backoff starts at 5 s, not at the 300 s cooldown.
+        let until = src.direct_health.until(&base).unwrap();
+        assert!(until <= Instant::now() + Duration::from_secs(6));
+    }
+
+    #[test]
+    fn a_rate_limit_moves_on_and_honours_retry_after() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let limited_hits = Arc::new(AtomicUsize::new(0));
+        let hits = Arc::clone(&limited_hits);
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let limited = format!("http://{}", listener.local_addr().unwrap());
+        std::thread::spawn(move || {
+            while let Ok((mut sock, _)) = listener.accept() {
+                hits.fetch_add(1, Ordering::SeqCst);
+                let mut buf = [0u8; 4096];
+                let _ = sock.read(&mut buf);
+                let _ = sock.write_all(
+                    b"HTTP/1.1 429 Too Many Requests\r\nRetry-After: 30\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                );
+            }
+        });
+        let good = serve_ok(vec![1, 2, 3], Arc::new(AtomicUsize::new(0)));
+        let src = EsploraSource::new(
+            vec![limited.clone(), good],
+            None,
+            true,
+            false,
+            Duration::from_secs(2),
+            Duration::from_secs(300),
+        )
+        .unwrap();
+        for i in 0..20u8 {
+            // The same request moves on to the healthy provider.
+            assert_eq!(src.fetch_block(&Hash32([i; 32])).unwrap(), vec![1, 2, 3]);
+            if limited_hits.load(Ordering::SeqCst) > 0 {
+                break;
+            }
+        }
+        assert_eq!(limited_hits.load(Ordering::SeqCst), 1);
+        assert!(src.under_pressure());
+        let until = src.direct_health.until(&limited).unwrap();
+        let left = until.saturating_duration_since(Instant::now());
+        assert!(
+            left > Duration::from_secs(25) && left <= Duration::from_secs(30),
+            "{left:?}"
+        );
+    }
+
+    #[test]
+    fn a_decoy_failure_does_not_cool_a_provider() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let requests = Arc::new(AtomicUsize::new(0));
+        let bad = serve_500(Arc::clone(&requests));
+        let src = EsploraSource::new(
+            vec![bad.clone()],
+            None,
+            true,
+            false,
+            Duration::from_secs(2),
+            Duration::from_secs(60),
+        )
+        .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        assert!(src
+            .fetch_block_until(&Hash32([0x63; 32]), deadline, FetchMode::Quiet)
+            .is_err());
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
+        assert!(src.direct_health.until(&bad).is_none());
     }
 }

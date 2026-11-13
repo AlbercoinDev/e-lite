@@ -216,8 +216,17 @@ Never treat a version number in this file as authoritative over the code/tag.
   reserved value`. Reject peers that do not advertise `NODE_WITNESS`, and
   validate the witness commitment inside the P2P source before marking a peer
   good. P2P is fail-fast: random order among the discovered peers (no peer is
-  preferred, AUD-135), per-peer timeout/failed-peer cooldown, total 2× timeout, and a Tor circuit breaker
-  before clearnet fallback. Never let one block spend minutes trying dead peers.
+  preferred, AUD-135), per-peer backoff (30 s doubling to the cooldown; a
+  wrong answer gets the full cooldown), at most two attempt budgets per call
+  (`p2p_tor_timeout_seconds` 30 s through Tor, `p2p_timeout_seconds` 8 s
+  direct). **Only a failure of the local SOCKS proxy** (no TCP, failed
+  greeting/auth) pauses P2P over Tor (15 s); a SOCKS reply about one peer
+  (refused, unreachable, exit policy) is that peer's failure. Never cool a
+  peer that was not contacted, and do not retry v1 after a v2 connection that
+  could not be made (AUD-153). Discovery takes Core's **outbound** peers with
+  `NODE_NETWORK`+`NODE_WITNESS`, onion first, never inbound (ephemeral port)
+  or I2P/CJDNS, and keeps Core's v1/v2 transport as a hint (AUD-154). Never
+  let one block spend minutes trying dead peers.
 - BIP141: when several coinbase outputs match the commitment pattern, the
   highest output index is the commitment; the coinbase witness must be exactly
   one 32-byte reserved value.
@@ -235,28 +244,44 @@ Never treat a version number in this file as authoritative over the code/tag.
   errors only via `without_url()` (AUD-132). P2P peers discovered from Core
   are refreshed every 10 min (60 s while empty) by `el-p2p-peers`; pinned
   `p2p_peers` are never replaced (AUD-137).
-- Provider health is sticky: a failed Tor **or direct** request cools that
-  provider for `provider_cooldown_seconds` (300 s). Providers are tried in
+- Provider health depends on the failure (`crates/el-rawtx/src/health.rs`,
+  AUD-155): timeout/stall/truncated body/5xx back off 5 s doubling to 60 s,
+  429/503 honour `Retry-After` (15 s doubling, max 120 s; over Tor the limit
+  is per exit), and only a wrong answer gets `provider_cooldown_seconds`
+  (300 s). A success clears the streak. Do not go back to cooling a provider
+  for minutes after a slow circuit: without the clearnet fallback that left a
+  wallet with no source at all. Providers are tried in
   **random order**; never prefer the one that answered last, which sent every
-  block of a wallet to a single provider (AUD-135). A provider that already
-  answered is cooled for at
-  most 30 s after a failure; if every provider is cooling down, e-lite forces
-  one attempt rather than failing the wallet request. `max_parallel_fetches`
-  (4) bounds total external downloads; concurrent requests for the same block
-  share one download. A request through Tor has its own timeout
-  (`tor_request_timeout_seconds`, 20 s; direct stays at
-  `request_timeout_seconds`, 8 s) because each one builds a new circuit and
-  downloads a whole block; one `fetch_block` call spends at most 40 s across
-  providers, below the 45 s that followers wait for a shared download.
+  block of a wallet to a single provider (AUD-135). If every provider is
+  cooling down, e-lite forces one attempt on the one whose pause ends first.
+  `max_parallel_fetches` (4) bounds total external downloads; concurrent
+  requests for the same block share one download. Through Tor an Esplora
+  attempt has `tor_connect_timeout_seconds` (20 s) for circuit + connection,
+  fails after `tor_stall_timeout_seconds` (25 s) without a header or byte (the
+  blocking reqwest client `timeout` is per read, not total; never use
+  `RequestBuilder::timeout`) and is capped at `tor_request_timeout_seconds`
+  (60 s). One block download has **one** budget, `EXTERNAL_BUDGET` (60 s),
+  fixed when its leader registers (queue wait included) and split across
+  sources (all but the last leave a third); followers wait
+  `EXTERNAL_BUDGET + FOLLOWER_GRACE` (65 s), so they never give up before the
+  leader (AUD-156). A block that failed is answered from that failure for
+  `FAILURE_MEMORY` (10 s) (AUD-158).
   `RawtxError::NoSource` (nothing could be asked) is distinct from
   `Unavailable` (every source failed); `/status.rawtx.tx_get_failures` counts
   `transaction.get` failures by cause.
-- Decoys default to 1, at most 2 are in flight, and the prefetch never spawns
-  decoys. For that reason the history prefetch is **off by default**
-  (`[rawtx] prefetch`, AUD-134). When enabled, the prefetcher enqueues up to 16 confirmed history blocks per
-  history response, each with **all** of that history's txids in the block
-  (`prefetch_block_txs`: one download caches them all), with one worker; it is
-  an optimisation, never correctness.
+- Decoys default to 1 **per real external download, wallet or prefetch**.
+  They are owed to one `el-decoys` thread that downloads them one at a time
+  (0.25-1.5 s apart) outside the wallet's download slots, in
+  `FetchMode::Quiet` (a decoy failure never changes provider/peer health),
+  waits while a provider rate-limits, and holds no store handle; at most 32
+  are owed (AUD-157). The history prefetch is therefore **on by default**
+  (`[rawtx] prefetch`, AUD-159, supersedes AUD-134): it enqueues up to 16
+  confirmed history blocks per history response, each with **all** of that
+  history's txids in the block (`prefetch_block_txs`: one download caches
+  them all), with one worker that never takes the last free download slot;
+  blocks already in the transaction cache are not downloaded. It is an
+  optimisation, never correctness. Without it a pruned node makes every
+  `transaction.get` wait for a whole block over Tor.
 - The rawtx cache defaults to 256 MiB under `<data-dir>/rawtx-cache` and is a
   **transaction** cache (AUD-139): wallet requests store the verified
   transaction plus its merkle branch (`tx/<xx>/<txid>.tx`, accounted in 4 KiB

@@ -122,6 +122,8 @@ fn fixture() -> (Fixture, ScriptHash, Hash32) {
                 fallback_clearnet: false,
                 request_timeout_seconds: 15,
                 tor_request_timeout_seconds: 15,
+                tor_connect_timeout_seconds: 15,
+                tor_stall_timeout_seconds: 15,
                 provider_cooldown_seconds: 120,
                 max_parallel_fetches: 4,
                 cache_dir: None,
@@ -131,6 +133,7 @@ fn fixture() -> (Fixture, ScriptHash, Hash32) {
                 esplora_urls: Vec::new(),
                 p2p_peers: Vec::new(),
                 p2p_timeout: Duration::from_secs(1),
+                p2p_tor_timeout: Duration::from_secs(1),
                 chain,
             },
         )
@@ -458,6 +461,8 @@ fn slow_transaction_get_does_not_hold_the_index_lock() {
                 fallback_clearnet: false,
                 request_timeout_seconds: 15,
                 tor_request_timeout_seconds: 15,
+                tor_connect_timeout_seconds: 15,
+                tor_stall_timeout_seconds: 15,
                 provider_cooldown_seconds: 120,
                 max_parallel_fetches: 4,
                 cache_dir: None,
@@ -467,6 +472,7 @@ fn slow_transaction_get_does_not_hold_the_index_lock() {
                 esplora_urls: Vec::new(),
                 p2p_peers: Vec::new(),
                 p2p_timeout: Duration::from_secs(1),
+                p2p_tor_timeout: Duration::from_secs(1),
                 chain: Chain::Regtest,
             },
         )

@@ -661,18 +661,26 @@ pub struct RawtxCfg {
     #[serde(default)]
     pub tor_fallback_clearnet: bool,
     /// Download the blocks of a wallet's confirmed history in the background
-    /// as soon as the history is requested. Off by default (AUD-134): it
-    /// fetches blocks the wallet may never ask for, without decoys.
-    #[serde(default)]
+    /// as soon as the history is requested. On by default: each external
+    /// download owes decoys like a wallet request and leaves a download slot
+    /// free for the wallet (AUD-159, supersedes the AUD-134 default).
+    #[serde(default = "d_true")]
     pub prefetch: bool,
     /// Timeout for each direct (clearnet) Esplora raw-block request.
     #[serde(default = "d_rawtx_timeout")]
     pub request_timeout_seconds: u64,
-    /// Timeout for each Esplora raw-block request through Tor. Every request
-    /// builds its own circuit (AUD-135) and downloads a whole block, so the
-    /// clearnet value is too short for it.
+    /// Absolute limit of one Esplora raw-block attempt. Every Tor request
+    /// builds its own circuit (AUD-135) and downloads a whole block; a
+    /// transfer that keeps receiving bytes may use all of it (AUD-155).
     #[serde(default = "d_rawtx_tor_timeout")]
     pub tor_request_timeout_seconds: u64,
+    /// Circuit + connection time of an Esplora request through Tor.
+    #[serde(default = "d_rawtx_tor_connect")]
+    pub tor_connect_timeout_seconds: u64,
+    /// No response header or body byte for this long through Tor: the
+    /// attempt is stalled and the next provider is tried.
+    #[serde(default = "d_rawtx_tor_stall")]
+    pub tor_stall_timeout_seconds: u64,
     /// Skip a provider (Tor and/or direct) after a failed request.
     #[serde(default = "d_provider_cooldown")]
     pub provider_cooldown_seconds: u64,
@@ -683,9 +691,12 @@ pub struct RawtxCfg {
     /// tmpfs (for example `/dev/shm/e-lite-rawtx`) to keep blocks off disk.
     #[serde(default)]
     pub cache_dir: String,
-    /// Timeout for one P2P connect/handshake/block attempt.
+    /// Timeout for one direct P2P connect/handshake/block attempt.
     #[serde(default = "d_p2p_timeout")]
     pub p2p_timeout_seconds: u64,
+    /// Timeout for one P2P attempt through Tor (circuit + whole block).
+    #[serde(default = "d_p2p_tor_timeout")]
+    pub p2p_tor_timeout_seconds: u64,
     #[serde(default = "d_true")]
     pub use_p2p: bool,
     #[serde(default = "d_true")]
@@ -708,13 +719,16 @@ impl Default for RawtxCfg {
             tor_socks: d_tor_socks(),
             allow_clearnet: false,
             tor_fallback_clearnet: false,
-            prefetch: false,
+            prefetch: true,
             request_timeout_seconds: d_rawtx_timeout(),
             tor_request_timeout_seconds: d_rawtx_tor_timeout(),
+            tor_connect_timeout_seconds: d_rawtx_tor_connect(),
+            tor_stall_timeout_seconds: d_rawtx_tor_stall(),
             provider_cooldown_seconds: d_provider_cooldown(),
             max_parallel_fetches: d_max_parallel_fetches(),
             cache_dir: String::new(),
             p2p_timeout_seconds: d_p2p_timeout(),
+            p2p_tor_timeout_seconds: d_p2p_tor_timeout(),
             use_p2p: true,
             use_esplora: true,
             p2p_v2: true,
@@ -783,7 +797,16 @@ fn d_rawtx_timeout() -> u64 {
     8
 }
 fn d_rawtx_tor_timeout() -> u64 {
+    60
+}
+fn d_rawtx_tor_connect() -> u64 {
     20
+}
+fn d_rawtx_tor_stall() -> u64 {
+    25
+}
+fn d_p2p_tor_timeout() -> u64 {
+    30
 }
 fn d_provider_cooldown() -> u64 {
     300

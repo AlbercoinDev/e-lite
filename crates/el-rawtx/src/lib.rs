@@ -9,6 +9,7 @@ pub mod cache;
 pub mod cachelayout;
 pub mod core_source;
 pub mod esplora;
+pub(crate) mod health;
 pub mod p2p;
 pub mod txcache;
 pub mod verify;
@@ -20,7 +21,7 @@ use rand::thread_rng;
 use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::panic::AssertUnwindSafe;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
@@ -97,7 +98,7 @@ fn verify_cached_tx(
 }
 pub use core_source::CoreBlockSource;
 pub use esplora::{isolated_tor_client, EsploraSource};
-pub use p2p::P2pSource;
+pub use p2p::{P2pSource, PeerHint};
 pub use verify::{extract_tx, verify_block, verify_block_by_hash, verify_witness_commitment};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -182,10 +183,48 @@ pub fn redact_hashes(text: &str) -> String {
     out
 }
 
+/// Total time one external block download may take, from the moment its
+/// leader registers it (queue wait included) to the last source. Callers that
+/// share the download wait `EXTERNAL_BUDGET + FOLLOWER_GRACE`, so a follower
+/// never gives up before its leader (AUD-156).
+pub const EXTERNAL_BUDGET: Duration = Duration::from_secs(60);
+/// Extra time a follower waits beyond the leader's deadline.
+pub const FOLLOWER_GRACE: Duration = Duration::from_secs(5);
+/// A block whose download just failed is answered from that failure for this
+/// long instead of asking every source again (AUD-158).
+pub const FAILURE_MEMORY: Duration = Duration::from_secs(10);
+/// An attempt with less time left than this is not started.
+pub(crate) const MIN_ATTEMPT: Duration = Duration::from_secs(2);
+
+/// Whether a download may change a source's view of its endpoints.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FetchMode {
+    /// A wallet or prefetch download: failures cool endpoints down.
+    Normal,
+    /// A decoy: its failures are not the wallet's problem and must not cool
+    /// down a provider or peer that real requests need (AUD-157).
+    Quiet,
+}
+
 /// A source that can return a **whole raw block** by hash.
 pub trait BlockSource: Send + Sync {
     fn name(&self) -> &str;
     fn fetch_block(&self, hash: &Hash32) -> Result<Vec<u8>>;
+    /// Like `fetch_block`, bounded by `deadline` and in `mode`. Sources that
+    /// talk to the network override it; the default ignores both.
+    fn fetch_block_until(
+        &self,
+        hash: &Hash32,
+        deadline: Instant,
+        mode: FetchMode,
+    ) -> Result<Vec<u8>> {
+        let _ = (deadline, mode);
+        self.fetch_block(hash)
+    }
+    /// Whether the source is being rate limited right now (decoys wait).
+    fn under_pressure(&self) -> bool {
+        false
+    }
     /// Local sources never leak anything to third parties.
     fn is_local(&self) -> bool {
         false
@@ -220,8 +259,13 @@ pub struct RawtxConfig {
     pub fallback_clearnet: bool,
     /// Timeout for a single direct (clearnet) Esplora block request.
     pub request_timeout_seconds: u64,
-    /// Timeout for a single Esplora block request through Tor.
+    /// Absolute limit of one Esplora attempt (Tor or direct); a transfer
+    /// that keeps receiving bytes may use all of it.
     pub tor_request_timeout_seconds: u64,
+    /// Circuit + connection time allowed for an Esplora request through Tor.
+    pub tor_connect_timeout_seconds: u64,
+    /// No response header or body byte for this long through Tor: stalled.
+    pub tor_stall_timeout_seconds: u64,
     /// Skip a provider (Tor or direct) after a failed attempt.
     pub provider_cooldown_seconds: u64,
     /// Maximum concurrent external block downloads.
@@ -234,6 +278,8 @@ pub struct RawtxConfig {
     pub esplora_urls: Vec<String>,
     pub p2p_peers: Vec<String>,
     pub p2p_timeout: Duration,
+    /// Per-attempt limit of a P2P connection made through Tor.
+    pub p2p_tor_timeout: Duration,
     pub chain: Chain,
 }
 
@@ -242,15 +288,95 @@ struct InflightBlock {
     done: Mutex<bool>,
     result: Mutex<Option<Result<Vec<u8>>>>,
     cv: Condvar,
+    /// The leader's deadline, fixed when it registered (before waiting for
+    /// a download slot). Followers wait until `deadline + FOLLOWER_GRACE`.
+    deadline: Instant,
 }
 
 impl InflightBlock {
-    fn new() -> Self {
+    fn new(deadline: Instant) -> Self {
         Self {
             done: Mutex::new(false),
             result: Mutex::new(None),
             cv: Condvar::new(),
+            deadline,
         }
+    }
+}
+
+/// Who asks for an external block. A wallet request may take the last free
+/// download slot; the background prefetch always leaves one for it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Priority {
+    Wallet,
+    Prefetch,
+}
+
+/// Decoys owed for real external downloads, at most this many.
+const MAX_DECOY_DEBT: usize = 32;
+
+/// Decoy downloads owed for real external downloads (wallet or prefetch),
+/// served one at a time by a background thread outside the wallet's
+/// download slots. A decoy never changes a provider's or peer's health and
+/// waits while a provider rate-limits (AUD-157).
+struct DecoyLane {
+    queue: Mutex<VecDeque<Hash32>>,
+    cv: Condvar,
+    closed: std::sync::atomic::AtomicBool,
+    started: std::sync::Once,
+}
+
+impl DecoyLane {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            queue: Mutex::new(VecDeque::new()),
+            cv: Condvar::new(),
+            closed: std::sync::atomic::AtomicBool::new(false),
+            started: std::sync::Once::new(),
+        })
+    }
+
+    fn pending(&self) -> usize {
+        self.queue.lock().map(|q| q.len()).unwrap_or(0)
+    }
+
+    /// Next owed decoy, or `None` once the resolver is gone.
+    fn next(&self) -> Option<Hash32> {
+        let mut queue = self
+            .queue
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        loop {
+            if self.closed.load(Ordering::Relaxed) {
+                return None;
+            }
+            if let Some(hash) = queue.front().copied() {
+                return Some(hash);
+            }
+            queue = self
+                .cv
+                .wait_timeout(queue, Duration::from_secs(1))
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .0;
+        }
+    }
+
+    fn done(&self) {
+        if let Ok(mut queue) = self.queue.lock() {
+            queue.pop_front();
+        }
+    }
+
+    /// Sleep up to `d`, returning early (false) once the resolver is gone.
+    fn pause(&self, d: Duration) -> bool {
+        let end = Instant::now() + d;
+        while Instant::now() < end {
+            if self.closed.load(Ordering::Relaxed) {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(50).min(end - Instant::now()));
+        }
+        !self.closed.load(Ordering::Relaxed)
     }
 }
 
@@ -258,32 +384,43 @@ impl InflightBlock {
 /// in an async runtime.
 struct Semaphore {
     permits: Mutex<usize>,
+    total: usize,
     cv: Condvar,
 }
 
 impl Semaphore {
     fn new(permits: usize) -> Arc<Self> {
+        let total = permits.max(1);
         Arc::new(Self {
-            permits: Mutex::new(permits.max(1)),
+            permits: Mutex::new(total),
+            total,
             cv: Condvar::new(),
         })
     }
 
-    fn acquire(self: &Arc<Self>) -> Permit {
+    /// Take a permit while more than `keep_free` are free, waiting until
+    /// `deadline` at most. `keep_free` never blocks a single-permit pool.
+    fn acquire_until(self: &Arc<Self>, deadline: Instant, keep_free: usize) -> Option<Permit> {
+        let keep_free = keep_free.min(self.total - 1);
         let mut permits = self
             .permits
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        while *permits == 0 {
+        while *permits <= keep_free {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return None;
+            }
             permits = self
                 .cv
-                .wait(permits)
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
+                .wait_timeout(permits, left)
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .0;
         }
         *permits -= 1;
-        Permit {
+        Some(Permit {
             sem: Arc::clone(self),
-        }
+        })
     }
 }
 
@@ -299,7 +436,9 @@ impl Drop for Permit {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         *permits += 1;
-        self.sem.cv.notify_one();
+        // Every waiter re-checks: a prefetch may not take what a wallet
+        // request is waiting for.
+        self.sem.cv.notify_all();
     }
 }
 
@@ -323,8 +462,17 @@ pub struct Resolver {
     stats: Arc<RawtxStats>,
     chain: Chain,
     inflight: Mutex<HashMap<Hash32, Arc<InflightBlock>>>,
+    /// Blocks whose download failed recently, with the error (AUD-158).
+    failed: Mutex<HashMap<Hash32, (Instant, RawtxError)>>,
     external_slots: Arc<Semaphore>,
-    decoys_inflight: Arc<AtomicUsize>,
+    decoy_lane: Arc<DecoyLane>,
+}
+
+impl Drop for Resolver {
+    fn drop(&mut self) {
+        self.decoy_lane.closed.store(true, Ordering::Relaxed);
+        self.decoy_lane.cv.notify_all();
+    }
 }
 
 impl Resolver {
@@ -351,6 +499,7 @@ impl Resolver {
                             cfg.fallback_clearnet,
                             Duration::from_secs(cfg.provider_cooldown_seconds.max(1)),
                         )
+                        .with_tor_timeout(cfg.p2p_tor_timeout)
                         .with_stats(Arc::clone(&stats)),
                     ));
                 }
@@ -365,10 +514,16 @@ impl Resolver {
                     Duration::from_secs(cfg.tor_request_timeout_seconds.max(1)),
                     Duration::from_secs(cfg.provider_cooldown_seconds.max(1)),
                 ) {
-                    Ok(s) => external.push(Arc::new(s)),
+                    Ok(s) => external.push(Arc::new(s.with_tor_timeouts(
+                        Duration::from_secs(cfg.tor_connect_timeout_seconds.max(1)),
+                        Duration::from_secs(cfg.tor_stall_timeout_seconds.max(1)),
+                    ))),
                     Err(e) => eprintln!("[e-lite] esplora disabled: {e}"),
                 }
             }
+        }
+        if let Some(p2p) = &p2p {
+            p2p.set_force_when_cooling(external.is_empty());
         }
 
         let cache_dir = cfg
@@ -408,8 +563,9 @@ impl Resolver {
             stats,
             chain: cfg.chain,
             inflight: Mutex::new(HashMap::new()),
+            failed: Mutex::new(HashMap::new()),
             external_slots: Semaphore::new(cfg.max_parallel_fetches),
-            decoys_inflight: Arc::new(AtomicUsize::new(0)),
+            decoy_lane: DecoyLane::new(),
         })
     }
 
@@ -421,6 +577,9 @@ impl Resolver {
     /// Inject an additional external source (used by tests and custom setups).
     pub fn with_external(mut self, source: Arc<dyn BlockSource>) -> Self {
         self.external.push(source);
+        if let Some(p2p) = &self.p2p {
+            p2p.set_force_when_cooling(false);
+        }
         self
     }
 
@@ -446,7 +605,7 @@ impl Resolver {
 
     /// Replace the P2P peer list (discovered from Core). Returns the new
     /// count, or `None` when P2P is disabled.
-    pub fn refresh_p2p_peers(&self, peers: Vec<String>) -> Option<usize> {
+    pub fn refresh_p2p_peers(&self, peers: Vec<PeerHint>) -> Option<usize> {
         self.p2p.as_ref().map(|p2p| p2p.set_peers(peers))
     }
 
@@ -575,17 +734,18 @@ impl Resolver {
 
     /// Resolve a confirmed transaction's raw hex at `height`.
     pub fn raw_tx(&self, txid: Hash32, height: u32) -> Result<String> {
-        self.raw_tx_inner(txid, height, true)
+        self.raw_tx_inner(txid, height, Priority::Wallet)
     }
 
-    /// Background prefetch path: same lookup, but no privacy decoys.
+    /// Background prefetch path: same lookup and decoys, lower priority.
     pub fn raw_tx_prefetch(&self, txid: Hash32, height: u32) -> Result<String> {
-        self.raw_tx_inner(txid, height, false)
+        self.raw_tx_inner(txid, height, Priority::Prefetch)
     }
 
     /// Prefetch every listed transaction of one block with a single block
-    /// fetch and no decoys, caching each one. Returns how many were fetched
-    /// (0 when all were already cached).
+    /// fetch, caching each one. An external download owes decoys like a
+    /// wallet request (AUD-159) and never takes the last free download
+    /// slot. Returns how many were fetched (0 when all were already cached).
     pub fn prefetch_block_txs(&self, height: u32, txids: &[Hash32]) -> Result<usize> {
         let rec = self.block_record(height)?;
         let missing: Vec<Hash32> = txids
@@ -596,7 +756,7 @@ impl Resolver {
         if missing.is_empty() {
             return Ok(0);
         }
-        let (block, _) = self.verified_block(&rec)?;
+        let (block, _) = self.verified_block(&rec, Priority::Prefetch)?;
         self.cache_txs(&rec, &block, &missing)?;
         Ok(missing.len())
     }
@@ -607,7 +767,7 @@ impl Resolver {
             .ok_or_else(|| RawtxError::Unavailable(format!("block {height} not indexed")))
     }
 
-    fn raw_tx_inner(&self, txid: Hash32, height: u32, allow_decoys: bool) -> Result<String> {
+    fn raw_tx_inner(&self, txid: Hash32, height: u32, priority: Priority) -> Result<String> {
         let rec = self.block_record(height)?;
         // 1) Transaction cache: one small file per transaction (AUD-139).
         if let Some(hex) = self.cached_tx(&rec, txid) {
@@ -616,14 +776,11 @@ impl Resolver {
         }
         // 2) The block: recent blocks in memory, legacy block cache, local
         //    Core, then external sources (shared across concurrent callers).
-        let (block, origin) = self.verified_block(&rec)?;
+        let (block, _) = self.verified_block(&rec, priority)?;
         let hex = self
             .cache_txs(&rec, &block, &[txid])?
             .pop()
             .ok_or_else(|| RawtxError::Verify("transaction is not in the block".into()))?;
-        if origin == Origin::External && allow_decoys {
-            self.spawn_decoys(rec.hash);
-        }
         Ok(hex)
     }
 
@@ -694,7 +851,11 @@ impl Resolver {
 
     /// A block fully verified against the indexed header (hash, header,
     /// merkle root, BIP141 commitment), from the cheapest source that has it.
-    fn verified_block(&self, rec: &el_model::BlockRecord) -> Result<(Arc<bitcoin::Block>, Origin)> {
+    fn verified_block(
+        &self,
+        rec: &el_model::BlockRecord,
+        priority: Priority,
+    ) -> Result<(Arc<bitcoin::Block>, Origin)> {
         let height = rec.height;
         if let Some(block) = self.recent_block(&rec.hash) {
             self.stats.cache_hits.fetch_add(1, Ordering::Relaxed);
@@ -737,7 +898,12 @@ impl Resolver {
                 "no external source configured (or Tor is required and unavailable)".to_string(),
             ));
         }
-        let bytes = match self.fetch_external_block(&rec.hash) {
+        // The same block failed a moment ago (a wallet retrying it): answer
+        // with that failure instead of asking every source again (AUD-158).
+        if let Some(e) = self.recent_failure(&rec.hash) {
+            return Err(e);
+        }
+        let bytes = match self.fetch_external_block(&rec.hash, priority) {
             Ok(bytes) => bytes,
             Err(e) => {
                 eprintln!(
@@ -749,7 +915,10 @@ impl Resolver {
             }
         };
         match verify_full(&bytes, rec) {
-            Ok(block) => Ok((self.remember(rec.hash, block), Origin::External)),
+            Ok(block) => {
+                self.owe_decoys(rec.hash);
+                Ok((self.remember(rec.hash, block), Origin::External))
+            }
             Err(e) => {
                 self.stats.verify_failures.fetch_add(1, Ordering::Relaxed);
                 eprintln!(
@@ -786,7 +955,7 @@ impl Resolver {
     /// Fetch one block from the external sources, deduplicating concurrent
     /// requests for the same hash. The first caller downloads; the rest wait
     /// for its result instead of hammering the same provider.
-    fn fetch_external_block(&self, hash: &Hash32) -> Result<Vec<u8>> {
+    fn fetch_external_block(&self, hash: &Hash32, priority: Priority) -> Result<Vec<u8>> {
         if let Some(cache) = &self.cache {
             if let Some(bytes) = cache.get(hash) {
                 return Ok(bytes);
@@ -800,7 +969,7 @@ impl Resolver {
             match map.get(hash) {
                 Some(existing) => (Arc::clone(existing), false),
                 None => {
-                    let entry = Arc::new(InflightBlock::new());
+                    let entry = Arc::new(InflightBlock::new(Instant::now() + EXTERNAL_BUDGET));
                     map.insert(*hash, Arc::clone(&entry));
                     (entry, true)
                 }
@@ -809,13 +978,16 @@ impl Resolver {
 
         if leader {
             let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
-                self.fetch_from_external_sources(hash)
+                self.fetch_from_external_sources(hash, entry.deadline, priority)
             }))
             .unwrap_or_else(|_| {
                 Err(RawtxError::Unavailable(
                     "external block fetch panicked".into(),
                 ))
             });
+            if let Err(e) = &result {
+                self.remember_failure(hash, e);
+            }
             *entry
                 .result
                 .lock()
@@ -832,7 +1004,9 @@ impl Resolver {
             return result;
         }
 
-        let deadline = Instant::now() + Duration::from_secs(45);
+        // The leader gives up at its own deadline; a follower waits a little
+        // longer so it always receives the leader's result (AUD-156).
+        let deadline = entry.deadline + FOLLOWER_GRACE;
         let mut done = entry
             .done
             .lock()
@@ -859,20 +1033,45 @@ impl Resolver {
         result.unwrap_or_else(|| Err(RawtxError::Unavailable("inflight result lost".into())))
     }
 
-    fn fetch_from_external_sources(&self, hash: &Hash32) -> Result<Vec<u8>> {
-        let _permit = self.external_slots.acquire();
+    fn fetch_from_external_sources(
+        &self,
+        hash: &Hash32,
+        deadline: Instant,
+        priority: Priority,
+    ) -> Result<Vec<u8>> {
+        // A wallet request may take the last free slot; the prefetch leaves
+        // it free. Neither waits past the point where no attempt would fit.
+        let keep_free = match priority {
+            Priority::Wallet => 0,
+            Priority::Prefetch => 1,
+        };
+        let queue_deadline = deadline.checked_sub(MIN_ATTEMPT).unwrap_or(deadline);
+        let Some(_permit) = self.external_slots.acquire_until(queue_deadline, keep_free) else {
+            self.stats.unavailable.fetch_add(1, Ordering::Relaxed);
+            return Err(RawtxError::Unavailable(
+                "every download slot stayed busy until the deadline".into(),
+            ));
+        };
         let sources = self.sources();
         let mut order: Vec<usize> = (0..sources.len()).collect();
         order.shuffle(&mut thread_rng());
-        let started = Instant::now();
         let mut errors = Vec::new();
-        for idx in order {
-            if started.elapsed() >= Duration::from_secs(30) {
-                errors.push("external fetch deadline exceeded".to_string());
+        let count = order.len();
+        for (pos, idx) in order.into_iter().enumerate() {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left < MIN_ATTEMPT {
+                errors.push("external fetch deadline reached".to_string());
                 break;
             }
+            // One deadline for the whole download (AUD-156): every source
+            // but the last leaves a third of what is left to the others.
+            let source_deadline = if pos + 1 == count {
+                deadline
+            } else {
+                Instant::now() + left * 2 / 3
+            };
             let source = &sources[idx];
-            match source.fetch_block(hash) {
+            match source.fetch_block_until(hash, source_deadline, FetchMode::Normal) {
                 Ok(bytes) => {
                     self.stats.fetches.fetch_add(1, Ordering::Relaxed);
                     self.stats
@@ -903,9 +1102,30 @@ impl Resolver {
         Err(RawtxError::Unavailable(errors.join("; ")))
     }
 
-    /// Number of decoy downloads currently in flight.
-    pub fn decoys_inflight(&self) -> usize {
-        self.decoys_inflight.load(Ordering::Relaxed)
+    /// A failure of `hash` younger than `FAILURE_MEMORY`, if any.
+    fn recent_failure(&self, hash: &Hash32) -> Option<RawtxError> {
+        let mut failed = self.failed.lock().ok()?;
+        let now = Instant::now();
+        failed.retain(|_, (at, _)| now.duration_since(*at) < FAILURE_MEMORY);
+        failed.get(hash).map(|(_, e)| e.clone())
+    }
+
+    /// Remember that every source failed for `hash`. "No source" is not
+    /// remembered: it is a configuration state, not a download failure.
+    fn remember_failure(&self, hash: &Hash32, e: &RawtxError) {
+        if !matches!(e, RawtxError::Unavailable(_)) {
+            return;
+        }
+        if let Ok(mut failed) = self.failed.lock() {
+            let now = Instant::now();
+            failed.retain(|_, (at, _)| now.duration_since(*at) < FAILURE_MEMORY);
+            failed.insert(*hash, (now, e.clone()));
+        }
+    }
+
+    /// Decoys owed and not yet downloaded.
+    pub fn decoys_pending(&self) -> usize {
+        self.decoy_lane.pending()
     }
 
     fn cache_store(&self, hash: &Hash32, bytes: &[u8]) {
@@ -919,9 +1139,9 @@ impl Resolver {
         }
     }
 
-    /// Fetch decoys in the background so the caller is not delayed.
-    fn spawn_decoys(&self, exclude: Hash32) {
-        const MAX_DECOYS_INFLIGHT: usize = 2;
+    /// Owe `decoys` downloads of random indexed blocks for one real external
+    /// download (wallet or prefetch), and start the decoy thread on first use.
+    fn owe_decoys(&self, exclude: Hash32) {
         if self.decoys == 0 || self.sources().is_empty() {
             return;
         }
@@ -932,43 +1152,104 @@ impl Resolver {
         if tip == 0 {
             return;
         }
+        let mut owed = Vec::new();
         for _ in 0..self.decoys {
-            if self.decoys_inflight.fetch_add(1, Ordering::Relaxed) >= MAX_DECOYS_INFLIGHT {
-                self.decoys_inflight.fetch_sub(1, Ordering::Relaxed);
-                break;
-            }
-            // Retry the random pick so decoys are always distinct from the real
-            // block and always exist in the index.
-            let mut chosen = None;
+            // Retry the random pick so decoys are distinct from the real block
+            // and always exist in the index.
             for _ in 0..8 {
                 let height = rand::random::<u32>() % (tip + 1);
                 if let Ok(Some(r)) = self.store.get_block(height) {
                     if r.hash != exclude {
-                        chosen = Some(r.hash);
+                        owed.push(r.hash);
                         break;
                     }
                 }
             }
-            let Some(hash) = chosen else {
-                self.decoys_inflight.fetch_sub(1, Ordering::Relaxed);
-                continue;
-            };
-            let sources = self.sources();
-            let stats = Arc::clone(&self.stats);
-            let inflight = Arc::clone(&self.decoys_inflight);
-            let slots = Arc::clone(&self.external_slots);
-            std::thread::spawn(move || {
-                let _permit = slots.acquire();
-                let mut order: Vec<usize> = (0..sources.len()).collect();
-                order.shuffle(&mut thread_rng());
-                for idx in order {
-                    if sources[idx].fetch_block(&hash).is_ok() {
-                        stats.decoys.fetch_add(1, Ordering::Relaxed);
-                        break;
-                    }
-                }
-                inflight.fetch_sub(1, Ordering::Relaxed);
-            });
         }
+        if owed.is_empty() {
+            return;
+        }
+        if let Ok(mut queue) = self.decoy_lane.queue.lock() {
+            for hash in owed {
+                if queue.len() >= MAX_DECOY_DEBT {
+                    break;
+                }
+                queue.push_back(hash);
+            }
+        }
+        self.decoy_lane.cv.notify_all();
+        self.start_decoy_thread();
+    }
+
+    /// One thread serves every owed decoy, one at a time, outside the
+    /// wallet's download slots. It holds the sources but not the store, so a
+    /// dropped resolver releases its database at once.
+    fn start_decoy_thread(&self) {
+        let lane = Arc::clone(&self.decoy_lane);
+        let external = self.external.clone();
+        let p2p = self.p2p.clone();
+        let stats = Arc::clone(&self.stats);
+        self.decoy_lane.started.call_once(move || {
+            let spawned = std::thread::Builder::new()
+                .name("el-decoys".to_string())
+                .spawn(move || {
+                    while let Some(hash) = lane.next() {
+                        // Spread decoys over time so they do not form a burst
+                        // next to the real download.
+                        let jitter = Duration::from_millis(250 + rand::random::<u64>() % 1250);
+                        if !lane.pause(jitter) {
+                            return;
+                        }
+                        let mut sources = external.clone();
+                        if let Some(p2p) = &p2p {
+                            if p2p.peer_count() > 0 {
+                                sources.push(Arc::clone(p2p) as Arc<dyn BlockSource>);
+                            }
+                        }
+                        if sources.iter().any(|s| s.under_pressure()) {
+                            // A provider asked us to slow down: keep the debt.
+                            if !lane.pause(Duration::from_secs(5)) {
+                                return;
+                            }
+                            continue;
+                        }
+                        sources.shuffle(&mut thread_rng());
+                        let deadline = Instant::now() + EXTERNAL_BUDGET;
+                        for source in &sources {
+                            if source
+                                .fetch_block_until(&hash, deadline, FetchMode::Quiet)
+                                .is_ok()
+                            {
+                                stats.decoys.fetch_add(1, Ordering::Relaxed);
+                                break;
+                            }
+                        }
+                        lane.done();
+                    }
+                });
+            if let Err(e) = spawned {
+                eprintln!("[e-lite] decoy thread did not start: {e}");
+            }
+        });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_prefetch_leaves_a_download_slot_for_wallets() {
+        let sem = Semaphore::new(2);
+        let soon = || Instant::now() + Duration::from_millis(50);
+        let wallet = sem.acquire_until(soon(), 0).expect("first slot");
+        // One slot left: the prefetch may not take it, a wallet may.
+        assert!(sem.acquire_until(soon(), 1).is_none());
+        let second = sem.acquire_until(soon(), 0).expect("last slot");
+        drop((wallet, second));
+        assert!(sem.acquire_until(soon(), 1).is_some());
+        // A single-slot pool never blocks the prefetch forever.
+        let single = Semaphore::new(1);
+        assert!(single.acquire_until(soon(), 1).is_some());
     }
 }
