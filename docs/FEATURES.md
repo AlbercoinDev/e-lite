@@ -12,6 +12,7 @@ available**.
 | Core `external`, `auto`, `managed` | experimental | only owned Core can be paused/pruned/stopped |
 | Local Core, LAN Core, WAN via SSH/VPN | experimental | RPC-only for LAN/WAN; no remote block files |
 | Core P2P networks | experimental | `[core] network = auto` (clearnet + onion via the managed Tor, + I2P/CJDNS when available), `private` (only those networks, fail-closed) or `clearnet`; opt-in `private_broadcast` (`-privatebroadcast`, needs Core 30+) |
+| ZFS ARC management without root | experimental | `e-lite arc-setup` prints (or applies with `--apply` as root) the group-writable `zfs_arc_max` + systemd oneshot; the installer adds it on ZFS hosts; a failed permission probe is retried every 10 min |
 | Core RPC exposure guard | experimental | warns on non-loopback; `require_loopback_rpc` makes it fatal; no native TLS |
 | Block source `files`, `rpc`, `auto` | experimental | files reads `blk*.dat`, XOR aware, read-only |
 | From-zero pruned IBD with `prune_mib=1` | experimental | manual prune gate; default 5k safe-block gain |

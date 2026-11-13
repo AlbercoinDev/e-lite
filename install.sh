@@ -305,7 +305,9 @@ configure_arc() {
   arc="/sys/module/zfs/parameters/zfs_arc_max"
   [ -e "$arc" ] || return 0
   command -v systemctl >/dev/null 2>&1 || return 0
-  group="$(id -gn "${SUDO_USER:-$USER}" 2>/dev/null || true)"
+  # USER may be unset (cron, minimal shells); with `set -u` that would abort.
+  owner="${SUDO_USER:-${USER:-$(id -un 2>/dev/null || true)}}"
+  group="$(id -gn "$owner" 2>/dev/null || true)"
   [ -n "$group" ] || return 0
   unit=/etc/systemd/system/e-lite-arc-cap.service
   if [ -w "$(dirname "$unit")" ] || [ "$(id -u)" = 0 ]; then

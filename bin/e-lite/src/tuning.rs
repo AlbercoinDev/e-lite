@@ -1455,9 +1455,6 @@ impl Tunables {
         self.last_commit.lock().ok().and_then(|slot| *slot)
     }
 
-    /// Blocks/s over the last commit cycle; falls back to the since-start
-    /// average only until a cycle is available. Do not take the maximum: an
-    /// optimistic rate would allow a larger backlog than the target.
     /// Blocks/s over the last 60 s of full commit groups. Unlike the
     /// cumulative `blocks/s` and the phase average, this tracks the real
     /// current rate: a 10k-block signet interval at 37 b/s reports 37, not
@@ -1489,6 +1486,9 @@ impl Tunables {
         (blocks as f64 / span).round() as u64
     }
 
+    /// Blocks/s over the last commit cycle; falls back to the since-start
+    /// average only until a cycle is available. Do not take the maximum: an
+    /// optimistic rate would allow a larger backlog than the target.
     pub fn recent_blocks_rate(&self) -> u64 {
         let recent = self.recent_blocks_per_sec.load(Ordering::Relaxed);
         if recent > 0 {

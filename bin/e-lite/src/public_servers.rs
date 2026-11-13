@@ -283,8 +283,7 @@ fn template_candidates(target: &Path) -> Vec<PathBuf> {
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
             candidates.push(dir.join("public-servers.toml"));
-            candidates.push(dir.join("../../public-servers.toml"));
-            candidates.push(dir.join("../../../public-servers.toml"));
+            candidates.extend(checkout_template(dir));
         }
     }
     // System packages.
@@ -292,6 +291,22 @@ fn template_candidates(target: &Path) -> Vec<PathBuf> {
     candidates.push(PathBuf::from("/usr/local/share/e-lite/public-servers.toml"));
     candidates.retain(|path| path != target);
     candidates
+}
+
+/// The template of the source checkout a binary was built in. Cargo decides
+/// where binaries live under `target/` and newer versions nest test binaries
+/// deeper (`target/debug/build/<pkg>/<hash>/out/`), so a fixed `../../..` is
+/// not enough. Walk up, but accept a directory only if it is a checkout: it
+/// must hold `Cargo.toml` next to the template. An installed binary (for
+/// example in `~/.local/bin`) therefore never picks up a stray
+/// `public-servers.toml` from a parent directory.
+fn checkout_template(exe_dir: &Path) -> Option<PathBuf> {
+    exe_dir
+        .ancestors()
+        .skip(1)
+        .take(8)
+        .find(|dir| dir.join("Cargo.toml").is_file() && dir.join("public-servers.toml").is_file())
+        .map(|dir| dir.join("public-servers.toml"))
 }
 
 fn find_template(target: &Path) -> Option<PathBuf> {
@@ -553,6 +568,28 @@ mod tests {
             .iter()
             .any(|u| u.contains("blockstream.info")));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn checkout_template_follows_any_cargo_layout_but_needs_a_checkout() {
+        let root = tmp_dir("checkout");
+        std::fs::write(
+            root.join("public-servers.toml"),
+            "[mainnet]\nesplora = []\n",
+        )
+        .unwrap();
+        // Classic and nested Cargo layouts.
+        let classic = root.join("target/debug/deps");
+        let nested = root.join("target/debug/build/e-lite/0123abcd/out");
+        std::fs::create_dir_all(&classic).unwrap();
+        std::fs::create_dir_all(&nested).unwrap();
+        // Not a checkout yet: a template in a parent directory is ignored.
+        assert_eq!(checkout_template(&classic), None);
+        std::fs::write(root.join("Cargo.toml"), "[workspace]\n").unwrap();
+        let expected = Some(root.join("public-servers.toml"));
+        assert_eq!(checkout_template(&classic), expected);
+        assert_eq!(checkout_template(&nested), expected);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

@@ -1,5 +1,28 @@
 # Changelog
 
+## Unreleased
+
+### Fixes found reviewing 29.12.0 / 29.12.1
+
+- **CI was red on `main` for both releases.** The `stable` toolchain the CI
+  installs now places test binaries under
+  `target/debug/build/<pkg>/<hash>/out/`, so the template lookup relative to
+  the executable (`../../..`) no longer reached the checkout and
+  `first_run_copies_the_shipped_template` failed; `cargo test` stopped there
+  and the remaining crates were not tested. The lookup now walks up from the
+  executable and accepts a directory only if it is a checkout (`Cargo.toml`
+  next to `public-servers.toml`), so an installed binary still never picks up
+  a stray file from a parent directory. Test:
+  `checkout_template_follows_any_cargo_layout_but_needs_a_checkout`.
+- **`e-lite arc-setup` failed without Core** (`network = auto: Bitcoin Core
+  is unavailable...`) because the network was resolved before a command that
+  does not need one. It now runs before the configuration is resolved.
+- **`install.sh` aborted on ZFS hosts when `USER` was unset** (`set -u`) in
+  the new ARC step, after e-lite was already installed. It falls back to
+  `id -un`.
+- Docs: `docs/AUDIT.md` rows fixed in 29.12.0 no longer say "unreleased";
+  `docs/FEATURES.md` lists `arc-setup`.
+
 ## 0.1.0-alpha.29.12.1 — 2026-11-12
 
 ### ARC without root, honest rate/ETA, wallet-session diagnostics
