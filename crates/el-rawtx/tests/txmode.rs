@@ -286,6 +286,17 @@ fn resolver(c: &Chain, privacy: PrivacyParams, src: Arc<FakeSource>, secret: [u8
     r
 }
 
+/// Wait until the per-txid path has nothing queued or running, so the test
+/// does not drop the store under a background session (SIGABRT in CI).
+fn settle(r: &Resolver) {
+    for _ in 0..500 {
+        if r.tx_idle() {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
 /// Wait until every real transaction is served (they were queued by
 /// `want_history`).
 fn load(r: &Resolver, c: &Chain, ctx: u64) -> Vec<String> {
@@ -316,16 +327,29 @@ fn a_wallet_loads_by_txid_with_decoy_wallets() {
         real.len()
     );
     let st = r.stats();
-    assert_eq!(st.tx_verified.load(Ordering::Relaxed), real.len() as u64);
+    // The fixture may list the same transaction for two of the wallet's
+    // addresses, so the counter can exceed the unique set; every unique
+    // transaction must be verified at least once.
+    assert!(
+        st.tx_verified.load(Ordering::Relaxed) >= real.len() as u64,
+        "{} verified for {} unique",
+        st.tx_verified.load(Ordering::Relaxed),
+        real.len()
+    );
     // Only real transactions are cached: a second load asks for none of
     // them again (decoy sessions still queued behind the per-server limit
     // may start meanwhile).
     let real_sent = |src: &FakeSource| src.sent().iter().filter(|t| real.contains(t)).count();
     let before = real_sent(&src);
     let again = load(&r, &c, 1);
+    // Let the second load's decoy sessions finish before counting the cache:
+    // every background write is a decoy (never real), but the count must be
+    // stable to assert on it.
+    settle(&r);
     assert_eq!(again, got);
     assert_eq!(real_sent(&src), before, "served from the cache");
     assert_eq!(r.cached_txs(), real.len());
+    settle(&r);
     let _ = std::fs::remove_dir_all(&c.dir);
 }
 
@@ -335,8 +359,15 @@ fn no_server_gets_more_than_its_share_and_sessions_are_short() {
     let src = FakeSource::new(&c.raw, 4, None);
     let mut p = PrivacyParams::balanced();
     p.session_size = 3;
+    // No decoys: in this fixture a decoy address can share a transaction with
+    // the wallet, so counting txids by membership cannot tell a real request
+    // from a decoy one (the spread of the real group is what this test
+    // measures; `a_wallet_loads_by_txid_with_decoy_wallets` covers decoys).
+    p.decoy_wallets = 0;
     let r = resolver(&c, p, Arc::clone(&src), [7; 32]);
     load(&r, &c, 1);
+    // Measure the whole load, not a snapshot in the middle of the batches.
+    settle(&r);
     let real: HashSet<Hash32> = c.real.1.iter().map(|t| t.txid).collect();
     let mut per_server: HashMap<String, usize> = HashMap::new();
     for (server, txids) in src.calls() {
@@ -349,6 +380,7 @@ fn no_server_gets_more_than_its_share_and_sessions_are_short() {
         "{max} of {} real txs on one server",
         real.len()
     );
+    settle(&r);
     let _ = std::fs::remove_dir_all(&c.dir);
 }
 
@@ -371,6 +403,7 @@ fn the_share_holds_across_many_batches() {
     }
     let max = per_server.values().copied().max().unwrap_or(0);
     assert!(max <= c.real.1.len().div_ceil(3), "{per_server:?}");
+    settle(&r);
     let _ = std::fs::remove_dir_all(&c.dir);
 }
 
@@ -391,6 +424,7 @@ fn a_lying_server_is_caught_by_the_index_and_bypassed() {
     if lied {
         assert!(r.stats().tx_verify_failed.load(Ordering::Relaxed) >= 1);
     }
+    settle(&r);
     let _ = std::fs::remove_dir_all(&c.dir);
 }
 
@@ -407,6 +441,7 @@ fn decoy_wallets_are_stable_for_one_secret() {
             .into_iter()
             .filter(|t| !real.contains(t))
             .collect();
+        settle(&r);
         let _ = std::fs::remove_dir_all(&c.dir);
         set
     };
@@ -433,6 +468,7 @@ fn block_mode_never_sends_a_txid() {
     let t = c.real.1[0];
     assert!(r.raw_tx_for(1, t.txid, t.height).is_err());
     assert!(src.calls().is_empty());
+    settle(&r);
     let _ = std::fs::remove_dir_all(&c.dir);
 }
 
@@ -461,6 +497,7 @@ fn the_txid_path_is_gated_on_core_prune_height() {
     r.set_prune_height(t.height + 1);
     assert!(r.raw_tx_for(1, t.txid, t.height).is_ok());
     assert!(!src.calls().is_empty());
+    settle(&r);
     let _ = std::fs::remove_dir_all(&c.dir);
 }
 
@@ -474,6 +511,7 @@ fn without_decoys_only_real_txids_are_sent() {
     load(&r, &c, 1);
     let real: HashSet<Hash32> = c.real.1.iter().map(|t| t.txid).collect();
     assert!(src.sent().iter().all(|t| real.contains(t)));
+    settle(&r);
     let _ = std::fs::remove_dir_all(&c.dir);
 }
 

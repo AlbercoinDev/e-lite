@@ -93,17 +93,27 @@ struct Shared {
     spread: Mutex<HashMap<(u64, usize), HashMap<String, usize>>>,
     stats: Arc<RawtxStats>,
     closed: AtomicBool,
+    /// Batches being dispatched and sessions running right now (tests).
+    active: std::sync::atomic::AtomicUsize,
+    sessions_active: std::sync::atomic::AtomicUsize,
 }
 
 /// The per-txid fetch mode of a resolver.
 pub(crate) struct TxMode {
     shared: Arc<Shared>,
+    /// The batcher thread, joined on drop: a thread still inside the index or
+    /// RocksDB when the process exits aborts it (`pthread lock: Invalid
+    /// argument`). The loop sees `closed` and returns, so the join is short.
+    worker: Option<std::thread::JoinHandle<()>>,
 }
 
 impl Drop for TxMode {
     fn drop(&mut self) {
         self.shared.closed.store(true, Ordering::Relaxed);
         self.shared.queue_cv.notify_all();
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
     }
 }
 
@@ -135,16 +145,24 @@ impl TxMode {
             spread: Mutex::new(HashMap::new()),
             stats,
             closed: AtomicBool::new(false),
+            active: std::sync::atomic::AtomicUsize::new(0),
+            sessions_active: std::sync::atomic::AtomicUsize::new(0),
         });
         let worker = Arc::clone(&shared);
-        if let Err(e) = std::thread::Builder::new()
+        let handle = match std::thread::Builder::new()
             .name("el-txbatch".into())
             .spawn(move || batch_loop(worker))
         {
-            eprintln!("[e-lite] tx batcher did not start: {e}");
-            return None;
-        }
-        Some(TxMode { shared })
+            Ok(handle) => handle,
+            Err(e) => {
+                eprintln!("[e-lite] tx batcher did not start: {e}");
+                return None;
+            }
+        };
+        Some(TxMode {
+            shared,
+            worker: Some(handle),
+        })
     }
 
     /// Servers usable now, over every source.
@@ -195,6 +213,27 @@ impl TxMode {
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .0;
         }
+    }
+
+    /// True when no batch, session or queued request remains. Tests wait on it
+    /// before dropping the store; `/status` can report it too.
+    pub(crate) fn idle(&self) -> bool {
+        let queue_empty = self
+            .shared
+            .queue
+            .lock()
+            .map(|q| q.is_empty())
+            .unwrap_or(false);
+        let waiters_empty = self
+            .shared
+            .waiters
+            .lock()
+            .map(|w| w.is_empty())
+            .unwrap_or(false);
+        queue_empty
+            && waiters_empty
+            && self.shared.active.load(Ordering::SeqCst) == 0
+            && self.shared.sessions_active.load(Ordering::SeqCst) == 0
     }
 
     /// The connection closed: forget its decoy wallets.
@@ -365,7 +404,9 @@ fn batch_loop(shared: Arc<Shared>) {
             std::thread::sleep(Duration::from_millis(shared.params.batch_window_ms));
             std::mem::take(&mut *shared.queue.lock().unwrap_or_else(|p| p.into_inner()))
         };
+        shared.active.fetch_add(1, Ordering::SeqCst);
         dispatch(&shared, reqs);
+        shared.active.fetch_sub(1, Ordering::SeqCst);
     }
 }
 
@@ -495,7 +536,18 @@ fn dispatch(shared: &Arc<Shared>, reqs: Vec<Req>) {
     }
 }
 
+/// Decrements the session counter when `run_session` returns or unwinds.
+struct SessionGuard<'a>(&'a std::sync::atomic::AtomicUsize);
+
+impl Drop for SessionGuard<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
 fn run_session(shared: &Arc<Shared>, src: Arc<dyn TxSource>, key: &str, items: Vec<Item>) {
+    shared.sessions_active.fetch_add(1, Ordering::SeqCst);
+    let _guard = SessionGuard(&shared.sessions_active);
     // The server's slot first: a session waiting for a busy server must not
     // hold one of the global slots.
     let slot = shared.server_slot(key);

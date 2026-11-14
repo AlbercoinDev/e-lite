@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.1.0-alpha.29.16.1 — 2026-11-14
+
+### Test stability and a clean TxMode shutdown
+
+No behaviour change to the wallet path; 29.16.0's code is unchanged.
+
+- **The `txmode` suite no longer aborts on exit.** The per-txid batcher thread
+  is now joined when `TxMode` drops (it already stopped on `closed`, but the
+  process could exit while the thread was between wakeups and abort in
+  RocksDB's teardown). Tests also wait for the queue and sessions to drain
+  (`Resolver::tx_idle`) before dropping the store.
+- **Two flaky assertions fixed (pre-existing, reproduced on 29.15.0):** one
+  counted a decoy request as real when the fixture's transaction graph shares
+  a transaction with the wallet (the spread test now runs without decoys and
+  says why), and one compared the verification counter with the number of
+  unique transactions although the fixture lists one twice.
+- `ci` for alpha.29.16.0 was red only because of these tests; the release
+  artifacts are equivalent. This release exists to get a green `ci` and the
+  shutdown fix.
+
+
 ## 0.1.0-alpha.29.16.0 — 2026-11-14
 
 ### Hardening pass: fail-closed providers, honest decoys, bounded server

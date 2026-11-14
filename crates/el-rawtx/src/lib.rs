@@ -922,6 +922,11 @@ impl Resolver {
         self.prune_height.store(height, Ordering::Relaxed);
     }
 
+    /// True when the per-txid path has nothing queued or running (tests).
+    pub fn tx_idle(&self) -> bool {
+        self.tx_mode.as_ref().is_none_or(|tm| tm.idle())
+    }
+
     pub fn tx_mode_servers(&self) -> Option<usize> {
         self.tx_mode.as_ref().map(|t| t.servers())
     }

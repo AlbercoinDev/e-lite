@@ -1,9 +1,9 @@
 # Session handoff
 
 **Updated:** 2026-11-14
-**Latest published release:** `0.1.0-alpha.29.16.0`
-**Release:** https://github.com/AlbercoinDev/e-lite/releases/tag/v0.1.0-alpha.29.16.0
-**Main commit at handoff:** tag `v0.1.0-alpha.29.16.0` (wallet-path audit, AUD-167)
+**Latest published release:** `0.1.0-alpha.29.16.1`
+**Release:** https://github.com/AlbercoinDev/e-lite/releases/tag/v0.1.0-alpha.29.16.1
+**Main commit at handoff:** tag `v0.1.0-alpha.29.16.1` (wallet-path audit, AUD-167)
 
 alpha.29.14.1: fixes AUD-161 (aborted P2P race losers spun at 100 % CPU) and
 AUD-162 (tx cache temporary-file race). Owner's 29.14.0 run (2026-11-14,
