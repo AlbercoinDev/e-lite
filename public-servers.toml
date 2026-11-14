@@ -1,8 +1,11 @@
 # public-servers.toml — public providers e-lite may query when local data is missing.
 #
 # This file is the single source of truth for public servers: e-lite has no
-# built-in list. Edit it freely. e-lite only ever requests whole blocks by hash
-# (`GET {base}/block/{hash}/raw`); it never sends txids, scripts or spk_hints.
+# built-in list. Edit it freely. What leaves the node depends on the mode: the
+# default `balanced` preset asks for loose transactions by txid (Electrum
+# `blockchain.transaction.get` / `GET {base}/tx/{txid}/raw`) with decoy
+# wallets; `preset = "max"` (privacy.toml) only requests whole blocks by hash.
+# It never sends scripts, addresses or xpubs either way.
 #
 # Clearnet entries must use https://. Plain http:// is only accepted for
 # `.onion` hosts and requires Tor (`[rawtx] tor_socks` / managed Tor).

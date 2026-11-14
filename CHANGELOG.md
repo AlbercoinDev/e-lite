@@ -1,5 +1,63 @@
 # Changelog
 
+## 0.1.0-alpha.29.16.0 — 2026-11-14
+
+### Hardening pass: fail-closed providers, honest decoys, bounded server
+
+No schema, protocol or consensus change. A full audit of the wallet path
+(AUD-167) found ten P1 issues; this release fixes them. Per-txid mode, the
+race and the privacy presets are unchanged in intent.
+
+- **`import-snapshot` refuses secrets.** An archive that contains `decoy.key`,
+  `tor/`, `tls/`, `wallets/`, `rawtx-cache/`, `bitcoin.conf`, `settings.json`,
+  `wallet.dat`, Core/Tor private state, the application logs or a config file
+  is rejected before extraction instead of being unpacked. Planting a known
+  `decoy.key` let the archive's author recompute the node's decoys.
+- **Fail-closed is now real.** A missing (`generate = false`), unreadable or
+  invalid `public-servers.toml` no longer falls back to the shipped template's
+  Electrum list: "local data only" also means no txid leaves. The template's
+  list stands in only for an existing, valid file that predates the `electrum`
+  key.
+- **The provider gate cannot hold the listeners forever.** It only waits when
+  there is an Esplora endpoint to probe; with the per-txid path alone (or no
+  source at all) the listeners open and the log says which mode is in force.
+- **The per-txid path is gated on Core's prune height.** `transaction.get`
+  sends a txid only for a height below the prune height reported by Core; a
+  local Core failure or an unknown prune height stays on the whole-block path,
+  so a Core restart cannot leak txids of blocks it still has.
+- **Decoys match the wallet.** Growth is recursive (through the outputs of
+  every decoy transaction, in a deterministic order that waits for the next
+  raw instead of depending on arrival order) until the look-alike reaches the
+  real address's size, and each decoy wallet sends as many transactions as the
+  round has real ones. Before, a large wallet was the only large group. The
+  cost is (k+1) times the requests of a load; `preset = "fast"` (k = 1) halves
+  it. Documentation for `preset = "max"` now says its decoy blocks are random.
+- **Server limits.** `server.ping` has a per-connection budget of 4 MiB of hex
+  (a 1000-item batch of 1 MiB pongs used to build ~2 GiB); checkpoint proofs
+  hash outside the index read lock (the guard is taken only around the store
+  reads, so a remote header proof cannot stall commits); `outpoint.get_status`
+  reads at most 64 spender candidates.
+- **Budgets and Tor pressure.** Waiting for an attempt permit is bounded by
+  the network budget instead of the 120 s download queue, a prefetch/decoy
+  leaves one attempt permit free for a wallet, and an attempt-queue timeout is
+  no longer remembered as a source failure. The per-txid path shares a pool of
+  8 connections (`ESPLORA_TX_PARALLEL` used to open 8 per session, up to 128
+  circuits with 16 sessions).
+- **Docs.** `public-servers.toml`, `PRIVACY.md`, `ARCHITECTURE.md`,
+  `FEATURES.md`, `README.md` and `AGENTS.md` no longer claim that txids never
+  leave the node in the default mode.
+
+### Still open (next pass)
+
+The audit's P2/P3 list stays in `docs/ROADMAP.md` and `docs/AUDIT.md`:
+followers re-verifying a block the leader already verified, the Tor retry
+that never happens after a transient failure, reorg errors penalising
+providers, `catch_unwind` and the `max_clients` slot, connection teardown,
+subscription caps, `get_merkle` tree caching, `client_min` negotiation,
+`privacy.toml` per network, cleartext `:t` on clearnet hosts, and the missing
+per-network tests.
+
+
 ## 0.1.0-alpha.29.15.0 — 2026-11-14
 
 ### Deep wallets load in tens of seconds over Tor: per-txid fetch with decoy wallets (AUD-163)

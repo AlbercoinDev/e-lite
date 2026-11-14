@@ -79,7 +79,7 @@ available**.
 | Feature | Status | Notes |
 |---|---|---|
 | Local-first rawtx | experimental | Core/cache before external |
-| Whole-block external fetch | experimental | by hash, never txid |
+| External fetch mode | experimental | default `balanced`: loose transactions by txid (Electrum/Esplora) with decoy wallets, verified against the index; `preset = "max"`: whole blocks by hash only, never txid |
 | Tor SOCKS5h, fail-closed | experimental | Tor only by default; opt-in `tor_fallback_clearnet` uses clearnet if Tor fails; `allow_clearnet` forces it |
 | Managed Tor + onion service | experimental | network plain/TLS ports; `e-lite onion show/reset` |
 | Auto self-signed TLS cert | experimental | generated without Tor; SAN includes localhost, hostname and onion; reloaded on change |

@@ -54,11 +54,15 @@ e-lite therefore loads **decoy wallets**:
    (`size_min_ratio`..`size_max_ratio` of yours) and overlaps the same era
    (`era_margin_blocks` around your heights). The search is local: a keyed
    seek in the index's history table.
-2. **Grown like a wallet.** e-lite reads the outputs of each decoy address's
-   transactions, in the address's own history order (not in arrival order),
-   and adds the addresses they pay to (again from the local index) until the
-   look-alike has as many transactions as your address (`decoys.growth`).
-   Decoy wallets are connected groups too, and about as large as yours.
+2. **Grown like a wallet, to your size.** e-lite reads the outputs of each
+   decoy address's transactions in a deterministic order and adds the
+   addresses they pay to (again from the local index), recursively, until the
+   look-alike has as many transactions as your address (`decoys.growth`). It
+   waits for the next transaction instead of depending on arrival order, so
+   two loads send the same set. Each decoy wallet sends as many transactions
+   as the round has real ones, even when only part of your history is missing
+   from the cache: the k+1 groups have the same size, so none is the outlier.
+   The price is (k+1) times the requests of a load.
 3. **Stable across loads.** Every choice depends only on the secret, your
    address and chain data, never on timing. The choice is keyed by a local secret,
    `<data-dir>/decoy.key` (created on the first run, mode 0600, never in a

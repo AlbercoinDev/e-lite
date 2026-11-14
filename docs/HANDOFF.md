@@ -1,9 +1,9 @@
 # Session handoff
 
 **Updated:** 2026-11-14
-**Latest published release:** `0.1.0-alpha.29.14.1`
-**Release:** https://github.com/AlbercoinDev/e-lite/releases/tag/v0.1.0-alpha.29.14.1
-**Main commit at handoff:** tag `v0.1.0-alpha.29.14.1` (CPU spin fix AUD-161 on top of AUD-160)
+**Latest published release:** `0.1.0-alpha.29.16.0`
+**Release:** https://github.com/AlbercoinDev/e-lite/releases/tag/v0.1.0-alpha.29.16.0
+**Main commit at handoff:** tag `v0.1.0-alpha.29.16.0` (wallet-path audit, AUD-167)
 
 alpha.29.14.1: fixes AUD-161 (aborted P2P race losers spun at 100 % CPU) and
 AUD-162 (tx cache temporary-file race). Owner's 29.14.0 run (2026-11-14,
@@ -153,7 +153,37 @@ the dynamic ARC to work, e-lite needs write access to
 `/sys/module/zfs/parameters/zfs_arc_max` (root, group-writable parameter or a
 non-read-only mount).
 
-## Last change (alpha.29.15.0, AUD-163..166) - not released yet
+## Last change (alpha.29.16.0)
+
+Audit of the 29.15.0 wallet path (AUD-167): ten P1 issues, all fixed here.
+Per-txid mode, the race and the privacy presets keep their intent.
+
+- **`import-snapshot` refuses secrets** (`decoy.key`, `tor/`, `tls/`,
+  `wallets/`, `rawtx-cache/`, `bitcoin.conf`, `settings.json`, `wallet.dat`,
+  Core/Tor state, app logs, config) instead of unpacking them.
+- **Fail-closed is literal**: a missing/invalid `public-servers.toml` no longer
+  falls back to the template's Electrum list; the template only stands in for
+  an existing valid file without the key. The readiness gate waits only when
+  there is an Esplora endpoint to probe.
+- **The per-txid path is gated on `core_pruneheight`**: a Core failure or an
+  unknown prune height keeps the whole-block path.
+- **Decoys match the wallet**: recursive, deterministic growth to the real
+  address's size, and each decoy wallet sends as many transactions as the round
+  has real ones. Cost: (k+1) times the requests; `preset = "fast"` halves it.
+- **Server limits**: 4 MiB `server.ping` budget per connection; checkpoint
+  proofs hash outside the index read lock; at most 64 outpoint candidates.
+- **Budgets/Tor**: attempt-permit waits bounded by the network budget with one
+  permit kept for wallets; attempt-queue timeouts are not remembered; the
+  per-txid path shares 8 connections.
+- Docs corrected where they claimed no txid ever leaves the node, and
+  `preset = "max"` now says its decoy blocks are random.
+- Gates: fmt, clippy -D warnings, `cargo test --workspace` (345), e2e regtest,
+  snapshot and defaults. Not measured on mainnet yet.
+
+The remaining P2/P3 items are listed in `docs/ROADMAP.md` ("Planned work
+(2026-11-14) — 29.16.1").
+
+## Previous change (alpha.29.15.0, AUD-163..166)
 
 Requested by the owner (2026-11-14): make a deep wallet's first load as fast
 as possible using the index, completing from external servers. Owner
@@ -195,6 +225,9 @@ resolver live_tor_burst -- --ignored --nocapture` (or `E_LITE_LIVE_CLEARNET=1`).
 **Next:** the owner's cold Sparrow load on the pruned mainnet node with
 `[logging] level = debug`, compared with the 29.13.0 log (the owner runs it).
 Candidates in ROADMAP: Core `getblockfrompeer` as an opt-in source.
+Deferred idea (owner, 2026-11-14): a smaller index, schema v3 (AUD-130, ROADMAP
+"Storage savings"), estimated ~300 GB -> ~150-160 GB total; first step is a
+cheap measurement (per-CF sizes, testnet4 reindex with both schemas).
 
 ## Previous release (alpha.29.13.0)
 

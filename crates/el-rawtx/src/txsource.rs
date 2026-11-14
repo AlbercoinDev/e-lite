@@ -13,6 +13,7 @@ use el_model::Hash32;
 use std::collections::HashMap;
 use std::io::Read;
 use std::sync::mpsc;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 /// Raw transactions a server returned, keyed by the txid asked for.
@@ -56,16 +57,20 @@ pub struct EsploraTxSource {
     stall: Duration,
     cooldown: Duration,
     health: HealthMap,
+    /// Shared pool of connections for the whole per-txid path (AUD-167).
+    conns: Arc<crate::Semaphore>,
 }
 
 impl EsploraTxSource {
-    pub fn new(
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new(
         bases: Vec<String>,
         tor_proxy: Option<String>,
         allow_clearnet: bool,
         connect: Duration,
         stall: Duration,
         cooldown: Duration,
+        conns: Arc<crate::Semaphore>,
     ) -> Option<Self> {
         let direct = (allow_clearnet && tor_proxy.is_none())
             .then(|| {
@@ -97,6 +102,7 @@ impl EsploraTxSource {
             stall,
             cooldown,
             health: HealthMap::new(),
+            conns,
         })
     }
 
@@ -202,7 +208,17 @@ impl TxSource for EsploraTxSource {
                 let base = server.to_string();
                 let tx = tx.clone();
                 let ctl = ctl.clone();
+                // One connection per request, from the shared pool: Tor must
+                // not be asked for 8 sessions x 8 circuits (AUD-167).
+                let Some(permit) = self.conns.acquire_until(deadline, 0) else {
+                    // No slot before the deadline: leave the rest for the next
+                    // attempt instead of blaming the server. If nothing is
+                    // running either, the caller sees a stalled session and
+                    // the deadline ends it.
+                    break;
+                };
                 std::thread::spawn(move || {
+                    let _permit = permit;
                     let r = Self::fetch_one(&client, &base, &txid, deadline, &ctl);
                     let _ = tx.send((txid, r));
                 });

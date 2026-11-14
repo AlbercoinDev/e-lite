@@ -118,7 +118,7 @@ gap that cannot be repaired from verified sources stops with a clear
 | Merkle and checkpoint proofs | yes + headers | no | no |
 | Broadcast | no | `sendrawtransaction` | no |
 | Raw tx, unpruned block | no | `blk*.dat` / RPC | no |
-| Raw tx, pruned block | transaction cache | fails | P2P/Esplora, whole block by hash |
+| Raw tx, pruned block | transaction cache | fails | by txid (default, decoys) / whole block by hash |
 | Prune-gap repair | optional cache | fails | P2P/Esplora, whole block by hash |
 
 Electrum method list and status are in [`FEATURES.md`](FEATURES.md). Privacy and

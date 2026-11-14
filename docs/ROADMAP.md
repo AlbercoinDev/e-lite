@@ -118,6 +118,34 @@ Rejected after checking: HTTP Range to split a block over several circuits
 unfetchable placeholder, AUD-045; a timeout is retried), clearnet on Tor
 failure (AUD-128).
 
+## Planned work (2026-11-14) — 29.16.1, proposed
+
+The P1 findings of the 29.15.0 audit are fixed in alpha.29.16.0 (AUD-167). These
+are the P2/P3 items it left, from the same audit; each was verified in code.
+
+| # | Pri | Item | Where |
+|---|---|---|---|
+| 1 | P2 | Followers of a shared block download re-verify it: the leader sets `done`/`notify_all` before the caller runs `verify_full`. Publish the verified block (or the `Arc<Block>`) before waking them. | `crates/el-rawtx/src/lib.rs` (`fetch_external_block`, `external_block`) |
+| 2 | P2 | The documented "one retry on a new circuit" never happens after a transient/unreachable failure: the retry is decided from `endpoints()`, which already excludes the cooled endpoint. Decide from the blame. | `crates/el-rawtx/src/lib.rs` (race), `esplora.rs`, `p2p.rs` |
+| 3 | P2 | An index-side error after a verified transaction (reorg moved its position, block not indexed) calls `penalize()` and cools up to three healthy providers for 300 s. Treat it as local and go straight to the block path. | `crates/el-rawtx/src/txbatch.rs` (`verify`, `run_session`) |
+| 4 | P2 | A panic in a connection thread skips `clients.fetch_sub` and `unregister`: the `max_clients` slot and the registry entry leak forever. Use a drop guard and `catch_unwind`. | `crates/el-serve/src/lib.rs` (`start_listener_on`, `handle_client`) |
+| 5 | P2 | A logically dead connection stays up to 600 s (`WireReader::read` never checks `alive`; `send` fails without shutting the socket). Check `alive` per poll and kill on a failed write. | `crates/el-serve/src/lib.rs` (`WireReader`, `send`, `kill`) |
+| 6 | P2 | `wait_below(PIPELINE_DEPTH)` blocks the reader without a timeout, and a disconnect waits for in-flight downloads (up to 60 s) before unregistering. Make the wait interruptible and cancel on disconnect. | `crates/el-serve/src/lib.rs` (`client_loop`) |
+| 7 | P2 | `scripthash`/`scriptpubkey` subscriptions are unbounded (only outpoints have a cap) and the notifier clones every subscription each pass. Cap them and iterate under the lock. | `crates/el-serve/src/lib.rs` (subscriptions, notifier) |
+| 8 | P2 | `get_merkle` rebuilds the whole merkle tree per call under the read lock. Cache the tree with the 64-block txid ring. | `crates/el-serve/src/lib.rs` (`transaction_merkle`), `el-model/src/merkle.rs` |
+| 9 | P2 | Verbose `transaction.get` can mix two tips across a reorg (two separate read guards) and serve raw bytes that are not in the announced block. Resolve and decorate under one snapshot. | `crates/el-serve/src/lib.rs` (`transaction_get`, `decorate_verbose_tx`) |
+| 10 | P2 | `negotiate_protocol` ignores `client_min`: a client asking `[1.4.3,1.4.3]` gets 1.4.2, below its minimum. Filter the available set by both ends. | `crates/el-serve/src/lib.rs` |
+| 11 | P2 | `privacy.toml` is single and shared, not "one per network" as `INSTALL`/`PRIVACY-TUNING` say. Move it to the data dir (with migration) or correct the docs. | `bin/e-lite/src/privacy.rs`, `config.rs`, docs |
+| 12 | P2 | The Electrum list accepts `:t` (cleartext) for clearnet hosts; Esplora already requires HTTPS for clearnet. Reject `:t` outside `.onion`. | `crates/el-rawtx/src/electrum.rs`, `bin/e-lite/src/public_servers.rs` |
+| 13 | P2 | `CLI.md` defaults are stale: `prefetch=false` (true), `tor_request_timeout_seconds=20` (60), `--decoys` "2 in flight" (1 at a time), external deadline 30 s (60/120). | `docs/CLI.md` |
+| 14 | P3 | A one-off `transaction.get` may chain the txid budget and a whole-block budget (~180 s worst case). One deadline per request. | `crates/el-rawtx/src/lib.rs` (`raw_tx_inner`) |
+| 15 | P3 | `privacy check` labels the origin of `blocks.decoys` as `config.toml` even when it is the default or `--decoys`. | `bin/e-lite/src/privacy.rs` |
+| 16 | P3 | signet/testnet4 ship `electrum = []` and two Esplora endpoints with `min_servers = 3`: every start warns. Add verified servers or document the per-network target. | `public-servers.toml`, `privacy.toml` |
+| 17 | P3 | `error_log` is keyed by the client's method name and never evicted (memory growth + log flood); `log_rpc_error` prints under the mutex. | `crates/el-serve/src/lib.rs` |
+| 18 | P3 | `server.features.pruning` is always `null`; document the deviation or return the effective retention. | `crates/el-serve/src/lib.rs` |
+| 19 | P3 | Slowloris: the idle deadline resets on every byte, and an unterminated line at EOF is executed. | `crates/el-serve/src/lib.rs` (`WireReader`, `read_line_limited`) |
+| 20 | P3 | Tests: no e2e for the per-network listeners, `esplora=[]` + Electrum, signet snapshot, `privacy check`, or `server.features.genesis_hash` per network; the snapshot fixture uses a fabricated regtest genesis. | `tests/`, `snapshot.rs` |
+
 ## Security and network compatibility
 
 | Priority | Item | Why / acceptance |
@@ -142,9 +170,9 @@ failure (AUD-128).
 
 | Priority | Item | Why / acceptance |
 |---|---|---|
-| P1 | History compaction / deduplication | reduce `history` size on mainnet; must preserve canonical digest semantics or version the schema. **Decision 2026-11-13: schema v2 as a from-zero reindex (no in-place migration); see "Planned work (2026-11-13)".** |
+| P1 | History compaction / deduplication (schema v3, AUD-130) | reduce the index from ~260 GiB to an estimated ~130-150 GiB (total ~150-160 GB with pruned Core, against ~300 GB today and ~870 GB for Core + electrs): `txnum` u40 references, 16-byte scripthash and 8-byte txid prefixes verified against `txids.dat`, 1-byte history value, trimmed UTXO values, zstd bottommost. Design and per-table byte counts in AUDIT AUD-130. **Decision 2026-11-13: from-zero reindex, no in-place migration. Decision 2026-11-14: deferred; worth doing during the alpha.** First step before any code: measure per-CF SST sizes (`/status.rocksdb.cf`) and row counts on the owner's node, and reindex testnet4 with both schemas; proceed only if it saves >= 35 %. |
 | P2 | 40-bit tx refs / compact occurrence encoding | storage reduction with migration and BIP30 tests. |
-| P2 | zstd/bottommost compression experiments | measure size vs CPU on HDD/SSD; no silent format change. |
+| P2 | zstd/bottommost compression experiments | measure size vs CPU on HDD/SSD; no silent format change. The cheapest disk saving without a schema change (applies to newly compacted data); measure it separately from schema v3. |
 | P2 | Incremental/encrypted snapshots | Per-file sizes/SHA-256 and `--verify=full` verification are delivered (alpha.29.10.0). Still missing: incremental backups and optional confidentiality. |
 | P3 | Undo retention policy | bounded reorg window is already conservative; tune only with recovery tests. |
 

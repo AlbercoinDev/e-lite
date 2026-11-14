@@ -79,16 +79,20 @@ pub struct ElectrumTxSource {
     /// Servers that answered a batch with an error: pipelined requests.
     no_batch: Mutex<HashSet<String>>,
     tls: Arc<rustls::ClientConfig>,
+    /// Shared pool of connections for the whole per-txid path (AUD-167).
+    conns: Arc<crate::Semaphore>,
 }
 
 impl ElectrumTxSource {
-    pub fn new(
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new(
         entries: &[String],
         tor_proxy: Option<String>,
         allow_clearnet: bool,
         connect: Duration,
         stall: Duration,
         cooldown: Duration,
+        conns: Arc<crate::Semaphore>,
     ) -> Option<Self> {
         let mut servers = Vec::new();
         for entry in entries {
@@ -115,6 +119,7 @@ impl ElectrumTxSource {
             health: HealthMap::new(),
             no_batch: Mutex::new(HashSet::new()),
             tls: Arc::new(insecure_tls_config()),
+            conns,
         })
     }
 
@@ -151,6 +156,10 @@ impl ElectrumTxSource {
         deadline: Instant,
         ctl: &AttemptCtl,
     ) -> std::result::Result<TxBatch, Blame> {
+        // One connection per session, from the shared pool (AUD-167).
+        let Some(_permit) = self.conns.acquire_until(deadline, 0) else {
+            return Err(Blame::Transient);
+        };
         let tcp = self.connect_tcp(s)?;
         ctl.watch(&tcp);
         let stall = self.stall * if s.is_onion() { 2 } else { 1 };

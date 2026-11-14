@@ -277,9 +277,13 @@ fn config(privacy: PrivacyParams) -> RawtxConfig {
 }
 
 fn resolver(c: &Chain, privacy: PrivacyParams, src: Arc<FakeSource>, secret: [u8; 32]) -> Resolver {
-    Resolver::new(Arc::clone(&c.store), &config(privacy))
+    let r = Resolver::new(Arc::clone(&c.store), &config(privacy))
         .unwrap()
-        .with_tx_sources(vec![src as Arc<dyn TxSource>], secret)
+        .with_tx_sources(vec![src as Arc<dyn TxSource>], secret);
+    // The per-txid path is gated on Core's prune height (AUD-167); these
+    // fixtures model a Core that has pruned nothing.
+    r.set_prune_height(u32::MAX);
+    r
 }
 
 /// Wait until every real transaction is served (they were queued by
@@ -429,6 +433,34 @@ fn block_mode_never_sends_a_txid() {
     let t = c.real.1[0];
     assert!(r.raw_tx_for(1, t.txid, t.height).is_err());
     assert!(src.calls().is_empty());
+    let _ = std::fs::remove_dir_all(&c.dir);
+}
+
+#[test]
+fn the_txid_path_is_gated_on_core_prune_height() {
+    let c = chain("prunegate");
+    let src = FakeSource::new(&c.raw, 1, None);
+    let r = Resolver::new(Arc::clone(&c.store), &config(PrivacyParams::balanced()))
+        .unwrap()
+        .with_tx_sources(vec![Arc::clone(&src) as Arc<dyn TxSource>], [7; 32]);
+    let t = c.real.1[0];
+    // Unknown prune height: never send the txid.
+    assert!(r.raw_tx_for(1, t.txid, t.height).is_err());
+    assert!(
+        src.calls().is_empty(),
+        "no txid may leave with prune_height=0"
+    );
+    // Core still has the block (height >= prune height): local path only.
+    r.set_prune_height(t.height);
+    assert!(r.raw_tx_for(1, t.txid, t.height).is_err());
+    assert!(
+        src.calls().is_empty(),
+        "no txid may leave for an unpruned block"
+    );
+    // Pruned below the block: the per-txid path is allowed.
+    r.set_prune_height(t.height + 1);
+    assert!(r.raw_tx_for(1, t.txid, t.height).is_ok());
+    assert!(!src.calls().is_empty());
     let _ = std::fs::remove_dir_all(&c.dir);
 }
 

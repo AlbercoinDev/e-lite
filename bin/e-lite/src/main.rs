@@ -6200,9 +6200,14 @@ fn spawn_p2p_refresh(shared: Arc<Shared>, cfg: &Config) {
     }
 }
 
-fn requires_ready_provider(cfg: &Config, chain: Chain) -> bool {
+fn requires_ready_provider(cfg: &Config, chain: Chain, has_esplora: bool) -> bool {
+    // Only an Esplora endpoint can be probed. With the per-txid path alone
+    // (Electrum servers, no Esplora) or with no sources at all, waiting could
+    // never succeed and would keep the wallet listeners closed forever
+    // (AUD-167). The caller reports the effective mode.
     cfg.rawtx.enabled
         && cfg.rawtx.use_esplora
+        && has_esplora
         && cfg.public_servers.require_ready
         && chain != Chain::Regtest
 }
@@ -6211,8 +6216,13 @@ fn requires_ready_provider(cfg: &Config, chain: Chain) -> bool {
 /// unpruned Core serves every raw transaction locally, so public providers
 /// are never needed for wallet data; `core_pruned = None` (Core did not
 /// answer) keeps the conservative gate.
-fn provider_gate_required(cfg: &Config, chain: Chain, core_pruned: Option<bool>) -> bool {
-    requires_ready_provider(cfg, chain) && core_pruned != Some(false)
+fn provider_gate_required(
+    cfg: &Config,
+    chain: Chain,
+    core_pruned: Option<bool>,
+    has_esplora: bool,
+) -> bool {
+    requires_ready_provider(cfg, chain, has_esplora) && core_pruned != Some(false)
 }
 
 /// With `open_without_provider` the gate gives up after
@@ -6419,6 +6429,7 @@ fn build_shared(
         core,
         resolver,
         public_servers,
+        tx_sources: resolved.electrum.len(),
         provider_status: Mutex::new(Vec::new()),
         provider_ready: AtomicBool::new(false),
         tor_ready: AtomicBool::new(false),
@@ -6923,12 +6934,30 @@ fn cmd_run(cfg: &Config, chain: Chain) -> R<()> {
     });
 
     let core_pruned = shared.core.blockchain_info().ok().map(|info| info.pruned);
-    let require_ready = provider_gate_required(cfg, chain, core_pruned);
-    if requires_ready_provider(cfg, chain) && !require_ready {
-        eprintln!(
-            "[e-lite] Core is not pruned: every raw transaction is served locally; \
-             Electrum opens without waiting for public providers"
-        );
+    let has_esplora = !shared.public_servers.is_empty();
+    let tx_sources = shared.tx_sources;
+    let require_ready = provider_gate_required(cfg, chain, core_pruned, has_esplora);
+    if cfg.rawtx.enabled
+        && cfg.public_servers.require_ready
+        && chain != Chain::Regtest
+        && !require_ready
+    {
+        if has_esplora && core_pruned == Some(false) {
+            eprintln!(
+                "[e-lite] Core is not pruned: every raw transaction is served locally; \
+                 Electrum opens without waiting for public providers"
+            );
+        } else if !has_esplora && tx_sources > 0 {
+            eprintln!(
+                "[e-lite] no Esplora endpoint to probe; the per-txid path ({tx_sources} Electrum \
+                 servers) opens Electrum without holding the provider gate"
+            );
+        } else if !has_esplora {
+            eprintln!(
+                "[e-lite] no external source configured; Electrum opens with local data only \
+                 (pruned raw transactions will fail)"
+            );
+        }
     }
     let gate_started = Instant::now();
     // Only wait inside the probe when the gate is actually holding the
@@ -7646,16 +7675,19 @@ mod tests {
     #[test]
     fn provider_readiness_is_required_only_for_networked_wallets() {
         let mut cfg = Config::default();
-        assert!(!requires_ready_provider(&cfg, Chain::Regtest));
-        assert!(requires_ready_provider(&cfg, Chain::Signet));
+        assert!(!requires_ready_provider(&cfg, Chain::Regtest, true));
+        assert!(requires_ready_provider(&cfg, Chain::Signet, true));
+        // No Esplora endpoint to probe: the gate cannot succeed, so it is
+        // skipped even with `require_ready` (AUD-167).
+        assert!(!requires_ready_provider(&cfg, Chain::Signet, false));
         cfg.public_servers.require_ready = false;
-        assert!(!requires_ready_provider(&cfg, Chain::Signet));
+        assert!(!requires_ready_provider(&cfg, Chain::Signet, true));
         cfg.public_servers.require_ready = true;
         cfg.rawtx.enabled = false;
-        assert!(!requires_ready_provider(&cfg, Chain::Signet));
+        assert!(!requires_ready_provider(&cfg, Chain::Signet, true));
         cfg.rawtx.enabled = true;
         cfg.rawtx.use_esplora = false;
-        assert!(!requires_ready_provider(&cfg, Chain::Signet));
+        assert!(!requires_ready_provider(&cfg, Chain::Signet, true));
     }
 
     #[test]
@@ -7736,12 +7768,27 @@ mod tests {
     fn provider_gate_skips_unpruned_core_and_expires() {
         let cfg = Config::default();
         // An unpruned Core serves every raw transaction: no gate.
-        assert!(!provider_gate_required(&cfg, Chain::Signet, Some(false)));
+        assert!(!provider_gate_required(
+            &cfg,
+            Chain::Signet,
+            Some(false),
+            true
+        ));
         // Pruned, or Core did not answer: the gate holds the listeners.
-        assert!(provider_gate_required(&cfg, Chain::Signet, Some(true)));
-        assert!(provider_gate_required(&cfg, Chain::Signet, None));
+        assert!(provider_gate_required(
+            &cfg,
+            Chain::Signet,
+            Some(true),
+            true
+        ));
+        assert!(provider_gate_required(&cfg, Chain::Signet, None, true));
         // Regtest never gates, whatever Core reports.
-        assert!(!provider_gate_required(&cfg, Chain::Regtest, Some(true)));
+        assert!(!provider_gate_required(
+            &cfg,
+            Chain::Regtest,
+            Some(true),
+            true
+        ));
         // Fail-closed by default (AUD-045): the gate never expires ...
         assert!(!provider_gate_expired(&cfg, Duration::from_secs(86_400)));
         // ... unless the operator opts in, and then only after the timeout.

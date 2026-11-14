@@ -601,14 +601,14 @@ impl DecoyLane {
 
 /// Small counting semaphore: bounds total external downloads without pulling
 /// in an async runtime.
-struct Semaphore {
+pub(crate) struct Semaphore {
     permits: Mutex<usize>,
     total: usize,
     cv: Condvar,
 }
 
 impl Semaphore {
-    fn new(permits: usize) -> Arc<Self> {
+    pub(crate) fn new(permits: usize) -> Arc<Self> {
         let total = permits.max(1);
         Arc::new(Self {
             permits: Mutex::new(total),
@@ -619,7 +619,11 @@ impl Semaphore {
 
     /// Take a permit while more than `keep_free` are free, waiting until
     /// `deadline` at most. `keep_free` never blocks a single-permit pool.
-    fn acquire_until(self: &Arc<Self>, deadline: Instant, keep_free: usize) -> Option<Permit> {
+    pub(crate) fn acquire_until(
+        self: &Arc<Self>,
+        deadline: Instant,
+        keep_free: usize,
+    ) -> Option<Permit> {
         let keep_free = keep_free.min(self.total - 1);
         let mut permits = self
             .permits
@@ -643,7 +647,7 @@ impl Semaphore {
     }
 }
 
-struct Permit {
+pub(crate) struct Permit {
     sem: Arc<Semaphore>,
 }
 
@@ -677,6 +681,10 @@ pub struct Resolver {
     /// Per-txid fetch mode (AUD-163); `None` in block mode or without
     /// per-txid sources.
     tx_mode: Option<txbatch::TxMode>,
+    /// Core's prune height as last reported by the server layer. The per-txid
+    /// path only sends txids of blocks Core no longer has (AUD-167); 0 means
+    /// unknown, which stays on the whole-block path.
+    prune_height: std::sync::atomic::AtomicU32,
     privacy: PrivacyParams,
     /// Verified external blocks kept in memory for a burst of requests.
     recent: Mutex<VecDeque<(Hash32, Arc<bitcoin::Block>)>>,
@@ -793,6 +801,7 @@ impl Resolver {
             cache,
             txcache,
             tx_mode,
+            prune_height: std::sync::atomic::AtomicU32::new(0),
             privacy: cfg.privacy.clone(),
             recent: Mutex::new(VecDeque::new()),
             cache_dir,
@@ -815,6 +824,11 @@ impl Resolver {
     }
 
     /// Per-txid sources (Electrum, Esplora `/tx/:txid/raw`) and the batcher.
+    /// Most simultaneous connections the per-txid path may open (AUD-167).
+    /// Esplora fans out inside a session, so the session count alone does not
+    /// bound the circuits Tor has to build.
+    const MAX_TX_CONNECTIONS: usize = 8;
+
     fn build_tx_mode(
         store: &Arc<Store>,
         cfg: &RawtxConfig,
@@ -828,6 +842,9 @@ impl Resolver {
         let connect = Duration::from_secs(cfg.tor_connect_timeout_seconds.max(1));
         let stall = Duration::from_secs(cfg.tor_stall_timeout_seconds.max(1));
         let cooldown = Duration::from_secs(cfg.provider_cooldown_seconds.max(1));
+        // One pool for every per-txid connection (AUD-167): a session's
+        // Esplora fan-out used to open up to 8 circuits per session.
+        let conns = Semaphore::new(Self::MAX_TX_CONNECTIONS);
         let mut sources: Vec<Arc<dyn TxSource>> = Vec::new();
         if let Some(s) = ElectrumTxSource::new(
             &cfg.electrum_servers,
@@ -836,6 +853,7 @@ impl Resolver {
             connect,
             stall,
             cooldown,
+            Arc::clone(&conns),
         ) {
             sources.push(Arc::new(s));
         }
@@ -847,6 +865,7 @@ impl Resolver {
                 connect,
                 stall,
                 cooldown,
+                Arc::clone(&conns),
             ) {
                 sources.push(Arc::new(s));
             }
@@ -897,6 +916,12 @@ impl Resolver {
     }
 
     /// Whether the per-txid mode is active, and over how many servers.
+    /// Record Core's prune height (called by the server layer on each wallet
+    /// request). 0 keeps the per-txid path disabled.
+    pub fn set_prune_height(&self, height: u32) {
+        self.prune_height.store(height, Ordering::Relaxed);
+    }
+
     pub fn tx_mode_servers(&self) -> Option<usize> {
         self.tx_mode.as_ref().map(|t| t.servers())
     }
@@ -1150,11 +1175,14 @@ impl Resolver {
             None => {
                 // 3) Per-txid mode (AUD-163): the loose transaction, verified
                 //    against the index; whole blocks only if it fails.
+                let pruned_below = self.prune_height.load(Ordering::Relaxed);
                 if let Some(tm) = &self.tx_mode {
-                    if let Some(pos) = self.position_of(txid, height) {
-                        let t = TxRef { txid, height, pos };
-                        if let Ok(hex) = tm.fetch(ctx, t, Instant::now() + EXTERNAL_BUDGET) {
-                            return Ok(hex);
+                    if pruned_below > 0 && height < pruned_below {
+                        if let Some(pos) = self.position_of(txid, height) {
+                            let t = TxRef { txid, height, pos };
+                            if let Ok(hex) = tm.fetch(ctx, t, Instant::now() + EXTERNAL_BUDGET) {
+                                return Ok(hex);
+                            }
                         }
                     }
                 }
@@ -1527,7 +1555,6 @@ impl Resolver {
         // The network budget starts now, not when the request queued.
         let deadline = Instant::now() + EXTERNAL_BUDGET;
         entry.set_deadline(deadline);
-        let attempt_queue = deadline.checked_sub(MIN_ATTEMPT).unwrap_or(deadline);
         let mut plan: Vec<(Arc<dyn BlockSource>, Endpoint)> = Vec::new();
         for source in self.sources() {
             for endpoint in source.endpoints(FetchMode::Normal) {
@@ -1545,7 +1572,7 @@ impl Resolver {
         }
         let wallet = priority == Priority::Wallet || entry.wallet_waiting.load(Ordering::Relaxed);
         let _wallet = wallet.then(|| Busy::new(&self.wallet_downloads));
-        let result = self.race(hash, deadline, plan, attempt_queue);
+        let result = self.race(hash, deadline, plan, wallet);
         if result.is_err() {
             self.stats.unavailable.fetch_add(1, Ordering::Relaxed);
         }
@@ -1557,7 +1584,7 @@ impl Resolver {
         hash: &Hash32,
         deadline: Instant,
         plan: Vec<(Arc<dyn BlockSource>, Endpoint)>,
-        queue_deadline: Instant,
+        wallet: bool,
     ) -> Result<Vec<u8>> {
         struct Running {
             ctl: AttemptCtl,
@@ -1610,12 +1637,15 @@ impl Resolver {
                 let allowed = !fallback
                     || (running.is_empty() && plan[next..].iter().all(|(_, e)| e.tier > 0));
                 if allowed {
-                    let wait_until = if running.is_empty() {
-                        queue_deadline
-                    } else {
-                        now
-                    };
-                    if let Some(permit) = self.external_attempts.acquire_until(wait_until, 0) {
+                    // Waiting for an attempt permit must not outlive the
+                    // network budget: `queue_deadline` covers the download
+                    // slot only (AUD-167). A prefetch or decoy leaves one
+                    // permit free so a wallet never queues behind them.
+                    let keep_free = usize::from(!wallet);
+                    let wait_until = if running.is_empty() { deadline } else { now };
+                    if let Some(permit) =
+                        self.external_attempts.acquire_until(wait_until, keep_free)
+                    {
                         self.stats.race_attempts.fetch_add(1, Ordering::Relaxed);
                         if !running.is_empty() {
                             self.stats.race_hedges.fetch_add(1, Ordering::Relaxed);
@@ -1934,7 +1964,11 @@ impl Resolver {
 /// A download that never got a download slot (local queueing, not a source
 /// failure).
 fn is_queue_timeout(e: &RawtxError) -> bool {
-    matches!(e, RawtxError::Unavailable(m) if m.contains("download slot stayed busy"))
+    matches!(
+        e,
+        RawtxError::Unavailable(m)
+            if m.contains("download slot stayed busy") || m.contains("attempt slot stayed busy")
+    )
 }
 
 /// Whether the newest attempt of a race deserves a parallel one: nothing

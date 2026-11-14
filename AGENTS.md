@@ -207,8 +207,23 @@ Never treat a version number in this file as authoritative over the code/tag.
 - Public servers are not compiled into the binary: they live in the editable
   `public-servers.toml` next to `config.toml`. A first run copies the shipped
   template; a missing file means local data only (fail closed), never a hidden
-  fallback list. Only whole blocks are requested by hash, and clearnet entries
+  fallback list. The default `balanced` preset asks for loose transactions by
+  txid (with decoy wallets, AUD-163); `preset = "max"` requests only whole
+  blocks by hash. Scripts, addresses and xpubs never leave. Clearnet entries
   must be HTTPS (`.onion` over Tor is the only plain-HTTP exception).
+  Fail-closed is literal: the template's Electrum list only stands in for an
+  existing, valid file without the `electrum` key; a missing or invalid file
+  means no Esplora **and** no txid source. The readiness gate only waits when
+  there is an Esplora endpoint to probe (AUD-167): with the per-txid path alone
+  the listeners open and the log names the mode. The per-txid path may send a
+  txid only for `height < core_pruneheight`; an unknown prune height (0) or a
+  local Core failure keeps the whole-block path, so a Core restart never leaks
+  txids of blocks Core still has.
+- `import-snapshot` refuses an archive that contains `decoy.key`, `tor/`,
+  `tls/`, `wallets/`, `rawtx-cache/`, `bitcoin.conf`, `settings.json`,
+  `wallet.dat`, Core/Tor private state, an application log or a config file.
+  Rejecting is intentional (AUD-167): a silently skipped entry would hide the
+  attempt, and the manifest/digest are untouched by the refusal.
 - P2P rawtx must advertise `NODE_WITNESS` (bit 3) **and request
   `MSG_WITNESS_BLOCK` (0x40000002) in `getdata`**. Advertising alone is not
   enough: `MSG_BLOCK` returns a block without witnesses, which still matches the
@@ -303,7 +318,14 @@ Never treat a version number in this file as authoritative over the code/tag.
   (0.25-1.5 s apart) outside the wallet's download slots, in
   `FetchMode::Quiet` (a decoy failure never changes provider/peer health),
   waits while a provider rate-limits or a wallet download runs (max 30 s,
-  AUD-160), and holds no store handle; at most 32 are owed (AUD-157). The history prefetch is therefore **on by default**
+  AUD-160), and holds no store handle; at most 32 are owed (AUD-157). Decoy
+  growth is **recursive to the real address's size** (outputs of every decoy
+  transaction, deterministic order that waits for the next raw) and each decoy
+  wallet sends as many transactions as the round has real ones, so no group is
+  the outlier (AUD-167). The cost is (k+1) times the requests of a load;
+  `preset = "fast"` halves it. The per-txid path shares one pool of 8
+  connections: `ESPLORA_TX_PARALLEL` inside a session must never multiply the
+  session count (AUD-167). The history prefetch is therefore **on by default**
   (`[rawtx] prefetch`, AUD-159, supersedes AUD-134): it enqueues up to 64
   confirmed history blocks per history response, each with **all** of that
   history's txids in the block (`prefetch_block_txs`: one download caches
@@ -367,6 +389,11 @@ Never treat a version number in this file as authoritative over the code/tag.
   decoys (AUD-165). `get_merkle`/`id_from_pos` reuse the txids of the last 64
   blocks (`block_txids_cached`, AUD-166). Local Core blocks stay in `recent`
   (24 blocks). `max_parallel_fetches` defaults to 16.
+- `server.ping` has a per-connection budget (4 MiB of hex, `MAX_PONG_BYTES`):
+  a 1000-item batch of maximum pongs used to build gigabytes (AUD-167).
+  Checkpoint proofs (`blockchain.block.header[s]` with `cp_height`) hash
+  outside the index read lock (the guard covers only the store reads) and
+  `outpoint.get_status` reads at most `MAX_OUTPOINT_CANDIDATES` (64) spenders.
 - JSON-RPC batches are served (max 1000 items, 8 in parallel, 32 when the
   batch carries `transaction.get`, ordered when the batch has
   `server.version`/unsubscribe). A connection runs `transaction.get` lines

@@ -139,6 +139,9 @@ pub fn log_rawtx_summary(shared: &Shared) {
 /// entries would hold the index lock for too long; keep a generous cap that
 /// still protects the server from pathological scripts.
 pub const MAX_HISTORY_ENTRIES: usize = 100_000;
+/// Spender candidates one `outpoint.get_status`/`subscribe` resolution may
+/// read (AUD-167).
+pub const MAX_OUTPOINT_CANDIDATES: usize = 64;
 
 pub const PROTOCOL_MIN: &str = "1.4";
 pub const PROTOCOL_MAX: &str = "1.7";
@@ -964,12 +967,21 @@ pub struct ClientState {
     /// Aggregate counters for the `debug:` wallet-session line. Counts and
     /// milliseconds only: never a hash, script or txid (AUD-132/133).
     pub stats: Mutex<ClientStats>,
+    /// Hex characters of `server.ping` pongs this connection may still
+    /// request. A batch of 1000 maximum-size pings would otherwise build
+    /// gigabytes (AUD-167).
+    pub pong_budget: AtomicU64,
     /// Notifications waiting for the connection lock. The notifier never
     /// waits for it: the client's own thread may hold it while it writes a
     /// large response (30 s write timeout) or polls the socket. Whoever holds
     /// the lock delivers the queue when it releases it.
     pub pending_notes: Mutex<VecDeque<Vec<u8>>>,
 }
+
+/// Hex characters of `server.ping` pongs one connection may request in total.
+/// Small enough that a batch cannot allocate gigabytes, large enough for any
+/// real client.
+pub const MAX_PONG_BYTES: u64 = 4 * 1024 * 1024;
 
 /// Notifications a client may have queued behind its own traffic before it
 /// is considered stuck and disconnected.
@@ -1317,6 +1329,7 @@ impl ClientRegistry {
             tls,
             protocol: Mutex::new(None),
             saw_message: AtomicBool::new(false),
+            pong_budget: AtomicU64::new(MAX_PONG_BYTES),
             stats: Mutex::new(ClientStats::empty()),
             pending_notes: Mutex::new(VecDeque::new()),
         });
@@ -1471,8 +1484,11 @@ pub struct Shared {
     pub core: CoreClient,
     pub resolver: Arc<Resolver>,
     /// Effective public Esplora bases for this network (from public-servers.toml
-    /// or the [rawtx] override). Empty means local data only.
+    /// or the [rawtx] override). Empty means no Esplora probe is possible.
     pub public_servers: Vec<String>,
+    /// Electrum servers of the per-txid path (AUD-163), resolved at startup.
+    /// Zero with a non-empty Esplora list means the block path only.
+    pub tx_sources: usize,
     /// Startup probe results, one JSON object per provider.
     pub provider_status: Mutex<Vec<Value>>,
     pub provider_ready: AtomicBool,
@@ -2050,7 +2066,7 @@ pub fn dispatch_for(
 ) -> RpcResult<Value> {
     match method {
         "server.version" => server_version(params, client),
-        "server.ping" => server_ping(params, version),
+        "server.ping" => server_ping(params, version, client),
         "server.banner" => Ok(json!(banner_text(shared))),
         "server.donation_address" => Ok(json!("")),
         "server.peers.subscribe" => Ok(json!([])),
@@ -2063,19 +2079,21 @@ pub fn dispatch_for(
             // non-misleading state. The read lock is taken per method and is
             // *never* held across Core or external network I/O.
             check_ready(shared)?;
+            // The per-txid path may only send txids of heights Core has
+            // pruned (AUD-167). One relaxed store per request.
+            shared
+                .resolver
+                .set_prune_height(shared.stats.core_pruneheight.load(Ordering::Relaxed) as u32);
             match method {
                 "blockchain.headers.subscribe" => {
                     let _g = read_guard(shared)?;
                     headers_subscribe(shared, client)
                 }
-                "blockchain.block.header" => {
-                    let _g = read_guard(shared)?;
-                    block_header(shared, params)
-                }
-                "blockchain.block.headers" => {
-                    let _g = read_guard(shared)?;
-                    block_headers(shared, params, version)
-                }
+                // The checkpoint proof hashes every header up to cp_height.
+                // The guard is taken inside, only around the store reads, so
+                // a remote proof request cannot stall commits (AUD-167).
+                "blockchain.block.header" => block_header(shared, params),
+                "blockchain.block.headers" => block_headers(shared, params, version),
                 "blockchain.scripthash.get_history" => {
                     let _g = read_guard(shared)?;
                     scripthash_history(shared, params)
@@ -2502,7 +2520,11 @@ fn uptime_text(d: std::time::Duration) -> String {
     )
 }
 
-fn server_ping(params: &Value, version: ProtocolVersion) -> RpcResult<Value> {
+fn server_ping(
+    params: &Value,
+    version: ProtocolVersion,
+    client: Option<&Arc<ClientState>>,
+) -> RpcResult<Value> {
     if version < V1_7 {
         return Ok(Value::Null);
     }
@@ -2518,6 +2540,17 @@ fn server_ping(params: &Value, version: ProtocolVersion) -> RpcResult<Value> {
         return Err(RpcError::invalid(format!(
             "pong_len must be <= {MAX_PONG_HEX} hex characters"
         )));
+    }
+    if let Some(c) = client {
+        // Per-connection budget: neither a batch nor a loop can make the
+        // server hold more than MAX_PONG_BYTES for one client (AUD-167).
+        let left = c.pong_budget.fetch_sub(pong_len, Ordering::Relaxed);
+        if left < pong_len {
+            c.pong_budget.fetch_add(pong_len, Ordering::Relaxed);
+            return Err(RpcError::invalid(
+                "pong_len exceeds this connection's remaining pong budget",
+            ));
+        }
     }
     Ok(json!({ "data": "0".repeat(pong_len as usize) }))
 }
@@ -2590,40 +2623,36 @@ fn header_chain(shared: &Shared, cp_height: u32) -> RpcResult<Vec<Hash32>> {
         .map_err(RpcError::server)
 }
 
-fn checkpoint_proof(
-    shared: &Shared,
-    leaf_height: u32,
-    cp_height: u32,
-) -> RpcResult<(Hash32, Vec<Hash32>)> {
-    if leaf_height > cp_height {
-        return Err(RpcError::invalid(
-            "height must be <= cp_height when cp_height is set",
-        ));
-    }
-    let hashes = header_chain(shared, cp_height)?;
-    merkle_branch(&hashes, leaf_height as usize)
-        .ok_or_else(|| RpcError::server("cannot compute checkpoint branch"))
-}
-
 fn block_header(shared: &Shared, params: &Value) -> RpcResult<Value> {
     let height = param_u32(params, 0)?;
     let cp_height = params
         .as_array()
         .and_then(|a| a.get(1))
         .and_then(|v| v.as_u64())
-        .unwrap_or(0);
-    let rec = shared
-        .store
-        .get_block(height)
-        .map_err(|e| RpcError::server(e.to_string()))?
-        .ok_or_else(|| RpcError::server(format!("height {height} not indexed")))?;
-    let header = hex::encode(rec.header);
-    if cp_height == 0 {
+        .unwrap_or(0)
+        .try_into()
+        .map_err(|_| RpcError::invalid("cp_height out of range"))?;
+    // Everything that needs a consistent tip happens under the read guard;
+    // the merkle branch (millions of hashes) is computed after releasing it.
+    let (header, hashes) = {
+        let _g = read_guard(shared)?;
+        let rec = shared
+            .store
+            .get_block(height)
+            .map_err(|e| RpcError::server(e.to_string()))?
+            .ok_or_else(|| RpcError::server(format!("height {height} not indexed")))?;
+        let hashes = if cp_height == 0 {
+            None
+        } else {
+            Some(header_chain(shared, cp_height)?)
+        };
+        (hex::encode(rec.header), hashes)
+    };
+    let Some(hashes) = hashes else {
         return Ok(json!(header));
-    }
-    let cp_height =
-        u32::try_from(cp_height).map_err(|_| RpcError::invalid("cp_height out of range"))?;
-    let (root, branch) = checkpoint_proof(shared, height, cp_height)?;
+    };
+    let (root, branch) = merkle_branch(&hashes, height as usize)
+        .ok_or_else(|| RpcError::server("cannot compute checkpoint branch"))?;
     Ok(json!({
         "header": header,
         "branch": branch.iter().map(|h| h.to_hex()).collect::<Vec<_>>(),
@@ -2641,21 +2670,30 @@ fn block_headers(shared: &Shared, params: &Value, version: ProtocolVersion) -> R
         .unwrap_or(0);
     let cp_height =
         u32::try_from(cp_height).map_err(|_| RpcError::invalid("cp_height out of range"))?;
-    let mut headers = Vec::new();
-    let mut got = 0u32;
-    for h in start..start.saturating_add(count) {
-        match shared
-            .store
-            .get_block(h)
-            .map_err(|e| RpcError::server(e.to_string()))?
-        {
-            Some(rec) => {
-                headers.push(hex::encode(rec.header));
-                got += 1;
+    let (headers, got, hashes) = {
+        let _g = read_guard(shared)?;
+        let mut headers = Vec::new();
+        let mut got = 0u32;
+        for h in start..start.saturating_add(count) {
+            match shared
+                .store
+                .get_block(h)
+                .map_err(|e| RpcError::server(e.to_string()))?
+            {
+                Some(rec) => {
+                    headers.push(hex::encode(rec.header));
+                    got += 1;
+                }
+                None => break,
             }
-            None => break,
         }
-    }
+        let hashes = if cp_height != 0 && got > 0 {
+            Some(header_chain(shared, cp_height)?)
+        } else {
+            None
+        };
+        (headers, got, hashes)
+    };
     // 1.6 changed the response from one concatenated `hex` string to a list.
     let mut result = if version >= V1_6 {
         json!({
@@ -2670,9 +2708,10 @@ fn block_headers(shared: &Shared, params: &Value, version: ProtocolVersion) -> R
             "max": MAX_HEADERS_CHUNK,
         })
     };
-    if cp_height != 0 && got > 0 {
+    if let Some(hashes) = hashes {
         let last = start + got - 1;
-        let (root, branch) = checkpoint_proof(shared, last, cp_height)?;
+        let (root, branch) = merkle_branch(&hashes, last as usize)
+            .ok_or_else(|| RpcError::server("cannot compute checkpoint branch"))?;
         result["root"] = json!(root.to_hex());
         result["branch"] = json!(branch.iter().map(|h| h.to_hex()).collect::<Vec<_>>());
     }
@@ -3193,6 +3232,13 @@ fn outpoint_status(
                 .txid_at(rec.txnum_base + tx_pos as u64)
                 .map_err(|e| RpcError::server(e.to_string()))?;
             candidates.push((candidate, height));
+        }
+        // A busy script (an exchange) can list thousands of spends; bounding
+        // the scan keeps a remote outpoint request from pinning external
+        // downloads (AUD-167). The most recent spends are the likely ones.
+        if candidates.len() > MAX_OUTPOINT_CANDIDATES {
+            let skip = candidates.len() - MAX_OUTPOINT_CANDIDATES;
+            candidates.drain(..skip);
         }
         candidates
     };

@@ -77,10 +77,12 @@ Shipped defaults (verified 2026-11-06):
 | testnet4 | `https://mempool.space/testnet4/api`, `https://blockstream.info/testnet4/api` |
 | regtest | none |
 
-Edit that file to add, remove or reorder providers. e-lite only requests whole
-blocks by hash (`GET {base}/block/{hash}/raw`); it never sends txids, scripts or
-`spk_hint` to these servers. Clearnet entries must be `https://`; plain `http://`
-is accepted only for `.onion` hosts and still requires Tor.
+Edit that file to add, remove or reorder providers. What a provider sees depends
+on the mode: the default `balanced` preset asks for loose transactions by txid
+(`GET {base}/tx/{txid}/raw` and the Electrum list), always with decoy wallets;
+`preset = "max"` requests whole blocks by hash only. Scripts, addresses, xpubs
+and `spk_hint` never leave the node. Clearnet entries must be `https://`; plain
+`http://` is accepted only for `.onion` hosts and still requires Tor.
 
 P2P peers are discovered from Core's address manager (`getnodeaddresses`) or set
 explicitly with `p2p_peers`. Only peers advertising full `NODE_NETWORK` service

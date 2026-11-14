@@ -357,6 +357,61 @@ fn excluded_from_index(name: &str) -> bool {
     )
 }
 
+/// Paths an archive must never contain: secrets and state that either the
+/// export never writes or a tampered archive could use to weaken the node
+/// (AUD-167). Rejecting the archive is stronger than skipping the entry: a
+/// silent skip would hide the attempt and leave the manifest's promise intact.
+fn forbidden_in_snapshot(path: &Path) -> Option<&'static str> {
+    const DIRS: [&str; 4] = ["tor", "tls", "rawtx-cache", "wallets"];
+    const FILES: [&str; 13] = [
+        "decoy.key",
+        ".decoy.key.tmp",
+        "bitcoin.conf",
+        "settings.json",
+        "wallet.dat",
+        "database",
+        "db.log",
+        ".walletlock",
+        "peers.dat",
+        "mempool.dat",
+        "onion_v3_private_key",
+        "i2p_private_key",
+        "anchors.dat",
+    ];
+    for component in path.components() {
+        let Some(name) = component.as_os_str().to_str() else {
+            continue;
+        };
+        if DIRS.contains(&name) {
+            return Some(match name {
+                "tor" => "the managed Tor data (onion keys)",
+                "tls" => "the TLS identity",
+                "rawtx-cache" => "the rawtx cache",
+                _ => "Core wallets",
+            });
+        }
+        if FILES.contains(&name) {
+            return Some(match name {
+                "decoy.key" | ".decoy.key.tmp" => "the decoy-wallet secret",
+                "bitcoin.conf" => "Core's configuration (RPC credentials)",
+                _ => "Core/Tor private state",
+            });
+        }
+        // RocksDB's write-ahead logs (`000008.log`) are part of the index, so
+        // only the application logs are refused, by name.
+        if matches!(
+            name,
+            "e-lite.log" | "e-lite.log.1" | "bitcoind.log" | "debug.log"
+        ) || name == "config.toml"
+            || name == "public-servers.toml"
+            || name == "privacy.toml"
+        {
+            return Some("logs or configuration (may hold credentials)");
+        }
+    }
+    None
+}
+
 /// Chain-data directories of a Core datadir. Only these are copied, at the
 /// datadir root (mainnet) or inside the network subdirectory (`testnet4/`,
 /// `signet/`, `regtest/`). Everything else at those two levels — legacy
@@ -712,6 +767,14 @@ fn import_into(
                 .any(|c| matches!(c, Component::ParentDir | Component::RootDir))
         {
             return Err(format!("unsafe path in snapshot: {}", path.display()).into());
+        }
+        if let Some(what) = forbidden_in_snapshot(&path) {
+            return Err(format!(
+                "snapshot contains {}; refusing to restore it (the entry would write {})",
+                what,
+                path.display()
+            )
+            .into());
         }
         entry.unpack_in(target)?;
     }
@@ -1369,6 +1432,43 @@ mod tests {
         let defaults = ExportOptions::default();
         assert_eq!((defaults.index_level, defaults.core_level), (0, 3));
         assert!(defaults.hash_files, "hashes are recorded by default");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_archive_with_a_secret_is_refused() {
+        let dir = std::env::temp_dir().join(format!(
+            "e-lite-snapshot-forbidden-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let archive = dir.join("evil.tar.gz");
+        {
+            let file = File::create(&archive).unwrap();
+            let enc = GzEncoder::new(file, Compression::default());
+            let mut tar = tar::Builder::new(enc);
+            let mut header = tar::Header::new_gnu();
+            header.set_size(4);
+            header.set_mode(0o600);
+            header.set_cksum();
+            tar.append_data(&mut header, "decoy.key", &b"evil"[..])
+                .unwrap();
+            tar.into_inner().unwrap().finish().unwrap();
+        }
+        let target = dir.join("out");
+        std::fs::create_dir_all(&target).unwrap();
+        let options = ImportOptions {
+            skip_hashes: true,
+            expect_digest: None,
+        };
+        let err = import_into(&archive, &target, Chain::Mainnet, &options, None).unwrap_err();
+        let text = err.to_string();
+        assert!(text.contains("decoy-wallet secret"), "{text}");
+        assert!(!target.join("decoy.key").exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

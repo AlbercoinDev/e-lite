@@ -501,6 +501,10 @@ pub fn load(cfg: &Config, chain: Chain, config_path: Option<&Path>) -> Resolved 
     }
 
     let mut electrum: Option<Vec<String>> = None;
+    // Whether the target exists AND parsed. The template's Electrum list may
+    // only stand in for a real file that predates the key: a missing,
+    // unreadable or invalid file must stay fail-closed (AUD-167).
+    let mut parsed_ok = false;
     let endpoints = if target.is_file() {
         if source == "none" {
             source = "file".to_string();
@@ -508,6 +512,7 @@ pub fn load(cfg: &Config, chain: Chain, config_path: Option<&Path>) -> Resolved 
         match std::fs::read_to_string(&target) {
             Ok(text) => match toml::from_str::<HashMap<String, NetworkServers>>(&text) {
                 Ok(mut networks) => {
+                    parsed_ok = true;
                     let key = chain.name();
                     let net = networks.remove(key);
                     electrum = net.as_ref().and_then(|n| n.electrum.clone());
@@ -555,6 +560,9 @@ pub fn load(cfg: &Config, chain: Chain, config_path: Option<&Path>) -> Resolved 
     // and say how to pin or disable it.
     let mut electrum = match electrum {
         Some(list) => list,
+        // Only an existing, valid file without the key falls back to the
+        // template. Otherwise "local data only" must also mean no txids leave.
+        None if !parsed_ok => Vec::new(),
         None => {
             let from_template = find_template(&target)
                 .and_then(|t| std::fs::read_to_string(&t).ok())
@@ -839,6 +847,9 @@ mod tests {
         let cfg = config_for(&path);
         let resolved = load(&cfg, Chain::Mainnet, None);
         assert!(resolved.endpoints.is_empty());
+        // Fail-closed for txids too: an invalid file must not fall back to
+        // the shipped template's Electrum list (AUD-167).
+        assert!(resolved.electrum.is_empty(), "{:?}", resolved.electrum);
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "this is not toml");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -852,6 +863,7 @@ mod tests {
         let resolved = load(&cfg, Chain::Mainnet, None);
         assert!(!path.exists());
         assert!(resolved.endpoints.is_empty());
+        assert!(resolved.electrum.is_empty(), "{:?}", resolved.electrum);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

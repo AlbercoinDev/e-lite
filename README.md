@@ -110,8 +110,9 @@ See [`docs/CLI.md`](docs/CLI.md) for every flag and `--set` example.
   listener follows the same host). Each network has its own ports, so several
   instances can run side by side.
 - Core RPC is HTTP. LAN/WAN use requires SSH/VPN; never expose the RPC port.
-- External rawtx lookup is local-first and Tor-first; it requests whole blocks by
-  hash and validates them. Public providers live in the editable
+- External rawtx lookup is local-first and Tor-first; it validates everything it
+  gets (whole blocks by hash, or loose transactions by txid in the default
+  mode, with decoy wallets). Public providers live in the editable
   `public-servers.toml` (next to `config.toml`), never in the binary. See
   [`docs/PRIVACY.md`](docs/PRIVACY.md).
 

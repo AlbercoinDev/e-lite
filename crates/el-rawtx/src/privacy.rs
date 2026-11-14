@@ -77,7 +77,8 @@ impl PrivacyParams {
         }
     }
 
-    /// The `max` preset: whole blocks only, decoy blocks from decoy wallets.
+    /// The `max` preset: whole blocks only, random decoy blocks (no txid ever
+    /// leaves the node, at the cost of weaker decoys).
     pub fn max() -> Self {
         PrivacyParams {
             preset: "max".into(),

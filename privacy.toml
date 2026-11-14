@@ -20,8 +20,10 @@
 #           like a wallet, and stable across reloads (seeded by a local
 #           secret, <data-dir>/decoy.key). The server sees k+1 plausible
 #           wallets loading at the same time and cannot tell which is yours.
-#   block - it sees whole block hashes (~3000 transactions each). Decoy blocks
-#           are the blocks of the same decoy wallets. Slowest, most private.
+#   block - it sees whole block hashes (~3000 transactions each), never a txid.
+#           Decoy blocks are random indexed blocks, not the same decoy wallets
+#           ([decoys] wallets has no effect in this mode), so block mode is the
+#           most private but its decoys are weaker. Slowest.
 #
 # Every key below is optional: a key that is not set takes the preset's
 # value; a key that is set replaces it. An unknown key or a value outside its
