@@ -183,8 +183,10 @@ open_without_provider = false  # true: open with local data after ready_timeout_
   (AUD-155): a timeout, a stalled or truncated body or a 5xx is usually the
   circuit, so it backs off 5 s, doubling up to 60 s; a 429/503 honours
   `Retry-After` (15 s doubling, at most 120 s) - over Tor the limit is per
-  exit, and the next request uses another one; only a wrong answer gets the
-  full `provider_cooldown_seconds` (300 s). A success clears the history. If
+  exit, so one limited circuit only fails that attempt and the provider is
+  paused after 3 limited circuits within 60 s (AUD-160); a provider that
+  never answers (no connection, no byte) backs off 5 s doubling to 10 min;
+  only a wrong answer gets the full `provider_cooldown_seconds` (300 s). A success clears the history. If
   every provider is cooling down, the one whose pause ends first is still
   attempted rather than failing the wallet's history/tx load.
 - `allow_clearnet = true` permits direct clearnet access if you explicitly
@@ -193,7 +195,8 @@ open_without_provider = false  # true: open with local data after ready_timeout_
   (wallet or prefetch), so the provider's view is not a set of “interesting”
   blocks. One background thread downloads the owed decoys one at a time,
   spread 0.25-1.5 s apart, outside the wallet's download slots, and waits
-  while a provider rate-limits; a decoy's failure never cools a provider or
+  while a provider rate-limits or a wallet download is running (at most 30 s
+  per decoy, so it does not take the wallet's Tor bandwidth); a decoy's failure never cools a provider or
   peer that real requests need (AUD-157). At most 32 are owed. Set
   `decoys = 0` to reduce bandwidth at the cost of privacy.
 - The validated cache reduces repeated external fetches, and every avoided
@@ -274,7 +277,7 @@ An external Core is never changed: set these flags in its `bitcoin.conf`.
   4 s direct) and reads stall after 12 s (Tor) or 6 s (direct) without data
   (AUD-160): Tor keeps retrying a dead peer on new circuits for up to its
   `SocksTimeout` (2 min), so waiting longer only holds a slot. A peer that
-  never answers backs off 30 s doubling to 10 min.
+  never answers or refuses the connection backs off 30 s doubling to 10 min.
 - Peers are discovered from Core's **outbound** connections first, then from
   addrman, and the list is refreshed every 10 minutes (every 60 s while it is
   empty, for example right after Core starts). Inbound peers (their address

@@ -61,7 +61,7 @@ Out of scope (with a reason, do not reintroduce blindly): a second Tor
 instance for the outbound/Core `-onion` side (revisit only with measured
 contention), and any change that hints at clearnet fetches.
 
-## External path: agile and resilient (AUD-160) — implemented, unreleased
+## External path: agile and resilient (AUD-160) — implemented in alpha.29.14.0
 
 The first proposal (two time planes, a `Degraded` breaker, a semaphore of 4
 connections) was replaced after measuring: the path was not mis-detected but

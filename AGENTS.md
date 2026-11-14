@@ -217,8 +217,8 @@ Never treat a version number in this file as authoritative over the code/tag.
   validate the witness commitment inside the P2P source before marking a peer
   good. P2P is fail-fast: random order among the discovered peers (no peer is
   preferred, AUD-135), per-peer backoff (30 s doubling to the cooldown; a
-  wrong answer gets the full cooldown; a peer that never answers 30 s
-  doubling to 10 min), at most two attempt budgets per call
+  wrong answer gets the full cooldown; a peer that never answers or refuses
+  the connection 30 s doubling to 10 min), at most two attempt budgets per call
   (`p2p_tor_timeout_seconds` 30 s through Tor, `p2p_timeout_seconds` 8 s
   direct) with a separate connect phase (10 s Tor, 20 s onion, 4 s direct)
   and stall (12 s / 6 s): a SOCKS CONNECT answers in seconds or never, and
@@ -251,7 +251,8 @@ Never treat a version number in this file as authoritative over the code/tag.
   AUD-155): timeout/stall/truncated body/5xx back off 5 s doubling to 60 s,
   429/503 honour `Retry-After` (15 s doubling, max 120 s; over Tor the limit
   is per exit: over Tor a 429 pauses the provider only after 3 limited
-  circuits in 60 s), an endpoint that never answers (`Blame::Unreachable`)
+  circuits in 60 s), an endpoint that never answers or refuses the connection
+  (`Blame::Unreachable`)
   backs off 5 s doubling to 10 min, and only a wrong answer gets
   `provider_cooldown_seconds` (300 s). A success clears the streak. Do not go back to cooling a provider
   for minutes after a slow circuit: without the clearnet fallback that left a
@@ -266,7 +267,9 @@ Never treat a version number in this file as authoritative over the code/tag.
   shuffled, up to `RACE_WIDTH` (3) run at once, the next starts on a
   failure, 6 s without a byte, <96 KB/s after 5 s or 15 s (direct 2 s /
   256 KB/s / 6 s); the first verified block wins and `AttemptCtl::abort`
-  shuts the losers' sockets; a losing or aborted attempt never blames its
+  stops the losers (P2P sockets are shut down at once; an Esplora attempt
+  stops at its next read, within the stall limit); an aborted attempt never
+  blames its
   endpoint. A Tor endpoint gets one retry on a new circuit; the clearnet
   fallback tier starts only when no Tor attempt is left; after everything
   failed the race waits up to 15 s for a paused endpoint (never forcing a
@@ -329,7 +332,8 @@ Never treat a version number in this file as authoritative over the code/tag.
   circuit, with one request each (the genesis raw block by its known hash,
   header-hash checked; `/block-height/0` first only when the genesis is
   unknown) and does not open Electrum until at least one answers. A Tor
-  attempt gets at least `tor_request_timeout_seconds`; the gate opens 2 s
+  attempt gets at least twice `tor_stall_timeout_seconds` (24 s, the onion
+  limit; `public_servers::probe_tor_floor`); the gate opens 2 s
   after the first healthy provider and reports slower ones as "no answer
   yet" (`doctor` waits for all); `require_ready`/`ready_timeout_seconds` control the gate. The gate
   applies only to a **pruned** Core (or one that did not answer): an unpruned

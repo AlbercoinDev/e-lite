@@ -40,7 +40,8 @@ pub(crate) const LIMITED_BASE: Duration = Duration::from_secs(15);
 /// Upper bound of a rate-limit pause (also caps `Retry-After`).
 pub(crate) const LIMITED_CAP: Duration = Duration::from_secs(120);
 
-/// Upper bound of the backoff of an endpoint that never answers.
+/// Upper bound of the backoff of an endpoint that never answers (or, for a
+/// P2P peer, refuses the connection).
 pub(crate) const UNREACHABLE_CAP: Duration = Duration::from_secs(600);
 /// Over Tor a 429 is about one exit, not the provider: the provider is paused
 /// only when this many distinct circuits were rate limited within

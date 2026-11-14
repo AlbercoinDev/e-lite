@@ -60,9 +60,15 @@ const GATE_GRACE: Duration = Duration::from_secs(2);
 ///
 /// Providers are probed in parallel, each through its own Tor circuit, so a
 /// round lasts one timeout instead of one per provider. A Tor attempt gets at
-/// least `rawtx.tor_stall_timeout_seconds` (a cold circuit to an onion
-/// service routinely takes longer than the 5 s probe timeout; the genesis
-/// block is tiny, so the long whole-block attempt limit is not needed).
+/// least twice `rawtx.tor_stall_timeout_seconds` (24 s by default, the onion
+/// limit of a block attempt): a cold rendezvous circuit to an onion service
+/// took up to 14 s to the first byte on mainnet. The genesis block is tiny,
+/// so the long whole-block attempt limit is not needed.
+/// Least time a Tor probe attempt gets (see `probe`).
+pub fn probe_tor_floor(cfg: &Config) -> Duration {
+    Duration::from_secs(cfg.rawtx.tor_stall_timeout_seconds.saturating_mul(2))
+}
+
 pub fn probe(
     cfg: &Config,
     urls: &[String],
@@ -81,7 +87,7 @@ pub fn probe(
             .map(str::trim)
             .filter(|s| !s.is_empty())
             .map(str::to_string),
-        tor_timeout: timeout.max(Duration::from_secs(cfg.rawtx.tor_stall_timeout_seconds)),
+        tor_timeout: timeout.max(probe_tor_floor(cfg)),
         direct: reqwest::blocking::Client::builder()
             .timeout(timeout)
             .user_agent(el_rawtx::HTTP_USER_AGENT)

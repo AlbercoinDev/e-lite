@@ -1359,7 +1359,8 @@ impl Resolver {
                     .max_by_key(|r| r.started)
                     .is_some_and(|r| should_hedge(r.ctl.bytes(), now - r.started, r.via_tor))
             };
-            if want_more && next < plan.len() {
+            let attempts: u32 = tried.values().sum();
+            if want_more && next < plan.len() && (attempts as usize) < MAX_RACE_ATTEMPTS {
                 let fallback = plan[next].1.tier > 0;
                 // The fallback tier waits for every primary to be done
                 // (none running, none queued after it).
@@ -1413,7 +1414,6 @@ impl Resolver {
                 // early; an endpoint already tried here does not return
                 // (a Tor one keeps its single retry on a new circuit).
                 let since = *exhausted_since.get_or_insert_with(Instant::now);
-                let attempts: u32 = tried.values().sum();
                 if attempts as usize >= MAX_RACE_ATTEMPTS
                     || since.elapsed() >= RACE_REFILL_WAIT
                     || deadline.saturating_duration_since(Instant::now()) < MIN_ATTEMPT * 3

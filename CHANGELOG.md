@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.1.0-alpha.29.14.0 — 2026-11-14
 
 ### Agile wallet loads over Tor and clearnet (AUD-160)
 
@@ -18,7 +18,8 @@ download slot. Live A/B over Tor with 32 distinct blocks at once: **0.11-0.14
   attempts at once: the next starts when one fails, when the newest has sent
   nothing for 6 s, crawls below 96 KB/s after 5 s, or runs 15 s (direct: 2 s,
   256 KB/s, 6 s). The first verified block wins and the others are aborted
-  (their sockets are shut down). A Tor provider that failed on one circuit
+  (a P2P socket is shut down at once, an Esplora transfer stops at its next
+  read). A Tor provider that failed on one circuit
   gets one more try on a new circuit. The clearnet fallback tier
   (`tor_fallback_clearnet`) still starts only after every Tor attempt failed.
   When everything failed or is paused, the race waits up to 15 s for an
@@ -28,7 +29,8 @@ download slot. Live A/B over Tor with 32 distinct blocks at once: **0.11-0.14
   direct), stall 12 s (6 s direct), inside `p2p_tor_timeout_seconds`.
   Esplora over Tor: `tor_connect_timeout_seconds` **20 -> 10**,
   `tor_stall_timeout_seconds` **25 -> 12**, both doubled for `.onion`.
-- **Health.** An endpoint that never answers (no connection, no byte) backs
+- **Health.** An endpoint that never answers (no connection, no byte) or
+  refuses the connection (a SOCKS reply code from the exit, for a peer) backs
   off 5 s (peers 30 s) doubling to 10 min, so an unreachable provider or dead
   peer stops costing an attempt per block. Over Tor a 429 pauses the
   provider only after 3 limited circuits within 60 s.
@@ -45,6 +47,9 @@ download slot. Live A/B over Tor with 32 distinct blocks at once: **0.11-0.14
   slot. Prefetch failures are `debug:` lines, not INFO.
 - **Decoys** wait (max 30 s each) while a wallet download is running, so
   they do not take its Tor bandwidth; the debt is kept.
+- The startup provider probe gives a Tor attempt at least twice
+  `tor_stall_timeout_seconds` (24 s, the onion limit); it followed the stall
+  value, which would have dropped to 12 s with the new default.
 - `/status.rawtx.race` (attempts, hedges, wins by source, total win time) and
   the startup `debug:` lines show the race and pipeline settings.
 - Live benchmark: `E_LITE_LIVE_TOR=127.0.0.1:9050 cargo test -p el-rawtx

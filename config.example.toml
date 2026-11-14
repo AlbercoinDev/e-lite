@@ -204,7 +204,7 @@ tor_request_timeout_seconds = 60    # absolute limit of one Esplora attempt; a t
 provider_cooldown_seconds = 300     # cooldown after a hard failure (bad answer, wrong
                                     # services). Timeouts back off 5 s doubling to 60 s;
                                     # an endpoint that never answers (no connection,
-                                    # no byte) 5 s (P2P peers 30 s) doubling to 10 min;
+                                    # no byte) or refuses it 5 s (P2P peers 30 s) doubling to 10 min;
                                     # a 429/503 honours Retry-After (15 s doubling, max
                                     # 120 s). Over Tor a 429 is one exit: the provider
                                     # is paused only after 3 limited circuits in 60 s
@@ -233,8 +233,8 @@ generate = true                     # create it from the template when missing
 require_ready = true                # run + pruned Core: keep wallets out until a provider answers
                                     # (an unpruned Core serves every raw tx locally: no gate)
 probe_timeout_seconds = 5           # per-provider probe timeout (providers are probed in
-                                    # parallel; a Tor attempt gets at least
-                                    # rawtx.tor_request_timeout_seconds)
+                                    # parallel; a Tor attempt gets at least twice
+                                    # rawtx.tor_stall_timeout_seconds, 24 s)
 ready_timeout_seconds = 60          # one readiness round; logged, then probed again
 open_without_provider = false       # true: open Electrum with local data after
                                     # ready_timeout_seconds; raw txs of pruned blocks

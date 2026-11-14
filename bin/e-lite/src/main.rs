@@ -6249,7 +6249,7 @@ fn log_startup_diagnostics(cfg: &Config, chain: Chain, shared: &Shared) {
          {}/{}/{}s (onion x2), p2p {}s (tor {}s), race {} (hedge tor {}/{}s, direct {}/{}s), \
          prefetch {}, decoys {}, max_parallel {}, clearnet fallback {}",
         cfg.public_servers.probe_timeout_seconds,
-        cfg.rawtx.tor_stall_timeout_seconds,
+        public_servers::probe_tor_floor(cfg).as_secs(),
         cfg.public_servers.ready_timeout_seconds,
         cfg.rawtx.tor_connect_timeout_seconds,
         cfg.rawtx.tor_stall_timeout_seconds,

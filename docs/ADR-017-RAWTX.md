@@ -39,6 +39,15 @@ integrity.
 - The index still requires a full node (or a snapshot) to build. "Thin" means no
   block store, not no index.
 
+## Later amendments
+This ADR records the original decision; the current values live in
+`config.example.toml`, `docs/PRIVACY.md` and `docs/FEATURES.md` (decoys 1,
+transaction cache, `MSG_WITNESS_BLOCK`, BIP324 v2). Since AUD-160 the external
+sources are not tried one after another: each block download races the
+endpoints of every source (up to 3 attempts at once) and the first block that
+passes the checks above wins, so a withholding source costs a hedge delay,
+not a turn.
+
 ## Evidence
 - Unit/mock: witness and Merkle tampering, corrupt/partial blocks, cache eviction,
   source fallback, decoys, Tor fail-closed, prune gap.
