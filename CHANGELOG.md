@@ -1,5 +1,35 @@
 # Changelog
 
+## 0.1.0-alpha.29.16.2 — 2026-11-15
+
+### Electrum servers for signet and testnet4 (shipped template)
+
+Until now `public-servers.toml` shipped `electrum = []` for signet and
+testnet4, so the per-txid path had only the two Esplora bases and every start
+warned `sessions.min_servers = 3 but only 2 servers are configured`. Native
+installs (the Umbrel app already filled the list itself) lost the spread and
+put the whole load on two endpoints.
+
+- **signet**: `mempool.space:60602`, `node202.fra.mempool.space:60602`,
+  `mempool.tk7.mempool.space:60602`, `signet-electrum.mineracks.com:50002`.
+- **testnet4**: `mempool.space:40002`, `blackie.c3-soft.com:57010`,
+  `testnet4-electrum.mineracks.com:50002`, `fulcrum.theuplink.net:60002`,
+  `testnet.aranguren.org:52002`.
+- **Verification**: 2026-11-15, over TLS, `server.version` plus
+  `blockchain.block.header(0)` hashed and compared with the network's genesis
+  (`00000008819873e9...` for signet, `00000000da84f2ba...` for testnet4).
+  Two further servers are listed as comments (one with a self-signed
+  certificate); e-lite does not validate the TLS certificate on this path
+  because every transaction is verified against the index.
+- **Regression test**: the shipped template must give every non-regtest
+  network at least three sources (`electrum + esplora >= min_servers`) and
+  every entry must parse. Nothing checked this before.
+- **Existing installations are not rewritten** (`public-servers.toml` is never
+  overwritten): delete the file and restart to regenerate it from the
+  template, or paste the lists. The Umbrel app's `ensure_public_servers`
+  already fills an empty list.
+
+
 ## 0.1.0-alpha.29.16.1 — 2026-11-14
 
 ### Test stability and a clean TxMode shutdown

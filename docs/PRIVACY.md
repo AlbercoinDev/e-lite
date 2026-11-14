@@ -68,14 +68,21 @@ Existing files are never overwritten. If the file and the template are both
 missing, e-lite uses local data only (fail closed). Set
 `[public_servers] generate = false` to disable automatic creation.
 
-Shipped defaults (verified 2026-11-06):
+Shipped defaults: Esplora bases verified 2026-11-06; per-txid Electrum
+servers verified 2026-11-15 with `server.version` and the genesis header
+(`blockchain.block.header(0)` hashed and compared with the network's genesis).
+e-lite does not validate the TLS certificate on the per-txid path; every
+transaction is verified against the local index instead.
 
-| Network | Default Esplora bases |
-|---|---|
-| mainnet | `https://blockstream.info/api`, `https://mempool.space/api`, `http://mempoolhqx4isw62xs7abwphsq7ldayuidyx2v2oethdhhj6mlo2r6ad.onion/api` (Tor; verified 2026-11-06) |
-| signet | `https://mempool.space/signet/api`, `https://blockstream.info/signet/api` |
-| testnet4 | `https://mempool.space/testnet4/api`, `https://blockstream.info/testnet4/api` |
-| regtest | none |
+| Network | Default Esplora bases | Default Electrum servers (per-txid) |
+|---|---|---|
+| mainnet | `https://blockstream.info/api`, `https://mempool.space/api`, `http://mempoolhqx4isw62xs7abwphsq7ldayuidyx2v2oethdhhj6mlo2r6ad.onion/api` (Tor) | 10 servers (`electrum.emzy.de`, `fortress.qtornado.com`, `electrum.blockstream.info`, ...) |
+| signet | `https://mempool.space/signet/api`, `https://blockstream.info/signet/api` | `mempool.space:60602`, `node202.fra.mempool.space:60602`, `mempool.tk7.mempool.space:60602`, `signet-electrum.mineracks.com:50002` |
+| testnet4 | `https://mempool.space/testnet4/api`, `https://blockstream.info/testnet4/api` | `mempool.space:40002`, `blackie.c3-soft.com:57010`, `testnet4-electrum.mineracks.com:50002`, `fulcrum.theuplink.net:60002`, `testnet.aranguren.org:52002` |
+| regtest | none | none |
+
+Both lists live in `public-servers.toml`; `electrum = []` disables the per-txid
+path for a network (Esplora `/tx/:txid/raw` and whole blocks stay).
 
 Edit that file to add, remove or reorder providers. What a provider sees depends
 on the mode: the default `balanced` preset asks for loose transactions by txid

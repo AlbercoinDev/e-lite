@@ -1,9 +1,9 @@
 # Session handoff
 
 **Updated:** 2026-11-14
-**Latest published release:** `0.1.0-alpha.29.16.1`
-**Release:** https://github.com/AlbercoinDev/e-lite/releases/tag/v0.1.0-alpha.29.16.1
-**Main commit at handoff:** tag `v0.1.0-alpha.29.16.1` (wallet-path audit, AUD-167)
+**Latest published release:** `0.1.0-alpha.29.16.2`
+**Release:** https://github.com/AlbercoinDev/e-lite/releases/tag/v0.1.0-alpha.29.16.2
+**Main commit at handoff:** tag `v0.1.0-alpha.29.16.2` (wallet-path audit, AUD-167)
 
 alpha.29.14.1: fixes AUD-161 (aborted P2P race losers spun at 100 % CPU) and
 AUD-162 (tx cache temporary-file race). Owner's 29.14.0 run (2026-11-14,
@@ -153,7 +153,16 @@ the dynamic ARC to work, e-lite needs write access to
 `/sys/module/zfs/parameters/zfs_arc_max` (root, group-writable parameter or a
 non-read-only mount).
 
-## Last change (alpha.29.16.0)
+## Last change (alpha.29.16.2)
+
+Shipped `public-servers.toml` now has Electrum servers for signet and
+testnet4 (verified 2026-11-15 with `server.version` and the genesis header),
+so the per-txid path is not limited to the two Esplora bases and the
+`min_servers = 3` warning is gone. A regression test requires every
+non-regtest network to reach three sources in the template. Existing files
+are never overwritten: delete and restart, or paste the lists.
+
+## Previous change (alpha.29.16.0)
 
 Audit of the 29.15.0 wallet path (AUD-167): ten P1 issues, all fixed here.
 Per-txid mode, the race and the privacy presets keep their intent.

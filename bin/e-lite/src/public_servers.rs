@@ -866,4 +866,36 @@ mod tests {
         assert!(resolved.electrum.is_empty(), "{:?}", resolved.electrum);
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    /// The shipped template must cover every non-regtest network: an empty
+    /// Electrum list leaves the per-txid path with only the Esplora bases
+    /// (and `privacy.toml`'s `min_servers = 3` can never be met). This test
+    /// is what would have caught signet/testnet4 shipping `electrum = []`.
+    #[test]
+    fn shipped_template_covers_every_network() {
+        let path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../public-servers.toml");
+        let text = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+        let nets: std::collections::HashMap<String, NetworkServers> =
+            toml::from_str(&text).expect("template must parse");
+        for name in ["mainnet", "signet", "testnet4"] {
+            let net = nets.get(name).unwrap_or_else(|| panic!("missing [{name}]"));
+            let electrum = net.electrum.clone().unwrap_or_default();
+            assert!(!electrum.is_empty(), "[{name}] ships no Electrum servers");
+            for entry in &electrum {
+                el_rawtx::ElectrumServer::parse(entry)
+                    .unwrap_or_else(|e| panic!("[{name}] {entry}: {e}"));
+            }
+            for url in &net.esplora {
+                validate(url).unwrap_or_else(|e| panic!("[{name}] {url}: {e}"));
+            }
+            // `balanced` starts from `min_servers = 3`.
+            assert!(
+                electrum.len() + net.esplora.len() >= 3,
+                "[{name}] has {} sources, below min_servers",
+                electrum.len() + net.esplora.len()
+            );
+        }
+    }
 }
