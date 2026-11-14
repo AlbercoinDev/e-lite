@@ -253,11 +253,23 @@ impl TxCache {
             return Ok(());
         }
         let path = self.path(txid);
+        // Already cached (a wallet retrying a batch, or the prefetch, put it
+        // a moment ago): nothing to write.
+        if self
+            .state
+            .lock()
+            .map(|s| s.entries.contains_key(txid))
+            .unwrap_or(false)
+        {
+            return Ok(());
+        }
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).map_err(|e| RawtxError::Io(format!("tx cache dir: {e}")))?;
         }
         // No fsync: a torn write fails the checksum and is dropped on read.
-        let tmp = path.with_extension("tmp");
+        // A unique temporary name: two writers of the same txid at once must
+        // not rename each other's file away.
+        let tmp = path.with_extension(format!("tmp{:016x}", rand::random::<u64>()));
         {
             let mut f = fs::File::create(&tmp)
                 .map_err(|e| RawtxError::Io(format!("tx cache create: {e}")))?;
@@ -270,7 +282,10 @@ impl TxCache {
             .map_err(|_| RawtxError::Io("tx cache lock poisoned".into()))?;
         state.remove(txid);
         self.evict_to(&mut state, self.capacity.saturating_sub(size));
-        fs::rename(&tmp, &path).map_err(|e| RawtxError::Io(format!("tx cache rename: {e}")))?;
+        fs::rename(&tmp, &path).map_err(|e| {
+            let _ = fs::remove_file(&tmp);
+            RawtxError::Io(format!("tx cache rename: {e}"))
+        })?;
         state.insert(*txid, size);
         Ok(())
     }
@@ -309,6 +324,38 @@ mod tests {
             branch: vec![Hash32([n; 32]), Hash32([n.wrapping_add(1); 32])],
             raw: vec![n; len],
         }
+    }
+
+    #[test]
+    fn concurrent_puts_of_one_transaction_all_succeed() {
+        // A wallet retrying its batch and the prefetch cache the same
+        // transaction at once: a shared temporary name made one rename fail.
+        let dir = tmp("concurrent");
+        let cache = std::sync::Arc::new(TxCache::open(&dir, 1 << 20).unwrap());
+        let txid = Hash32([9; 32]);
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(16));
+        let handles: Vec<_> = (0..16)
+            .map(|_| {
+                let cache = std::sync::Arc::clone(&cache);
+                let barrier = std::sync::Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    cache.put(&txid, &entry(9, 200))
+                })
+            })
+            .collect();
+        for h in handles {
+            assert!(h.join().unwrap().is_ok());
+        }
+        assert_eq!(cache.get(&txid).unwrap(), entry(9, 200));
+        assert_eq!(cache.len(), 1);
+        let stray = fs::read_dir(cache.path(&txid).parent().unwrap())
+            .unwrap()
+            .flatten()
+            .filter(|f| !f.file_name().to_string_lossy().ends_with(".tx"))
+            .count();
+        assert_eq!(stray, 0, "no temporary file left behind");
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

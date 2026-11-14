@@ -1,9 +1,15 @@
 # Session handoff
 
 **Updated:** 2026-11-14
-**Latest published release:** `0.1.0-alpha.29.14.0`
-**Release:** https://github.com/AlbercoinDev/e-lite/releases/tag/v0.1.0-alpha.29.14.0
-**Main commit at handoff:** tag `v0.1.0-alpha.29.14.0` (agile external path, AUD-160)
+**Latest published release:** `0.1.0-alpha.29.14.1`
+**Release:** https://github.com/AlbercoinDev/e-lite/releases/tag/v0.1.0-alpha.29.14.1
+**Main commit at handoff:** tag `v0.1.0-alpha.29.14.1` (CPU spin fix AUD-161 on top of AUD-160)
+
+alpha.29.14.1: fixes AUD-161 (aborted P2P race losers spun at 100 % CPU) and
+AUD-162 (tx cache temporary-file race). Owner's 29.14.0 run (2026-11-14,
+LAN Sparrow, cold): the wallet loaded completely in ~5 min with 0
+`tx.get` failures (29.13.0 needed a reconnect and had 14+ failures), but the
+CPU stayed busy afterwards (AUD-161). Re-measure on 29.14.1.
 
 alpha.29.14.0: tagged and pushed; check that the `ci` and `release` workflows
 are green and the release is marked Latest. Owner tests it on the real

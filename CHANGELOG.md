@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.1.0-alpha.29.14.1 — 2026-11-14
+
+### Fixes
+
+- **CPU spin after a wallet load (AUD-161).** A P2P attempt that lost a block
+  race was aborted with an `Interrupted` I/O error, which `read_exact` and
+  `write_all` retry forever: every aborted P2P loser kept one core busy
+  until e-lite restarted. Aborts now fail with `ConnectionAborted`. Seen on
+  the owner's node right after a Sparrow load on 29.14.0; upgrade and
+  restart.
+- **`tx cache put failed: io` (AUD-162).** Two requests caching the same
+  transaction at once (a wallet retrying its batch while the prefetch runs)
+  shared one temporary file name, so one rename failed. The transaction was
+  cached anyway; the temporary name is now unique and an already cached
+  transaction is not written again.
+
 ## 0.1.0-alpha.29.14.0 — 2026-11-14
 
 ### Agile wallet loads over Tor and clearnet (AUD-160)

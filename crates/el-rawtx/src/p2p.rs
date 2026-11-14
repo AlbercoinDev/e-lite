@@ -139,7 +139,9 @@ struct DeadlineIo {
 impl DeadlineIo {
     fn arm(&self, write: bool) -> io::Result<()> {
         if self.ctl.aborted() {
-            return Err(io::Error::new(io::ErrorKind::Interrupted, "aborted"));
+            // Never `Interrupted`: `read_exact`/`write_all` retry that kind
+            // forever, which spun an aborted race loser at 100 % CPU.
+            return Err(io::Error::new(io::ErrorKind::ConnectionAborted, "aborted"));
         }
         let left = self.deadline.saturating_duration_since(Instant::now());
         if left.is_zero() {
@@ -1771,5 +1773,32 @@ mod tests {
             "{:?}",
             started.elapsed()
         );
+    }
+
+    #[test]
+    fn an_aborted_attempt_returns_instead_of_spinning() {
+        // A race loser is aborted while it waits on the peer: every read and
+        // write must fail at once (an `Interrupted` error made `read_exact`
+        // retry forever at 100 % CPU).
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let _peer = std::thread::spawn(move || {
+            let (_sock, _) = listener.accept().unwrap();
+            std::thread::sleep(Duration::from_secs(5));
+        });
+        let stream = TcpStream::connect(addr).unwrap();
+        let ctl = AttemptCtl::new();
+        let mut io = DeadlineIo {
+            stream,
+            deadline: Instant::now() + Duration::from_secs(30),
+            stall: Duration::from_secs(10),
+            ctl: ctl.clone(),
+        };
+        ctl.abort();
+        let started = Instant::now();
+        let mut buf = [0u8; 24];
+        assert!(io.read_exact(&mut buf).is_err());
+        assert!(io.write_all(b"version").is_err());
+        assert!(started.elapsed() < Duration::from_secs(1));
     }
 }
