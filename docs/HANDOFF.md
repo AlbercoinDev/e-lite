@@ -1,10 +1,12 @@
 # Session handoff
 
 **Updated:** 2026-11-14
-**Latest published release:** `0.1.0-alpha.29.12.3`
-**Release:** https://github.com/AlbercoinDev/e-lite/releases/tag/v0.1.0-alpha.29.12.3
-**Main commit at handoff:** tag `v0.1.0-alpha.29.12.3`
-**In the working tree, not tagged:** `0.1.0-alpha.29.13.0` (wallet loads over Tor, AUD-153..159)
+**Latest published release:** `0.1.0-alpha.29.13.0`
+**Release:** https://github.com/AlbercoinDev/e-lite/releases/tag/v0.1.0-alpha.29.13.0
+**Main commit at handoff:** tag `v0.1.0-alpha.29.13.0` (wallet loads over Tor, AUD-153..159)
+
+alpha.29.13.0: `ci` and `release` workflows green, release marked Latest
+(installer `.deb`, tarball, `install.sh`, `SHA256SUMS`).
 
 alpha.29.11.0 was verified after publishing: `ci` and `release` workflows
 green, and both one-line installers (`--no-core` and `--with-core --yes`)
@@ -141,7 +143,7 @@ the dynamic ARC to work, e-lite needs write access to
 `/sys/module/zfs/parameters/zfs_arc_max` (root, group-writable parameter or a
 non-read-only mount).
 
-## Last change (alpha.29.13.0, not published)
+## Last change (alpha.29.13.0)
 
 Requested by the owner (2026-11-14) after Sparrow loads on a pruned mainnet
 and testnet4 node took 16-28 s per `transaction.get` (85 s max, 25 failures)
