@@ -154,8 +154,15 @@ and cooled providers for minutes, mismatched budgets and decoys competing
 with the wallet. Owner decision: keep the private defaults, fix the bugs,
 prefetch on with decoys. See CHANGELOG and AUD-153..159.
 
-**Open:** measure Sparrow over Tor on the owner's pruned mainnet node with
-`[logging] level = debug` (acceptance in ROADMAP item 4). Not measured yet.
+**Open:** the owner measured the LAN path on 2026-11-14 (29.13.0): 218 of 239
+transactions came from Core/cache, but the 21 that needed a pruned block
+failed outside at 20.4 s average / 51.9 s max (AUD-160). **New proposal for
+29.13.1** in `docs/ROADMAP.md` ("External path: agile and precise"): two time
+planes (wallet 10 s, background probe 75 s), a `Healthy`/`Degraded`/`ProxyDown`
+breaker with hysteresis and one probe, a per-symptom blame table and a
+semaphore of 4 external connections. The onion measurement over Tor with
+`[logging] level = debug` (acceptance of AUD-159) is still pending and may show
+the same path problem.
 
 ## Previous change (alpha.29.12.3)
 

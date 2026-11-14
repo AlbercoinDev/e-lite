@@ -61,6 +61,106 @@ Out of scope (with a reason, do not reintroduce blindly): a second Tor
 instance for the outbound/Core `-onion` side (revisit only with measured
 contention), and any change that hints at clearnet fetches.
 
+## Planned work (2026-11-14) — 29.13.1, proposed
+
+### External path: agile and precise (AUD-160)
+
+Measured on mainnet with alpha.29.13.0 (owner log, LAN, pruned Core): a
+wallet load served 218 of 239 transactions from Core/cache; the 21 that
+needed a **pruned block** all failed outside, at **20.4 s average / 51.9 s
+max** per `transaction.get`, 8 `external_failed`, with every source failing
+at once:
+
+```text
+p2p: tor 65.191.83.40:8333: socks connect: Resource temporarily unavailable (os error 11)
+p2p: 34.93.152.123:8333 block: Resource temporarily unavailable (os error 11); p2p deadline reached
+esplora: tor https://mempool.space/api: timeout; deadline reached
+```
+
+Why it happens (verified in the code and in `man tor`):
+
+| Fact | Evidence |
+|---|---|
+| Tor allows **60 s** to build a circuit (`CircuitBuildTimeout`, adaptive) and **2 min** per SOCKS handshake (`SocksTimeout`); **32** pending circuits max (`MaxClientCircuitsPending`) | `man tor`, defaults |
+| e-lite gives up earlier: P2P over Tor **30 s**, Esplora connect **20 s** | `p2p_tor_timeout_seconds`, `tor_connect_timeout_seconds` |
+| A SOCKS CONNECT that never gets an answer is blamed on the **peer** (`Blame::Transient`, 30 s→300 s cooldown) and the 15 s proxy pause never trips | `p2p.rs:550`, `p2p.rs:763-770` |
+| P2P has one deadline for circuit + handshake + whole block; Esplora already has connect/stall/absolute (AUD-155) | `p2p_tor_timeout_seconds` |
+| No global cap on new Tor connections: 4 downloads can open P2P v2+v1 each, plus prefetch and decoys | `lib.rs`, `p2p.rs` |
+
+So the path is not slow, it is **mis-detected**: each block pays the full
+60 s budget, healthy peers are cooled, and a dead proxy is indistinguishable
+from a slow circuit.
+
+Design (two time planes; a breaker with hysteresis; one probe):
+
+| Layer | Budget | Behaviour |
+|---|---|---|
+| Wallet | **10 s** (`wallet_external_wait_seconds`) | a pruned-block `tx.get` answers in 1-5 s when the path is healthy; otherwise returns a typed error in 10 s and the wallet retries |
+| Probe | **75 s** (`CircuitBuildTimeout` 60 + margin), background | launched once after a circuit stall, off the wallet's path; success restores `Healthy`, failure extends the pause with 15→30→60 s backoff |
+
+| State | Enters on | Behaviour |
+|---|---|---|
+| `Healthy` | one success | normal attempts |
+| `Degraded` | **2 CONNECT stalls in 90 s** against distinct peers/providers (or 1 stall + Esplora down) | wallet fails in ms; P2P-over-Tor paused; one probe per 30-60 s |
+| `ProxyDown` | SOCKS TCP/greeting/auth failure (exists) | same, 15 s pause |
+
+Blame table (precision): a SOCKS **reply code** (refused, unreachable, exit
+policy) is that peer/provider's failure (short backoff); a **CONNECT without
+an answer** is a *path* signal counted globally (peer gets 30 s only); a proxy
+handshake failure is `ProxyDown`; 429/503 keep `Retry-After`; a wrong answer
+keeps the full 300 s. Never cool a peer that was not contacted, and never
+declare the proxy dead from one slow circuit.
+
+Concurrency: a global semaphore of **4** new SOCKS connections shared by P2P,
+Esplora, decoys and prefetch, well below Tor's 32 pending. `max_parallel_fetches`
+keeps bounding downloads.
+
+Files: `crates/el-rawtx/src/health.rs` (state machine, counters, probe),
+`p2p.rs` (connect/stall/absolute split, blame, consult the state),
+`esplora.rs` (consult the state; no attempts while degraded), `lib.rs`
+(wallet plane, probe, semaphore, prefetch/decoys paused while degraded),
+`config.rs` + `config.example.toml` (`wallet_external_wait_seconds` 10,
+`external_pause_seconds` 30, `external_stalls_to_degrade` 2,
+`max_external_connects` 4), `el-serve` (`/status.rawtx.external` and one INFO
+line per state change; per-block failures move to `debug:` deduplicated).
+
+Tests (fake SOCKS, which already exists for the greeting): greeting ok and no
+CONNECT answer → no peer cooled, second stall → `Degraded`, next `tx.get` in
+ms; reply code 5 → only that peer; greeting rejected → `ProxyDown`; probe ok →
+`Healthy`; prefetch/decoys do not queue while degraded; 20 concurrent requests
+never open more than 4 connections; a healthy path keeps 29.13.0's timings.
+
+Acceptance: healthy path unchanged; with the path down no `tx.get` exceeds
+~10 s, `/status` shows `Degraded` plus the probe, recovery in ≤60 s without a
+restart, one INFO line per state change and no `rawtx at height … failed`
+flood.
+
+Out of scope: reusing circuits per time window (one per provider per 30-60 s)
+would remove the storm but breaks per-request isolation (AUD-135); keep it as a
+documented opt-in with its privacy trade-off. Clearnet on Tor failure stays
+rejected (AUD-128); a second Tor instance stays out until contention is
+measured.
+
+Environment check before/while implementing (to separate network from code):
+
+```bash
+tail -50 <data-dir>/tor/tor.log
+curl -s --max-time 20 --socks5-hostname 127.0.0.1:9050 \
+  https://mempool.space/api/blocks/tip/height; echo " exit=$?"
+```
+
+A `curl` that also times out means Tor cannot leave the host; this design then
+turns it into fast errors and retries, which is all a server can do.
+
+Interim mitigation (config, no code):
+
+```toml
+[rawtx]
+prefetch = false
+decoys = 0
+max_parallel_fetches = 2
+```
+
 ### Schema v2 / history compaction (AUD-130) — from-zero reindex
 
 **Owner decision (2026-11-13): no in-place migration.** Schema v2 will be
