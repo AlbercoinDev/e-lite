@@ -697,6 +697,32 @@ impl Store {
         Ok(out)
     }
 
+    /// The first script with history whose hash is at or after `key`,
+    /// wrapping to the first one of the family. Script hashes are uniform,
+    /// so a random (or keyed-random) `key` picks a script uniformly: the
+    /// decoy wallets of the per-txid fetch mode are chosen this way (AUD-163).
+    pub fn script_at_or_after(&self, key: &[u8; PREFIX_LEN]) -> Result<Option<ScriptHash>> {
+        let cf = self.cf("history")?;
+        let mut opts = ReadOptions::default();
+        opts.set_total_order_seek(true);
+        let mut iter =
+            self.db
+                .iterator_cf_opt(cf, opts, IteratorMode::From(key, Direction::Forward));
+        let first = match iter.next() {
+            Some(item) => Some(item?),
+            None => match self.full_iter("history")?.next() {
+                Some(item) => Some(item?),
+                None => None,
+            },
+        };
+        match first {
+            Some((k, _)) if k.len() >= PREFIX_LEN => {
+                Ok(Some(ScriptHash(Hash32::from_slice(&k[..PREFIX_LEN])?)))
+            }
+            _ => Ok(None),
+        }
+    }
+
     // -------------------------------------------------------------------- utxo
 
     pub fn put_utxo(&self, batch: &mut WriteBatch, op: &Outpoint, value: &UtxoValue) -> Result<()> {

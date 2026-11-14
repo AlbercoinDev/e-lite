@@ -26,6 +26,9 @@ onion show       show the Tor onion address, ports and managed-Tor state
 onion reset      generate a new onion address (stop e-lite first)
 cache status     size, limits and free space of the rawtx cache (the only
                  on-disk cache: verified transactions and repair blocks)
+privacy check    validate privacy.toml and print the effective values, where
+                 each comes from (preset, file, --set) and its range
+                 (--json for scripts); never starts anything
 cache clear      delete the rawtx cache (needs --yes; --dry-run previews it).
                  Never touches the index, Core, TLS or Tor; restart e-lite to
                  release the in-memory block cache as well
@@ -241,7 +244,9 @@ e-lite run --network mainnet --allow-mainnet \
 | `--set rawtx.request_timeout_seconds=<n>` | per-provider block timeout, direct (clearnet) | `8` |
 | `--set rawtx.tor_request_timeout_seconds=<n>` | per-provider block timeout through Tor (new circuit + whole block) | `20` |
 | `--set rawtx.provider_cooldown_seconds=<n>` | cool down a failed provider (Tor or direct) | `300` |
-| `--set rawtx.max_parallel_fetches=<n>` | concurrent external block downloads | `8` |
+| `--set rawtx.max_parallel_fetches=<n>` | concurrent external block downloads | `16` |
+| `--set rawtx.privacy_file=<path>` | `privacy.toml` location (empty: next to config.toml) | empty |
+| `--set privacy.<section>.<key>=<v>` | override one `privacy.toml` value for this run (range-checked, see `docs/PRIVACY-TUNING.md`) | — |
 | `--set rawtx.p2p_timeout_seconds=<n>` | P2P connect/handshake/block timeout | `8` |
 | `--set public_servers.require_ready=false` | start without a ready provider | `true` |
 | `--set public_servers.probe_timeout_seconds=<n>` | per-provider probe timeout (parallel probe; Tor attempts get at least `rawtx.tor_request_timeout_seconds`) | `5` |

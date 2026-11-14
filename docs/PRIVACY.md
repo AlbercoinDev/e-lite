@@ -2,8 +2,12 @@
 
 e-lite is local-first. The index answers headers, history, balances, UTXOs and
 proofs without contacting third parties. External networks are used only when
-the local Core cannot supply a raw transaction block (pruned old blocks) or when
+the local Core cannot supply a raw transaction (pruned old blocks) or when
 repairing a prune gap.
+
+How pruned transactions are fetched, what a server can learn and every
+setting of `privacy.toml` are explained in
+[`PRIVACY-TUNING.md`](PRIVACY-TUNING.md).
 
 ## What stays local
 
@@ -23,16 +27,24 @@ repairing a prune gap.
 
 ## What can leave the machine
 
-Only raw transaction resolution and prune-gap repair can use external sources.
-They request **whole blocks by block hash**:
+Only raw transaction resolution and prune-gap repair can use external sources,
+always through Tor unless clearnet is explicitly allowed. The default
+(`privacy.toml`, preset `balanced`, AUD-163) fetches **loose transactions by
+txid** from public Electrum servers and Esplora, mixed with **decoy wallets**
+built from the local index and spread over several servers:
 
 ```text
-Core local block -> validated disk cache -> P2P/Esplora (whole block by hash)
+tx cache -> Core local block -> per-txid (Electrum batch / Esplora /tx, with
+decoy wallets, verified against the index) -> whole block by hash (fallback)
 ```
 
-A provider learns the set of block hashes fetched. It does **not** receive the
-wallet's scripts, txids or query history. Every fetched block is verified before
-use:
+A server learns the txids it is asked for, never the wallet's scripts,
+addresses, xpub or IP; it sees `k + 1` plausible wallets loading at once
+(`decoys.wallets`, default 3). Every loose transaction is checked before use:
+its txid, its position in the indexed block and its merkle branch up to the
+indexed header. `preset = "max"` restores **whole blocks by block hash
+only**: no txid ever leaves the node, and a provider learns only block
+hashes. Every fetched block is verified before use:
 
 1. block hash equals the expected hash from Core's active chain;
 2. header/chain continuity;
@@ -92,7 +104,7 @@ tor_connect_timeout_seconds = 10
 tor_stall_timeout_seconds = 12
 tor_request_timeout_seconds = 60
 provider_cooldown_seconds = 300
-max_parallel_fetches = 8
+max_parallel_fetches = 16
 p2p_timeout_seconds = 8
 p2p_tor_timeout_seconds = 30
 use_p2p = true

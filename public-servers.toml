@@ -31,18 +31,41 @@ esplora = [
     # Blockstream API onion candidate did not resolve over Tor on 2026-11-06;
     # it is intentionally not enabled.
 ]
+# Public Electrum servers for the per-txid mode (privacy.toml, AUD-163):
+# host:port:s (TLS) or host:port:t (plain, for .onion). Only txids are sent,
+# always through Tor, mixed with decoy wallets and spread over several
+# servers; every answer is verified against the local index. Checked over Tor
+# on 2026-11-14 with server.version + a JSON-RPC batch of transaction.get.
+# `electrum = []` disables them (Esplora /tx/:txid/raw and whole blocks stay).
+electrum = [
+    "electrum.emzy.de:50002:s",
+    "fortress.qtornado.com:443:s",
+    "electrum.blockstream.info:50002:s",
+    "btc.electroncash.dk:60002:s",
+    "fulcrum.grey.pw:51002:s",
+    "electrum.acinq.co:50002:s",
+    "electrum.hodlister.co:50002:s",
+    "fulcrum.sethforprivacy.com:50002:s",
+    "electrum.bitaroo.net:50002:s",
+    "bitcoin.aranguren.org:50002:s",
+]
 
 [signet]
 esplora = [
     "https://mempool.space/signet/api",
     "https://blockstream.info/signet/api",
 ]
+# No signet Electrum server verified yet: the per-txid mode uses Esplora.
+electrum = []
 
 [testnet4]
 esplora = [
     "https://mempool.space/testnet4/api",
     "https://blockstream.info/testnet4/api",
 ]
+# No testnet4 Electrum server verified yet: the per-txid mode uses Esplora.
+electrum = []
 
 [regtest]
 esplora = []
+electrum = []

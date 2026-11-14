@@ -48,6 +48,13 @@ endpoints of every source (up to 3 attempts at once) and the first block that
 passes the checks above wins, so a withholding source costs a hedge delay,
 not a turn.
 
+Since AUD-163 (29.15.0, owner decision) the default external path fetches
+loose transactions **by txid** (public Electrum batches, Esplora `/tx`),
+verified against the index (txid, position in the indexed block, merkle
+branch up to the indexed header), with decoy wallets from the index. Whole
+blocks remain the fallback and the `max` preset. See
+`docs/PRIVACY-TUNING.md`.
+
 ## Evidence
 - Unit/mock: witness and Merkle tampering, corrupt/partial blocks, cache eviction,
   source fallback, decoys, Tor fail-closed, prune gap.

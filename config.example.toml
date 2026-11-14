@@ -208,7 +208,7 @@ provider_cooldown_seconds = 300     # cooldown after a hard failure (bad answer,
                                     # a 429/503 honours Retry-After (15 s doubling, max
                                     # 120 s). Over Tor a 429 is one exit: the provider
                                     # is paused only after 3 limited circuits in 60 s
-max_parallel_fetches = 8            # external block downloads in flight (the prefetch
+max_parallel_fetches = 16           # external block downloads in flight (the prefetch
                                     # never takes the last free one); attempts in
                                     # flight (hedges included) are capped at twice
                                     # this, at most 24 (Tor allows 32 pending circuits)
@@ -222,6 +222,11 @@ p2p_peers = []                      # empty: discover from local Core (outbound 
                                     # witness peers only, onion first, refreshed 10 min)
 # esplora_urls = []                 # one-off override; normally leave empty and
 #                                   # edit public-servers.toml instead (see below)
+# privacy_file = ""                 # privacy.toml; empty = next to this config.
+#                                   # How pruned transactions are fetched (per-txid
+#                                   # with decoy wallets by default, or whole blocks),
+#                                   # every setting with its range:
+#                                   # docs/PRIVACY-TUNING.md, `e-lite privacy check`
 
 [public_servers]
 # Public providers are NOT compiled into e-lite. The file is read from the same

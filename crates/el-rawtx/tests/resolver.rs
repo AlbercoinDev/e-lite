@@ -191,6 +191,8 @@ fn config(decoys: u32, cache_mib: u64) -> RawtxConfig {
         p2p_timeout: Duration::from_secs(1),
         p2p_tor_timeout: Duration::from_secs(1),
         chain: el_model::Chain::Regtest,
+        privacy: el_rawtx::PrivacyParams::default(),
+        electrum_servers: Vec::new(),
     }
 }
 
@@ -1198,5 +1200,69 @@ fn a_race_waits_for_an_endpoint_that_comes_back() {
     let started = Instant::now();
     assert!(resolver.raw_tx(txid, 0).is_ok());
     assert!(started.elapsed() < el_rawtx::RACE_REFILL_WAIT);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_prefetch_failure_is_not_returned_to_a_wallet() {
+    // AUD-165: the failure memory holds only wallet failures. A background
+    // prefetch that failed must not answer the wallet's own request with its
+    // error (Sparrow would store the transaction as unfetchable).
+    let dir = tmp("prefetch-failure");
+    let block = multi_tx_block(5);
+    let ids: Vec<Hash32> = block.txdata.iter().map(txid_of).collect();
+    let (store, _hash, _txid, _bytes) = setup_with(&dir, 4, block);
+    let src = Arc::new(FailingSource {
+        calls: AtomicU64::new(0),
+    });
+    let resolver = Resolver::new(Arc::clone(&store), &config(0, 1))
+        .unwrap()
+        .with_external(src.clone());
+    assert!(resolver.prefetch_block_txs(4, &ids[1..2]).is_err());
+    let after_prefetch = src.calls.load(Ordering::SeqCst);
+    assert!(resolver.raw_tx(ids[1], 4).is_err());
+    assert!(
+        src.calls.load(Ordering::SeqCst) > after_prefetch,
+        "the wallet asked the sources itself"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_shared_download_owes_one_decoy() {
+    // AUD-165: eight callers sharing one download owe one decoy, not eight.
+    use std::sync::Barrier;
+    let dir = tmp("one-decoy");
+    let (store, _hash, txid, bytes) = setup(&dir, 0);
+    let src = SlowSource::new(bytes);
+    let resolver = Arc::new(
+        Resolver::new(Arc::clone(&store), &config(1, 0))
+            .unwrap()
+            .with_external(src.clone()),
+    );
+    let barrier = Arc::new(Barrier::new(8));
+    let handles: Vec<_> = (0..8)
+        .map(|_| {
+            let resolver = Arc::clone(&resolver);
+            let barrier = Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                barrier.wait();
+                resolver.raw_tx(txid, 0)
+            })
+        })
+        .collect();
+    for h in handles {
+        assert!(h.join().unwrap().is_ok());
+    }
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while resolver.decoys_pending() > 0 && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    // One real download plus at most one decoy download.
+    assert!(
+        src.calls.load(Ordering::SeqCst) <= 2,
+        "{}",
+        src.calls.load(Ordering::SeqCst)
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }

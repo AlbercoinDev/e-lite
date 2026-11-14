@@ -151,6 +151,14 @@ else
       install -m 0644 "$TMP/pkg/public-servers.toml" "$CFG_DIR/public-servers.toml"
       log "public servers: installed the default list at $CFG_DIR/public-servers.toml"
     fi
+    # Reference templates, refreshed on every update (never your own files):
+    # e-lite reads the shipped Electrum list from here when your
+    # public-servers.toml predates it.
+    SHARE_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/e-lite"
+    mkdir -p "$SHARE_DIR"
+    for f in public-servers.toml privacy.toml; do
+      [ -f "$TMP/pkg/$f" ] && install -m 0644 "$TMP/pkg/$f" "$SHARE_DIR/$f"
+    done
   fi
   log "e-lite: installed $CURRENT at $PREFIX/e-lite"
 fi

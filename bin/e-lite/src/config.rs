@@ -709,6 +709,12 @@ pub struct RawtxCfg {
     pub esplora_urls: Vec<String>,
     #[serde(default)]
     pub p2p_peers: Vec<String>,
+    /// `privacy.toml` path. Empty = next to config.toml (AUD-163).
+    #[serde(default)]
+    pub privacy_file: Option<String>,
+    /// `--set privacy.*` overrides, filled from the command line.
+    #[serde(skip)]
+    pub privacy_overrides: Vec<String>,
 }
 
 impl Default for RawtxCfg {
@@ -735,6 +741,8 @@ impl Default for RawtxCfg {
             p2p_v2: true,
             esplora_urls: Vec::new(),
             p2p_peers: Vec::new(),
+            privacy_file: None,
+            privacy_overrides: Vec::new(),
         }
     }
 }
@@ -813,7 +821,7 @@ fn d_provider_cooldown() -> u64 {
     300
 }
 fn d_max_parallel_fetches() -> usize {
-    8
+    16
 }
 fn d_p2p_timeout() -> u64 {
     8

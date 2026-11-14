@@ -135,6 +135,8 @@ fn fixture() -> (Fixture, ScriptHash, Hash32) {
                 p2p_timeout: Duration::from_secs(1),
                 p2p_tor_timeout: Duration::from_secs(1),
                 chain,
+                privacy: el_rawtx::PrivacyParams::default(),
+                electrum_servers: Vec::new(),
             },
         )
         .unwrap(),
@@ -476,6 +478,8 @@ fn slow_fixture(delay: Duration) -> (Arc<Shared>, Hash32, std::path::PathBuf) {
                 p2p_timeout: Duration::from_secs(1),
                 p2p_tor_timeout: Duration::from_secs(1),
                 chain: Chain::Regtest,
+                privacy: el_rawtx::PrivacyParams::default(),
+                electrum_servers: Vec::new(),
             },
         )
         .unwrap()

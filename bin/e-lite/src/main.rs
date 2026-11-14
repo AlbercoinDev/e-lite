@@ -4,6 +4,7 @@ mod core_probe;
 mod core_supervisor;
 mod ibd_lock;
 mod logging;
+mod privacy;
 mod public_servers;
 mod snapshot;
 mod tls;
@@ -189,6 +190,7 @@ enum Command {
     Core,
     Onion,
     Cache,
+    Privacy,
     ArcSetup,
 }
 
@@ -486,7 +488,10 @@ fn parse_args() -> R<Args> {
             other => {
                 if matches!(
                     args.command,
-                    Some(Command::Core) | Some(Command::Onion) | Some(Command::Cache)
+                    Some(Command::Core)
+                        | Some(Command::Onion)
+                        | Some(Command::Cache)
+                        | Some(Command::Privacy)
                 ) && args.subcommand.is_none()
                 {
                     args.subcommand = Some(other.to_string());
@@ -505,6 +510,7 @@ fn parse_args() -> R<Args> {
                     "core" => Command::Core,
                     "onion" => Command::Onion,
                     "cache" => Command::Cache,
+                    "privacy" => Command::Privacy,
                     "export-snapshot" => Command::ExportSnapshot,
                     "import-snapshot" => Command::ImportSnapshot,
                     "arc-setup" => Command::ArcSetup,
@@ -526,7 +532,14 @@ fn effective_config(args: &Args) -> R<(Config, Chain)> {
 /// directory (`cache`): resolving `network = auto` must not wait on Core or
 /// open the database (which a running daemon holds locked).
 fn effective_config_with(args: &Args, probe_core: bool) -> R<(Config, Chain)> {
-    let mut cfg = Config::load_with_overrides(args.config.as_deref(), &args.set)?;
+    // `--set privacy.*` belongs to privacy.toml, not to config.toml.
+    let (privacy_sets, config_sets): (Vec<String>, Vec<String>) = args
+        .set
+        .iter()
+        .cloned()
+        .partition(|s| s.trim_start().starts_with("privacy."));
+    let mut cfg = Config::load_with_overrides(args.config.as_deref(), &config_sets)?;
+    cfg.rawtx.privacy_overrides = privacy_sets;
     if let Some(n) = &args.network {
         cfg.network.name = n.clone();
     }
@@ -1279,7 +1292,7 @@ fn run() -> R<()> {
         return cmd_arc_setup(args.apply);
     }
 
-    let (cfg, chain) = if cmd == Command::Cache {
+    let (cfg, chain) = if matches!(cmd, Command::Cache | Command::Privacy) {
         // Maintenance: no Core probe and no database open (a running daemon
         // holds the RocksDB lock).
         effective_config_with(&args, false)?
@@ -1317,6 +1330,14 @@ fn run() -> R<()> {
             args.purge,
             args.yes,
         ),
+        Command::Privacy => match args.subcommand.as_deref() {
+            None | Some("check") => {
+                privacy::cmd_check(&cfg, config_path().as_deref(), args.json).map_err(Into::into)
+            }
+            Some(other) => {
+                Err(format!("unknown privacy command: {other} (expected: check)").into())
+            }
+        },
         Command::Cache => cmd_cache(
             &cfg,
             chain,
@@ -5956,6 +5977,7 @@ fn build_resolver(
     store: &Arc<Store>,
     core: &CoreClient,
     esplora_urls: Vec<String>,
+    electrum_servers: Vec<String>,
 ) -> R<Arc<Resolver>> {
     let mut peers = cfg.rawtx.p2p_peers.clone();
     let mut hints = Vec::new();
@@ -5972,10 +5994,18 @@ fn build_resolver(
         hints = found;
     }
     let tor = cfg.rawtx.tor_socks.clone().filter(|s| !s.trim().is_empty());
+    // privacy.toml (AUD-163): created from the template on the first run; an
+    // invalid file stops the start with the file, the key and the range.
+    let privacy_loaded = privacy::load(cfg, config_path().as_deref(), true)?;
+    eprintln!("[e-lite] privacy: {}", privacy::summary(&privacy_loaded));
+    for w in &privacy_loaded.warnings {
+        eprintln!("[e-lite] WARNING: privacy: {w}");
+    }
+    let privacy_params = privacy_loaded.params.clone();
     let rc = RawtxConfig {
         enabled: cfg.rawtx.enabled,
         cache_mib: cfg.rawtx.cache_mib,
-        decoys: cfg.rawtx.decoys,
+        decoys: privacy_params.block_decoys,
         tor_socks: tor,
         allow_clearnet: cfg.rawtx.allow_clearnet,
         fallback_clearnet: cfg.rawtx.tor_fallback_clearnet,
@@ -5998,8 +6028,35 @@ fn build_resolver(
         p2p_timeout: Duration::from_secs(cfg.rawtx.p2p_timeout_seconds.max(1)),
         p2p_tor_timeout: Duration::from_secs(cfg.rawtx.p2p_tor_timeout_seconds.max(1)),
         chain,
+        privacy: privacy_params.clone(),
+        electrum_servers,
     };
     let resolver = Resolver::new(Arc::clone(store), &rc)?;
+    match resolver.tx_mode_servers() {
+        Some(n) => {
+            eprintln!(
+                "[e-lite] privacy: per-txid mode over {n} servers ({} electrum, {} esplora), \
+                 {} decoy wallets; whole blocks as fallback",
+                rc.electrum_servers.len(),
+                rc.esplora_urls.len(),
+                privacy_params.decoy_wallets
+            );
+            if n < privacy_params.min_servers {
+                eprintln!(
+                    "[e-lite] WARNING: privacy: sessions.min_servers = {} but only {n} servers are \
+                     configured; transactions are spread over the ones available",
+                    privacy_params.min_servers
+                );
+            }
+        }
+        None if privacy_params.mode == el_rawtx::ExternalMode::Tx && cfg.rawtx.enabled => {
+            eprintln!(
+                "[e-lite] privacy: per-txid mode unavailable (no Electrum/Esplora server reachable \
+                 through Tor); whole blocks only"
+            );
+        }
+        None => {}
+    }
     if !hints.is_empty() {
         // Same peers, plus Core's view of their transport (v1/v2).
         resolver.refresh_p2p_peers(hints);
@@ -6283,12 +6340,20 @@ fn build_shared(
     identity: NetworkIdentity,
 ) -> R<Arc<Shared>> {
     let core = core_client(cfg, chain)?;
+    let resolved = public_servers::load(cfg, chain, crate::config_path().as_deref());
     let public_servers = if !cfg.rawtx.esplora_urls.is_empty() {
         cfg.rawtx.esplora_urls.clone()
     } else {
-        public_servers::load(cfg, chain, crate::config_path().as_deref()).endpoints
+        resolved.endpoints.clone()
     };
-    let resolver = build_resolver(cfg, chain, &store, &core, public_servers.clone())?;
+    let resolver = build_resolver(
+        cfg,
+        chain,
+        &store,
+        &core,
+        public_servers.clone(),
+        resolved.electrum.clone(),
+    )?;
     let readers = el_chain::ReaderTracker::new();
     // Opt-in (AUD-134). P2P may gain peers later, so the configured sources
     // count, not the ones usable right now.

@@ -16,6 +16,6 @@ reqwest.workspace = true
 rand.workspace = true
 filetime.workspace = true
 bip324.workspace = true
-
-[dev-dependencies]
 serde_json.workspace = true
+rustls.workspace = true
+

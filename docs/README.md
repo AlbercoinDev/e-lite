@@ -7,6 +7,8 @@ Start here:
 3. [`ARCHITECTURE.md`](ARCHITECTURE.md) — components and execution modes.
 4. [`OPERATIONS.md`](OPERATIONS.md) — first run, pruning, disks, monitoring.
 5. [`PRIVACY.md`](PRIVACY.md) — local vs external data, Tor/clearnet, providers.
+   [`PRIVACY-TUNING.md`](PRIVACY-TUNING.md) — `privacy.toml`: per-txid mode,
+   decoy wallets, presets, every parameter with its range.
 6. [`FEATURES.md`](FEATURES.md) — what exists today.
 7. [`ROADMAP.md`](ROADMAP.md) — future features/improvements.
 8. [`CLI.md`](CLI.md) — every command-line flag, `--set` and tuning examples.

@@ -1,5 +1,72 @@
 # Changelog
 
+## 0.1.0-alpha.29.15.0 — 2026-11-14
+
+### Deep wallets load in tens of seconds over Tor: per-txid fetch with decoy wallets (AUD-163)
+
+No schema, protocol or consensus change. On a pruned node, the owner's cold
+Sparrow load (29.14.1) spent 3 min 29 s on one chunk of 239 transactions
+because ~144 whole blocks (~210 MB) had to come through Tor. e-lite's index
+already knows every transaction's block, position and the block's txids, so
+it can verify a loose transaction locally without its block.
+
+- **Per-txid mode by default** (owner decision). Pruned transactions are
+  fetched by txid from public Electrum servers (one JSON-RPC batch per short
+  session on a fresh Tor circuit) and Esplora `/tx/:txid/raw`. Every
+  transaction is verified against the index (txid, position in the indexed
+  block, merkle branch up to the indexed header) before it is cached or
+  served; a server that fails it is penalised and the transaction goes to
+  another one; after three servers, the whole-block race is the fallback.
+  The fetch starts when the wallet subscribes to an address, from the index,
+  only for heights Core has pruned. Measured over Tor with real mainnet
+  blocks: 480 transactions in 33 s, and **907 (the volume of the owner's
+  wallet plus three decoy wallets) in 50.6 s with no failure**; whole blocks
+  took ~3.5 min for the owner's load.
+- **Decoy wallets, not decoy txids.** A wallet's transactions are connected
+  in the graph, so random decoys do not hide it. For each real address,
+  e-lite picks look-alike addresses from its own index (similar history size
+  and era), grows them through their outputs like a wallet, and loads them
+  alongside: a server sees `k + 1` plausible wallets (default k = 3). The
+  choice is keyed by a local secret (`<data-dir>/decoy.key`, 0600, never in a
+  snapshot), so reloads show the same decoys and cannot be intersected.
+  Every choice depends only on the secret, the address and chain data
+  (growth follows the decoy's own history order), never on timing. Groups
+  are shuffled and spread so that no server receives more than a third of
+  any of them over the whole load (counted per connection, not per batch);
+  at most two sessions per server at once (measured: more parallel sessions
+  are refused).
+- **`privacy.toml`**, a file of its own next to `config.toml`, created from
+  the template and never overwritten: presets `balanced` (default), `max`
+  (whole blocks only: no txid ever leaves the node) and `fast`, and every
+  parameter optional with a minimum and maximum (decoy wallets 0..8, session
+  size 1..500, servers 1..16, max share 0.1..1.0, parallel sessions 1..32,
+  ...). An unknown key or a value out of range stops the start with the
+  file, the key and the range. `--set privacy.<section>.<key>=<value>`
+  overrides it; **`e-lite privacy check [--json]`** prints the effective
+  values and where each one comes from. Full guide:
+  `docs/PRIVACY-TUNING.md`.
+- **Electrum servers** in `public-servers.toml` (`electrum = [...]`, 10
+  servers verified over Tor with batches). A file without the key uses the
+  shipped list (logged); `electrum = []` disables them. `install.sh` keeps a
+  reference copy of the templates in `~/.local/share/e-lite/`.
+- `/status.rawtx.tx_mode`: sessions, real and decoy txids sent, verified,
+  rejected and block fallbacks; startup lines `privacy:` with the effective
+  settings and the servers in use.
+
+### Server pauses removed (AUD-164..166)
+
+- Background `transaction.get` answers no longer wait up to 250 ms for the
+  socket lock: the reader polls every 10 ms while they run.
+- A prefetch failure is never returned to a wallet (it could be stored as an
+  unfetchable transaction); a wallet joining a prefetch download upgrades it,
+  and wallets get download slots first.
+- One verification and one decoy per shared block download (followers used
+  to verify again and owe one each).
+- Blocks read from the local Core stay in memory (24 blocks): a burst of
+  transactions from one block costs one `getblock`.
+- Merkle proofs reuse the txids of the last 64 blocks.
+- `max_parallel_fetches` 8 -> 16 for whole-block downloads.
+
 ## 0.1.0-alpha.29.14.1 — 2026-11-14
 
 ### Fixes

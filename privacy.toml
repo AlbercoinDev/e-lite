@@ -1,0 +1,101 @@
+# e-lite privacy settings for transactions fetched from outside (AUD-163).
+#
+# This file lives next to config.toml (one per network) and is created from
+# this template on the first run. Updates never overwrite it. Delete it and
+# restart to get the template back. `e-lite privacy check` validates it and
+# prints the effective values and where each one comes from.
+#
+# Background (docs/PRIVACY-TUNING.md has the full explanation):
+# On a pruned node, a wallet's old transactions are not on disk. e-lite asks
+# public servers for them, always through Tor (never your IP), and never sends
+# addresses, scripts or xpubs. Every answer is verified against the local
+# index (txid + merkle branch up to the indexed header), so a lying server can
+# only withhold data, never forge it.
+#
+# What a server can learn depends on the mode:
+#   tx    - it sees the txids requested. A wallet's transactions form a
+#           connected group in the transaction graph, so e-lite also loads k
+#           "decoy wallets": real address histories from the index, chosen
+#           with the same size and age as yours, grown through their outputs
+#           like a wallet, and stable across reloads (seeded by a local
+#           secret, <data-dir>/decoy.key). The server sees k+1 plausible
+#           wallets loading at the same time and cannot tell which is yours.
+#   block - it sees whole block hashes (~3000 transactions each). Decoy blocks
+#           are the blocks of the same decoy wallets. Slowest, most private.
+#
+# Every key below is optional: a key that is not set takes the preset's
+# value; a key that is set replaces it. An unknown key or a value outside its
+# range stops e-lite at startup with the file, the key and the range.
+
+# Preset: "balanced" (default), "max" or "fast".
+#   balanced - tx mode, 3 decoy wallets, sessions of 50 txids spread over at
+#              least 3 servers. Tens of seconds cold over Tor.
+#   max      - block mode only: no txid ever leaves the node. Minutes over Tor
+#              for a deep wallet.
+#   fast     - tx mode, 1 decoy wallet, sessions of 100 txids over 2 servers.
+#              About half the requests of balanced, but a server only has 2
+#              groups to choose from.
+preset = "balanced"
+
+# mode = "tx"                # "tx" or "block"; overrides the preset's mode
+
+[decoys]
+# Decoy wallets loaded with each real wallet (k). More hides you among more
+# wallets (a server's chance of picking yours is 1/(k+1)) and costs k times
+# the requests (still kilobytes per transaction).
+# Range 0..8. balanced 3, max 3, fast 1. 0 disables decoys (not recommended).
+# wallets = 3
+
+# A decoy address's history may be this fraction of the real one's size...
+# Range 0.1..1.0. Default 0.5. Lower finds decoys faster but less alike.
+# size_min_ratio = 0.5
+
+# ...up to this multiple of it.
+# Range 1.0..10.0. Default 2.0. Must not be below size_min_ratio.
+# size_max_ratio = 2.0
+
+# A decoy history must overlap the real one's height range widened by this
+# many blocks, so decoys come from the same era as your wallet.
+# Range 0..500000. Default 52560 (about one year).
+# era_margin_blocks = 52560
+
+# Index seeks tried per decoy address before the size/era limits are relaxed.
+# Range 8..1024. Default 64. All local and cheap.
+# seek_attempts = 64
+
+# Grow each decoy wallet through the outputs of its transactions (local index
+# lookups, in history order, up to the size of your address), so it is
+# connected like a real wallet instead of a set of unrelated addresses.
+# Deterministic: reloads send the same decoys. Default true.
+# growth = true
+
+[sessions]
+# Txids per Electrum session before it is closed. Each session costs a new
+# Tor circuit and TLS handshake (2-7 s measured), so larger sessions are much
+# faster: 480 transactions took 61 s with 20 per session and 33 s with 50.
+# Smaller sessions show one circuit fewer transactions together, but a server
+# can link its own sessions by timing anyway: the decoy wallets and the spread
+# over servers are what hide you.
+# Range 1..500. balanced 50, fast 100 (unused in max).
+# size = 50
+
+# Distinct servers one group (yours or a decoy) is spread over.
+# Range 1..16. balanced 3, fast 2. Fewer configured servers: all of them.
+# min_servers = 3
+
+# Largest fraction of one group a single server receives.
+# Range 0.1..1.0. balanced 0.34, fast 0.5. It never goes below 1/servers.
+# max_share = 0.34
+
+# Electrum sessions open at the same time (each on its own Tor circuit).
+# Range 1..32 (Tor builds at most 32 circuits at once). Default 16.
+# parallel = 16
+
+# How long requests are gathered before they are mixed and sent, in ms.
+# Range 0..1000. Default 20.
+# batch_window_ms = 20
+
+[blocks]
+# Decoy blocks per real block download (block mode, and the tx-mode
+# fallback). Range 0..8. Default 1 (or [rawtx] decoys in config.toml).
+# decoys = 1

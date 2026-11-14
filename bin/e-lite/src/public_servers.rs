@@ -17,6 +17,10 @@ use std::time::{Duration, Instant};
 struct NetworkServers {
     #[serde(default)]
     esplora: Vec<String>,
+    /// `None`: the key is absent (a file from before 29.15.0), so the
+    /// shipped template's list applies. `Some([])` disables Electrum.
+    #[serde(default)]
+    electrum: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -369,6 +373,8 @@ pub struct Resolved {
     pub source: String,
     /// Effective Esplora bases for the active network.
     pub endpoints: Vec<String>,
+    /// Electrum servers (`host:port:s|t`) for the per-txid mode (AUD-163).
+    pub electrum: Vec<String>,
 }
 
 impl Resolved {
@@ -412,6 +418,11 @@ fn template_candidates(target: &Path) -> Vec<PathBuf> {
             candidates.extend(checkout_template(dir));
         }
     }
+    // Reference copy that install.sh refreshes on every install/update.
+    let data_home = std::env::var_os("XDG_DATA_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| crate::config::home().join(".local/share"));
+    candidates.push(data_home.join("e-lite/public-servers.toml"));
     // System packages.
     candidates.push(PathBuf::from("/usr/share/e-lite/public-servers.toml"));
     candidates.push(PathBuf::from("/usr/local/share/e-lite/public-servers.toml"));
@@ -489,6 +500,7 @@ pub fn load(cfg: &Config, chain: Chain, config_path: Option<&Path>) -> Resolved 
         }
     }
 
+    let mut electrum: Option<Vec<String>> = None;
     let endpoints = if target.is_file() {
         if source == "none" {
             source = "file".to_string();
@@ -497,7 +509,9 @@ pub fn load(cfg: &Config, chain: Chain, config_path: Option<&Path>) -> Resolved 
             Ok(text) => match toml::from_str::<HashMap<String, NetworkServers>>(&text) {
                 Ok(mut networks) => {
                     let key = chain.name();
-                    let mut endpoints = networks.remove(key).map(|n| n.esplora).unwrap_or_default();
+                    let net = networks.remove(key);
+                    electrum = net.as_ref().and_then(|n| n.electrum.clone());
+                    let mut endpoints = net.map(|n| n.esplora).unwrap_or_default();
                     endpoints.retain(|url| match validate(url) {
                         Ok(()) => true,
                         Err(reason) => {
@@ -536,10 +550,44 @@ pub fn load(cfg: &Config, chain: Chain, config_path: Option<&Path>) -> Resolved 
         );
     }
 
+    // A file written before the Electrum list existed has no `electrum` key:
+    // take the shipped template's list so an update gets the per-txid mode,
+    // and say how to pin or disable it.
+    let mut electrum = match electrum {
+        Some(list) => list,
+        None => {
+            let from_template = find_template(&target)
+                .and_then(|t| std::fs::read_to_string(&t).ok())
+                .and_then(|text| toml::from_str::<HashMap<String, NetworkServers>>(&text).ok())
+                .and_then(|mut n| n.remove(chain.name()))
+                .and_then(|n| n.electrum)
+                .unwrap_or_default();
+            if !from_template.is_empty() {
+                eprintln!(
+                    "[e-lite] public servers: {} has no `electrum` list for {}; using the {} servers \
+                     of the shipped template (add `electrum = [...]` to pin your own, `electrum = []` \
+                     to disable)",
+                    target.display(),
+                    chain.name(),
+                    from_template.len()
+                );
+            }
+            from_template
+        }
+    };
+    electrum.retain(|entry| match el_rawtx::ElectrumServer::parse(entry) {
+        Ok(_) => true,
+        Err(reason) => {
+            eprintln!("[e-lite] WARNING: ignoring electrum server: {reason}");
+            false
+        }
+    });
+
     Resolved {
         path: target,
         source,
         endpoints,
+        electrum,
     }
 }
 

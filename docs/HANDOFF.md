@@ -153,7 +153,29 @@ the dynamic ARC to work, e-lite needs write access to
 `/sys/module/zfs/parameters/zfs_arc_max` (root, group-writable parameter or a
 non-read-only mount).
 
-## Last change (alpha.29.14.0, AUD-160)
+## Last change (alpha.29.15.0, AUD-163..166) - not released yet
+
+Requested by the owner (2026-11-14): make a deep wallet's first load as fast
+as possible using the index, completing from external servers. Owner
+decisions: per-txid fetch by default; privacy level `balanced` (3 decoy
+wallets from the index, spread over servers); every parameter adjustable with
+minimum and maximum in its own file `privacy.toml`, well documented
+(`docs/PRIVACY-TUNING.md`). Rejected by the owner: keeping xpubs in the
+config to pre-warm wallets.
+
+Measured over Tor with the new code: 480 loose transactions of real mainnet
+blocks in 33 s (sessions of 50; 61 s with 20); 907 transactions (the owner's
+volume with 3 decoy wallets) in 50.6 s, no failure; 32 parallel sessions get
+refused (87/480 lost), so 16 with at most 2 per server. Decoys are
+deterministic (five identical loads in tests) and the per-server share is
+counted over the whole load.
+
+**Next:** the owner's cold Sparrow load on the pruned mainnet node with debug
+logs, comparing with the 3 min 29 s of 29.14.1 and reading
+`/status.rawtx.tx_mode`. Not done: a script-status cache (measured
+189-257 µs per history scan).
+
+## Previous change (alpha.29.14.0, AUD-160)
 
 Requested by the owner (2026-11-14) after a cold Sparrow load over LAN on the
 pruned mainnet node: 0.14 blocks/s, up to 60 s per `transaction.get`, Sparrow

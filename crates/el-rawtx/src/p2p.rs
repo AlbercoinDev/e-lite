@@ -390,7 +390,7 @@ fn check_block(payload: &[u8], hash: &Hash32, peer: &str) -> Result<bitcoin::Blo
     Ok(block)
 }
 
-fn split_host_port(peer: &str) -> io::Result<(&str, u16)> {
+pub(crate) fn split_host_port(peer: &str) -> io::Result<(&str, u16)> {
     if let Some(rest) = peer.strip_prefix('[') {
         let (host, tail) = rest
             .split_once(']')
@@ -454,7 +454,7 @@ fn socks_reply_name(code: u8) -> &'static str {
 /// The `socks` crate does not expose timeouts, so a stalled Tor SOCKS proxy
 /// could block a P2P fetch indefinitely. This performs the same handshake with
 /// the P2P timeout applied to every step.
-fn socks_connect(
+pub(crate) fn socks_connect(
     proxy: &str,
     peer: &str,
     timeout: Duration,

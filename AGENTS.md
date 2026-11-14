@@ -238,6 +238,15 @@ Never treat a version number in this file as authoritative over the code/tag.
   scriptpubkey subscriptions get a forced notification on reorg even if the
   status string is unchanged. Outpoint status resolution runs in a bounded
   worker pool, never in the notifier thread.
+- `privacy.toml` lives next to `config.toml` like `public-servers.toml`,
+  is created from the template on the first run and never overwritten; an
+  unknown key or an out-of-range value is a startup error naming the file,
+  the key and the range; `--set privacy.<section>.<key>=<value>` overrides
+  it; `e-lite privacy check [--json]` prints effective values and their
+  origin. The Electrum list is `electrum = [...]` in `public-servers.toml`
+  (not compiled in); a file without the key uses the shipped template's list
+  (found via `template_candidates`, which includes the copy `install.sh`
+  refreshes in `~/.local/share/e-lite/`).
 - External requests do not identify e-lite: HTTP `User-Agent` is
   `el_rawtx::HTTP_USER_AGENT` and the P2P subversion `P2P_USER_AGENT`
   (AUD-133). Every Esplora request over Tor uses a fresh random SOCKS
@@ -260,8 +269,8 @@ Never treat a version number in this file as authoritative over the code/tag.
   **random order**; never prefer the one that answered last, which sent every
   block of a wallet to a single provider (AUD-135). If every provider is
   cooling down, e-lite forces one attempt on the one whose pause ends first.
-  `max_parallel_fetches` (8) bounds external downloads and twice that (max
-  24) the attempts in flight; concurrent requests for the same block share
+  `max_parallel_fetches` (16) bounds external block downloads and twice that
+  (max 24) the attempts in flight; concurrent requests for the same block share
   one download. **Every download is a race** (AUD-160, `Resolver::race`):
   endpoints of all sources (`BlockSource::endpoints`/`fetch_endpoint`) are
   shuffled, up to `RACE_WIDTH` (3) run at once, the next starts on a
@@ -348,6 +357,16 @@ Never treat a version number in this file as authoritative over the code/tag.
   clearnet when Tor is unavailable or a request fails (log + `/status`),
   while `.onion` still needs Tor. Do not turn the default back on: it ties
   the operator IP to the blocks of the wallet.
+- While a connection has background lines, its reader polls the socket every
+  10 ms instead of 250 ms (`CLIENT_READ_POLL_BUSY`): the reader holds the
+  socket lock for one poll and background answers wait for it (AUD-164).
+  Only a wallet failure is remembered in `FAILURE_MEMORY`, never a prefetch
+  or a slot timeout; a wallet joining a prefetch download upgrades it to
+  wallet priority, and the prefetch steps aside while a wallet waits for a
+  slot; followers reuse the leader's verified block and only the leader owes
+  decoys (AUD-165). `get_merkle`/`id_from_pos` reuse the txids of the last 64
+  blocks (`block_txids_cached`, AUD-166). Local Core blocks stay in `recent`
+  (24 blocks). `max_parallel_fetches` defaults to 16.
 - JSON-RPC batches are served (max 1000 items, 8 in parallel, 32 when the
   batch carries `transaction.get`, ordered when the batch has
   `server.version`/unsubscribe). A connection runs `transaction.get` lines
@@ -509,8 +528,32 @@ Never treat a version number in this file as authoritative over the code/tag.
   never override an explicit `batch_blocks`.
 - Disk accounting excludes a Core datadir nested inside the data directory;
   otherwise `disk.index_bytes` and the benchmark double-count Core.
-- Raw transactions are local-first. External fallback requests whole blocks by
-  hash, validates them, uses Tor by default and never sends wallet txids/scripts.
+- Raw transactions are local-first: tx cache -> recent/local Core block ->
+  external. **Owner decision 2026-11-14 (AUD-163): the external path fetches
+  loose transactions by txid by default** (`privacy.toml`, preset
+  `balanced`): public Electrum servers (one JSON-RPC batch per short session,
+  `sessions.size` 50, a fresh Tor circuit each, TLS without certificate
+  checks because the data is verified) and Esplora `/tx/:txid/raw`. Every
+  real transaction is verified against the index before it is cached or
+  served (`txbatch.rs` `verify`: txid, position in `block_txids`, merkle
+  branch up to the indexed header); a server that fails it is penalised.
+  Never send scripts, addresses, xpubs or anything the wallet sent; never
+  leave Tor unless clearnet is explicitly allowed. Txids always travel with
+  **decoy wallets** (`decoy_wallets.rs`): look-alike addresses picked from the
+  index's history table by a keyed seek (HMAC of the local secret
+  `<data-dir>/decoy.key`, 0600, excluded from snapshots), grown through their
+  outputs, **stable across loads** (fresh decoys per load would let a server
+  intersect loads), shuffled with the real ones, every group spread over at
+  least `min_servers` servers with at most `max_share` per server, at most
+  two sessions per server at once. Decoy transactions are never cached or
+  served. Do not replace decoy wallets with random txids: the transaction
+  graph exposes them. The request starts at `scripthash.subscribe` /
+  `get_history` for pruned heights only (`core_pruneheight`); heights Core
+  still has never leave the node. After three servers a transaction falls
+  back to the whole-block race. `preset = "max"` (`mode = "block"`) never
+  sends a txid: whole blocks by hash only, as before 29.15.0. Parameters and
+  ranges: `bin/e-lite/src/privacy.rs` + `privacy.toml` (a test keeps the
+  template equal to `balanced`), docs in `docs/PRIVACY-TUNING.md`.
 
 ## TLS certificate model (one cert, no SNI)
 

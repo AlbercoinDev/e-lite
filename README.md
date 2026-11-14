@@ -81,6 +81,7 @@ See [`docs/CLI.md`](docs/CLI.md) for every flag and `--set` example.
 | [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) | Components, execution modes, local/LAN/WAN Core |
 | [`docs/OPERATIONS.md`](docs/OPERATIONS.md) | Pruning, disks, remote Core, monitoring, troubleshooting |
 | [`docs/PRIVACY.md`](docs/PRIVACY.md) | Local vs external data, Tor/clearnet, providers |
+| [`docs/PRIVACY-TUNING.md`](docs/PRIVACY-TUNING.md) | `privacy.toml`: per-txid mode, decoy wallets, presets and ranges |
 | [`docs/FEATURES.md`](docs/FEATURES.md) | What exists today, with status |
 | [`docs/ROADMAP.md`](docs/ROADMAP.md) | Future features and proposed improvements |
 | [`docs/CLI.md`](docs/CLI.md) | All command-line flags, `--set`, tuning examples |

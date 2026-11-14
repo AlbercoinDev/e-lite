@@ -33,6 +33,32 @@ pub use version::{
 /// The wire format stays byte-compatible: these lines only add information.
 static DEBUG_LOGS: AtomicBool = AtomicBool::new(false);
 
+thread_local! {
+    /// The wallet connection whose request this thread is serving (0: none).
+    /// The per-txid mode keys its decoy wallets by it (AUD-163).
+    static CURRENT_CLIENT: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+fn current_client() -> u64 {
+    CURRENT_CLIENT.with(|c| c.get())
+}
+
+/// Sets `CURRENT_CLIENT` for the life of a request.
+struct ClientScope(u64);
+
+impl ClientScope {
+    fn enter(id: u64) -> Self {
+        let old = CURRENT_CLIENT.with(|c| c.replace(id));
+        ClientScope(old)
+    }
+}
+
+impl Drop for ClientScope {
+    fn drop(&mut self) {
+        CURRENT_CLIENT.with(|c| c.set(self.0));
+    }
+}
+
 /// Enable/disable the extra `debug:` lines (wallet sessions, provider notes).
 pub fn set_debug_logs(on: bool) {
     DEBUG_LOGS.store(on, Ordering::Relaxed);
@@ -129,6 +155,10 @@ pub const MAX_REQUEST_BYTES: usize = 1024 * 1024;
 /// shared between the request reader and the notifier writer without splitting
 /// rustls' connection state. It also bounds notification latency.
 const CLIENT_READ_POLL: Duration = Duration::from_millis(250);
+/// Read poll while background lines of the connection are running: the
+/// reader holds the socket lock for one poll, and their answers wait for it
+/// (up to 250 ms each before, AUD-164).
+const CLIENT_READ_POLL_BUSY: Duration = Duration::from_millis(10);
 /// A client that sends nothing for this long is disconnected.
 const CLIENT_IDLE_TIMEOUT: Duration = Duration::from_secs(600);
 const CLIENT_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
@@ -920,6 +950,8 @@ pub struct ClientState {
     /// Per-connection request budget (rate limiting).
     pub budget: Mutex<RateLimit>,
     pub headers: AtomicBool,
+    /// Lines of this connection running beside its reader.
+    pub background: AtomicUsize,
     pub last_height: AtomicU64,
     pub alive: AtomicBool,
     pub tls: bool,
@@ -1279,6 +1311,7 @@ impl ClientRegistry {
                 self.rate_limit_rps.load(Ordering::Relaxed),
             )),
             headers: AtomicBool::new(false),
+            background: AtomicUsize::new(0),
             last_height: AtomicU64::new(0),
             alive: AtomicBool::new(true),
             tls,
@@ -1867,6 +1900,20 @@ impl Shared {
                 "p2p_failures": rawtx.p2p_failures.load(Ordering::Relaxed),
                 "p2p_skipped": rawtx.p2p_skipped.load(Ordering::Relaxed),
                 "p2p_tor_failures": rawtx.p2p_tor_failures.load(Ordering::Relaxed),
+                "tx_mode": {
+                    "active": self.resolver.tx_mode_servers().is_some(),
+                    "servers": self.resolver.tx_mode_servers().unwrap_or(0),
+                    "preset": self.resolver.privacy().preset,
+                    "mode": self.resolver.privacy().mode.name(),
+                    "decoy_wallets": self.resolver.privacy().decoy_wallets,
+                    "session_size": self.resolver.privacy().session_size,
+                    "sessions": rawtx.tx_sessions.load(Ordering::Relaxed),
+                    "real_sent": rawtx.tx_real.load(Ordering::Relaxed),
+                    "decoys_sent": rawtx.tx_decoys.load(Ordering::Relaxed),
+                    "verified": rawtx.tx_verified.load(Ordering::Relaxed),
+                    "rejected": rawtx.tx_verify_failed.load(Ordering::Relaxed),
+                    "block_fallback": rawtx.tx_fallback.load(Ordering::Relaxed),
+                },
                 "race": {
                     "attempts": rawtx.race_attempts.load(Ordering::Relaxed),
                     "hedges": rawtx.race_hedges.load(Ordering::Relaxed),
@@ -2699,6 +2746,29 @@ fn history_entries_with_code(
             effect.spent_sat,
         ));
     }
+    if prefetch && shared.resolver.tx_mode_servers().is_some() {
+        // Per-txid mode (AUD-163): every pruned transaction of the history,
+        // fetched now with the connection's decoy wallets. Heights Core
+        // still has are served locally and never leave the node.
+        let pruned_below = shared.stats.core_pruneheight.load(Ordering::Relaxed);
+        let refs: Vec<el_rawtx::TxRef> = out
+            .iter()
+            .filter(|(height, ..)| (*height as u64) < pruned_below)
+            .filter_map(|(height, tx_pos, txid, ..)| {
+                Hash32::from_hex(txid).ok().map(|txid| el_rawtx::TxRef {
+                    txid,
+                    height: *height,
+                    pos: *tx_pos,
+                })
+            })
+            .collect();
+        if !refs.is_empty() {
+            shared
+                .resolver
+                .want_history(current_client(), script, &refs);
+        }
+        return Ok(out);
+    }
     let mut prefetched = 0usize;
     for (hash, height, txids) in prefetch_blocks {
         if prefetched >= PREFETCH_PER_HISTORY {
@@ -2817,8 +2887,9 @@ fn status_value(
     shared: &Shared,
     script: ScriptHash,
     too_large_code: i64,
+    prefetch: bool,
 ) -> RpcResult<Option<String>> {
-    let entries = history_entries_with_code(shared, script, too_large_code, false)?;
+    let entries = history_entries_with_code(shared, script, too_large_code, prefetch)?;
     let mem = shared
         .mempool
         .read()
@@ -2838,7 +2909,7 @@ fn status_value(
 }
 
 fn script_status(shared: &Shared, script: ScriptHash) -> RpcResult<Option<String>> {
-    status_value(shared, script, -32000)
+    status_value(shared, script, -32000, false)
 }
 
 fn mempool_value(shared: &Shared, script: ScriptHash) -> RpcResult<Value> {
@@ -2887,7 +2958,9 @@ fn scripthash_subscribe(
     params: &Value,
 ) -> RpcResult<Value> {
     let script = param_scripthash(params)?;
-    let status = script_status(shared, script)?;
+    // A subscribe is the wallet's first look at an address: start fetching
+    // its transactions now (AUD-163), one round trip before get_history.
+    let status = status_value(shared, script, -32000, true)?;
     if let Some(c) = client {
         if let Ok(mut subs) = c.subs.lock() {
             subs.insert(script, status.clone());
@@ -2936,7 +3009,7 @@ fn scriptpubkey_subscribe(
     params: &Value,
 ) -> RpcResult<Value> {
     let script = param_scriptpubkey(params)?;
-    let status = status_value(shared, script, 10001)?;
+    let status = status_value(shared, script, 10001, true)?;
     if let Some(c) = client {
         if let Ok(mut spk) = c.spk_subs.lock() {
             spk.insert(script, status.clone());
@@ -3274,7 +3347,7 @@ fn transaction_get(shared: &Shared, params: &Value) -> RpcResult<Value> {
                 let _guard = rawtx_reader_guard(shared, height);
                 shared
                     .resolver
-                    .raw_tx(txid_hash, height)
+                    .raw_tx_for(current_client(), txid_hash, height)
                     .map_err(|e| rawtx_failure(shared, height, e))?
             };
             let mut decoded = shared.core.decode_raw_transaction(&raw).map_err(|e| {
@@ -3321,7 +3394,7 @@ fn transaction_get(shared: &Shared, params: &Value) -> RpcResult<Value> {
             let _guard = rawtx_reader_guard(shared, height);
             shared
                 .resolver
-                .raw_tx(txid_hash, height)
+                .raw_tx_for(current_client(), txid_hash, height)
                 .map(|raw| json!(raw))
                 .map_err(|e| rawtx_failure(shared, height, e))
         }
@@ -3599,6 +3672,39 @@ fn scripthash_mempool(shared: &Shared, params: &Value) -> RpcResult<Value> {
     mempool_value(shared, script)
 }
 
+/// Txids of recently proven blocks, by block hash. A wallet asks for the
+/// merkle proof of every history transaction (Sparrow: pages of 250); this
+/// reads each block's txids from `txids.dat` once instead of once per proof
+/// (AUD-166). Txids of a block hash never change, so sharing is safe.
+const MERKLE_CACHE_BLOCKS: usize = 64;
+
+type TxidsByBlock = VecDeque<(Hash32, Arc<Vec<Hash32>>)>;
+
+static BLOCK_TXIDS: std::sync::LazyLock<Mutex<TxidsByBlock>> =
+    std::sync::LazyLock::new(|| Mutex::new(VecDeque::new()));
+
+fn block_txids_cached(shared: &Shared, rec: &el_model::BlockRecord) -> RpcResult<Arc<Vec<Hash32>>> {
+    if let Ok(cache) = BLOCK_TXIDS.lock() {
+        if let Some((_, txids)) = cache.iter().find(|(h, _)| *h == rec.hash) {
+            return Ok(Arc::clone(txids));
+        }
+    }
+    let txids = Arc::new(
+        shared
+            .store
+            .block_txids(rec)
+            .map_err(|e| RpcError::server(e.to_string()))?,
+    );
+    if let Ok(mut cache) = BLOCK_TXIDS.lock() {
+        cache.retain(|(h, _)| *h != rec.hash);
+        cache.push_back((rec.hash, Arc::clone(&txids)));
+        while cache.len() > MERKLE_CACHE_BLOCKS {
+            cache.pop_front();
+        }
+    }
+    Ok(txids)
+}
+
 fn transaction_merkle(shared: &Shared, params: &Value) -> RpcResult<Value> {
     let txid = params
         .as_array()
@@ -3612,10 +3718,7 @@ fn transaction_merkle(shared: &Shared, params: &Value) -> RpcResult<Value> {
         .get_block(height)
         .map_err(|e| RpcError::server(e.to_string()))?
         .ok_or_else(|| RpcError::server(format!("height {height} not indexed")))?;
-    let txids = shared
-        .store
-        .block_txids(&rec)
-        .map_err(|e| RpcError::server(e.to_string()))?;
+    let txids = block_txids_cached(shared, &rec)?;
     let pos = txids
         .iter()
         .position(|t| *t == txid_hash)
@@ -3642,10 +3745,7 @@ fn transaction_id_from_pos(shared: &Shared, params: &Value) -> RpcResult<Value> 
         .get_block(height)
         .map_err(|e| RpcError::server(e.to_string()))?
         .ok_or_else(|| RpcError::server(format!("height {height} not indexed")))?;
-    let txids = shared
-        .store
-        .block_txids(&rec)
-        .map_err(|e| RpcError::server(e.to_string()))?;
+    let txids = block_txids_cached(shared, &rec)?;
     let txid = txids
         .get(pos as usize)
         .ok_or_else(|| RpcError::server("position out of range"))?;
@@ -4111,6 +4211,7 @@ pub fn start_listener_on(
 struct WireReader {
     client: Arc<ClientState>,
     idle_deadline: Instant,
+    poll: Duration,
 }
 
 impl WireReader {
@@ -4118,6 +4219,7 @@ impl WireReader {
         Self {
             client,
             idle_deadline: Instant::now() + CLIENT_IDLE_TIMEOUT,
+            poll: CLIENT_READ_POLL,
         }
     }
 }
@@ -4134,6 +4236,16 @@ impl Read for WireReader {
                     .writer
                     .lock()
                     .map_err(|_| std::io::Error::other("connection lock poisoned"))?;
+                // Short polls while background answers are pending, so their
+                // writer gets the lock within ~10 ms (AUD-164).
+                let poll = if self.client.background.load(Ordering::Relaxed) > 0 {
+                    CLIENT_READ_POLL_BUSY
+                } else {
+                    CLIENT_READ_POLL
+                };
+                if poll != self.poll && wire.socket().set_read_timeout(Some(poll)).is_ok() {
+                    self.poll = poll;
+                }
                 let read = wire.read(buf);
                 drop(wire);
                 // Notifications queued while this poll held the lock.
@@ -4209,6 +4321,7 @@ fn handle_client(shared: &Shared, client: Arc<ClientState>) -> std::io::Result<(
     let result = client_loop(shared, &client);
     client.alive.store(false, Ordering::SeqCst);
     shared.clients.unregister(client.id);
+    shared.resolver.forget_client(client.id);
     client.log_close(shared);
     result
 }
@@ -4276,6 +4389,7 @@ fn client_loop(shared: &Shared, client: &Arc<ClientState>) -> std::io::Result<()
                 let mut n = wait_below(PIPELINE_DEPTH);
                 *n += 1;
                 drop(n);
+                client.background.fetch_add(1, Ordering::Relaxed);
                 let in_flight = &in_flight;
                 let closing = &closing;
                 scope.spawn(move || {
@@ -4287,6 +4401,7 @@ fn client_loop(shared: &Shared, client: &Arc<ClientState>) -> std::io::Result<()
                     if !sent || outcome.close {
                         closing.store(true, Ordering::Relaxed);
                     }
+                    client.background.fetch_sub(1, Ordering::Relaxed);
                     let (count, cv) = in_flight;
                     *count.lock().unwrap_or_else(|p| p.into_inner()) -= 1;
                     cv.notify_all();
@@ -4510,6 +4625,7 @@ fn process_request(
     client: Option<&Arc<ClientState>>,
     request: &Value,
 ) -> LineOutcome {
+    let _scope = ClientScope::enter(client.map(|c| c.id).unwrap_or(0));
     shared.stats.requests_total.fetch_add(1, Ordering::Relaxed);
     let is_notification = request
         .as_object()

@@ -145,11 +145,26 @@ editable file next to your config:
 
 The installer copies the shipped template if the file does not exist; e-lite
 also creates it on a first run. Existing files are never overwritten. Edit it to
-add, remove or reorder providers; only whole blocks are requested, by hash.
-Clearnet entries must be `https://`; `.onion` entries use Tor. If the file and
+add, remove or reorder providers. Esplora entries (`esplora = [...]`) serve
+whole blocks by hash and loose transactions by txid; Electrum entries
+(`electrum = [...]`, `host:port:s` or `host.onion:port:t`) serve loose
+transactions in batches. Clearnet Esplora entries must be `https://`;
+`.onion` entries use Tor. If the file and
 the template are both missing, e-lite uses local data only (fail closed). Set
 `[public_servers] generate = false` in `config.toml` to disable automatic
 creation.
+
+## Privacy settings
+
+How pruned transactions are fetched is set in `privacy.toml`, next to
+`config.toml` (one per network). e-lite creates it from the template on the
+first run and an update never overwrites it; delete it and restart to get the
+template back. `e-lite privacy check` validates it and prints the effective
+values. The default (`preset = "balanced"`) fetches loose transactions by
+txid through Tor with decoy wallets; `preset = "max"` fetches only whole
+blocks. Every setting and its range: [`PRIVACY-TUNING.md`](PRIVACY-TUNING.md).
+The installer keeps a reference copy of both templates in
+`~/.local/share/e-lite/` (refreshed on every update, never your own files).
 
 ## Update safely
 

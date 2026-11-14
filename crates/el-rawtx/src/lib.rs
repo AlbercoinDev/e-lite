@@ -8,10 +8,15 @@
 pub mod cache;
 pub mod cachelayout;
 pub mod core_source;
+pub mod decoy_wallets;
+pub mod electrum;
 pub mod esplora;
 pub(crate) mod health;
 pub mod p2p;
+pub mod privacy;
+pub mod txbatch;
 pub mod txcache;
+pub mod txsource;
 pub mod verify;
 
 use el_model::{Chain, Hash32};
@@ -54,9 +59,10 @@ pub use cache::BlockCache;
 pub use cachelayout::{CacheInventory, CACHE_DIR_NAME};
 pub use txcache::TxCache;
 
-/// Verified external blocks kept in memory (a mainnet block decodes to a few
-/// MiB; 8 cover a wallet's burst of requests without a re-download).
-const RECENT_BLOCKS: usize = 8;
+/// Verified blocks kept in memory (external and local Core): a burst of
+/// `transaction.get` from one block costs one download or one `getblock`.
+/// A mainnet block decodes to a few MiB, so 24 stay below ~100 MiB.
+const RECENT_BLOCKS: usize = 24;
 
 /// Where a verified block came from; decoys follow external fetches only.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -111,8 +117,12 @@ fn verify_cached_tx(
     Ok(())
 }
 pub use core_source::CoreBlockSource;
+pub use decoy_wallets::TxRef;
+pub use electrum::{ElectrumServer, ElectrumTxSource};
 pub use esplora::{isolated_tor_client, EsploraSource};
 pub use p2p::{P2pSource, PeerHint};
+pub use privacy::{ExternalMode, PrivacyParams};
+pub use txsource::{EsploraTxSource, TxBatch, TxSource};
 pub use verify::{extract_tx, verify_block, verify_block_by_hash, verify_witness_commitment};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -401,6 +411,15 @@ pub struct RawtxStats {
     pub race_wins_other: AtomicU64,
     /// Sum of the time from the first attempt to the winning block, in ms.
     pub race_win_ms: AtomicU64,
+    /// Per-txid mode (AUD-163): sessions run, real and decoy txids sent,
+    /// real transactions verified against the index, rejected answers, and
+    /// transactions that fell back to the whole-block path.
+    pub tx_sessions: AtomicU64,
+    pub tx_real: AtomicU64,
+    pub tx_decoys: AtomicU64,
+    pub tx_verified: AtomicU64,
+    pub tx_verify_failed: AtomicU64,
+    pub tx_fallback: AtomicU64,
 }
 
 #[derive(Clone, Debug)]
@@ -438,6 +457,10 @@ pub struct RawtxConfig {
     /// Per-attempt limit of a P2P connection made through Tor.
     pub p2p_tor_timeout: Duration,
     pub chain: Chain,
+    /// Effective `privacy.toml` values (AUD-163).
+    pub privacy: PrivacyParams,
+    /// Public Electrum servers (`host:port:s|t`) for the per-txid mode.
+    pub electrum_servers: Vec<String>,
 }
 
 /// A block download shared by concurrent callers asking for the same height.
@@ -449,15 +472,19 @@ struct InflightBlock {
     /// then exactly `EXTERNAL_BUDGET` from the moment it gets a download
     /// slot. Followers wait until the current `deadline + FOLLOWER_GRACE`.
     deadline: Mutex<Instant>,
+    /// A wallet request is waiting on this download: a prefetch leader
+    /// switches to wallet priority (AUD-165).
+    wallet_waiting: AtomicBool,
 }
 
 impl InflightBlock {
-    fn new(deadline: Instant) -> Self {
+    fn new(deadline: Instant, wallet: bool) -> Self {
         Self {
             done: Mutex::new(false),
             result: Mutex::new(None),
             cv: Condvar::new(),
             deadline: Mutex::new(deadline),
+            wallet_waiting: AtomicBool::new(wallet),
         }
     }
 
@@ -646,7 +673,11 @@ pub struct Resolver {
     /// Whole blocks: prune-gap repair, plus entries from older releases.
     cache: Option<BlockCache>,
     /// Verified transactions for wallet requests (AUD-139).
-    txcache: Option<TxCache>,
+    txcache: Option<Arc<TxCache>>,
+    /// Per-txid fetch mode (AUD-163); `None` in block mode or without
+    /// per-txid sources.
+    tx_mode: Option<txbatch::TxMode>,
+    privacy: PrivacyParams,
     /// Verified external blocks kept in memory for a burst of requests.
     recent: Mutex<VecDeque<(Hash32, Arc<bitcoin::Block>)>>,
     cache_dir: std::path::PathBuf,
@@ -662,6 +693,8 @@ pub struct Resolver {
     external_attempts: Arc<Semaphore>,
     /// Wallet downloads running now; decoys wait for them (bandwidth).
     wallet_downloads: Arc<AtomicU64>,
+    /// Wallet downloads waiting for a slot: the prefetch steps aside.
+    wallet_slot_waiters: Arc<AtomicU64>,
     decoy_lane: Arc<DecoyLane>,
 }
 
@@ -739,10 +772,15 @@ impl Resolver {
             None
         };
         let txcache = if tx_mib > 0 {
-            Some(TxCache::open(
+            Some(Arc::new(TxCache::open(
                 &cache_dir.join("tx"),
                 tx_mib.saturating_mul(1024 * 1024),
-            )?)
+            )?))
+        } else {
+            None
+        };
+        let tx_mode = if cfg.enabled && cfg.privacy.mode == ExternalMode::Tx {
+            Self::build_tx_mode(&store, cfg, txcache.clone(), Arc::clone(&stats))
         } else {
             None
         };
@@ -754,6 +792,8 @@ impl Resolver {
             p2p,
             cache,
             txcache,
+            tx_mode,
+            privacy: cfg.privacy.clone(),
             recent: Mutex::new(VecDeque::new()),
             cache_dir,
             decoys: cfg.decoys,
@@ -769,8 +809,113 @@ impl Resolver {
                     .clamp(2, 24),
             ),
             wallet_downloads: Arc::new(AtomicU64::new(0)),
+            wallet_slot_waiters: Arc::new(AtomicU64::new(0)),
             decoy_lane: DecoyLane::new(),
         })
+    }
+
+    /// Per-txid sources (Electrum, Esplora `/tx/:txid/raw`) and the batcher.
+    fn build_tx_mode(
+        store: &Arc<Store>,
+        cfg: &RawtxConfig,
+        txcache: Option<Arc<TxCache>>,
+        stats: Arc<RawtxStats>,
+    ) -> Option<txbatch::TxMode> {
+        let tor = cfg.tor_socks.clone();
+        if tor.is_none() && !cfg.allow_clearnet {
+            return None;
+        }
+        let connect = Duration::from_secs(cfg.tor_connect_timeout_seconds.max(1));
+        let stall = Duration::from_secs(cfg.tor_stall_timeout_seconds.max(1));
+        let cooldown = Duration::from_secs(cfg.provider_cooldown_seconds.max(1));
+        let mut sources: Vec<Arc<dyn TxSource>> = Vec::new();
+        if let Some(s) = ElectrumTxSource::new(
+            &cfg.electrum_servers,
+            tor.clone(),
+            cfg.allow_clearnet,
+            connect,
+            stall,
+            cooldown,
+        ) {
+            sources.push(Arc::new(s));
+        }
+        if cfg.use_esplora {
+            if let Some(s) = EsploraTxSource::new(
+                cfg.esplora_urls.clone(),
+                tor,
+                cfg.allow_clearnet,
+                connect,
+                stall,
+                cooldown,
+            ) {
+                sources.push(Arc::new(s));
+            }
+        }
+        if sources.is_empty() {
+            return None;
+        }
+        let secret = match decoy_wallets::load_or_create_secret(store.path()) {
+            Ok(k) => k,
+            Err(e) => {
+                eprintln!(
+                    "[e-lite] WARNING: decoy key unavailable ({}); per-txid mode disabled, whole blocks only",
+                    e.kind()
+                );
+                return None;
+            }
+        };
+        txbatch::TxMode::new(
+            Arc::clone(store),
+            txcache,
+            sources,
+            cfg.privacy.clone(),
+            secret,
+            stats,
+        )
+    }
+
+    /// Replace the per-txid sources (tests and custom setups). `secret` keys
+    /// the decoy wallets. Nothing changes in block mode.
+    pub fn with_tx_sources(mut self, sources: Vec<Arc<dyn TxSource>>, secret: [u8; 32]) -> Self {
+        if self.privacy.mode != ExternalMode::Tx {
+            return self;
+        }
+        self.tx_mode = txbatch::TxMode::new(
+            Arc::clone(&self.store),
+            self.txcache.clone(),
+            sources,
+            self.privacy.clone(),
+            secret,
+            Arc::clone(&self.stats),
+        );
+        self
+    }
+
+    /// Effective privacy parameters (`privacy.toml`).
+    pub fn privacy(&self) -> &PrivacyParams {
+        &self.privacy
+    }
+
+    /// Whether the per-txid mode is active, and over how many servers.
+    pub fn tx_mode_servers(&self) -> Option<usize> {
+        self.tx_mode.as_ref().map(|t| t.servers())
+    }
+
+    /// The index served `script`'s history to connection `ctx`: in per-txid
+    /// mode, fetch every transaction of it now (with the connection's decoy
+    /// wallets), before the wallet asks. Returns how many were queued.
+    pub fn want_history(&self, ctx: u64, script: el_model::ScriptHash, hist: &[TxRef]) -> usize {
+        match &self.tx_mode {
+            Some(tm) => tm.want_history(ctx, script, hist.to_vec()),
+            None => 0,
+        }
+    }
+
+    /// Connection `ctx` closed: drop its decoy wallets.
+    pub fn forget_client(&self, ctx: u64) {
+        if let Some(tm) = &self.tx_mode {
+            tm.forget(ctx);
+        }
     }
 
     pub fn with_local(mut self, source: Arc<dyn BlockSource>) -> Self {
@@ -938,12 +1083,17 @@ impl Resolver {
 
     /// Resolve a confirmed transaction's raw hex at `height`.
     pub fn raw_tx(&self, txid: Hash32, height: u32) -> Result<String> {
-        self.raw_tx_inner(txid, height, Priority::Wallet)
+        self.raw_tx_inner(0, txid, height, Priority::Wallet)
+    }
+
+    /// `raw_tx` for wallet connection `ctx` (its decoy wallets go along).
+    pub fn raw_tx_for(&self, ctx: u64, txid: Hash32, height: u32) -> Result<String> {
+        self.raw_tx_inner(ctx, txid, height, Priority::Wallet)
     }
 
     /// Background prefetch path: same lookup and decoys, lower priority.
     pub fn raw_tx_prefetch(&self, txid: Hash32, height: u32) -> Result<String> {
-        self.raw_tx_inner(txid, height, Priority::Prefetch)
+        self.raw_tx_inner(0, txid, height, Priority::Prefetch)
     }
 
     /// Prefetch every listed transaction of one block with a single block
@@ -965,22 +1115,53 @@ impl Resolver {
         Ok(missing.len())
     }
 
+    /// The position of `txid` in the block at `height`, from the index.
+    fn position_of(&self, txid: Hash32, height: u32) -> Option<u32> {
+        self.store
+            .occurrences(txid)
+            .ok()?
+            .into_iter()
+            .find(|(h, _)| *h == height)
+            .map(|(_, pos)| pos)
+    }
+
     fn block_record(&self, height: u32) -> Result<el_model::BlockRecord> {
         self.store
             .get_block(height)?
             .ok_or_else(|| RawtxError::Unavailable(format!("block {height} not indexed")))
     }
 
-    fn raw_tx_inner(&self, txid: Hash32, height: u32, priority: Priority) -> Result<String> {
+    fn raw_tx_inner(
+        &self,
+        ctx: u64,
+        txid: Hash32,
+        height: u32,
+        priority: Priority,
+    ) -> Result<String> {
         let rec = self.block_record(height)?;
         // 1) Transaction cache: one small file per transaction (AUD-139).
         if let Some(hex) = self.cached_tx(&rec, txid) {
             self.stats.cache_hits.fetch_add(1, Ordering::Relaxed);
             return Ok(hex);
         }
-        // 2) The block: recent blocks in memory, legacy block cache, local
-        //    Core, then external sources (shared across concurrent callers).
-        let (block, _) = self.verified_block(&rec, priority)?;
+        // 2) The block without asking outside: memory, block cache, Core.
+        let block = match self.local_block(&rec) {
+            Some((block, _)) => block,
+            None => {
+                // 3) Per-txid mode (AUD-163): the loose transaction, verified
+                //    against the index; whole blocks only if it fails.
+                if let Some(tm) = &self.tx_mode {
+                    if let Some(pos) = self.position_of(txid, height) {
+                        let t = TxRef { txid, height, pos };
+                        if let Ok(hex) = tm.fetch(ctx, t, Instant::now() + EXTERNAL_BUDGET) {
+                            return Ok(hex);
+                        }
+                    }
+                }
+                // 4) Whole block from external sources.
+                self.external_block(&rec, priority)?.0
+            }
+        };
         let hex = self
             .cache_txs(&rec, &block, &[txid])?
             .pop()
@@ -1060,10 +1241,19 @@ impl Resolver {
         rec: &el_model::BlockRecord,
         priority: Priority,
     ) -> Result<(Arc<bitcoin::Block>, Origin)> {
+        if let Some(found) = self.local_block(rec) {
+            return Ok(found);
+        }
+        self.external_block(rec, priority)
+    }
+
+    /// The block without asking anyone outside: recent blocks in memory, the
+    /// legacy block cache, then the local Core.
+    fn local_block(&self, rec: &el_model::BlockRecord) -> Option<(Arc<bitcoin::Block>, Origin)> {
         let height = rec.height;
         if let Some(block) = self.recent_block(&rec.hash) {
             self.stats.cache_hits.fetch_add(1, Ordering::Relaxed);
-            return Ok((block, Origin::Recent));
+            return Some((block, Origin::Recent));
         }
         // Legacy whole-block cache (and repair blocks).
         if let Some(cache) = &self.cache {
@@ -1071,7 +1261,7 @@ impl Resolver {
                 match verify_full(&bytes, rec) {
                     Ok(block) => {
                         self.stats.cache_hits.fetch_add(1, Ordering::Relaxed);
-                        return Ok((self.remember(rec.hash, block), Origin::BlockCache));
+                        return Some((self.remember(rec.hash, block), Origin::BlockCache));
                     }
                     Err(e) => {
                         self.stats.verify_failures.fetch_add(1, Ordering::Relaxed);
@@ -1088,7 +1278,9 @@ impl Resolver {
         if let Some(local) = &self.local {
             if let Ok(bytes) = local.fetch_block(&rec.hash) {
                 match verify_full(&bytes, rec) {
-                    Ok(block) => return Ok((Arc::new(block), Origin::Local)),
+                    // Kept in memory too: a burst of transactions from one
+                    // block costs one `getblock`.
+                    Ok(block) => return Some((self.remember(rec.hash, block), Origin::Local)),
                     Err(e) => {
                         self.stats.verify_failures.fetch_add(1, Ordering::Relaxed);
                         eprintln!("[e-lite] local rawtx rejected ({})", e.kind());
@@ -1096,6 +1288,16 @@ impl Resolver {
                 }
             }
         }
+        None
+    }
+
+    /// The block from external sources (shared across concurrent callers).
+    fn external_block(
+        &self,
+        rec: &el_model::BlockRecord,
+        priority: Priority,
+    ) -> Result<(Arc<bitcoin::Block>, Origin)> {
+        let height = rec.height;
         if self.sources().is_empty() {
             self.stats.unavailable.fetch_add(1, Ordering::Relaxed);
             return Err(RawtxError::NoSource(
@@ -1107,8 +1309,8 @@ impl Resolver {
         if let Some(e) = self.recent_failure(&rec.hash) {
             return Err(e);
         }
-        let bytes = match self.fetch_external_block(&rec.hash, priority) {
-            Ok(bytes) => bytes,
+        let (bytes, leader) = match self.fetch_external_block(&rec.hash, priority) {
+            Ok(found) => found,
             Err(e) => {
                 // A prefetch failure is an optimisation that did not happen;
                 // only a wallet's failure is worth an INFO line.
@@ -1127,9 +1329,18 @@ impl Resolver {
                 return Err(e);
             }
         };
+        // A follower uses the leader's verified block when it is already in
+        // memory; decoys are owed once per download, by its leader (AUD-165).
+        if !leader {
+            if let Some(block) = self.recent_block(&rec.hash) {
+                return Ok((block, Origin::External));
+            }
+        }
         match verify_full(&bytes, rec) {
             Ok(block) => {
-                self.owe_decoys(rec.hash);
+                if leader {
+                    self.owe_decoys(rec.hash);
+                }
                 Ok((self.remember(rec.hash, block), Origin::External))
             }
             Err(e) => {
@@ -1168,10 +1379,12 @@ impl Resolver {
     /// Fetch one block from the external sources, deduplicating concurrent
     /// requests for the same hash. The first caller downloads; the rest wait
     /// for its result instead of hammering the same provider.
-    fn fetch_external_block(&self, hash: &Hash32, priority: Priority) -> Result<Vec<u8>> {
+    /// Returns the bytes and whether this caller led the download (only the
+    /// leader owes decoys for it).
+    fn fetch_external_block(&self, hash: &Hash32, priority: Priority) -> Result<(Vec<u8>, bool)> {
         if let Some(cache) = &self.cache {
             if let Some(bytes) = cache.get(hash) {
-                return Ok(bytes);
+                return Ok((bytes, false));
             }
         }
         let (entry, leader) = {
@@ -1180,10 +1393,17 @@ impl Resolver {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             match map.get(hash) {
-                Some(existing) => (Arc::clone(existing), false),
+                Some(existing) => {
+                    if priority == Priority::Wallet {
+                        existing.wallet_waiting.store(true, Ordering::Relaxed);
+                        self.external_slots.cv.notify_all();
+                    }
+                    (Arc::clone(existing), false)
+                }
                 None => {
                     let entry = Arc::new(InflightBlock::new(
                         Instant::now() + EXTERNAL_QUEUE_MAX + EXTERNAL_BUDGET,
+                        priority == Priority::Wallet,
                     ));
                     map.insert(*hash, Arc::clone(&entry));
                     (entry, true)
@@ -1200,8 +1420,14 @@ impl Resolver {
                     "external block fetch panicked".into(),
                 ))
             });
+            // Only a wallet's failure is remembered (AUD-165): a prefetch
+            // that waited for a slot, or failed in the background, must not
+            // answer a later wallet request with its error (Sparrow stores
+            // it as an unfetchable transaction, AUD-045).
             if let Err(e) = &result {
-                self.remember_failure(hash, e);
+                if entry.wallet_waiting.load(Ordering::Relaxed) && !is_queue_timeout(e) {
+                    self.remember_failure(hash, e);
+                }
             }
             *entry
                 .result
@@ -1216,7 +1442,7 @@ impl Resolver {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .remove(hash);
-            return result;
+            return result.map(|bytes| (bytes, true));
         }
 
         // The leader gives up at its own deadline; a follower waits a little
@@ -1249,7 +1475,9 @@ impl Resolver {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone();
-        result.unwrap_or_else(|| Err(RawtxError::Unavailable("inflight result lost".into())))
+        result
+            .unwrap_or_else(|| Err(RawtxError::Unavailable("inflight result lost".into())))
+            .map(|bytes| (bytes, false))
     }
 
     /// Race the endpoints of every external source for one block (AUD-160).
@@ -1267,16 +1495,30 @@ impl Resolver {
         priority: Priority,
     ) -> Result<Vec<u8>> {
         // A wallet request may take the last free slot; the prefetch leaves
-        // it free. Neither waits past the point where no attempt would fit.
-        let keep_free = match priority {
-            Priority::Wallet => 0,
-            Priority::Prefetch => 1,
-        };
+        // it free and steps aside while any wallet request waits for a slot.
+        // A prefetch that a wallet joined becomes a wallet download (AUD-165).
         let queue_deadline = entry
             .deadline()
             .checked_sub(EXTERNAL_BUDGET)
             .unwrap_or_else(Instant::now);
-        let Some(_permit) = self.external_slots.acquire_until(queue_deadline, keep_free) else {
+        let mut permit = None;
+        while Instant::now() < queue_deadline {
+            let wallet =
+                priority == Priority::Wallet || entry.wallet_waiting.load(Ordering::Relaxed);
+            let step = queue_deadline.min(Instant::now() + Duration::from_millis(250));
+            if wallet {
+                let _waiting = Busy::new(&self.wallet_slot_waiters);
+                permit = self.external_slots.acquire_until(step, 0);
+            } else if self.wallet_slot_waiters.load(Ordering::Relaxed) == 0 {
+                permit = self.external_slots.acquire_until(step, 1);
+            } else {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            if permit.is_some() {
+                break;
+            }
+        }
+        let Some(_permit) = permit else {
             self.stats.unavailable.fetch_add(1, Ordering::Relaxed);
             return Err(RawtxError::Unavailable(
                 "every download slot stayed busy until the deadline".into(),
@@ -1301,7 +1543,8 @@ impl Resolver {
                 "every external endpoint is cooling down".into(),
             ));
         }
-        let _wallet = (priority == Priority::Wallet).then(|| Busy::new(&self.wallet_downloads));
+        let wallet = priority == Priority::Wallet || entry.wallet_waiting.load(Ordering::Relaxed);
+        let _wallet = wallet.then(|| Busy::new(&self.wallet_downloads));
         let result = self.race(hash, deadline, plan, attempt_queue);
         if result.is_err() {
             self.stats.unavailable.fetch_add(1, Ordering::Relaxed);
@@ -1686,6 +1929,12 @@ impl Resolver {
             }
         });
     }
+}
+
+/// A download that never got a download slot (local queueing, not a source
+/// failure).
+fn is_queue_timeout(e: &RawtxError) -> bool {
+    matches!(e, RawtxError::Unavailable(m) if m.contains("download slot stayed busy"))
 }
 
 /// Whether the newest attempt of a race deserves a parallel one: nothing

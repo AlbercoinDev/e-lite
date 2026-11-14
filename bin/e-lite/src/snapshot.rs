@@ -350,6 +350,10 @@ fn excluded_from_index(name: &str) -> bool {
             | "core-child.pid"
             | "bitcoind.log"
             | "bitcoin"
+            // The decoy-wallet secret (AUD-163): whoever holds a snapshot
+            // must not be able to recompute this node's decoys.
+            | el_rawtx::decoy_wallets::DECOY_KEY_FILE
+            | ".decoy.key.tmp"
     )
 }
 
@@ -855,6 +859,7 @@ mod tests {
         assert!(excluded_from_index("tor"));
         assert!(excluded_from_index("tls"));
         assert!(excluded_from_index("core-child.pid"));
+        assert!(excluded_from_index("decoy.key"));
         assert!(!excluded_from_index("chainstate")); // index CF dirs stay
         assert!(!excluded_from_index("txids.dat"));
     }

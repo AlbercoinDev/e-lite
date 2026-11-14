@@ -18,7 +18,8 @@ e-lite indexer  --->  RocksDB index (history, UTXO, txids, blocks, undo)
         +--> Electrum plain 127.0.0.1:<network port> (55011 mainnet; LAN is opt-in)
         +--> Electrum TLS 0.0.0.0:<network TLS port> (55022 mainnet, ...)
         +--> /status and /metrics 127.0.0.1:<network metrics port> (55084, ...)
-        +--> rawtx resolver: Core -> validated cache -> P2P/Esplora (Tor-first)
+        +--> rawtx resolver: tx cache -> Core -> per-txid (Electrum/Esplora over Tor,
+        |     decoy wallets, verified against the index) -> whole blocks (fallback)
 ```
 
 The plain and TLS Electrum listeners share the same JSON-RPC dispatcher. TLS
