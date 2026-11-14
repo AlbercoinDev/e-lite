@@ -377,6 +377,7 @@ fn silent_payments_are_gated_with_an_explicit_error() {
 
 struct SlowSource {
     block: Vec<u8>,
+    delay: Duration,
 }
 
 impl BlockSource for SlowSource {
@@ -385,15 +386,16 @@ impl BlockSource for SlowSource {
     }
 
     fn fetch_block(&self, _hash: &Hash32) -> std::result::Result<Vec<u8>, RawtxError> {
-        std::thread::sleep(Duration::from_millis(500));
+        std::thread::sleep(self.delay);
         Ok(self.block.clone())
     }
 }
 
-#[test]
-fn slow_transaction_get_does_not_hold_the_index_lock() {
+/// A served index with one transaction whose block only a slow external
+/// source has.
+fn slow_fixture(delay: Duration) -> (Arc<Shared>, Hash32, std::path::PathBuf) {
     let dir = std::env::temp_dir().join(format!(
-        "e-lite-lock-{}-{}",
+        "e-lite-slow-{}-{}",
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -479,6 +481,7 @@ fn slow_transaction_get_does_not_hold_the_index_lock() {
         .unwrap()
         .with_external(Arc::new(SlowSource {
             block: bitcoin::consensus::serialize(&block),
+            delay,
         })),
     );
     let shared = Arc::new(Shared {
@@ -517,6 +520,12 @@ fn slow_transaction_get_does_not_hold_the_index_lock() {
         lock: Arc::new(RwLock::new(())),
         stats: Stats::default(),
     });
+    (shared, txid, dir)
+}
+
+#[test]
+fn slow_transaction_get_does_not_hold_the_index_lock() {
+    let (shared, txid, dir) = slow_fixture(Duration::from_millis(500));
 
     let worker = Arc::clone(&shared);
     let call = std::thread::spawn(move || {
@@ -540,6 +549,48 @@ fn slow_transaction_get_does_not_hold_the_index_lock() {
     let response = call.join().unwrap();
     assert!(response.get("error").is_none(), "{response}");
     assert!(response["result"].as_str().unwrap().len() > 100);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_slow_transaction_get_does_not_hold_the_connection() {
+    // AUD-160: on one connection, a transaction.get waiting on a download
+    // must not hold the requests sent after it (no head-of-line blocking).
+    use std::io::{BufRead, BufReader, Write};
+    use std::net::{TcpListener, TcpStream};
+
+    let delay = Duration::from_millis(1500);
+    let (shared, txid, dir) = slow_fixture(delay);
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    el_serve::start_listener_on(listener, Arc::clone(&shared), None);
+    let sock = TcpStream::connect(addr).unwrap();
+    sock.set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    let mut writer = sock.try_clone().unwrap();
+    let mut reader = BufReader::new(sock);
+    let slow = json!({"jsonrpc":"2.0","id":10,"method":"blockchain.transaction.get",
+        "params":[txid.to_hex()]});
+    let ping = json!({"jsonrpc":"2.0","id":11,"method":"server.ping","params":[]});
+    let started = std::time::Instant::now();
+    writer
+        .write_all(format!("{slow}\n{ping}\n").as_bytes())
+        .unwrap();
+    writer.flush().unwrap();
+    let mut answers = Vec::new();
+    for _ in 0..2 {
+        let mut line = String::new();
+        reader.read_line(&mut line).unwrap();
+        let v: Value = serde_json::from_str(&line).unwrap();
+        answers.push((v, started.elapsed()));
+    }
+    assert_eq!(
+        answers[0].0["id"], 11,
+        "the ping must not wait: {answers:?}"
+    );
+    assert!(answers[0].1 < delay, "{answers:?}");
+    assert_eq!(answers[1].0["id"], 10);
+    assert!(answers[1].0["result"].as_str().unwrap().len() > 100);
     let _ = std::fs::remove_dir_all(&dir);
 }
 

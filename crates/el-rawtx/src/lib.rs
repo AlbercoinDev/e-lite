@@ -20,10 +20,24 @@ use rand::seq::SliceRandom;
 use rand::thread_rng;
 use std::collections::{HashMap, VecDeque};
 use std::fmt;
+use std::net::TcpStream;
 use std::panic::AssertUnwindSafe;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{mpsc, Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
+
+/// Extra `debug:` lines (per-block failures of the background prefetch),
+/// mirrored from the binary's `[logging] level`.
+static DEBUG_LOGS: AtomicBool = AtomicBool::new(false);
+
+/// Enable/disable the rawtx `debug:` lines.
+pub fn set_debug_logs(on: bool) {
+    DEBUG_LOGS.store(on, Ordering::Relaxed);
+}
+
+fn debug_logs() -> bool {
+    DEBUG_LOGS.load(Ordering::Relaxed)
+}
 
 /// HTTP `User-Agent` for every external request. A generic value: the
 /// project name and version would put the operator in a tiny anonymity set
@@ -188,6 +202,11 @@ pub fn redact_hashes(text: &str) -> String {
 /// share the download wait `EXTERNAL_BUDGET + FOLLOWER_GRACE`, so a follower
 /// never gives up before its leader (AUD-156).
 pub const EXTERNAL_BUDGET: Duration = Duration::from_secs(60);
+/// Longest a download waits for a free download slot before its network
+/// budget starts (AUD-160). A burst of distinct blocks queues behind the
+/// slots; that local wait must not eat the network budget, or the last
+/// blocks of a wallet load fail although every source works.
+pub const EXTERNAL_QUEUE_MAX: Duration = Duration::from_secs(120);
 /// Extra time a follower waits beyond the leader's deadline.
 pub const FOLLOWER_GRACE: Duration = Duration::from_secs(5);
 /// A block whose download just failed is answered from that failure for this
@@ -195,6 +214,115 @@ pub const FOLLOWER_GRACE: Duration = Duration::from_secs(5);
 pub const FAILURE_MEMORY: Duration = Duration::from_secs(10);
 /// An attempt with less time left than this is not started.
 pub(crate) const MIN_ATTEMPT: Duration = Duration::from_secs(2);
+
+/// Attempts of one block download running at the same time (AUD-160). The
+/// first starts at once; another starts when one fails, or when the newest
+/// one has received nothing for the first-byte limit or is still running
+/// at the slow limit. The first verified block wins and the rest stop.
+pub const RACE_WIDTH: usize = 3;
+/// Hedge timings through Tor: no byte after this long (a circuit or peer that
+/// is not answering), or still running after the slow limit.
+pub const HEDGE_FIRST_BYTE_TOR: Duration = Duration::from_secs(6);
+pub const HEDGE_SLOW_TOR: Duration = Duration::from_secs(15);
+/// A transfer still below this average rate after `HEDGE_RATE_AFTER_*` is
+/// hedged: circuits differ by an order of magnitude (60-450 KB/s measured on
+/// mainnet for the same provider), so a second circuit usually finishes
+/// first. The slow attempt keeps running; the first verified block wins.
+pub const HEDGE_RATE_AFTER_TOR: Duration = Duration::from_secs(5);
+pub const HEDGE_MIN_RATE_TOR: u64 = 96 * 1024;
+pub const HEDGE_RATE_AFTER_DIRECT: Duration = Duration::from_secs(2);
+pub const HEDGE_MIN_RATE_DIRECT: u64 = 256 * 1024;
+/// Hedge timings for a direct (clearnet) attempt.
+pub const HEDGE_FIRST_BYTE_DIRECT: Duration = Duration::from_secs(2);
+pub const HEDGE_SLOW_DIRECT: Duration = Duration::from_secs(6);
+/// Extra attempts one Tor endpoint may get inside a race, each on a new
+/// circuit, while its provider is not cooling down.
+pub const TOR_RETRIES_PER_ENDPOINT: u32 = 1;
+/// Attempts one block download may start in all (hedges, retries and
+/// endpoints that came back from a pause included).
+pub const MAX_RACE_ATTEMPTS: usize = 12;
+/// Once every endpoint failed or is paused, how long a race waits for one
+/// to come back before it reports the failure.
+pub const RACE_REFILL_WAIT: Duration = Duration::from_secs(15);
+/// How often a running race re-evaluates its hedges.
+const RACE_TICK: Duration = Duration::from_millis(200);
+
+/// One way to ask a source for a block: one provider over one transport, or
+/// one peer.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Endpoint {
+    /// Source-private identifier (`tor <base>`, `direct <base>`, a peer).
+    pub key: String,
+    /// 0: primary. 1: clearnet fallback, started only once no primary
+    /// attempt is left running or waiting (AUD-128).
+    pub tier: u8,
+    /// Whether the attempt goes through Tor (selects the hedge timings).
+    pub via_tor: bool,
+}
+
+impl Endpoint {
+    /// The whole source as a single endpoint (sources without endpoints).
+    pub fn whole() -> Self {
+        Endpoint {
+            key: String::new(),
+            tier: 0,
+            via_tor: false,
+        }
+    }
+}
+
+#[derive(Default)]
+struct CtlInner {
+    aborted: AtomicBool,
+    bytes: AtomicU64,
+    sockets: Mutex<Vec<TcpStream>>,
+}
+
+/// Shared by one attempt and the race that started it: progress (bytes
+/// received) flows up, an abort flows down. Aborting shuts down the
+/// attempt's sockets, so a losing attempt stops at once instead of holding a
+/// circuit until its own timeout.
+#[derive(Clone, Default)]
+pub struct AttemptCtl(Arc<CtlInner>);
+
+impl AttemptCtl {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn aborted(&self) -> bool {
+        self.0.aborted.load(Ordering::Relaxed)
+    }
+
+    pub fn abort(&self) {
+        self.0.aborted.store(true, Ordering::Relaxed);
+        if let Ok(sockets) = self.0.sockets.lock() {
+            for s in sockets.iter() {
+                let _ = s.shutdown(std::net::Shutdown::Both);
+            }
+        }
+    }
+
+    pub fn add_bytes(&self, n: usize) {
+        self.0.bytes.fetch_add(n as u64, Ordering::Relaxed);
+    }
+
+    pub fn bytes(&self) -> u64 {
+        self.0.bytes.load(Ordering::Relaxed)
+    }
+
+    /// Register a socket so an abort can shut it down.
+    pub fn watch(&self, stream: &TcpStream) {
+        if let Ok(clone) = stream.try_clone() {
+            if let Ok(mut sockets) = self.0.sockets.lock() {
+                sockets.push(clone);
+            }
+        }
+        if self.aborted() {
+            let _ = stream.shutdown(std::net::Shutdown::Both);
+        }
+    }
+}
 
 /// Whether a download may change a source's view of its endpoints.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -221,6 +349,26 @@ pub trait BlockSource: Send + Sync {
         let _ = (deadline, mode);
         self.fetch_block(hash)
     }
+    /// Endpoints a download may race over now, in random order, without
+    /// the ones cooling down. A source with nothing to split is one endpoint.
+    fn endpoints(&self, mode: FetchMode) -> Vec<Endpoint> {
+        let _ = mode;
+        vec![Endpoint::whole()]
+    }
+    /// One attempt on one endpoint returned by `endpoints`. It updates the
+    /// endpoint's health itself (never after `ctl` was aborted) and reports
+    /// bytes received to `ctl`.
+    fn fetch_endpoint(
+        &self,
+        endpoint: &Endpoint,
+        hash: &Hash32,
+        deadline: Instant,
+        mode: FetchMode,
+        ctl: &AttemptCtl,
+    ) -> Result<Vec<u8>> {
+        let _ = (endpoint, ctl);
+        self.fetch_block_until(hash, deadline, mode)
+    }
     /// Whether the source is being rate limited right now (decoys wait).
     fn under_pressure(&self) -> bool {
         false
@@ -244,6 +392,15 @@ pub struct RawtxStats {
     pub p2p_failures: AtomicU64,
     pub p2p_skipped: AtomicU64,
     pub p2p_tor_failures: AtomicU64,
+    /// Attempts started by block races (AUD-160), hedges among them, and
+    /// the races won by each kind of source.
+    pub race_attempts: AtomicU64,
+    pub race_hedges: AtomicU64,
+    pub race_wins_esplora: AtomicU64,
+    pub race_wins_p2p: AtomicU64,
+    pub race_wins_other: AtomicU64,
+    /// Sum of the time from the first attempt to the winning block, in ms.
+    pub race_win_ms: AtomicU64,
 }
 
 #[derive(Clone, Debug)]
@@ -288,9 +445,10 @@ struct InflightBlock {
     done: Mutex<bool>,
     result: Mutex<Option<Result<Vec<u8>>>>,
     cv: Condvar,
-    /// The leader's deadline, fixed when it registered (before waiting for
-    /// a download slot). Followers wait until `deadline + FOLLOWER_GRACE`.
-    deadline: Instant,
+    /// The leader's deadline: queue limit plus budget when it registers,
+    /// then exactly `EXTERNAL_BUDGET` from the moment it gets a download
+    /// slot. Followers wait until the current `deadline + FOLLOWER_GRACE`.
+    deadline: Mutex<Instant>,
 }
 
 impl InflightBlock {
@@ -299,8 +457,22 @@ impl InflightBlock {
             done: Mutex::new(false),
             result: Mutex::new(None),
             cv: Condvar::new(),
-            deadline,
+            deadline: Mutex::new(deadline),
         }
+    }
+
+    fn deadline(&self) -> Instant {
+        *self
+            .deadline
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn set_deadline(&self, deadline: Instant) {
+        *self
+            .deadline
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = deadline;
     }
 }
 
@@ -310,6 +482,26 @@ impl InflightBlock {
 enum Priority {
     Wallet,
     Prefetch,
+}
+
+/// Longest a decoy waits for running wallet downloads (AUD-160): decoys
+/// still happen during a long load, just not in front of the wallet.
+const DECOY_YIELD: Duration = Duration::from_secs(30);
+
+/// Counts a running download for as long as it lives.
+struct Busy(Arc<AtomicU64>);
+
+impl Busy {
+    fn new(counter: &Arc<AtomicU64>) -> Self {
+        counter.fetch_add(1, Ordering::Relaxed);
+        Busy(Arc::clone(counter))
+    }
+}
+
+impl Drop for Busy {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
+    }
 }
 
 /// Decoys owed for real external downloads, at most this many.
@@ -465,6 +657,11 @@ pub struct Resolver {
     /// Blocks whose download failed recently, with the error (AUD-158).
     failed: Mutex<HashMap<Hash32, (Instant, RawtxError)>>,
     external_slots: Arc<Semaphore>,
+    /// Attempts running at once over every download (hedges included),
+    /// well below Tor's 32 pending circuits.
+    external_attempts: Arc<Semaphore>,
+    /// Wallet downloads running now; decoys wait for them (bandwidth).
+    wallet_downloads: Arc<AtomicU64>,
     decoy_lane: Arc<DecoyLane>,
 }
 
@@ -565,6 +762,13 @@ impl Resolver {
             inflight: Mutex::new(HashMap::new()),
             failed: Mutex::new(HashMap::new()),
             external_slots: Semaphore::new(cfg.max_parallel_fetches),
+            external_attempts: Semaphore::new(
+                cfg.max_parallel_fetches
+                    .max(1)
+                    .saturating_mul(2)
+                    .clamp(2, 24),
+            ),
+            wallet_downloads: Arc::new(AtomicU64::new(0)),
             decoy_lane: DecoyLane::new(),
         })
     }
@@ -906,11 +1110,20 @@ impl Resolver {
         let bytes = match self.fetch_external_block(&rec.hash, priority) {
             Ok(bytes) => bytes,
             Err(e) => {
-                eprintln!(
-                    "[e-lite] rawtx at height {height} failed ({}); sources: {}",
-                    e.kind(),
-                    redact_hashes(&e.to_string())
-                );
+                // A prefetch failure is an optimisation that did not happen;
+                // only a wallet's failure is worth an INFO line.
+                if priority == Priority::Wallet {
+                    eprintln!(
+                        "[e-lite] rawtx at height {height} failed ({}); sources: {}",
+                        e.kind(),
+                        redact_hashes(&e.to_string())
+                    );
+                } else if debug_logs() {
+                    eprintln!(
+                        "[e-lite] debug: prefetch at height {height} failed ({})",
+                        e.kind()
+                    );
+                }
                 return Err(e);
             }
         };
@@ -969,7 +1182,9 @@ impl Resolver {
             match map.get(hash) {
                 Some(existing) => (Arc::clone(existing), false),
                 None => {
-                    let entry = Arc::new(InflightBlock::new(Instant::now() + EXTERNAL_BUDGET));
+                    let entry = Arc::new(InflightBlock::new(
+                        Instant::now() + EXTERNAL_QUEUE_MAX + EXTERNAL_BUDGET,
+                    ));
                     map.insert(*hash, Arc::clone(&entry));
                     (entry, true)
                 }
@@ -978,7 +1193,7 @@ impl Resolver {
 
         if leader {
             let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
-                self.fetch_from_external_sources(hash, entry.deadline, priority)
+                self.fetch_from_external_sources(hash, &entry, priority)
             }))
             .unwrap_or_else(|_| {
                 Err(RawtxError::Unavailable(
@@ -1005,22 +1220,26 @@ impl Resolver {
         }
 
         // The leader gives up at its own deadline; a follower waits a little
-        // longer so it always receives the leader's result (AUD-156).
-        let deadline = entry.deadline + FOLLOWER_GRACE;
+        // longer so it always receives the leader's result (AUD-156). The
+        // deadline moves once the leader gets a slot, so it is re-read.
         let mut done = entry
             .done
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         while !*done {
             let now = Instant::now();
+            let deadline = entry.deadline() + FOLLOWER_GRACE;
             if now >= deadline {
                 return Err(RawtxError::Unavailable(
                     "inflight block download timed out".into(),
                 ));
             }
+            let wait = deadline
+                .saturating_duration_since(now)
+                .min(Duration::from_secs(1));
             let (guard, _) = entry
                 .cv
-                .wait_timeout(done, deadline.saturating_duration_since(now))
+                .wait_timeout(done, wait)
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             done = guard;
         }
@@ -1033,10 +1252,18 @@ impl Resolver {
         result.unwrap_or_else(|| Err(RawtxError::Unavailable("inflight result lost".into())))
     }
 
+    /// Race the endpoints of every external source for one block (AUD-160).
+    ///
+    /// Endpoints are shuffled (no provider or peer is preferred, AUD-135)
+    /// and tried with at most `RACE_WIDTH` attempts at once. A failure
+    /// starts the next endpoint at once; a silent or slow attempt is hedged
+    /// without being cut, so a slow but live circuit can still win. The
+    /// first verified block wins and every other attempt is aborted. The
+    /// clearnet fallback tier starts only when no primary attempt is left.
     fn fetch_from_external_sources(
         &self,
         hash: &Hash32,
-        deadline: Instant,
+        entry: &InflightBlock,
         priority: Priority,
     ) -> Result<Vec<u8>> {
         // A wallet request may take the last free slot; the prefetch leaves
@@ -1045,61 +1272,277 @@ impl Resolver {
             Priority::Wallet => 0,
             Priority::Prefetch => 1,
         };
-        let queue_deadline = deadline.checked_sub(MIN_ATTEMPT).unwrap_or(deadline);
+        let queue_deadline = entry
+            .deadline()
+            .checked_sub(EXTERNAL_BUDGET)
+            .unwrap_or_else(Instant::now);
         let Some(_permit) = self.external_slots.acquire_until(queue_deadline, keep_free) else {
             self.stats.unavailable.fetch_add(1, Ordering::Relaxed);
             return Err(RawtxError::Unavailable(
                 "every download slot stayed busy until the deadline".into(),
             ));
         };
-        let sources = self.sources();
-        let mut order: Vec<usize> = (0..sources.len()).collect();
-        order.shuffle(&mut thread_rng());
-        let mut errors = Vec::new();
-        let count = order.len();
-        for (pos, idx) in order.into_iter().enumerate() {
-            let left = deadline.saturating_duration_since(Instant::now());
-            if left < MIN_ATTEMPT {
+        // The network budget starts now, not when the request queued.
+        let deadline = Instant::now() + EXTERNAL_BUDGET;
+        entry.set_deadline(deadline);
+        let attempt_queue = deadline.checked_sub(MIN_ATTEMPT).unwrap_or(deadline);
+        let mut plan: Vec<(Arc<dyn BlockSource>, Endpoint)> = Vec::new();
+        for source in self.sources() {
+            for endpoint in source.endpoints(FetchMode::Normal) {
+                plan.push((Arc::clone(&source), endpoint));
+            }
+        }
+        plan.shuffle(&mut thread_rng());
+        // Stable: random order inside each tier, primaries first.
+        plan.sort_by_key(|(_, endpoint)| endpoint.tier);
+        if plan.is_empty() {
+            self.stats.unavailable.fetch_add(1, Ordering::Relaxed);
+            return Err(RawtxError::Unavailable(
+                "every external endpoint is cooling down".into(),
+            ));
+        }
+        let _wallet = (priority == Priority::Wallet).then(|| Busy::new(&self.wallet_downloads));
+        let result = self.race(hash, deadline, plan, attempt_queue);
+        if result.is_err() {
+            self.stats.unavailable.fetch_add(1, Ordering::Relaxed);
+        }
+        result
+    }
+
+    fn race(
+        &self,
+        hash: &Hash32,
+        deadline: Instant,
+        plan: Vec<(Arc<dyn BlockSource>, Endpoint)>,
+        queue_deadline: Instant,
+    ) -> Result<Vec<u8>> {
+        struct Running {
+            ctl: AttemptCtl,
+            started: Instant,
+            via_tor: bool,
+            _permit: Permit,
+        }
+        let (tx, rx) = mpsc::channel::<(usize, Result<Vec<u8>>)>();
+        let race_started = Instant::now();
+        let mut exhausted_since: Option<Instant> = None;
+        // Attempts started per endpoint in this race.
+        let mut tried: HashMap<String, u32> = HashMap::new();
+        let mut running: HashMap<usize, Running> = HashMap::new();
+        let mut errors: Vec<String> = Vec::new();
+        let mut next = 0usize;
+        let mut plan = plan;
+        let mut retried: HashMap<String, u32> = HashMap::new();
+
+        let finish = |running: &mut HashMap<usize, Running>| {
+            for r in running.values() {
+                r.ctl.abort();
+            }
+            running.clear();
+        };
+
+        loop {
+            let now = Instant::now();
+            if now + MIN_ATTEMPT.min(Duration::from_millis(500)) >= deadline {
                 errors.push("external fetch deadline reached".to_string());
+                finish(&mut running);
                 break;
             }
-            // One deadline for the whole download (AUD-156): every source
-            // but the last leaves a third of what is left to the others.
-            let source_deadline = if pos + 1 == count {
-                deadline
+            // Start attempts: the first one (waiting for an attempt permit if
+            // needed), the next after a failure, or a hedge.
+            let want_more = if running.is_empty() {
+                true
+            } else if running.len() >= RACE_WIDTH {
+                false
             } else {
-                Instant::now() + left * 2 / 3
+                running
+                    .values()
+                    .max_by_key(|r| r.started)
+                    .is_some_and(|r| should_hedge(r.ctl.bytes(), now - r.started, r.via_tor))
             };
-            let source = &sources[idx];
-            match source.fetch_block_until(hash, source_deadline, FetchMode::Normal) {
-                Ok(bytes) => {
+            if want_more && next < plan.len() {
+                let fallback = plan[next].1.tier > 0;
+                // The fallback tier waits for every primary to be done
+                // (none running, none queued after it).
+                let allowed = !fallback
+                    || (running.is_empty() && plan[next..].iter().all(|(_, e)| e.tier > 0));
+                if allowed {
+                    let wait_until = if running.is_empty() {
+                        queue_deadline
+                    } else {
+                        now
+                    };
+                    if let Some(permit) = self.external_attempts.acquire_until(wait_until, 0) {
+                        self.stats.race_attempts.fetch_add(1, Ordering::Relaxed);
+                        if !running.is_empty() {
+                            self.stats.race_hedges.fetch_add(1, Ordering::Relaxed);
+                        }
+                        let (source, endpoint) = plan[next].clone();
+                        *tried.entry(endpoint.key.clone()).or_insert(0) += 1;
+                        let ctl = AttemptCtl::new();
+                        running.insert(
+                            next,
+                            Running {
+                                ctl: ctl.clone(),
+                                started: Instant::now(),
+                                via_tor: endpoint.via_tor,
+                                _permit: permit,
+                            },
+                        );
+                        self.spawn_attempt(
+                            next,
+                            source,
+                            endpoint,
+                            *hash,
+                            deadline,
+                            ctl,
+                            tx.clone(),
+                        );
+                        next += 1;
+                        continue;
+                    } else if running.is_empty() {
+                        errors.push("every attempt slot stayed busy".to_string());
+                        break;
+                    }
+                }
+            }
+            if running.is_empty() && next >= plan.len() {
+                // Every endpoint failed or is cooling down. While budget
+                // remains, wait a little for one to come back instead of
+                // failing the wallet (whose client may store the error,
+                // AUD-045). Quiet: a rate-limited provider is not forced
+                // early; an endpoint already tried here does not return
+                // (a Tor one keeps its single retry on a new circuit).
+                let since = *exhausted_since.get_or_insert_with(Instant::now);
+                let attempts: u32 = tried.values().sum();
+                if attempts as usize >= MAX_RACE_ATTEMPTS
+                    || since.elapsed() >= RACE_REFILL_WAIT
+                    || deadline.saturating_duration_since(Instant::now()) < MIN_ATTEMPT * 3
+                {
+                    break;
+                }
+                std::thread::sleep(Duration::from_secs(1));
+                let mut fresh: Vec<(Arc<dyn BlockSource>, Endpoint)> = Vec::new();
+                for source in self.sources() {
+                    for endpoint in source.endpoints(FetchMode::Quiet) {
+                        let tries = tried.get(&endpoint.key).copied().unwrap_or(0);
+                        let allowed =
+                            tries == 0 || (endpoint.via_tor && tries <= TOR_RETRIES_PER_ENDPOINT);
+                        if allowed && !fresh.iter().any(|(_, e)| e.key == endpoint.key) {
+                            fresh.push((Arc::clone(&source), endpoint));
+                        }
+                    }
+                }
+                if !fresh.is_empty() {
+                    exhausted_since = None;
+                }
+                fresh.shuffle(&mut thread_rng());
+                fresh.sort_by_key(|(_, endpoint)| endpoint.tier);
+                plan.extend(fresh);
+                continue;
+            }
+            if running.is_empty() {
+                // Nothing running and nothing startable now.
+                break;
+            }
+            let wait = RACE_TICK.min(deadline.saturating_duration_since(Instant::now()));
+            match rx.recv_timeout(wait) {
+                Ok((idx, Ok(bytes))) => {
+                    running.remove(&idx);
+                    finish(&mut running);
+                    let wins = match plan[idx].0.name() {
+                        "esplora" => &self.stats.race_wins_esplora,
+                        "p2p" => &self.stats.race_wins_p2p,
+                        _ => &self.stats.race_wins_other,
+                    };
+                    wins.fetch_add(1, Ordering::Relaxed);
+                    self.stats
+                        .race_win_ms
+                        .fetch_add(race_started.elapsed().as_millis() as u64, Ordering::Relaxed);
                     self.stats.fetches.fetch_add(1, Ordering::Relaxed);
                     self.stats
                         .bytes
                         .fetch_add(bytes.len() as u64, Ordering::Relaxed);
-                    match verify_block_by_hash(&bytes, hash).and_then(|block| {
+                    return Ok(bytes);
+                }
+                Ok((idx, Err(e))) => {
+                    if running.remove(&idx).is_some() {
+                        let (source, endpoint) = plan[idx].clone();
+                        errors.push(format!("{}: {e}", source.name()));
+                        // Over Tor the next attempt is a new circuit (new exit):
+                        // a provider that is not cooling down gets one more
+                        // try in this race, at the end of the queue.
+                        let tries = retried.entry(endpoint.key.clone()).or_insert(0);
+                        if endpoint.via_tor
+                            && *tries < TOR_RETRIES_PER_ENDPOINT
+                            && source
+                                .endpoints(FetchMode::Quiet)
+                                .iter()
+                                .any(|e| e.key == endpoint.key)
+                        {
+                            *tries += 1;
+                            // Before the fallback tier, which waits for it.
+                            let at = (next..plan.len())
+                                .find(|&i| plan[i].1.tier > endpoint.tier)
+                                .unwrap_or(plan.len());
+                            plan.insert(at, (source, endpoint));
+                        }
+                    }
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            }
+        }
+        Err(RawtxError::Unavailable(if errors.is_empty() {
+            "no external attempt could be made".to_string()
+        } else {
+            errors.join("; ")
+        }))
+    }
+
+    /// One attempt in its own thread: fetch from one endpoint, verify, report.
+    #[allow(clippy::too_many_arguments)]
+    fn spawn_attempt(
+        &self,
+        idx: usize,
+        source: Arc<dyn BlockSource>,
+        endpoint: Endpoint,
+        hash: Hash32,
+        deadline: Instant,
+        ctl: AttemptCtl,
+        tx: mpsc::Sender<(usize, Result<Vec<u8>>)>,
+    ) {
+        let stats = Arc::clone(&self.stats);
+        let spawned = std::thread::Builder::new()
+            .name("el-fetch".to_string())
+            .spawn(move || {
+                let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
+                    source.fetch_endpoint(&endpoint, &hash, deadline, FetchMode::Normal, &ctl)
+                }))
+                .unwrap_or_else(|_| Err(RawtxError::Unavailable("attempt panicked".into())));
+                let result = result.and_then(|bytes| {
+                    match verify_block_by_hash(&bytes, &hash).and_then(|block| {
                         verify_witness_commitment(&block)?;
                         Ok(block)
                     }) {
                         // Not written to the block cache: the caller keeps the
                         // transactions it needs (AUD-139).
-                        Ok(_) => return Ok(bytes),
+                        Ok(_) => Ok(bytes),
                         Err(e) => {
-                            self.stats.verify_failures.fetch_add(1, Ordering::Relaxed);
+                            stats.verify_failures.fetch_add(1, Ordering::Relaxed);
                             eprintln!(
                                 "[e-lite] {} returned an invalid block ({})",
                                 source.name(),
                                 e.kind()
                             );
-                            errors.push(format!("{}: {e}", source.name()));
+                            Err(e)
                         }
                     }
-                }
-                Err(e) => errors.push(format!("{}: {e}", source.name())),
-            }
+                });
+                let _ = tx.send((idx, result));
+            });
+        if let Err(e) = spawned {
+            eprintln!("[e-lite] fetch thread did not start: {e}");
         }
-        self.stats.unavailable.fetch_add(1, Ordering::Relaxed);
-        Err(RawtxError::Unavailable(errors.join("; ")))
     }
 
     /// A failure of `hash` younger than `FAILURE_MEMORY`, if any.
@@ -1186,6 +1629,7 @@ impl Resolver {
     /// dropped resolver releases its database at once.
     fn start_decoy_thread(&self) {
         let lane = Arc::clone(&self.decoy_lane);
+        let wallet_downloads = Arc::clone(&self.wallet_downloads);
         let external = self.external.clone();
         let p2p = self.p2p.clone();
         let stats = Arc::clone(&self.stats);
@@ -1204,6 +1648,16 @@ impl Resolver {
                         if let Some(p2p) = &p2p {
                             if p2p.peer_count() > 0 {
                                 sources.push(Arc::clone(p2p) as Arc<dyn BlockSource>);
+                            }
+                        }
+                        // A wallet download shares the same Tor bandwidth:
+                        // the decoy waits for it, at most DECOY_YIELD.
+                        let yield_until = Instant::now() + DECOY_YIELD;
+                        while wallet_downloads.load(Ordering::Relaxed) > 0
+                            && Instant::now() < yield_until
+                        {
+                            if !lane.pause(Duration::from_millis(250)) {
+                                return;
                             }
                         }
                         if sources.iter().any(|s| s.under_pressure()) {
@@ -1234,9 +1688,55 @@ impl Resolver {
     }
 }
 
+/// Whether the newest attempt of a race deserves a parallel one: nothing
+/// received after the first-byte limit, or still running at the slow limit.
+fn should_hedge(bytes: u64, elapsed: Duration, via_tor: bool) -> bool {
+    let (first_byte, rate_after, min_rate, slow) = if via_tor {
+        (
+            HEDGE_FIRST_BYTE_TOR,
+            HEDGE_RATE_AFTER_TOR,
+            HEDGE_MIN_RATE_TOR,
+            HEDGE_SLOW_TOR,
+        )
+    } else {
+        (
+            HEDGE_FIRST_BYTE_DIRECT,
+            HEDGE_RATE_AFTER_DIRECT,
+            HEDGE_MIN_RATE_DIRECT,
+            HEDGE_SLOW_DIRECT,
+        )
+    };
+    let rate = bytes as f64 / elapsed.as_secs_f64().max(0.001);
+    (bytes == 0 && elapsed >= first_byte)
+        || (elapsed >= rate_after && rate < min_rate as f64)
+        || elapsed >= slow
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_silent_or_slow_attempt_is_hedged() {
+        let s = Duration::from_secs;
+        assert!(!should_hedge(0, s(1), true));
+        assert!(should_hedge(0, HEDGE_FIRST_BYTE_TOR, true));
+        let fast_tor = 300 * 1024 * 10; // 300 KB/s for 10 s
+        assert!(
+            !should_hedge(fast_tor, s(10), true),
+            "a good transfer is not hedged"
+        );
+        assert!(
+            should_hedge(60 * 1024 * 6, s(6), true),
+            "a 60 KB/s circuit is"
+        );
+        assert!(!should_hedge(10, s(4), true), "too early to judge the rate");
+        assert!(should_hedge(fast_tor, HEDGE_SLOW_TOR, true));
+        assert!(should_hedge(0, HEDGE_FIRST_BYTE_DIRECT, false));
+        assert!(!should_hedge(10, s(1), false));
+        assert!(should_hedge(10, s(3), false), "a crawling direct transfer");
+        assert!(should_hedge(10 << 20, HEDGE_SLOW_DIRECT, false));
+    }
 
     #[test]
     fn the_prefetch_leaves_a_download_slot_for_wallets() {

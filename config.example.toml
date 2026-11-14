@@ -186,21 +186,35 @@ prefetch = true                     # download a wallet's history blocks in the 
                                     # (faster first load); owes decoys like a wallet
                                     # request and leaves a download slot free for it
 request_timeout_seconds = 8         # direct (clearnet) Esplora: connect/header/stall limit
-tor_connect_timeout_seconds = 20    # Esplora through Tor: circuit + connection
-tor_stall_timeout_seconds = 25      # Esplora through Tor: no header/byte for this long
-                                    # = stalled, try the next provider (new circuit)
+tor_connect_timeout_seconds = 10    # Esplora through Tor: circuit + connection
+tor_stall_timeout_seconds = 12      # Esplora through Tor: no header/byte for this long
+                                    # = stalled. Both doubled for .onion providers.
+                                    # Every block download is a race (AUD-160): up to
+                                    # 3 attempts on different providers/peers/circuits,
+                                    # a new one when one fails, sends nothing for 6 s,
+                                    # crawls below 96 KB/s after 5 s or runs 15 s
+                                    # (direct: 2 s / 256 KB/s / 6 s); the first
+                                    # verified block wins, the rest are aborted
 tor_request_timeout_seconds = 60    # absolute limit of one Esplora attempt; a transfer
                                     # that keeps receiving bytes may use all of it.
-                                    # One block download (all sources, queue included)
-                                    # has 60 s; requests sharing it wait 65 s
+                                    # One block download has 60 s of network time from
+                                    # the moment it gets a download slot (waiting for
+                                    # a slot: up to 120 s more); requests sharing it
+                                    # wait for it
 provider_cooldown_seconds = 300     # cooldown after a hard failure (bad answer, wrong
-                                    # services). Timeouts back off 5 s doubling to 60 s
-                                    # (P2P peers: 30 s doubling to this value); a 429/503
-                                    # honours Retry-After (15 s doubling, max 120 s)
-max_parallel_fetches = 4            # total external block downloads in flight (the
-                                    # prefetch never takes the last free one)
-p2p_timeout_seconds = 8             # direct P2P connect/handshake/block attempt
-p2p_tor_timeout_seconds = 30        # P2P attempt through Tor (circuit + whole block)
+                                    # services). Timeouts back off 5 s doubling to 60 s;
+                                    # an endpoint that never answers (no connection,
+                                    # no byte) 5 s (P2P peers 30 s) doubling to 10 min;
+                                    # a 429/503 honours Retry-After (15 s doubling, max
+                                    # 120 s). Over Tor a 429 is one exit: the provider
+                                    # is paused only after 3 limited circuits in 60 s
+max_parallel_fetches = 8            # external block downloads in flight (the prefetch
+                                    # never takes the last free one); attempts in
+                                    # flight (hedges included) are capped at twice
+                                    # this, at most 24 (Tor allows 32 pending circuits)
+p2p_timeout_seconds = 8             # direct P2P attempt (connect 4 s, stall 6 s)
+p2p_tor_timeout_seconds = 30        # P2P attempt through Tor (connect 10 s, onion
+                                    # 20 s; stall 12 s; whole block within this)
 use_p2p = true                      # minimal P2P client; used for prune-gap repair
 use_esplora = true                  # Esplora block endpoints; used for repair too
 p2p_v2 = true                       # BIP324 encrypted transport, fallback to v1

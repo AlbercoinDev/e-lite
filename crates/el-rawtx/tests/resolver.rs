@@ -10,7 +10,9 @@ use bitcoin::{
 };
 use el_model::codec::SCHEMA_VERSION;
 use el_model::{BlockRecord, Hash32, IndexedTip};
-use el_rawtx::{BlockSource, RawtxConfig, RawtxError, Resolver, Result};
+use el_rawtx::{
+    AttemptCtl, BlockSource, Endpoint, FetchMode, RawtxConfig, RawtxError, Resolver, Result,
+};
 use el_store::Store;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -768,4 +770,433 @@ fn the_shared_download_budget_outlives_every_attempt() {
     assert!(el_rawtx::FOLLOWER_GRACE > Duration::ZERO);
     assert!(el_rawtx::EXTERNAL_BUDGET >= Duration::from_secs(60));
     assert!(el_rawtx::FAILURE_MEMORY < el_rawtx::EXTERNAL_BUDGET);
+}
+
+/// A source with several endpoints whose behaviour is chosen per key:
+/// `ok` answers, `fail` fails at once, `mute` never sends a byte (until the
+/// attempt is aborted or 30 s pass). `fallback` endpoints are tier 1.
+struct RaceSource {
+    blocks: Vec<u8>,
+    endpoints: Vec<(String, u8)>,
+    running: AtomicU64,
+    max_running: AtomicU64,
+    calls: std::sync::Mutex<Vec<(String, Instant)>>,
+}
+
+impl RaceSource {
+    fn new(blocks: Vec<u8>, endpoints: &[(&str, u8)]) -> Arc<Self> {
+        Arc::new(RaceSource {
+            blocks,
+            endpoints: endpoints.iter().map(|(k, t)| (k.to_string(), *t)).collect(),
+            running: AtomicU64::new(0),
+            max_running: AtomicU64::new(0),
+            calls: std::sync::Mutex::new(Vec::new()),
+        })
+    }
+
+    fn called(&self, prefix: &str) -> usize {
+        self.calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(k, _)| k.starts_with(prefix))
+            .count()
+    }
+}
+
+impl BlockSource for RaceSource {
+    fn name(&self) -> &str {
+        "race"
+    }
+    fn fetch_block(&self, _hash: &Hash32) -> Result<Vec<u8>> {
+        Err(RawtxError::Unavailable("use endpoints".into()))
+    }
+    fn endpoints(&self, _mode: FetchMode) -> Vec<Endpoint> {
+        self.endpoints
+            .iter()
+            .map(|(key, tier)| Endpoint {
+                key: key.clone(),
+                tier: *tier,
+                via_tor: false,
+            })
+            .collect()
+    }
+    fn fetch_endpoint(
+        &self,
+        endpoint: &Endpoint,
+        _hash: &Hash32,
+        _deadline: Instant,
+        _mode: FetchMode,
+        ctl: &AttemptCtl,
+    ) -> Result<Vec<u8>> {
+        self.calls
+            .lock()
+            .unwrap()
+            .push((endpoint.key.clone(), Instant::now()));
+        let now = self.running.fetch_add(1, Ordering::SeqCst) + 1;
+        self.max_running.fetch_max(now, Ordering::SeqCst);
+        let out = if endpoint.key.starts_with("ok") {
+            ctl.add_bytes(self.blocks.len());
+            Ok(self.blocks.clone())
+        } else if endpoint.key.starts_with("fail") {
+            Err(RawtxError::Unavailable("refused".into()))
+        } else {
+            let until = Instant::now() + Duration::from_secs(30);
+            while !ctl.aborted() && Instant::now() < until {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Err(RawtxError::Unavailable("aborted".into()))
+        };
+        self.running.fetch_sub(1, Ordering::SeqCst);
+        out
+    }
+}
+
+#[test]
+fn a_mute_endpoint_is_hedged_and_the_live_one_wins() {
+    // AUD-160: an endpoint that never answers costs the hedge delay, not
+    // the whole budget, whatever the order.
+    let dir = tmp("race-mute");
+    let (store, _hash, txid, bytes) = setup(&dir, 0);
+    for _ in 0..4 {
+        let src = RaceSource::new(bytes.clone(), &[("mute-a", 0), ("ok-b", 0)]);
+        let resolver = Resolver::new(Arc::clone(&store), &config(0, 0))
+            .unwrap()
+            .with_external(src.clone());
+        let started = Instant::now();
+        assert!(resolver.raw_tx(txid, 0).is_ok());
+        assert!(
+            started.elapsed() < el_rawtx::HEDGE_FIRST_BYTE_DIRECT + Duration::from_secs(2),
+            "took {:?}",
+            started.elapsed()
+        );
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_failure_starts_the_next_endpoint_at_once() {
+    let dir = tmp("race-fail");
+    let (store, _hash, txid, bytes) = setup(&dir, 0);
+    let src = RaceSource::new(
+        bytes,
+        &[("fail-a", 0), ("fail-b", 0), ("fail-c", 0), ("ok-d", 0)],
+    );
+    let resolver = Resolver::new(Arc::clone(&store), &config(0, 0))
+        .unwrap()
+        .with_external(src.clone());
+    let started = Instant::now();
+    assert!(resolver.raw_tx(txid, 0).is_ok());
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "{:?}",
+        started.elapsed()
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_race_never_runs_more_than_its_width() {
+    let dir = tmp("race-width");
+    let (store, _hash, txid, bytes) = setup(&dir, 0);
+    let mutes: Vec<(String, u8)> = (0..8).map(|i| (format!("mute-{i}"), 0)).collect();
+    let refs: Vec<(&str, u8)> = mutes.iter().map(|(k, t)| (k.as_str(), *t)).collect();
+    let src = RaceSource::new(bytes, &refs);
+    let resolver = Arc::new(
+        Resolver::new(Arc::clone(&store), &config(0, 0))
+            .unwrap()
+            .with_external(src.clone()),
+    );
+    let r = Arc::clone(&resolver);
+    let handle = std::thread::spawn(move || r.raw_tx(txid, 0));
+    // Three hedges need 2 x HEDGE_FIRST_BYTE_DIRECT; watch a little longer.
+    std::thread::sleep(el_rawtx::HEDGE_FIRST_BYTE_DIRECT * 3 + Duration::from_millis(500));
+    assert_eq!(
+        src.max_running.load(Ordering::SeqCst),
+        el_rawtx::RACE_WIDTH as u64
+    );
+    drop(handle); // the download keeps its own 60 s budget; not awaited
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn the_clearnet_tier_waits_for_every_primary() {
+    // AUD-128: the fallback is used only when the primary attempts failed,
+    // never raced against a primary that is still running.
+    let dir = tmp("race-tier");
+    let (store, _hash, txid, bytes) = setup(&dir, 0);
+    let src = RaceSource::new(bytes.clone(), &[("ok-tor", 0), ("ok-direct", 1)]);
+    let resolver = Resolver::new(Arc::clone(&store), &config(0, 0))
+        .unwrap()
+        .with_external(src.clone());
+    assert!(resolver.raw_tx(txid, 0).is_ok());
+    assert_eq!(src.called("ok-direct"), 0);
+
+    let src = RaceSource::new(bytes, &[("fail-tor", 0), ("ok-direct", 1)]);
+    let resolver = Resolver::new(Arc::clone(&store), &config(0, 0))
+        .unwrap()
+        .with_external(src.clone());
+    assert!(resolver.raw_tx(txid, 0).is_ok());
+    assert_eq!(src.called("ok-direct"), 1);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Live burst over Tor against mainnet, as a wallet's `transaction.get`
+/// batch would cause: N distinct pruned blocks requested at once.
+/// E_LITE_LIVE_TOR=127.0.0.1:9050 [E_LITE_LIVE_BLOCKS=24] [E_LITE_LIVE_PEERS=ip:8333,...]
+/// cargo test -p el-rawtx --test resolver live_tor_burst -- --ignored --nocapture
+#[test]
+#[ignore]
+fn live_tor_burst_mainnet() {
+    let clearnet = std::env::var("E_LITE_LIVE_CLEARNET").is_ok();
+    let socks = match std::env::var("E_LITE_LIVE_TOR") {
+        Ok(s) => s,
+        Err(_) if clearnet => String::new(),
+        Err(_) => {
+            eprintln!("set E_LITE_LIVE_TOR (or E_LITE_LIVE_CLEARNET=1)");
+            return;
+        }
+    };
+    let n: usize = std::env::var("E_LITE_LIVE_BLOCKS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(24);
+    let peers: Vec<String> = std::env::var("E_LITE_LIVE_PEERS")
+        .map(|v| v.split(',').map(str::to_string).collect())
+        .unwrap_or_default();
+    // Headers from Esplora's /blocks/:start (10 per request), then the index
+    // records are built from them; the blocks themselves come from the race.
+    let mut records = Vec::new();
+    let mut start = 700_000 + (rand_u32() % 100_000);
+    while records.len() < n {
+        let url = format!("https://blockstream.info/api/blocks/{start}");
+        // A fresh circuit per try: one exit may be rate limited.
+        let list = (0..8)
+            .find_map(|_| {
+                let meta = if clearnet {
+                    reqwest::blocking::Client::builder()
+                        .timeout(Duration::from_secs(30))
+                        .build()
+                        .ok()?
+                } else {
+                    el_rawtx::isolated_tor_client(&socks, Duration::from_secs(30))?
+                };
+                let text = meta.get(&url).send().ok()?.text().ok()?;
+                let v: serde_json::Value = serde_json::from_str(&text).ok()?;
+                v.is_array().then_some(v)
+            })
+            .expect("block headers over Tor");
+        for b in list.as_array().unwrap() {
+            let mut header = Vec::with_capacity(80);
+            header.extend_from_slice(&(b["version"].as_u64().unwrap() as u32).to_le_bytes());
+            let mut prev = hex::decode(b["previousblockhash"].as_str().unwrap()).unwrap();
+            prev.reverse();
+            header.extend_from_slice(&prev);
+            let mut root = hex::decode(b["merkle_root"].as_str().unwrap()).unwrap();
+            root.reverse();
+            header.extend_from_slice(&root);
+            header.extend_from_slice(&(b["timestamp"].as_u64().unwrap() as u32).to_le_bytes());
+            header.extend_from_slice(&(b["bits"].as_u64().unwrap() as u32).to_le_bytes());
+            header.extend_from_slice(&(b["nonce"].as_u64().unwrap() as u32).to_le_bytes());
+            records.push(BlockRecord {
+                height: b["height"].as_u64().unwrap() as u32,
+                hash: Hash32::from_hex(b["id"].as_str().unwrap()).unwrap(),
+                header: header.try_into().unwrap(),
+                tx_count: b["tx_count"].as_u64().unwrap() as u32,
+                txnum_base: 0,
+            });
+        }
+        start += 2_000 + rand_u32() % 3_000;
+    }
+    records.truncate(n);
+    let dir = tmp("live-tor-burst");
+    let store = Arc::new(Store::open(&dir).unwrap());
+    let mut batch = Store::batch();
+    for (i, rec) in records.iter().enumerate() {
+        store.put_block(&mut batch, rec).unwrap();
+        // A txid that is not in the block: the download and full
+        // verification run, then the lookup reports "not in the block".
+        store
+            .put_occurrence(&mut batch, Hash32([i as u8 + 1; 32]), rec.height, 0)
+            .unwrap();
+    }
+    let top = records.iter().max_by_key(|r| r.height).unwrap();
+    store
+        .commit(
+            batch,
+            &IndexedTip {
+                height: top.height,
+                block_hash: top.hash,
+                schema_version: SCHEMA_VERSION,
+                txnum: 1,
+            },
+            &[],
+        )
+        .unwrap();
+    let mut cfg = config(0, 0);
+    cfg.chain = el_model::Chain::Mainnet;
+    cfg.tor_socks = (!clearnet).then_some(socks);
+    cfg.allow_clearnet = clearnet;
+    cfg.use_esplora = true;
+    cfg.use_p2p = !peers.is_empty();
+    cfg.p2p_v2 = true;
+    cfg.esplora_urls = vec![
+        "https://blockstream.info/api".into(),
+        "https://mempool.space/api".into(),
+        "http://mempoolhqx4isw62xs7abwphsq7ldayuidyx2v2oethdhhj6mlo2r6ad.onion/api".into(),
+    ];
+    cfg.tor_request_timeout_seconds = 60;
+    cfg.tor_connect_timeout_seconds = std::env::var("E_LITE_LIVE_TOR_CONNECT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(10);
+    cfg.tor_stall_timeout_seconds = std::env::var("E_LITE_LIVE_TOR_STALL")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(12);
+    cfg.p2p_timeout = Duration::from_secs(8);
+    cfg.p2p_tor_timeout = Duration::from_secs(30);
+    cfg.max_parallel_fetches = std::env::var("E_LITE_LIVE_SLOTS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(8);
+    let resolver = Arc::new(Resolver::new(Arc::clone(&store), &cfg).unwrap());
+    if !peers.is_empty() {
+        resolver.refresh_p2p_peers(peers.into_iter().map(el_rawtx::PeerHint::from).collect());
+    }
+    let started = Instant::now();
+    let handles: Vec<_> = records
+        .iter()
+        .enumerate()
+        .map(|(i, rec)| {
+            let resolver = Arc::clone(&resolver);
+            let height = rec.height;
+            std::thread::spawn(move || {
+                let t = Instant::now();
+                let r = resolver.raw_tx(Hash32([i as u8 + 1; 32]), height);
+                let ok = matches!(&r, Err(RawtxError::Verify(m)) if m.contains("not in the block"));
+                (
+                    height,
+                    ok,
+                    t.elapsed(),
+                    r.err().map(|e| el_rawtx::redact_hashes(&e.to_string())),
+                )
+            })
+        })
+        .collect();
+    let mut lat = Vec::new();
+    let mut failed = 0;
+    for h in handles {
+        let (height, ok, took, kind) = h.join().unwrap();
+        eprintln!(
+            "height {height}: {} in {:.1}s",
+            if ok {
+                "ok".to_string()
+            } else {
+                kind.unwrap_or_default()
+            },
+            took.as_secs_f64()
+        );
+        if ok {
+            lat.push(took.as_secs_f64());
+        } else {
+            failed += 1;
+        }
+    }
+    lat.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let total = started.elapsed().as_secs_f64();
+    let p = |q: f64| {
+        lat.get(((lat.len() as f64 - 1.0) * q) as usize)
+            .copied()
+            .unwrap_or(0.0)
+    };
+    let st = resolver.stats();
+    eprintln!(
+        "burst {n}: {} ok, {failed} failed, total {total:.1}s ({:.2} blocks/s), p50 {:.1}s p90 {:.1}s max {:.1}s, p2p attempts {} failures {}, race attempts {} hedges {} wins esplora {} p2p {} avg race {} ms",
+        lat.len(),
+        lat.len() as f64 / total,
+        p(0.5),
+        p(0.9),
+        p(1.0),
+        st.p2p_attempts.load(Ordering::Relaxed),
+        st.p2p_failures.load(Ordering::Relaxed),
+        st.race_attempts.load(Ordering::Relaxed),
+        st.race_hedges.load(Ordering::Relaxed),
+        st.race_wins_esplora.load(Ordering::Relaxed),
+        st.race_wins_p2p.load(Ordering::Relaxed),
+        st.race_win_ms.load(Ordering::Relaxed) / lat.len().max(1) as u64,
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+fn rand_u32() -> u32 {
+    (SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap()
+        .subsec_nanos())
+    .wrapping_mul(2_654_435_761)
+}
+
+/// One endpoint that always fails, and one that is cooling down until
+/// `ready_at` and then answers.
+struct RecoveringSource {
+    blocks: Vec<u8>,
+    ready_at: Instant,
+}
+
+impl BlockSource for RecoveringSource {
+    fn name(&self) -> &str {
+        "recovering"
+    }
+    fn fetch_block(&self, _hash: &Hash32) -> Result<Vec<u8>> {
+        Err(RawtxError::Unavailable("use endpoints".into()))
+    }
+    fn endpoints(&self, _mode: FetchMode) -> Vec<Endpoint> {
+        let mut out = vec![Endpoint {
+            key: "down".into(),
+            tier: 0,
+            via_tor: false,
+        }];
+        if Instant::now() >= self.ready_at {
+            out.push(Endpoint {
+                key: "back".into(),
+                tier: 0,
+                via_tor: false,
+            });
+        }
+        out
+    }
+    fn fetch_endpoint(
+        &self,
+        endpoint: &Endpoint,
+        _hash: &Hash32,
+        _deadline: Instant,
+        _mode: FetchMode,
+        _ctl: &AttemptCtl,
+    ) -> Result<Vec<u8>> {
+        if endpoint.key == "back" {
+            Ok(self.blocks.clone())
+        } else {
+            Err(RawtxError::Unavailable("down".into()))
+        }
+    }
+}
+
+#[test]
+fn a_race_waits_for_an_endpoint_that_comes_back() {
+    // AUD-160: every endpoint failing or paused is not an answer while the
+    // budget lasts; a provider whose pause ends is used.
+    let dir = tmp("race-recover");
+    let (store, _hash, txid, bytes) = setup(&dir, 0);
+    let src = Arc::new(RecoveringSource {
+        blocks: bytes,
+        ready_at: Instant::now() + Duration::from_secs(2),
+    });
+    let resolver = Resolver::new(Arc::clone(&store), &config(0, 0))
+        .unwrap()
+        .with_external(src);
+    let started = Instant::now();
+    assert!(resolver.raw_tx(txid, 0).is_ok());
+    assert!(started.elapsed() < el_rawtx::RACE_REFILL_WAIT);
+    let _ = std::fs::remove_dir_all(&dir);
 }

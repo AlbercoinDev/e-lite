@@ -88,11 +88,11 @@ allow_clearnet = false
 tor_fallback_clearnet = false
 prefetch = true
 request_timeout_seconds = 8
-tor_connect_timeout_seconds = 20
-tor_stall_timeout_seconds = 25
+tor_connect_timeout_seconds = 10
+tor_stall_timeout_seconds = 12
 tor_request_timeout_seconds = 60
 provider_cooldown_seconds = 300
-max_parallel_fetches = 4
+max_parallel_fetches = 8
 p2p_timeout_seconds = 8
 p2p_tor_timeout_seconds = 30
 use_p2p = true
@@ -126,14 +126,29 @@ open_without_provider = false  # true: open with local data after ready_timeout_
   the blocks of one wallet are spread over all of them. Timing can still
   correlate requests.
 - A block request through Tor builds a new circuit and downloads a whole
-  block. It gets `tor_connect_timeout_seconds` (20 s) for the circuit and the
+  block. It gets `tor_connect_timeout_seconds` (10 s) for the circuit and the
   connection, then fails only when nothing arrives for
-  `tor_stall_timeout_seconds` (25 s): a slow transfer that keeps receiving
-  bytes continues up to `tor_request_timeout_seconds` (60 s). A stalled
-  attempt moves on to the next provider on a new circuit within the same
-  request. One block download has one budget of 60 s for every source,
-  queue included; requests that share it wait 65 s, so they never give up
-  before it (AUD-155/156). `/status.rawtx.tx_get_failures` says why a
+  `tor_stall_timeout_seconds` (12 s); both are doubled for `.onion`
+  providers. A slow transfer that keeps receiving bytes continues up to
+  `tor_request_timeout_seconds` (60 s).
+- **Every block download is a race (AUD-160).** Endpoints (each provider over
+  Tor, each P2P peer) are shuffled and tried with up to 3 attempts at once: a
+  new attempt starts when one fails, when the newest one has sent nothing for
+  6 s, crawls below 96 KB/s after 5 s, or is still running at 15 s (direct:
+  2 s, 256 KB/s, 6 s). The slow attempt is not cut; the first verified block
+  wins and the others are aborted. Over Tor a provider that failed on one
+  circuit gets one more try on a new circuit in the same race. **Privacy
+  cost:** up to 3 providers or peers may receive the same block hash for one
+  download (each on its own circuit, none of them learns more than the block
+  hash, and decoys still follow every download). Measured on mainnet over Tor
+  with 32 distinct pruned blocks at once: 0.11-0.14 blocks/s and 66-78 %
+  failures before, 0.55-0.66 blocks/s and 0-9 % failures after; over
+  clearnet 32 blocks took 6 s.
+- One block download has 60 s of network time from the moment it gets a
+  download slot; waiting for the slot (a burst of distinct blocks) may add
+  up to 120 s and does not eat that budget. Requests that share a download
+  wait for it. When every endpoint failed or is paused, the race waits up to
+  15 s for one to come back before it reports the failure (AUD-160). `/status.rawtx.tx_get_failures` says why a
   `transaction.get` failed (`no_source`, `external_failed`, ...), without any
   hash.
 - A block that just failed is answered with that failure for 10 s instead
@@ -207,8 +222,8 @@ alpha.29.12.0 (AUD-159).
 What a provider can observe is the same as for the wallet's own requests:
 each block goes to a random provider on its own circuit, and each external
 download owes decoys exactly like a wallet request (AUD-134 is superseded).
-It fetches up to 16 blocks per history response, one at a time, and never
-takes the last free download slot, so a wallet request is never queued
+It queues up to 64 blocks per history response and downloads them with
+every download slot but one (it never takes the last free slot), so a wallet request is never queued
 behind it. Blocks whose transactions are already in the transaction cache are
 not downloaded, so a wallet that loaded once costs nothing on reconnect. Set
 `prefetch = false` if you prefer the wallet to fetch only what it asks for.
@@ -254,8 +269,12 @@ An external Core is never changed: set these flags in its `bitcoin.conf`.
   peer. v1 is tried only when the v2 connection was established and the v2
   handshake failed; a connection that could not be made is not paid for twice.
   Each protocol attempt has its own budget: `p2p_tor_timeout_seconds` (30 s)
-  through Tor, `p2p_timeout_seconds` (8 s) direct; reads stall after 20 s
-  without data.
+  through Tor, `p2p_timeout_seconds` (8 s) direct. Inside it the connection
+  phase is bounded on its own (10 s through Tor, 20 s to an `.onion` peer,
+  4 s direct) and reads stall after 12 s (Tor) or 6 s (direct) without data
+  (AUD-160): Tor keeps retrying a dead peer on new circuits for up to its
+  `SocksTimeout` (2 min), so waiting longer only holds a slot. A peer that
+  never answers backs off 30 s doubling to 10 min.
 - Peers are discovered from Core's **outbound** connections first, then from
   addrman, and the list is refreshed every 10 minutes (every 60 s while it is
   empty, for example right after Core starts). Inbound peers (their address

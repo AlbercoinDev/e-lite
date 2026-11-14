@@ -241,7 +241,7 @@ e-lite run --network mainnet --allow-mainnet \
 | `--set rawtx.request_timeout_seconds=<n>` | per-provider block timeout, direct (clearnet) | `8` |
 | `--set rawtx.tor_request_timeout_seconds=<n>` | per-provider block timeout through Tor (new circuit + whole block) | `20` |
 | `--set rawtx.provider_cooldown_seconds=<n>` | cool down a failed provider (Tor or direct) | `300` |
-| `--set rawtx.max_parallel_fetches=<n>` | concurrent external block downloads | `4` |
+| `--set rawtx.max_parallel_fetches=<n>` | concurrent external block downloads | `8` |
 | `--set rawtx.p2p_timeout_seconds=<n>` | P2P connect/handshake/block timeout | `8` |
 | `--set public_servers.require_ready=false` | start without a ready provider | `true` |
 | `--set public_servers.probe_timeout_seconds=<n>` | per-provider probe timeout (parallel probe; Tor attempts get at least `rawtx.tor_request_timeout_seconds`) | `5` |

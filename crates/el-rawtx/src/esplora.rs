@@ -5,7 +5,7 @@
 //! clearnet is refused unless `allow_clearnet` is explicitly enabled.
 
 use crate::health::{Blame, HealthMap, TRANSIENT_BASE, TRANSIENT_CAP};
-use crate::{BlockSource, FetchMode, RawtxError, Result};
+use crate::{AttemptCtl, BlockSource, Endpoint, FetchMode, RawtxError, Result};
 use el_model::Hash32;
 use rand::seq::SliceRandom;
 use rand::thread_rng;
@@ -43,8 +43,12 @@ const MAX_BLOCK_BYTES: u64 = 8 * 1024 * 1024;
 const READ_CHUNK: usize = 64 * 1024;
 /// Defaults of the Tor connect and stall timeouts (`[rawtx]
 /// tor_connect_timeout_seconds` / `tor_stall_timeout_seconds`).
-pub const DEFAULT_TOR_CONNECT: Duration = Duration::from_secs(20);
-pub const DEFAULT_TOR_STALL: Duration = Duration::from_secs(25);
+/// A Tor attempt that has not connected or answered by then is hedged by the
+/// resolver anyway (AUD-160); waiting longer only holds a circuit that Tor
+/// itself would already be retrying elsewhere. `.onion` endpoints get twice
+/// these limits (rendezvous circuits take longer).
+pub const DEFAULT_TOR_CONNECT: Duration = Duration::from_secs(10);
+pub const DEFAULT_TOR_STALL: Duration = Duration::from_secs(12);
 
 /// A client whose SOCKS username is random. Tor isolates streams with
 /// different SOCKS credentials onto different circuits.
@@ -232,13 +236,20 @@ impl EsploraSource {
         base: &str,
         hash: &Hash32,
         deadline: Instant,
+        ctl: &AttemptCtl,
     ) -> Attempt {
         let url = format!("{}/block/{}/raw", base, hash.to_hex());
         let unavailable = |msg: String| RawtxError::Unavailable(format!("{base}: {msg}"));
-        let mut resp = client
-            .get(&url)
-            .send()
-            .map_err(|e| (unavailable(describe_reqwest(&e)), Blame::Transient))?;
+        let mut resp = client.get(&url).send().map_err(|e| {
+            // No connection, or no response header in time: the endpoint
+            // never answered (AUD-160).
+            let blame = if e.is_connect() || e.is_timeout() {
+                Blame::Unreachable
+            } else {
+                Blame::Transient
+            };
+            (unavailable(describe_reqwest(&e)), blame)
+        })?;
         let status = resp.status();
         if status == reqwest::StatusCode::TOO_MANY_REQUESTS
             || status == reqwest::StatusCode::SERVICE_UNAVAILABLE
@@ -265,6 +276,9 @@ impl EsploraSource {
         let mut bytes = Vec::with_capacity(expected.unwrap_or(0).min(MAX_BLOCK_BYTES) as usize);
         let mut buf = vec![0u8; READ_CHUNK];
         loop {
+            if ctl.aborted() {
+                return Err((unavailable("aborted".into()), Blame::Transient));
+            }
             if Instant::now() >= deadline {
                 return Err((
                     unavailable(format!(
@@ -277,6 +291,7 @@ impl EsploraSource {
             match resp.read(&mut buf) {
                 Ok(0) => break,
                 Ok(n) => {
+                    ctl.add_bytes(n);
                     bytes.extend_from_slice(&buf[..n]);
                     if bytes.len() as u64 > MAX_BLOCK_BYTES {
                         return Err((unavailable("block too large".into()), Blame::Hard));
@@ -303,6 +318,54 @@ impl EsploraSource {
 
     fn fail(&self, map: &HealthMap, base: &str, blame: Blame) {
         map.fail(base, blame, TRANSIENT_BASE, TRANSIENT_CAP, self.cooldown);
+    }
+
+    /// Record a failure of a Tor attempt. A 429/503 over Tor is about one
+    /// exit: the provider is paused only when several distinct circuits were
+    /// limited within a minute (AUD-160).
+    fn fail_tor(&self, base: &str, blame: Blame) {
+        match blame {
+            Blame::RateLimited(_) => {
+                if self.tor_health.circuit_limited(base) {
+                    self.fail(&self.tor_health, base, blame);
+                }
+            }
+            _ => self.fail(&self.tor_health, base, blame),
+        }
+    }
+
+    /// Tor connect and stall limits for `base` (doubled for `.onion`).
+    fn tor_limits(&self, base: &str) -> (Duration, Duration) {
+        let factor = if is_onion(base) { 2 } else { 1 };
+        (
+            (self.tor_connect * factor).min(self.attempt_limit),
+            (self.tor_stall * factor).min(self.attempt_limit),
+        )
+    }
+
+    /// Endpoints usable now: each provider through Tor (tier 0) and, when
+    /// clearnet is allowed, directly (tier 0 without Tor, tier 1 with it, so
+    /// Tor is always tried first).
+    fn usable_endpoints(&self) -> Vec<Endpoint> {
+        let mut out = Vec::new();
+        for base in &self.bases {
+            if self.tor_proxy.is_some() && !self.tor_health.cooling(base) {
+                out.push(Endpoint {
+                    key: format!("tor {base}"),
+                    tier: 0,
+                    via_tor: true,
+                });
+            }
+            if !is_onion(base) && self.direct_client.is_some() && !self.direct_health.cooling(base)
+            {
+                out.push(Endpoint {
+                    key: format!("direct {base}"),
+                    tier: if self.tor_proxy.is_some() { 1 } else { 0 },
+                    via_tor: false,
+                });
+            }
+        }
+        out
     }
 
     fn attemptable(&self, base: &str) -> bool {
@@ -342,9 +405,88 @@ impl EsploraSource {
     }
 }
 
+fn is_onion(base: &str) -> bool {
+    base.to_ascii_lowercase().contains(".onion")
+}
+
 impl BlockSource for EsploraSource {
     fn name(&self) -> &str {
         "esplora"
+    }
+
+    fn endpoints(&self, mode: FetchMode) -> Vec<Endpoint> {
+        let mut out = self.usable_endpoints();
+        if out.is_empty() && mode == FetchMode::Normal {
+            // Every provider is cooling down: release the one whose pause
+            // ends first rather than failing without touching the network.
+            let order: Vec<usize> = (0..self.bases.len()).collect();
+            self.force_one(&order);
+            out = self.usable_endpoints();
+        }
+        out.shuffle(&mut thread_rng());
+        out
+    }
+
+    fn fetch_endpoint(
+        &self,
+        endpoint: &Endpoint,
+        hash: &Hash32,
+        deadline: Instant,
+        mode: FetchMode,
+        ctl: &AttemptCtl,
+    ) -> Result<Vec<u8>> {
+        let quiet = mode == FetchMode::Quiet;
+        let Some(attempt) = self.attempt_deadline(deadline) else {
+            return Err(RawtxError::Unavailable("deadline reached".into()));
+        };
+        if let Some(base) = endpoint.key.strip_prefix("tor ") {
+            let socks = self
+                .tor_proxy
+                .as_deref()
+                .ok_or_else(|| RawtxError::Unavailable(format!("tor {base}: no proxy")))?;
+            let (connect, stall) = self.tor_limits(base);
+            let client = isolated_tor_client_with(socks, connect, stall).ok_or_else(|| {
+                RawtxError::Unavailable(format!("tor {base}: client unavailable"))
+            })?;
+            return match Self::fetch_with(&client, base, hash, attempt, ctl) {
+                Ok(bytes) => {
+                    self.tor_health.succeed(base);
+                    Ok(bytes)
+                }
+                Err((e, blame)) => {
+                    // A decoy or a losing hedge never cools a provider down.
+                    if !quiet && !ctl.aborted() {
+                        self.fail_tor(base, blame);
+                    }
+                    Err(RawtxError::Unavailable(format!("tor {e}")))
+                }
+            };
+        }
+        if let Some(base) = endpoint.key.strip_prefix("direct ") {
+            let client = self
+                .direct_client
+                .as_ref()
+                .ok_or_else(|| RawtxError::Unavailable(format!("direct {base}: no client")))?;
+            let via_fallback = self.fallback_clearnet && !self.allow_clearnet;
+            return match Self::fetch_with(client, base, hash, attempt, ctl) {
+                Ok(bytes) => {
+                    self.direct_health.succeed(base);
+                    if via_fallback && !self.fallback_warned.swap(true, Ordering::Relaxed) {
+                        eprintln!(
+                            "[e-lite] WARNING: Tor request failed; using clearnet for {base} (operator IP exposed)"
+                        );
+                    }
+                    Ok(bytes)
+                }
+                Err((e, blame)) => {
+                    if !quiet && !ctl.aborted() {
+                        self.fail(&self.direct_health, base, blame);
+                    }
+                    Err(RawtxError::Unavailable(format!("direct {e}")))
+                }
+            };
+        }
+        Err(RawtxError::Unavailable("unknown esplora endpoint".into()))
     }
 
     fn fetch_block(&self, hash: &Hash32) -> Result<Vec<u8>> {
@@ -389,13 +531,12 @@ impl BlockSource for EsploraSource {
                 if self.tor_health.cooling(base) {
                     errors.push(format!("tor {base}: cooling down"));
                 } else if let Some(attempt) = self.attempt_deadline(deadline) {
-                    let Some(client) =
-                        isolated_tor_client_with(socks, self.tor_connect, self.tor_stall)
-                    else {
+                    let (connect, stall) = self.tor_limits(base);
+                    let Some(client) = isolated_tor_client_with(socks, connect, stall) else {
                         errors.push(format!("tor {base}: client unavailable"));
                         continue;
                     };
-                    match Self::fetch_with(&client, base, hash, attempt) {
+                    match Self::fetch_with(&client, base, hash, attempt, &AttemptCtl::new()) {
                         Ok(bytes) => {
                             self.tor_health.succeed(base);
                             return Ok(bytes);
@@ -403,7 +544,7 @@ impl BlockSource for EsploraSource {
                         Err((e, blame)) => {
                             // A decoy never cools a provider down (AUD-157).
                             if !quiet {
-                                self.fail(&self.tor_health, base, blame);
+                                self.fail_tor(base, blame);
                             }
                             errors.push(format!("tor {e}"));
                         }
@@ -425,7 +566,7 @@ impl BlockSource for EsploraSource {
                         break;
                     };
                     let via_fallback = self.fallback_clearnet && !self.allow_clearnet;
-                    match Self::fetch_with(client, base, hash, attempt) {
+                    match Self::fetch_with(client, base, hash, attempt, &AttemptCtl::new()) {
                         Ok(bytes) => {
                             self.direct_health.succeed(base);
                             if via_fallback && !self.fallback_warned.swap(true, Ordering::Relaxed) {
@@ -964,5 +1105,54 @@ mod tests {
             .is_err());
         assert_eq!(requests.load(Ordering::SeqCst), 1);
         assert!(src.direct_health.until(&bad).is_none());
+    }
+
+    #[test]
+    fn a_rate_limit_over_tor_pauses_the_provider_only_after_several_circuits() {
+        // AUD-160: over Tor a 429 is about one exit; the next request uses
+        // another circuit, so one limited circuit must not stop the provider.
+        let src = EsploraSource::new(
+            vec!["https://provider.example/api".into()],
+            Some("127.0.0.1:9".into()),
+            false,
+            false,
+            Duration::from_secs(2),
+            Duration::from_secs(60),
+        )
+        .unwrap();
+        let base = "https://provider.example/api";
+        let limited = Blame::RateLimited(Some(Duration::from_secs(30)));
+        src.fail_tor(base, limited);
+        src.fail_tor(base, limited);
+        assert!(!src.tor_health.cooling(base));
+        src.fail_tor(base, limited);
+        assert!(src.tor_health.cooling(base));
+    }
+
+    #[test]
+    fn onion_endpoints_get_longer_tor_limits_and_tor_comes_first() {
+        let src = EsploraSource::with_budget(
+            vec![
+                "https://provider.example/api".into(),
+                "http://abc.onion/api".into(),
+            ],
+            Some("127.0.0.1:9".into()),
+            true,
+            false,
+            Duration::from_secs(2),
+            Duration::from_secs(60),
+            Duration::from_secs(60),
+        )
+        .unwrap();
+        let (c, st) = src.tor_limits("https://provider.example/api");
+        let (oc, ost) = src.tor_limits("http://abc.onion/api");
+        assert_eq!((oc, ost), (c * 2, st * 2));
+        let eps = src.endpoints(FetchMode::Normal);
+        assert_eq!(eps.iter().filter(|e| e.tier == 0).count(), 2);
+        // The clearnet endpoint exists only for the clearnet provider, as
+        // the second tier.
+        let direct: Vec<_> = eps.iter().filter(|e| !e.via_tor).collect();
+        assert_eq!(direct.len(), 1);
+        assert_eq!(direct[0].tier, 1);
     }
 }

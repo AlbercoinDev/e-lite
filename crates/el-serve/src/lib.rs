@@ -1324,6 +1324,13 @@ impl ClientRegistry {
 /// subsequent `blockchain.transaction.get` calls hit the block cache instead of
 /// waiting for a provider. Deduplicated by height, bounded queue, and only used
 /// when external sources exist.
+/// History blocks queued per history response. The wallet asks for these
+/// transactions right after the history; starting them now is what makes a
+/// cold load over Tor fast (AUD-160).
+pub const PREFETCH_PER_HISTORY: usize = 64;
+/// Prefetch queue length.
+pub const PREFETCH_QUEUE: usize = 1024;
+
 /// One queued prefetch: a block and the history transactions it contains.
 type PrefetchJob = (Hash32, u32, Vec<Hash32>);
 
@@ -1860,6 +1867,14 @@ impl Shared {
                 "p2p_failures": rawtx.p2p_failures.load(Ordering::Relaxed),
                 "p2p_skipped": rawtx.p2p_skipped.load(Ordering::Relaxed),
                 "p2p_tor_failures": rawtx.p2p_tor_failures.load(Ordering::Relaxed),
+                "race": {
+                    "attempts": rawtx.race_attempts.load(Ordering::Relaxed),
+                    "hedges": rawtx.race_hedges.load(Ordering::Relaxed),
+                    "wins_esplora": rawtx.race_wins_esplora.load(Ordering::Relaxed),
+                    "wins_p2p": rawtx.race_wins_p2p.load(Ordering::Relaxed),
+                    "wins_other": rawtx.race_wins_other.load(Ordering::Relaxed),
+                    "win_ms_total": rawtx.race_win_ms.load(Ordering::Relaxed),
+                },
             },
             "prefetch": {
                 "queued": self.prefetch.stats().0,
@@ -2686,7 +2701,7 @@ fn history_entries_with_code(
     }
     let mut prefetched = 0usize;
     for (hash, height, txids) in prefetch_blocks {
-        if prefetched >= 16 {
+        if prefetched >= PREFETCH_PER_HISTORY {
             break;
         }
         if shared.prefetch.enqueue(hash, height, txids) {
@@ -4219,36 +4234,91 @@ fn client_loop(shared: &Shared, client: &Arc<ClientState>) -> std::io::Result<()
 
     let mut reader = BufReader::new(WireReader::new(Arc::clone(client)));
     let mut buf = Vec::new();
-    loop {
-        buf.clear();
-        match read_line_limited(&mut reader, &mut buf, MAX_REQUEST_BYTES) {
-            Ok(true) => {}
-            Ok(false) => break,
-            Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
-                let _ = client.send(&json!({
-                    "jsonrpc": "2.0",
-                    "id": Value::Null,
-                    "error": {"code": -32600, "message": "request too large"},
-                }));
+    // Lines that may wait on an external block download run beside the
+    // connection's reader (AUD-160): a slow `transaction.get` must not hold
+    // every later request of the connection, including the wallet's retry
+    // of the same batch after its own read timeout. Responses carry their
+    // ids, so their order on the wire does not matter.
+    let in_flight = (Mutex::new(0usize), Condvar::new());
+    let closing = AtomicBool::new(false);
+    let wait_below = |limit: usize| {
+        let (count, cv) = &in_flight;
+        let mut n = count.lock().unwrap_or_else(|p| p.into_inner());
+        while *n > limit.saturating_sub(1) {
+            n = cv.wait(n).unwrap_or_else(|p| p.into_inner());
+        }
+        n
+    };
+    std::thread::scope(|scope| {
+        loop {
+            if closing.load(Ordering::Relaxed) {
                 break;
             }
-            Err(_) => break,
-        }
-        let line = String::from_utf8_lossy(&buf);
-        if line.trim().is_empty() {
-            continue;
-        }
-        let outcome = process_line_for(shared, Some(client), &line);
-        if let Some(response) = outcome.response {
-            if !client.send(&response) {
+            buf.clear();
+            match read_line_limited(&mut reader, &mut buf, MAX_REQUEST_BYTES) {
+                Ok(true) => {}
+                Ok(false) => break,
+                Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
+                    let _ = client.send(&json!({
+                        "jsonrpc": "2.0",
+                        "id": Value::Null,
+                        "error": {"code": -32600, "message": "request too large"},
+                    }));
+                    break;
+                }
+                Err(_) => break,
+            }
+            let line = String::from_utf8_lossy(&buf).into_owned();
+            if line.trim().is_empty() {
+                continue;
+            }
+            if may_wait_on_network(&line) {
+                let mut n = wait_below(PIPELINE_DEPTH);
+                *n += 1;
+                drop(n);
+                let in_flight = &in_flight;
+                let closing = &closing;
+                scope.spawn(move || {
+                    let outcome = process_line_for(shared, Some(client), &line);
+                    let sent = outcome
+                        .response
+                        .as_ref()
+                        .is_none_or(|response| client.send(response));
+                    if !sent || outcome.close {
+                        closing.store(true, Ordering::Relaxed);
+                    }
+                    let (count, cv) = in_flight;
+                    *count.lock().unwrap_or_else(|p| p.into_inner()) -= 1;
+                    cv.notify_all();
+                });
+                continue;
+            }
+            // `server.version` fixes the protocol of everything after it:
+            // let the background lines finish first.
+            if line.contains("server.version") {
+                drop(wait_below(1));
+            }
+            let outcome = process_line_for(shared, Some(client), &line);
+            if let Some(response) = outcome.response {
+                if !client.send(&response) {
+                    break;
+                }
+            }
+            if outcome.close {
                 break;
             }
         }
-        if outcome.close {
-            break;
-        }
-    }
+    });
     Ok(())
+}
+
+/// Lines of one connection that may run at the same time while they wait on
+/// an external block download.
+pub const PIPELINE_DEPTH: usize = 4;
+
+/// Whether a request line may wait on an external block download.
+fn may_wait_on_network(line: &str) -> bool {
+    line.contains("blockchain.transaction.get\"")
 }
 
 /// Result of one line from the wire. Notifications have no response; a fatal
@@ -4282,6 +4352,10 @@ pub const MAX_BATCH_REQUESTS: usize = 1000;
 /// Requests of one batch resolved at the same time. External block
 /// downloads stay bounded by `rawtx.max_parallel_fetches` underneath.
 pub const BATCH_WORKERS: usize = 8;
+/// Workers of a batch that carries `transaction.get`: those mostly wait on
+/// the network, and every distinct block of the batch should be in the
+/// download queue at once, not eight at a time (AUD-160).
+pub const BATCH_IO_WORKERS: usize = 32;
 
 pub fn process_line_for(
     shared: &Shared,
@@ -4373,8 +4447,15 @@ fn process_batch(
             .and_then(Value::as_str)
             .is_some_and(|m| m == "server.version" || m.ends_with(".unsubscribe"))
     });
+    let io_bound = items.iter().any(|item| {
+        item.get("method")
+            .and_then(Value::as_str)
+            .is_some_and(|m| m == "blockchain.transaction.get")
+    });
     let workers = if ordered {
         1
+    } else if io_bound {
+        items.len().min(BATCH_IO_WORKERS)
     } else {
         items.len().min(BATCH_WORKERS)
     };

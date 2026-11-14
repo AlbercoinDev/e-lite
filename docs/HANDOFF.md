@@ -143,7 +143,27 @@ the dynamic ARC to work, e-lite needs write access to
 `/sys/module/zfs/parameters/zfs_arc_max` (root, group-writable parameter or a
 non-read-only mount).
 
-## Last change (alpha.29.13.0)
+## Unreleased on `main` (AUD-160)
+
+Requested by the owner (2026-11-14) after a cold Sparrow load over LAN on the
+pruned mainnet node: 0.14 blocks/s, up to 60 s per `transaction.get`, Sparrow
+dropping its 239-item batch. The first AUD-160 proposal (breaker, 10 s wallet
+plane, 4 connections) was dropped after measuring; the implemented design is
+in AUDIT AUD-160, PRIVACY ("Every block download is a race") and CHANGELOG
+"Unreleased": endpoint races with hedging, phase limits, `Unreachable`
+backoff, per-circuit 429, budget from the download slot, 8 slots,
+per-connection pipelining, wider prefetch, decoys yielding to the wallet.
+Live A/B over Tor (32 blocks): 0.11-0.14 -> 0.49-0.66 blocks/s, failures
+66-78 % -> 0-9 % (160/160 in the last five runs); clearnet 5.1 blocks/s.
+Benchmark: `E_LITE_LIVE_TOR=127.0.0.1:9050 cargo test -p el-rawtx --test
+resolver live_tor_burst -- --ignored --nocapture` (or `E_LITE_LIVE_CLEARNET=1`).
+
+**Next:** the owner's cold Sparrow load on the pruned mainnet node with
+`[logging] level = debug`, compared with the 29.13.0 log; then release.
+Candidates in ROADMAP: Core `getblockfrompeer` as an opt-in source.
+Not released, no version bump yet.
+
+## Last release (alpha.29.13.0)
 
 Requested by the owner (2026-11-14) after Sparrow loads on a pruned mainnet
 and testnet4 node took 16-28 s per `transaction.get` (85 s max, 25 failures)
@@ -154,15 +174,7 @@ and cooled providers for minutes, mismatched budgets and decoys competing
 with the wallet. Owner decision: keep the private defaults, fix the bugs,
 prefetch on with decoys. See CHANGELOG and AUD-153..159.
 
-**Open:** the owner measured the LAN path on 2026-11-14 (29.13.0): 218 of 239
-transactions came from Core/cache, but the 21 that needed a pruned block
-failed outside at 20.4 s average / 51.9 s max (AUD-160). **New proposal for
-29.13.1** in `docs/ROADMAP.md` ("External path: agile and precise"): two time
-planes (wallet 10 s, background probe 75 s), a `Healthy`/`Degraded`/`ProxyDown`
-breaker with hysteresis and one probe, a per-symptom blame table and a
-semaphore of 4 external connections. The onion measurement over Tor with
-`[logging] level = debug` (acceptance of AUD-159) is still pending and may show
-the same path problem.
+**Open:** see "Unreleased" above (AUD-160).
 
 ## Previous change (alpha.29.12.3)
 

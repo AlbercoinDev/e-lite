@@ -22,6 +22,13 @@ pub(crate) enum Blame {
     /// Wrong services, `notfound`, invalid or oversized block, other 4xx: the
     /// full `provider_cooldown_seconds`.
     Hard,
+    /// The endpoint never answered: no connection, or no response byte
+    /// before the connect/first-byte limit. Backs off like `Transient` but
+    /// up to `UNREACHABLE_CAP`, so an endpoint that is unreachable from this
+    /// host (a provider that drops Tor exits, a dead peer) stops costing an
+    /// attempt per block while the others work (AUD-160). One success
+    /// forgets it.
+    Unreachable,
 }
 
 /// Transient failures back off from this, doubling per consecutive failure.
@@ -32,6 +39,14 @@ pub(crate) const TRANSIENT_CAP: Duration = Duration::from_secs(60);
 pub(crate) const LIMITED_BASE: Duration = Duration::from_secs(15);
 /// Upper bound of a rate-limit pause (also caps `Retry-After`).
 pub(crate) const LIMITED_CAP: Duration = Duration::from_secs(120);
+
+/// Upper bound of the backoff of an endpoint that never answers.
+pub(crate) const UNREACHABLE_CAP: Duration = Duration::from_secs(600);
+/// Over Tor a 429 is about one exit, not the provider: the provider is paused
+/// only when this many distinct circuits were rate limited within
+/// `LIMITED_WINDOW` (AUD-160).
+pub(crate) const LIMITED_CIRCUITS: usize = 3;
+pub(crate) const LIMITED_WINDOW: Duration = Duration::from_secs(60);
 
 /// `base * 2^(streak-1)`, capped. `streak` counts the failure being recorded.
 pub(crate) fn backoff(base: Duration, streak: u32, cap: Duration) -> Duration {
@@ -50,6 +65,8 @@ struct Health {
 #[derive(Default)]
 pub(crate) struct HealthMap {
     inner: Mutex<HashMap<String, Health>>,
+    /// Recent per-circuit rate limits (Tor), by endpoint.
+    limited: Mutex<HashMap<String, Vec<Instant>>>,
 }
 
 impl HealthMap {
@@ -102,6 +119,7 @@ impl HealthMap {
                 (own.max(asked), true)
             }
             Blame::Hard => (hard, false),
+            Blame::Unreachable => (backoff(transient_base, streak, UNREACHABLE_CAP), false),
         };
         m.insert(
             key.to_string(),
@@ -115,6 +133,24 @@ impl HealthMap {
     }
 
     /// A success forgets every past failure of `key`.
+    /// Record a rate limit seen on one Tor circuit of `key`. Returns true when
+    /// enough distinct circuits were limited recently that the endpoint
+    /// itself should be paused.
+    pub(crate) fn circuit_limited(&self, key: &str) -> bool {
+        let Ok(mut m) = self.limited.lock() else {
+            return false;
+        };
+        let now = Instant::now();
+        let hits = m.entry(key.to_string()).or_default();
+        hits.retain(|t| now.duration_since(*t) < LIMITED_WINDOW);
+        hits.push(now);
+        if hits.len() >= LIMITED_CIRCUITS {
+            hits.clear();
+            return true;
+        }
+        false
+    }
+
     pub(crate) fn succeed(&self, key: &str) {
         if let Ok(mut m) = self.inner.lock() {
             m.remove(key);
@@ -171,5 +207,28 @@ mod tests {
         h.succeed("a");
         assert_eq!(h.fail("a", Blame::Transient, s(5), s(60), s(300)), s(5));
         assert_eq!(h.fail("a", Blame::Hard, s(5), s(60), s(300)), s(300));
+    }
+
+    #[test]
+    fn an_unreachable_endpoint_backs_off_up_to_ten_minutes() {
+        let h = HealthMap::new();
+        let s = Duration::from_secs;
+        let mut pause = Duration::ZERO;
+        for _ in 0..12 {
+            pause = h.fail("a", Blame::Unreachable, s(5), s(60), s(300));
+        }
+        assert_eq!(pause, UNREACHABLE_CAP);
+        h.succeed("a");
+        assert_eq!(h.fail("a", Blame::Unreachable, s(5), s(60), s(300)), s(5));
+    }
+
+    #[test]
+    fn one_limited_circuit_does_not_pause_the_provider() {
+        let h = HealthMap::new();
+        assert!(!h.circuit_limited("p"));
+        assert!(!h.circuit_limited("p"));
+        assert!(h.circuit_limited("p"));
+        assert!(!h.circuit_limited("p"), "the window restarts after a pause");
+        assert!(!h.circuit_limited("q"));
     }
 }

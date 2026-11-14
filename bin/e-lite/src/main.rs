@@ -1290,6 +1290,7 @@ fn run() -> R<()> {
         logging::set_level(level);
     }
     el_serve::set_debug_logs(logging::debug_enabled());
+    el_rawtx::set_debug_logs(logging::debug_enabled());
     el_serve::set_electrumx_compat(cfg.server.advertise_electrumx_compat);
     if matches!(cmd, Command::Index | Command::Serve | Command::Run) && !args.no_log_file {
         let path = cfg.app_log_file(chain);
@@ -5465,6 +5466,7 @@ fn reload_hot(
                 if a != b {
                     logging::set_level(a);
                     el_serve::set_debug_logs(a >= logging::DEBUG);
+                    el_rawtx::set_debug_logs(a >= logging::DEBUG);
                     changed.push("logging.level");
                 }
             }
@@ -6212,7 +6214,7 @@ fn log_startup_diagnostics(cfg: &Config, chain: Chain, shared: &Shared) {
     }
     eprintln!(
         "[e-lite] debug: server: banner {:?} | electrumx compat {} | batches max {} items, \
-         {} workers | plain {} | tls {}",
+         {} workers ({} with transaction.get), pipeline {} | plain {} | tls {}",
         el_serve::banner_for_log(),
         if cfg.server.advertise_electrumx_compat {
             "on (opt-in)"
@@ -6221,6 +6223,8 @@ fn log_startup_diagnostics(cfg: &Config, chain: Chain, shared: &Shared) {
         },
         el_serve::MAX_BATCH_REQUESTS,
         el_serve::BATCH_WORKERS,
+        el_serve::BATCH_IO_WORKERS,
+        el_serve::PIPELINE_DEPTH,
         cfg.server.listen,
         if cfg.server.tls_enabled() {
             cfg.server.tls_listen.as_str()
@@ -6242,7 +6246,8 @@ fn log_startup_diagnostics(cfg: &Config, chain: Chain, shared: &Shared) {
     );
     eprintln!(
         "[e-lite] debug: rawtx: probe {}s (tor >= {}s), ready {}s, tor connect/stall/attempt \
-         {}/{}/{}s, p2p {}s (tor {}s), prefetch {}, decoys {}, max_parallel {}, clearnet fallback {}",
+         {}/{}/{}s (onion x2), p2p {}s (tor {}s), race {} (hedge tor {}/{}s, direct {}/{}s), \
+         prefetch {}, decoys {}, max_parallel {}, clearnet fallback {}",
         cfg.public_servers.probe_timeout_seconds,
         cfg.rawtx.tor_stall_timeout_seconds,
         cfg.public_servers.ready_timeout_seconds,
@@ -6251,6 +6256,11 @@ fn log_startup_diagnostics(cfg: &Config, chain: Chain, shared: &Shared) {
         cfg.rawtx.tor_request_timeout_seconds,
         cfg.rawtx.p2p_timeout_seconds,
         cfg.rawtx.p2p_tor_timeout_seconds,
+        el_rawtx::RACE_WIDTH,
+        el_rawtx::HEDGE_FIRST_BYTE_TOR.as_secs(),
+        el_rawtx::HEDGE_SLOW_TOR.as_secs(),
+        el_rawtx::HEDGE_FIRST_BYTE_DIRECT.as_secs(),
+        el_rawtx::HEDGE_SLOW_DIRECT.as_secs(),
         if cfg.rawtx.prefetch { "on" } else { "off" },
         cfg.rawtx.decoys,
         cfg.rawtx.max_parallel_fetches,
@@ -6283,7 +6293,13 @@ fn build_shared(
     // Opt-in (AUD-134). P2P may gain peers later, so the configured sources
     // count, not the ones usable right now.
     let prefetch = if cfg.rawtx.prefetch && cfg.rawtx.enabled {
-        el_serve::Prefetcher::new(Arc::clone(&resolver), Arc::clone(&readers), 1, 64)
+        // Every download slot but the one kept for the wallet (AUD-160).
+        el_serve::Prefetcher::new(
+            Arc::clone(&resolver),
+            Arc::clone(&readers),
+            cfg.rawtx.max_parallel_fetches.saturating_sub(1).max(1),
+            el_serve::PREFETCH_QUEUE,
+        )
     } else {
         el_serve::Prefetcher::disabled()
     };

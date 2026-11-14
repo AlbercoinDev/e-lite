@@ -674,11 +674,12 @@ pub struct RawtxCfg {
     /// transfer that keeps receiving bytes may use all of it (AUD-155).
     #[serde(default = "d_rawtx_tor_timeout")]
     pub tor_request_timeout_seconds: u64,
-    /// Circuit + connection time of an Esplora request through Tor.
+    /// Circuit + connection time of an Esplora request through Tor
+    /// (doubled for `.onion`). A silent attempt is hedged after 6 s anyway.
     #[serde(default = "d_rawtx_tor_connect")]
     pub tor_connect_timeout_seconds: u64,
     /// No response header or body byte for this long through Tor: the
-    /// attempt is stalled and the next provider is tried.
+    /// attempt is stalled (doubled for `.onion`).
     #[serde(default = "d_rawtx_tor_stall")]
     pub tor_stall_timeout_seconds: u64,
     /// Skip a provider (Tor and/or direct) after a failed request.
@@ -800,10 +801,10 @@ fn d_rawtx_tor_timeout() -> u64 {
     60
 }
 fn d_rawtx_tor_connect() -> u64 {
-    20
+    10
 }
 fn d_rawtx_tor_stall() -> u64 {
-    25
+    12
 }
 fn d_p2p_tor_timeout() -> u64 {
     30
@@ -812,7 +813,7 @@ fn d_provider_cooldown() -> u64 {
     300
 }
 fn d_max_parallel_fetches() -> usize {
-    4
+    8
 }
 fn d_p2p_timeout() -> u64 {
     8

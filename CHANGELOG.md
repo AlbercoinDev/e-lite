@@ -1,5 +1,55 @@
 # Changelog
 
+## Unreleased
+
+### Agile wallet loads over Tor and clearnet (AUD-160)
+
+No schema, protocol or consensus change. A cold Sparrow load on a pruned
+mainnet node (29.13.0, LAN) fetched 0.14 blocks/s with up to 60 s per
+`transaction.get`, and Sparrow dropped its batch. Measured causes: each
+connection served one request line at a time, sources were tried one after
+another (a dead endpoint cost 20-40 s), a Tor 429 paused a whole provider,
+slow circuits were never raced, and the 60 s budget included the wait for a
+download slot. Live A/B over Tor with 32 distinct blocks at once: **0.11-0.14
+-> 0.49-0.66 blocks/s, failures 66-78 % -> 0-9 %**; clearnet 32 blocks in 6 s.
+
+- **Block download race.** Each external block download shuffles its
+  endpoints (every provider over Tor, every P2P peer) and runs up to 3
+  attempts at once: the next starts when one fails, when the newest has sent
+  nothing for 6 s, crawls below 96 KB/s after 5 s, or runs 15 s (direct: 2 s,
+  256 KB/s, 6 s). The first verified block wins and the others are aborted
+  (their sockets are shut down). A Tor provider that failed on one circuit
+  gets one more try on a new circuit. The clearnet fallback tier
+  (`tor_fallback_clearnet`) still starts only after every Tor attempt failed.
+  When everything failed or is paused, the race waits up to 15 s for an
+  endpoint to come back. At most 12 attempts per block. Privacy: up to 3
+  providers/peers may see the same block hash for one download (PRIVACY.md).
+- **Phase limits.** P2P: connect 10 s through Tor (20 s to `.onion`, 4 s
+  direct), stall 12 s (6 s direct), inside `p2p_tor_timeout_seconds`.
+  Esplora over Tor: `tor_connect_timeout_seconds` **20 -> 10**,
+  `tor_stall_timeout_seconds` **25 -> 12**, both doubled for `.onion`.
+- **Health.** An endpoint that never answers (no connection, no byte) backs
+  off 5 s (peers 30 s) doubling to 10 min, so an unreachable provider or dead
+  peer stops costing an attempt per block. Over Tor a 429 pauses the
+  provider only after 3 limited circuits within 60 s.
+- **Budgets and concurrency.** `max_parallel_fetches` **4 -> 8**; attempts in
+  flight capped at twice that (max 24, below Tor's 32 pending circuits). The
+  60 s network budget starts when a download gets its slot; the slot wait may
+  add up to 120 s instead of eating the budget.
+- **No head-of-line blocking.** `transaction.get` lines run beside the
+  connection reader (4 per connection): a slow download no longer holds the
+  wallet's next requests or its retry of the same batch. Batches carrying
+  `transaction.get` use up to 32 workers (8 before).
+- **Prefetch.** Up to 64 blocks per history response (16 before), downloaded
+  by `max_parallel_fetches - 1` workers (1 before); still never the last free
+  slot. Prefetch failures are `debug:` lines, not INFO.
+- **Decoys** wait (max 30 s each) while a wallet download is running, so
+  they do not take its Tor bandwidth; the debt is kept.
+- `/status.rawtx.race` (attempts, hedges, wins by source, total win time) and
+  the startup `debug:` lines show the race and pipeline settings.
+- Live benchmark: `E_LITE_LIVE_TOR=127.0.0.1:9050 cargo test -p el-rawtx
+  --test resolver live_tor_burst -- --ignored --nocapture`.
+
 ## 0.1.0-alpha.29.13.0 — 2026-11-14
 
 ### Fast wallet loads over Tor again, without the clearnet fallback

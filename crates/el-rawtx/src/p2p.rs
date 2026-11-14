@@ -6,7 +6,7 @@
 //! privacy.
 
 use crate::health::{Blame, HealthMap};
-use crate::{BlockSource, FetchMode, RawtxError, RawtxStats, Result};
+use crate::{AttemptCtl, BlockSource, Endpoint, FetchMode, RawtxError, RawtxStats, Result};
 use bip324::io::{Payload, Protocol};
 use bip324::{PacketType, Role};
 use el_model::{Chain, Hash32};
@@ -58,8 +58,18 @@ const PEER_TRANSIENT_BASE: Duration = Duration::from_secs(30);
 const PROXY_PAUSE: Duration = Duration::from_secs(15);
 /// Peers tried per call.
 const PEERS_PER_CALL: usize = 3;
-/// A bulk read stalls when no byte arrives for this long (P2P over Tor).
-const P2P_STALL: Duration = Duration::from_secs(20);
+/// Phase limits (AUD-160). A SOCKS CONNECT (circuit + peer TCP) through Tor
+/// either completes in a few seconds or not at all: measured on mainnet, 3
+/// of 10 peers answered in ~2 s and 7 never did within 30 s, while Tor keeps
+/// retrying a dead peer on new circuits for up to `SocksTimeout` (2 min).
+/// The resolver hedges a silent attempt anyway; these bound what is held.
+const P2P_TOR_CONNECT: Duration = Duration::from_secs(10);
+/// `.onion` peers need a rendezvous circuit.
+const P2P_ONION_CONNECT: Duration = Duration::from_secs(20);
+const P2P_DIRECT_CONNECT: Duration = Duration::from_secs(4);
+/// No byte for this long once connected: stalled (Tor / direct).
+const P2P_TOR_STALL: Duration = Duration::from_secs(12);
+const P2P_DIRECT_STALL: Duration = Duration::from_secs(6);
 
 pub struct P2pSource {
     /// Replaced at runtime by `set_peers` (AUD-137): a list discovered once
@@ -123,10 +133,14 @@ struct DeadlineIo {
     stream: TcpStream,
     deadline: Instant,
     stall: Duration,
+    ctl: AttemptCtl,
 }
 
 impl DeadlineIo {
     fn arm(&self, write: bool) -> io::Result<()> {
+        if self.ctl.aborted() {
+            return Err(io::Error::new(io::ErrorKind::Interrupted, "aborted"));
+        }
         let left = self.deadline.saturating_duration_since(Instant::now());
         if left.is_zero() {
             return Err(io::Error::new(
@@ -147,6 +161,7 @@ impl DeadlineIo {
             stream: self.stream.try_clone()?,
             deadline: self.deadline,
             stall: self.stall,
+            ctl: self.ctl.clone(),
         })
     }
 }
@@ -154,7 +169,9 @@ impl DeadlineIo {
 impl Read for DeadlineIo {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         self.arm(false)?;
-        self.stream.read(buf)
+        let n = self.stream.read(buf)?;
+        self.ctl.add_bytes(n);
+        Ok(n)
     }
 }
 
@@ -687,7 +704,24 @@ impl P2pSource {
     fn attempt(&self, call_deadline: Instant) -> (Instant, Duration) {
         let limit = self.per_attempt();
         let deadline = call_deadline.min(Instant::now() + limit);
-        (deadline, limit.min(P2P_STALL))
+        let stall = if self.via_tor() {
+            P2P_TOR_STALL
+        } else {
+            P2P_DIRECT_STALL
+        };
+        (deadline, limit.min(stall))
+    }
+
+    /// Limit of the connection phase to `peer` (circuit + TCP).
+    fn connect_limit(&self, peer: &str) -> Duration {
+        let phase = if !self.via_tor() {
+            P2P_DIRECT_CONNECT
+        } else if peer.to_ascii_lowercase().contains(".onion") {
+            P2P_ONION_CONNECT
+        } else {
+            P2P_TOR_CONNECT
+        };
+        phase.min(self.per_attempt())
     }
 
     fn direct_connect(&self, peer: &str, timeout: Duration) -> Result<TcpStream> {
@@ -723,7 +757,7 @@ impl P2pSource {
         }
         self.direct_connect(peer, timeout).map_err(|err| Failure {
             err,
-            blame: Some(Blame::Transient),
+            blame: Some(Blame::Unreachable),
             connected: false,
         })
     }
@@ -733,9 +767,11 @@ impl P2pSource {
         peer: &str,
         deadline: Instant,
         stall: Duration,
+        ctl: &AttemptCtl,
     ) -> std::result::Result<DeadlineIo, Failure> {
         let timeout = deadline
             .saturating_duration_since(Instant::now())
+            .min(self.connect_limit(peer))
             .max(Duration::from_millis(100));
         let stream = match &self.tor_socks {
             Some(proxy) if !self.proxy_down() => match socks_connect(proxy, peer, timeout) {
@@ -757,14 +793,15 @@ impl P2pSource {
                         });
                     }
                 }
-                // The proxy works; this peer (or this circuit) does not.
+                // The proxy works; this peer does not answer through it (a
+                // reply code, or no reply within the connect limit).
                 Err(e) => {
                     if self.fallback_clearnet {
                         self.fallback_connect(peer, timeout, "circuit")?
                     } else {
                         return Err(Failure {
                             err: RawtxError::Unavailable(format!("tor {peer}: {e}")),
-                            blame: Some(Blame::Transient),
+                            blame: Some(Blame::Unreachable),
                             connected: false,
                         });
                     }
@@ -785,16 +822,18 @@ impl P2pSource {
             }
             None => self.direct_connect(peer, timeout).map_err(|err| Failure {
                 err,
-                blame: Some(Blame::Transient),
+                blame: Some(Blame::Unreachable),
                 connected: false,
             })?,
         };
         let setup = |e: io::Error| Failure::transient(RawtxError::Io(e.to_string()));
         stream.set_nodelay(true).map_err(setup)?;
+        ctl.watch(&stream);
         Ok(DeadlineIo {
             stream,
             deadline,
             stall,
+            ctl: ctl.clone(),
         })
     }
 
@@ -803,11 +842,12 @@ impl P2pSource {
         hint: &PeerHint,
         hash: &Hash32,
         call_deadline: Instant,
+        ctl: &AttemptCtl,
     ) -> std::result::Result<Vec<u8>, Failure> {
         let peer = hint.addr.as_str();
         let mut v2_error = None;
         if self.v2 && hint.v2 != Some(false) {
-            match self.fetch_from_v2(peer, hash, call_deadline) {
+            match self.fetch_from_v2(peer, hash, call_deadline, ctl) {
                 Ok(bytes) => return Ok(bytes),
                 // No connection (dead peer, slow circuit, Tor down), or a
                 // peer that answered with wrong services or a bad block: a
@@ -822,7 +862,12 @@ impl P2pSource {
                 Failure::transient(RawtxError::Unavailable(format!("{peer} p2p timeout")))
             }));
         }
-        match self.fetch_from_v1(peer, hash, call_deadline) {
+        if ctl.aborted() {
+            return Err(v2_error.unwrap_or_else(|| {
+                Failure::transient(RawtxError::Unavailable(format!("{peer} aborted")))
+            }));
+        }
+        match self.fetch_from_v1(peer, hash, call_deadline, ctl) {
             Ok(bytes) => Ok(bytes),
             Err(mut f) => {
                 if let Some(v2) = v2_error {
@@ -838,9 +883,10 @@ impl P2pSource {
         peer: &str,
         hash: &Hash32,
         call_deadline: Instant,
+        ctl: &AttemptCtl,
     ) -> std::result::Result<Vec<u8>, Failure> {
         let (deadline, stall) = self.attempt(call_deadline);
-        let mut stream = self.connect_raw(peer, deadline, stall)?;
+        let mut stream = self.connect_raw(peer, deadline, stall, ctl)?;
         let fail = |what: &str, e: io::Error| {
             Failure::transient(RawtxError::Unavailable(format!("{peer} {what}: {e}")))
         };
@@ -907,9 +953,10 @@ impl P2pSource {
         peer: &str,
         hash: &Hash32,
         call_deadline: Instant,
+        ctl: &AttemptCtl,
     ) -> std::result::Result<Vec<u8>, Failure> {
         let (deadline, stall) = self.attempt(call_deadline);
-        let stream = self.connect_raw(peer, deadline, stall)?;
+        let stream = self.connect_raw(peer, deadline, stall, ctl)?;
         let reader = BufReader::new(
             stream
                 .try_clone()
@@ -997,6 +1044,68 @@ impl P2pSource {
         }
     }
 
+    /// Apply one attempt's outcome to the peer's health. Returns false when
+    /// the local proxy failed (no other peer can work now).
+    fn record_failure(&self, peer: &str, f: &Failure, mode: FetchMode, ctl: &AttemptCtl) -> bool {
+        self.bump(|stats| {
+            stats.p2p_failures.fetch_add(1, Ordering::Relaxed);
+        });
+        match f.blame {
+            // A decoy or a losing hedge never cools a peer down (AUD-157).
+            Some(blame) if mode == FetchMode::Normal && !ctl.aborted() => {
+                self.health.fail(
+                    peer,
+                    blame,
+                    PEER_TRANSIENT_BASE,
+                    self.cooldown,
+                    self.cooldown,
+                );
+                true
+            }
+            Some(_) => true,
+            None => false,
+        }
+    }
+
+    fn record_success(&self, peer: &str) {
+        if let Ok(mut good) = self.good.lock() {
+            good.insert(peer.to_string());
+        }
+        self.health.succeed(peer);
+    }
+
+    /// Peers usable now, random order, without the cooling ones; the one
+    /// whose cooldown ends first when P2P is the only source.
+    fn candidates(&self, mode: FetchMode) -> Vec<PeerHint> {
+        let mut peers = self.peers.read().map(|p| p.clone()).unwrap_or_default();
+        if peers.is_empty() {
+            return peers;
+        }
+        if self.tor_socks.is_some() && self.proxy_down() && !self.fallback_clearnet {
+            return Vec::new();
+        }
+        peers.shuffle(&mut thread_rng());
+        // Purely random order (AUD-135): no peer is preferred because it
+        // answered last; failed peers are skipped while they cool down.
+        let mut candidates: Vec<PeerHint> = peers
+            .iter()
+            .filter(|p| !self.health.cooling(&p.addr))
+            .cloned()
+            .collect();
+        if candidates.is_empty()
+            && mode == FetchMode::Normal
+            && self.force_when_cooling.load(Ordering::Relaxed)
+        {
+            // P2P is the only external source: try the peer whose cooldown
+            // ends first rather than failing without touching the network.
+            if let Some(peer) = peers.iter().min_by_key(|p| self.health.until(&p.addr)) {
+                self.health.release(&peer.addr);
+                candidates.push(peer.clone());
+            }
+        }
+        candidates
+    }
+
     fn require_network(&self, peer: &str, services: u64) -> std::result::Result<(), Failure> {
         if services & NODE_NETWORK == 0 {
             let limited = services & NODE_NETWORK_LIMITED != 0;
@@ -1027,14 +1136,64 @@ impl BlockSource for P2pSource {
         )
     }
 
+    fn endpoints(&self, mode: FetchMode) -> Vec<Endpoint> {
+        let via_tor = self.via_tor();
+        self.candidates(mode)
+            .into_iter()
+            .take(PEERS_PER_CALL)
+            .map(|p| Endpoint {
+                key: p.addr,
+                tier: 0,
+                via_tor,
+            })
+            .collect()
+    }
+
+    fn fetch_endpoint(
+        &self,
+        endpoint: &Endpoint,
+        hash: &Hash32,
+        deadline: Instant,
+        mode: FetchMode,
+        ctl: &AttemptCtl,
+    ) -> Result<Vec<u8>> {
+        if self.tor_socks.is_some() && self.proxy_down() && !self.fallback_clearnet {
+            return Err(RawtxError::Unavailable(
+                "tor proxy unavailable; clearnet fallback disabled".into(),
+            ));
+        }
+        let hint = self
+            .peers
+            .read()
+            .ok()
+            .and_then(|p| p.iter().find(|h| h.addr == endpoint.key).cloned())
+            .unwrap_or_else(|| PeerHint::from(endpoint.key.clone()));
+        let call_deadline = deadline.min(Instant::now() + self.per_attempt().saturating_mul(2));
+        if call_deadline.saturating_duration_since(Instant::now()) < self.min_attempt() {
+            return Err(RawtxError::Unavailable("p2p deadline reached".into()));
+        }
+        self.bump(|stats| {
+            stats.p2p_attempts.fetch_add(1, Ordering::Relaxed);
+        });
+        match self.fetch_from(&hint, hash, call_deadline, ctl) {
+            Ok(bytes) => {
+                self.record_success(&hint.addr);
+                Ok(bytes)
+            }
+            Err(f) => {
+                self.record_failure(&hint.addr, &f, mode, ctl);
+                Err(RawtxError::Unavailable(format!("{}: {}", hint.addr, f.err)))
+            }
+        }
+    }
+
     fn fetch_block_until(
         &self,
         hash: &Hash32,
         deadline: Instant,
         mode: FetchMode,
     ) -> Result<Vec<u8>> {
-        let mut peers = self.peers.read().map(|p| p.clone()).unwrap_or_default();
-        if peers.is_empty() {
+        if self.peers.read().map(|p| p.is_empty()).unwrap_or(true) {
             return Err(RawtxError::Unavailable("no p2p peers".into()));
         }
         if self.tor_socks.is_some() && self.proxy_down() && !self.fallback_clearnet {
@@ -1042,25 +1201,7 @@ impl BlockSource for P2pSource {
                 "tor proxy unavailable; clearnet fallback disabled".into(),
             ));
         }
-        peers.shuffle(&mut thread_rng());
-        // Purely random order (AUD-135): no peer is preferred because it
-        // answered last; failed peers are skipped while they cool down.
-        let mut candidates: Vec<PeerHint> = peers
-            .iter()
-            .filter(|p| !self.health.cooling(&p.addr))
-            .cloned()
-            .collect();
-        if candidates.is_empty()
-            && mode == FetchMode::Normal
-            && self.force_when_cooling.load(Ordering::Relaxed)
-        {
-            // P2P is the only external source: try the peer whose cooldown
-            // ends first rather than failing without touching the network.
-            if let Some(peer) = peers.iter().min_by_key(|p| self.health.until(&p.addr)) {
-                self.health.release(&peer.addr);
-                candidates.push(peer.clone());
-            }
-        }
+        let candidates = self.candidates(mode);
         if candidates.is_empty() {
             self.bump(|stats| {
                 stats.p2p_skipped.fetch_add(1, Ordering::Relaxed);
@@ -1073,6 +1214,7 @@ impl BlockSource for P2pSource {
         // One call gets at most two attempt budgets, so a slow peer list
         // leaves time for the other sources.
         let call_deadline = deadline.min(Instant::now() + self.per_attempt().saturating_mul(2));
+        let ctl = AttemptCtl::new();
         let mut errors = Vec::new();
         for hint in candidates.into_iter().take(PEERS_PER_CALL) {
             if call_deadline.saturating_duration_since(Instant::now()) < self.min_attempt() {
@@ -1082,33 +1224,16 @@ impl BlockSource for P2pSource {
             self.bump(|stats| {
                 stats.p2p_attempts.fetch_add(1, Ordering::Relaxed);
             });
-            match self.fetch_from(&hint, hash, call_deadline) {
+            match self.fetch_from(&hint, hash, call_deadline, &ctl) {
                 Ok(bytes) => {
-                    if let Ok(mut good) = self.good.lock() {
-                        good.insert(hint.addr.clone());
-                    }
-                    self.health.succeed(&hint.addr);
+                    self.record_success(&hint.addr);
                     return Ok(bytes);
                 }
                 Err(f) => {
-                    self.bump(|stats| {
-                        stats.p2p_failures.fetch_add(1, Ordering::Relaxed);
-                    });
                     errors.push(format!("{}: {}", hint.addr, f.err));
-                    match f.blame {
-                        // A decoy never cools a peer down (AUD-157).
-                        Some(blame) if mode == FetchMode::Normal => {
-                            self.health.fail(
-                                &hint.addr,
-                                blame,
-                                PEER_TRANSIENT_BASE,
-                                self.cooldown,
-                                self.cooldown,
-                            );
-                        }
-                        Some(_) => {}
+                    if !self.record_failure(&hint.addr, &f, mode, &ctl) {
                         // The local proxy failed: no other peer can work now.
-                        None => break,
+                        break;
                     }
                 }
             }

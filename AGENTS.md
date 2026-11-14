@@ -217,9 +217,12 @@ Never treat a version number in this file as authoritative over the code/tag.
   validate the witness commitment inside the P2P source before marking a peer
   good. P2P is fail-fast: random order among the discovered peers (no peer is
   preferred, AUD-135), per-peer backoff (30 s doubling to the cooldown; a
-  wrong answer gets the full cooldown), at most two attempt budgets per call
+  wrong answer gets the full cooldown; a peer that never answers 30 s
+  doubling to 10 min), at most two attempt budgets per call
   (`p2p_tor_timeout_seconds` 30 s through Tor, `p2p_timeout_seconds` 8 s
-  direct). **Only a failure of the local SOCKS proxy** (no TCP, failed
+  direct) with a separate connect phase (10 s Tor, 20 s onion, 4 s direct)
+  and stall (12 s / 6 s): a SOCKS CONNECT answers in seconds or never, and
+  Tor retries a dead peer for 2 min (AUD-160). **Only a failure of the local SOCKS proxy** (no TCP, failed
   greeting/auth) pauses P2P over Tor (15 s); a SOCKS reply about one peer
   (refused, unreachable, exit policy) is that peer's failure. Never cool a
   peer that was not contacted, and do not retry v1 after a v2 connection that
@@ -247,24 +250,38 @@ Never treat a version number in this file as authoritative over the code/tag.
 - Provider health depends on the failure (`crates/el-rawtx/src/health.rs`,
   AUD-155): timeout/stall/truncated body/5xx back off 5 s doubling to 60 s,
   429/503 honour `Retry-After` (15 s doubling, max 120 s; over Tor the limit
-  is per exit), and only a wrong answer gets `provider_cooldown_seconds`
-  (300 s). A success clears the streak. Do not go back to cooling a provider
+  is per exit: over Tor a 429 pauses the provider only after 3 limited
+  circuits in 60 s), an endpoint that never answers (`Blame::Unreachable`)
+  backs off 5 s doubling to 10 min, and only a wrong answer gets
+  `provider_cooldown_seconds` (300 s). A success clears the streak. Do not go back to cooling a provider
   for minutes after a slow circuit: without the clearnet fallback that left a
   wallet with no source at all. Providers are tried in
   **random order**; never prefer the one that answered last, which sent every
   block of a wallet to a single provider (AUD-135). If every provider is
   cooling down, e-lite forces one attempt on the one whose pause ends first.
-  `max_parallel_fetches` (4) bounds total external downloads; concurrent
-  requests for the same block share one download. Through Tor an Esplora
-  attempt has `tor_connect_timeout_seconds` (20 s) for circuit + connection,
-  fails after `tor_stall_timeout_seconds` (25 s) without a header or byte (the
-  blocking reqwest client `timeout` is per read, not total; never use
-  `RequestBuilder::timeout`) and is capped at `tor_request_timeout_seconds`
-  (60 s). One block download has **one** budget, `EXTERNAL_BUDGET` (60 s),
-  fixed when its leader registers (queue wait included) and split across
-  sources (all but the last leave a third); followers wait
-  `EXTERNAL_BUDGET + FOLLOWER_GRACE` (65 s), so they never give up before the
-  leader (AUD-156). A block that failed is answered from that failure for
+  `max_parallel_fetches` (8) bounds external downloads and twice that (max
+  24) the attempts in flight; concurrent requests for the same block share
+  one download. **Every download is a race** (AUD-160, `Resolver::race`):
+  endpoints of all sources (`BlockSource::endpoints`/`fetch_endpoint`) are
+  shuffled, up to `RACE_WIDTH` (3) run at once, the next starts on a
+  failure, 6 s without a byte, <96 KB/s after 5 s or 15 s (direct 2 s /
+  256 KB/s / 6 s); the first verified block wins and `AttemptCtl::abort`
+  shuts the losers' sockets; a losing or aborted attempt never blames its
+  endpoint. A Tor endpoint gets one retry on a new circuit; the clearnet
+  fallback tier starts only when no Tor attempt is left; after everything
+  failed the race waits up to 15 s for a paused endpoint (never forcing a
+  rate-limited one), max 12 attempts. Do not go back to serial sources: a
+  dead endpoint cost 20-40 s per block. Through Tor an Esplora attempt has
+  `tor_connect_timeout_seconds` (10 s) for circuit + connection, fails after
+  `tor_stall_timeout_seconds` (12 s) without a header or byte (both doubled
+  for `.onion`; the blocking reqwest client `timeout` is per read, not
+  total; never use `RequestBuilder::timeout`) and is capped at
+  `tor_request_timeout_seconds` (60 s). One block download has **one**
+  network budget, `EXTERNAL_BUDGET` (60 s), starting when its leader gets a
+  download slot (the slot wait is bounded by `EXTERNAL_QUEUE_MAX`, 120 s, and
+  must not eat the budget: the last blocks of a burst failed that way);
+  followers re-read the leader's deadline and wait `FOLLOWER_GRACE` past it
+  (AUD-156/160). A block that failed is answered from that failure for
   `FAILURE_MEMORY` (10 s) (AUD-158).
   `RawtxError::NoSource` (nothing could be asked) is distinct from
   `Unavailable` (every source failed); `/status.rawtx.tx_get_failures` counts
@@ -273,12 +290,13 @@ Never treat a version number in this file as authoritative over the code/tag.
   They are owed to one `el-decoys` thread that downloads them one at a time
   (0.25-1.5 s apart) outside the wallet's download slots, in
   `FetchMode::Quiet` (a decoy failure never changes provider/peer health),
-  waits while a provider rate-limits, and holds no store handle; at most 32
-  are owed (AUD-157). The history prefetch is therefore **on by default**
-  (`[rawtx] prefetch`, AUD-159, supersedes AUD-134): it enqueues up to 16
+  waits while a provider rate-limits or a wallet download runs (max 30 s,
+  AUD-160), and holds no store handle; at most 32 are owed (AUD-157). The history prefetch is therefore **on by default**
+  (`[rawtx] prefetch`, AUD-159, supersedes AUD-134): it enqueues up to 64
   confirmed history blocks per history response, each with **all** of that
   history's txids in the block (`prefetch_block_txs`: one download caches
-  them all), with one worker that never takes the last free download slot;
+  them all), with `max_parallel_fetches - 1` workers that never take the last
+  free download slot; its failures are `debug:` lines only;
   blocks already in the transaction cache are not downloaded. It is an
   optimisation, never correctness. Without it a pruned node makes every
   `transaction.get` wait for a whole block over Tor.
@@ -326,8 +344,15 @@ Never treat a version number in this file as authoritative over the code/tag.
   clearnet when Tor is unavailable or a request fails (log + `/status`),
   while `.onion` still needs Tor. Do not turn the default back on: it ties
   the operator IP to the blocks of the wallet.
-- JSON-RPC batches are served (max 1000 items, 8 in parallel, ordered when
-  the batch has `server.version`/unsubscribe). Sparrow batches only for
+- JSON-RPC batches are served (max 1000 items, 8 in parallel, 32 when the
+  batch carries `transaction.get`, ordered when the batch has
+  `server.version`/unsubscribe). A connection runs `transaction.get` lines
+  beside its reader (`PIPELINE_DEPTH` 4) and answers them when ready (ids
+  match responses); `server.version` waits for them. Never go back to one
+  line at a time: after Sparrow's read timeout its retry queued behind the
+  slow batch (AUD-160). Never answer a wallet early with an error to beat
+  its timeout: Sparrow stores an unfetchable placeholder (AUD-045), a timeout
+  is retried. Sparrow batches only for
   banner names it knows; `[server] advertise_electrumx_compat` (opt-in,
   hot-reloadable) appends "(electrumx-compatible)" to the banner. The banner
   must always **start with "e-lite"**: never advertise another server's name
