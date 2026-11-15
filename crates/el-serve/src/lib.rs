@@ -1489,6 +1489,9 @@ pub struct Shared {
     /// Electrum servers of the per-txid path (AUD-163), resolved at startup.
     /// Zero with a non-empty Esplora list means the block path only.
     pub tx_sources: usize,
+    /// Transport of the external path: `tor`, `tor+fallback` or `direct`
+    /// (`rawtx.use_tor = false`, AUD-168).
+    pub rawtx_path: String,
     /// Startup probe results, one JSON object per provider.
     pub provider_status: Mutex<Vec<Value>>,
     pub provider_ready: AtomicBool,
@@ -1898,6 +1901,7 @@ impl Shared {
             "tor_ready": self.tor_ready.load(Ordering::Relaxed),
             "clearnet_fallback": self.clearnet_fallback.load(Ordering::Relaxed),
             "rawtx": {
+                "path": self.rawtx_path,
                 "cache_hits": rawtx.cache_hits.load(Ordering::Relaxed),
                 "cache_puts": rawtx.cache_puts.load(Ordering::Relaxed),
                 "cache_blocks": self.resolver.cached_blocks(),

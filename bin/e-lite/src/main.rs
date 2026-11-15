@@ -226,6 +226,7 @@ struct Args {
     prune_mib: Option<u64>,
     min_free_gib: Option<u64>,
     allow_clearnet: bool,
+    use_tor: Option<bool>,
     allow_auto_prune: bool,
     no_rawtx: bool,
     output: Option<String>,
@@ -480,6 +481,8 @@ fn parse_args() -> R<Args> {
             "--no-restart" => args.restart = Some(false),
             "--allow-mainnet" => args.allow_mainnet = true,
             "--allow-clearnet" => args.allow_clearnet = true,
+            "--rawtx-tor" => args.use_tor = Some(true),
+            "--no-rawtx-tor" => args.use_tor = Some(false),
             "--allow-auto-prune" => args.allow_auto_prune = true,
             "--no-rawtx" => args.no_rawtx = true,
             "--json" => args.json = true,
@@ -620,6 +623,15 @@ fn effective_config_with(args: &Args, probe_core: bool) -> R<(Config, Chain)> {
     }
     if args.allow_clearnet {
         cfg.rawtx.allow_clearnet = true;
+    }
+    if let Some(v) = args.use_tor {
+        cfg.rawtx.use_tor = v;
+    }
+    if !cfg.rawtx.use_tor && cfg.rawtx.tor_fallback_clearnet {
+        eprintln!(
+            "[e-lite] WARNING: rawtx.use_tor = false makes tor_fallback_clearnet meaningless; \
+             external fetches are direct"
+        );
     }
     if args.allow_auto_prune {
         cfg.pruning.allow_auto_prune = true;
@@ -1529,6 +1541,8 @@ OPTIONS:
     --reorg-window <n>      undo window in blocks (default 288)
     --allow-mainnet         required for mainnet
     --allow-clearnet        allow external rawtx over clearnet (privacy risk)
+    --no-rawtx-tor          fetch wallet data directly, no Tor (exposes your IP)
+    --rawtx-tor             fetch wallet data through Tor (default)
     --no-rawtx              disable external rawtx sources
     --no-follow             stop when caught up (only for `index`)
     --json                  JSON output for status
@@ -1858,10 +1872,11 @@ fn cmd_doctor(cfg: &Config, chain: Chain) -> R<()> {
         }
     }
 
-    let tor = cfg.rawtx.tor_socks.clone().filter(|s| !s.trim().is_empty());
+    // The transport actually in force (rawtx.use_tor, AUD-168).
+    let tor = cfg.rawtx.effective_tor_socks();
     let external_enabled = cfg.rawtx.enabled
         && (cfg.rawtx.use_p2p || cfg.rawtx.use_esplora)
-        && (tor.is_some() || cfg.rawtx.allow_clearnet);
+        && (tor.is_some() || cfg.rawtx.effective_allow_clearnet());
 
     if core_pruned {
         match &db_tip {
@@ -5993,7 +6008,9 @@ fn build_resolver(
         }
         hints = found;
     }
-    let tor = cfg.rawtx.tor_socks.clone().filter(|s| !s.trim().is_empty());
+    // `rawtx.use_tor = false` is the explicit direct opt-out (AUD-168): no
+    // SOCKS proxy for any external fetch, and clearnet implied.
+    let tor = cfg.rawtx.effective_tor_socks();
     // privacy.toml (AUD-163): created from the template on the first run; an
     // invalid file stops the start with the file, the key and the range.
     let privacy_loaded = privacy::load(cfg, config_path().as_deref(), true)?;
@@ -6007,7 +6024,7 @@ fn build_resolver(
         cache_mib: cfg.rawtx.cache_mib,
         decoys: privacy_params.block_decoys,
         tor_socks: tor,
-        allow_clearnet: cfg.rawtx.allow_clearnet,
+        allow_clearnet: cfg.rawtx.effective_allow_clearnet(),
         fallback_clearnet: cfg.rawtx.tor_fallback_clearnet,
         request_timeout_seconds: cfg.rawtx.request_timeout_seconds,
         tor_request_timeout_seconds: cfg.rawtx.tor_request_timeout_seconds,
@@ -6276,6 +6293,12 @@ fn effective_rate_limit(cfg: &Config) -> (u64, u64) {
 /// process), what the rawtx cache held at startup (cold vs warm) and the
 /// effective provider limits. No per-request cost.
 fn log_startup_diagnostics(cfg: &Config, chain: Chain, shared: &Shared) {
+    if cfg.rawtx.enabled && !cfg.rawtx.use_tor {
+        eprintln!(
+            "[e-lite] WARNING: external fetches use DIRECT connections (rawtx.use_tor = false); \
+             public providers and P2P peers see this machine's IP"
+        );
+    }
     if !logging::debug_enabled() {
         return;
     }
@@ -6312,9 +6335,10 @@ fn log_startup_diagnostics(cfg: &Config, chain: Chain, shared: &Shared) {
         tx_mib,
     );
     eprintln!(
-        "[e-lite] debug: rawtx: probe {}s (tor >= {}s), ready {}s, tor connect/stall/attempt \
-         {}/{}/{}s (onion x2), p2p {}s (tor {}s), race {} (hedge tor {}/{}s, direct {}/{}s), \
-         prefetch {}, decoys {}, max_parallel {}, clearnet fallback {}",
+        "[e-lite] debug: rawtx: path {} | probe {}s (tor >= {}s), ready {}s, tor \
+         connect/stall/attempt {}/{}/{}s (onion x2), p2p {}s (tor {}s), race {} (hedge tor \
+         {}/{}s, direct {}/{}s), prefetch {}, decoys {}, max_parallel {}, clearnet fallback {}",
+        cfg.rawtx.transport(),
         cfg.public_servers.probe_timeout_seconds,
         public_servers::probe_tor_floor(cfg).as_secs(),
         cfg.public_servers.ready_timeout_seconds,
@@ -6430,6 +6454,7 @@ fn build_shared(
         resolver,
         public_servers,
         tx_sources: resolved.electrum.len(),
+        rawtx_path: cfg.rawtx.transport().to_string(),
         provider_status: Mutex::new(Vec::new()),
         provider_ready: AtomicBool::new(false),
         tor_ready: AtomicBool::new(false),

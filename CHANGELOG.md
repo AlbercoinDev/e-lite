@@ -1,5 +1,35 @@
 # Changelog
 
+## 0.1.0-alpha.29.16.3 — 2026-11-15
+
+### `rawtx.use_tor`: an explicit direct-fetch opt-out
+
+External fetches (Esplora, Electrum by txid, P2P) use Tor by default. Until now
+the only way to avoid Tor was an undocumented combination (`tor_socks = ""`
+plus `allow_clearnet = true`); `allow_clearnet` alone still tried Tor first and
+`[tor] mode = "off"` did not stop the rawtx path from dialling the SOCKS proxy.
+
+- **`[rawtx] use_tor`** (default `true`) and `--rawtx-tor` / `--no-rawtx-tor`:
+  `false` means no SOCKS proxy is built for any external fetch and direct
+  connections are implied. The three transports are now explicit: `tor`
+  (default), `tor+fallback` (`tor_fallback_clearnet = true`) and `direct`.
+- **Independent of the onion listener**: `[tor] mode` still runs the managed
+  Tor and publishes the onion service, so a wallet can connect through the
+  onion while data is fetched directly.
+- **Visible**: a startup `WARNING` names the transport when it is direct;
+  `/status.rawtx.path` reports `tor`, `tor+fallback` or `direct`; the debug
+  `rawtx` line starts with `path`.
+- **`use_tor = false` makes `tor_fallback_clearnet` meaningless**: the startup
+  warns if both are set.
+- **Privacy**: with direct fetches, providers and P2P peers see the machine's
+  IP and can correlate loads from it; the decoy wallets still hide which
+  wallet a load belongs to, not the IP. Documented in `PRIVACY.md`.
+- The provider probe, the block race, the per-txid path and P2P all read the
+  same effective transport (`RawtxCfg::effective_tor_socks` /
+  `effective_allow_clearnet`), so a misconfiguration cannot leave one path on
+  Tor and another off.
+
+
 ## 0.1.0-alpha.29.16.2 — 2026-11-15
 
 ### Electrum servers for signet and testnet4 (shipped template)

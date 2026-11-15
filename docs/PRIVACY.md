@@ -105,6 +105,7 @@ cache_mib = 256
 # cache_dir = "/dev/shm/e-lite-rawtx"  # tmpfs: no disk, counts as RAM
 decoys = 1
 tor_socks = "127.0.0.1:9050"
+use_tor = true              # false: direct fetches, no Tor at all
 allow_clearnet = false
 tor_fallback_clearnet = false
 prefetch = true
@@ -132,6 +133,13 @@ open_without_provider = false  # true: open with local data after ready_timeout_
 
 ## Tor and clearnet
 
+- `rawtx.use_tor = false` is an explicit opt-out (AUD-168): no Tor circuit is
+  opened for external fetches and they go direct. Public providers and P2P
+  peers then see this machine's IP, and can correlate every load from it; the
+  decoy wallets still hide *which wallet* among the k+1 of one load, but not
+  the IP across loads. The onion listener is independent (`[tor] mode`), so a
+  wallet may still connect through the onion while data goes direct. The
+  startup log says which transport is in force.
 - Default is **Tor only, fail-closed**: external blocks are requested through
   Tor, and if Tor is unavailable the request fails (history, balances and
   UTXOs keep working from the local index). `tor_fallback_clearnet = true`

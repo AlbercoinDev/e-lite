@@ -115,6 +115,8 @@ st = json.load(urllib.request.urlopen(f"http://127.0.0.1:{metrics}/status"))
 assert st["tls_listen"] == f"0.0.0.0:{tls}", st.get("tls_listen")
 assert st["listen"] == f"127.0.0.1:{plain}", st.get("listen")  # plain is loopback-only by default
 assert st["tls_handshakes"] >= 1, st.get("tls_handshakes")
+# Transport of the external path (rawtx.use_tor defaults to true).
+assert st["rawtx"]["path"] == "tor", st["rawtx"].get("path")
 
 def verified(host, server_hostname):
     """Full wallet-style validation: trust the generated cert as CA and check

@@ -234,6 +234,7 @@ e-lite run --network mainnet --allow-mainnet \
 | `--set rawtx.cache_dir=<path>` | `rawtx.cache_dir` | `<data-dir>/rawtx-cache`; tmpfs keeps it off disk |
 | `--tor-socks <addr>` | `rawtx.tor_socks` | `127.0.0.1:9050` |
 | `--allow-clearnet` | `rawtx.allow_clearnet` | `false` |
+| `--no-rawtx-tor` / `--rawtx-tor` | `rawtx.use_tor`: fetch wallet data directly (no Tor; your IP is visible) or through Tor | `true` |
 | `--set rawtx.tor_fallback_clearnet=true` | use clearnet when Tor fails (exposes your IP to the provider) | `false` |
 | `--set rawtx.prefetch=true` | download a wallet's history blocks in the background (faster first load, no decoys) | `false` |
 | `--plain-lan` / `--set server.plain_lan=true` | plain Electrum on `0.0.0.0` | `false` |

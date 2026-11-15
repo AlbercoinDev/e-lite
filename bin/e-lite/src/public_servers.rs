@@ -84,20 +84,14 @@ pub fn probe(
     }
     let timeout = Duration::from_secs(cfg.public_servers.probe_timeout_seconds.max(1));
     let plan = ProbePlan {
-        tor_socks: cfg
-            .rawtx
-            .tor_socks
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(str::to_string),
+        tor_socks: cfg.rawtx.effective_tor_socks(),
         tor_timeout: timeout.max(probe_tor_floor(cfg)),
         direct: reqwest::blocking::Client::builder()
             .timeout(timeout)
             .user_agent(el_rawtx::HTTP_USER_AGENT)
             .build()
             .ok(),
-        allow_clearnet: cfg.rawtx.allow_clearnet,
+        allow_clearnet: cfg.rawtx.effective_allow_clearnet(),
         fallback: cfg.rawtx.tor_fallback_clearnet,
         expected_genesis: expected_genesis.map(str::to_ascii_lowercase),
     };

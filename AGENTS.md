@@ -211,6 +211,11 @@ Never treat a version number in this file as authoritative over the code/tag.
   txid (with decoy wallets, AUD-163); `preset = "max"` requests only whole
   blocks by hash. Scripts, addresses and xpubs never leave. Clearnet entries
   must be HTTPS (`.onion` over Tor is the only plain-HTTP exception).
+  `[rawtx] use_tor = false` (`--no-rawtx-tor`) is the **explicit** direct
+  opt-out (AUD-168): no SOCKS for any external fetch, clearnet implied, never
+  the default, logged at startup and in `/status.rawtx.path`. It does not
+  touch the onion listener (`[tor] mode`). With it, decoys still hide which
+  wallet within a load but the provider sees the IP across loads.
   Fail-closed is literal: the template's Electrum list only stands in for an
   existing, valid file without the `electrum` key; a missing or invalid file
   means no Esplora **and** no txid source. The readiness gate only waits when

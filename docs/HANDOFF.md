@@ -1,9 +1,9 @@
 # Session handoff
 
 **Updated:** 2026-11-14
-**Latest published release:** `0.1.0-alpha.29.16.2`
-**Release:** https://github.com/AlbercoinDev/e-lite/releases/tag/v0.1.0-alpha.29.16.2
-**Main commit at handoff:** tag `v0.1.0-alpha.29.16.2` (wallet-path audit, AUD-167)
+**Latest published release:** `0.1.0-alpha.29.16.3`
+**Release:** https://github.com/AlbercoinDev/e-lite/releases/tag/v0.1.0-alpha.29.16.3
+**Main commit at handoff:** tag `v0.1.0-alpha.29.16.3` (wallet-path audit, AUD-167)
 
 alpha.29.14.1: fixes AUD-161 (aborted P2P race losers spun at 100 % CPU) and
 AUD-162 (tx cache temporary-file race). Owner's 29.14.0 run (2026-11-14,
@@ -153,7 +153,16 @@ the dynamic ARC to work, e-lite needs write access to
 `/sys/module/zfs/parameters/zfs_arc_max` (root, group-writable parameter or a
 non-read-only mount).
 
-## Last change (alpha.29.16.2)
+## Last change (alpha.29.16.3)
+
+`[rawtx] use_tor` (default `true`, `--no-rawtx-tor`): `false` fetches wallet
+data directly, without opening any Tor circuit, and implies clearnet. It does
+not touch the onion listener (`[tor] mode`), so the wallet can still connect
+over the onion while data goes direct. A startup WARNING and
+`/status.rawtx.path` (`tor`, `tor+fallback`, `direct`) name the transport.
+`use_tor = false` makes `tor_fallback_clearnet` meaningless (warned).
+
+## Previous change (alpha.29.16.2)
 
 Shipped `public-servers.toml` now has Electrum servers for signet and
 testnet4 (verified 2026-11-15 with `server.version` and the genesis header),

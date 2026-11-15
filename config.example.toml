@@ -180,6 +180,9 @@ decoys = 1                          # random indexed blocks downloaded per real 
                                     # the background, paused while a provider rate-limits
 tor_socks = "127.0.0.1:9050"        # empty requires allow_clearnet = true
 allow_clearnet = false              # fail closed without Tor; also gates repair
+use_tor = true                      # false: external fetches go direct, no Tor at
+                                    # all (providers and P2P peers see your IP).
+                                    # The onion listener is independent ([tor] mode)
 tor_fallback_clearnet = false       # true: if Tor fails, use clearnet (your IP is tied
                                     # to the blocks of your wallet)
 prefetch = true                     # download a wallet's history blocks in the background

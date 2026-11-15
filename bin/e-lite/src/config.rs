@@ -653,6 +653,12 @@ pub struct RawtxCfg {
     pub decoys: u32,
     #[serde(default = "d_tor_socks")]
     pub tor_socks: Option<String>,
+    /// Use Tor for every external fetch (Esplora, Electrum by txid, P2P).
+    /// On by default. `false` is an explicit opt-out: connections go direct
+    /// and the operator IP is visible to providers and peers (AUD-168).
+    /// The onion listener is independent (`[tor] mode`).
+    #[serde(default = "d_true")]
+    pub use_tor: bool,
     #[serde(default)]
     pub allow_clearnet: bool,
     /// Use clearnet when Tor is unavailable or a Tor request fails. Off by
@@ -717,6 +723,37 @@ pub struct RawtxCfg {
     pub privacy_overrides: Vec<String>,
 }
 
+impl RawtxCfg {
+    /// SOCKS proxy the external path may use, honouring the `use_tor` opt-out.
+    pub fn effective_tor_socks(&self) -> Option<String> {
+        if !self.use_tor {
+            return None;
+        }
+        self.tor_socks
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+    }
+
+    /// Whether direct connections are allowed. `use_tor = false` implies it:
+    /// otherwise there would be no source at all.
+    pub fn effective_allow_clearnet(&self) -> bool {
+        self.allow_clearnet || !self.use_tor
+    }
+
+    /// Transport in force, for logs and `/status`.
+    pub fn transport(&self) -> &'static str {
+        if !self.use_tor {
+            "direct"
+        } else if self.tor_fallback_clearnet {
+            "tor+fallback"
+        } else {
+            "tor"
+        }
+    }
+}
+
 impl Default for RawtxCfg {
     fn default() -> Self {
         RawtxCfg {
@@ -724,6 +761,7 @@ impl Default for RawtxCfg {
             cache_mib: d_cache_mib(),
             decoys: d_decoys(),
             tor_socks: d_tor_socks(),
+            use_tor: true,
             allow_clearnet: false,
             tor_fallback_clearnet: false,
             prefetch: true,
@@ -1651,5 +1689,37 @@ mod tests {
         assert!(cg.validate().is_err());
         cg.core.cgroup_io_weight = Some(100);
         assert!(cg.validate().is_ok());
+    }
+
+    #[test]
+    fn use_tor_is_on_by_default_and_false_means_direct() {
+        let cfg = Config::default();
+        assert!(cfg.rawtx.use_tor);
+        assert_eq!(
+            cfg.rawtx.effective_tor_socks().as_deref(),
+            Some("127.0.0.1:9050")
+        );
+        assert!(!cfg.rawtx.effective_allow_clearnet());
+        assert_eq!(cfg.rawtx.transport(), "tor");
+
+        let mut direct = Config::default();
+        direct.rawtx.use_tor = false;
+        assert_eq!(direct.rawtx.effective_tor_socks(), None);
+        assert!(
+            direct.rawtx.effective_allow_clearnet(),
+            "direct needs clearnet"
+        );
+        assert_eq!(direct.rawtx.transport(), "direct");
+
+        let mut fallback = Config::default();
+        fallback.rawtx.tor_fallback_clearnet = true;
+        assert_eq!(fallback.rawtx.transport(), "tor+fallback");
+    }
+
+    #[test]
+    fn use_tor_parses_from_set() {
+        let cfg = Config::load_with_overrides(None, &["rawtx.use_tor=false".to_string()]).unwrap();
+        assert!(!cfg.rawtx.use_tor);
+        assert!(cfg.rawtx.effective_allow_clearnet());
     }
 }
