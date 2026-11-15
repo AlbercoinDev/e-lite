@@ -80,7 +80,7 @@ available**.
 |---|---|---|
 | Local-first rawtx | experimental | Core/cache before external |
 | External fetch mode | experimental | default `balanced`: loose transactions by txid (Electrum/Esplora) with decoy wallets, verified against the index; `preset = "max"`: whole blocks by hash only, never txid |
-| Tor SOCKS5h, fail-closed | experimental | Tor only by default; opt-in `tor_fallback_clearnet` uses clearnet if Tor fails; `allow_clearnet` forces it |
+| Tor SOCKS5h, fail-closed | experimental | Tor only by default (`rawtx.use_tor`); opt-in `tor_fallback_clearnet` uses clearnet if Tor fails; `allow_clearnet` forces it; `use_tor = false` (`--no-rawtx-tor`) is the explicit direct opt-out and is independent of the onion listener (`/status.rawtx.path`) |
 | Managed Tor + onion service | experimental | network plain/TLS ports; `e-lite onion show/reset` |
 | Auto self-signed TLS cert | experimental | generated without Tor; SAN includes localhost, hostname and onion; reloaded on change |
 | Decoys and random source order | experimental | `decoys=1` per real external download (wallet or prefetch), served one at a time by a background thread outside the wallet's download slots, paused while a provider rate-limits; a decoy failure never cools a provider/peer; at most 32 owed (`/status.rawtx.decoys_pending`) |

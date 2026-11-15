@@ -135,7 +135,7 @@ detect_root() {
   if [ -n "$src" ] && [ -f "$src" ]; then
     local d
     d="$(cd "$(dirname "$src")/.." && pwd)"
-    if [ -f "$d/Cargo.toml" ] && [ -f "$d/tests/e2e_networks.sh" ]; then
+    if [ -f "$d/Cargo.toml" ] && [ -f "$d/tests/e2e/e2e_networks.sh" ]; then
       ROOT="$d"
       return
     fi
@@ -420,7 +420,7 @@ run_quick() {
   wait_ready || { tail -80 "$TMP/serve.log"; die "index did not reach READY"; }
   sh="$(scripthash_for_address "$addr")"
   local entries
-  entries="$(python3 "$ROOT/tests/query_history.py" "$ELECTRUM_PORT" "$sh")"
+  entries="$(python3 "$ROOT/tests/lib/query_history.py" "$ELECTRUM_PORT" "$sh")"
   info "history entries: $entries"
   printf 'quick regtest: OK (%s history entries)\n' "$entries" >"$TMP/results.txt"
   report_common
@@ -442,12 +442,12 @@ run_suite() {
   local failed=0
   : >"$TMP/results.txt"
   local scripts=(
-    tests/e2e_launch_core.sh
-    tests/e2e_wait_core.sh
-    tests/e2e_external_pruned.sh
-    tests/e2e_pruned_ibd.sh
-    tests/e2e_regtest.sh
-    tests/e2e_resilience.sh
+    tests/e2e/e2e_launch_core.sh
+    tests/e2e/e2e_wait_core.sh
+    tests/e2e/e2e_external_pruned.sh
+    tests/e2e/e2e_pruned_ibd.sh
+    tests/e2e/e2e_regtest.sh
+    tests/e2e/e2e_resilience.sh
   )
   for s in "${scripts[@]}"; do
     log "Running $s"
@@ -493,7 +493,7 @@ run_acceptance() {
        E_LITE_E2E_RPC_PORT="$RPC_PORT" \
        E_LITE_E2E_ELECTRUM_PORT="$ELECTRUM_PORT" \
        E_LITE_E2E_METRICS_PORT="$METRICS_PORT" \
-       tests/e2e_networks.sh >"$log" 2>&1 ); then
+       tests/e2e/e2e_networks.sh >"$log" 2>&1 ); then
     tail -20 "$log"
     printf '%s acceptance: OK\n' "$NETWORK" >"$TMP/results.txt"
     report_common

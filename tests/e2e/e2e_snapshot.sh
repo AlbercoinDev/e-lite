@@ -5,7 +5,7 @@
 # (<data-dir>/bitcoin) so the nested-datadir exclusion is exercised too.
 set -euo pipefail
 
-cd "$(dirname "$0")/.."
+cd "$(dirname "$0")/../.."
 BIN="${E_LITE_BIN:-$PWD/target/debug/e-lite}"
 [ -x "$BIN" ] || { echo "build first: cargo build -p e-lite" >&2; exit 1; }
 command -v bitcoind >/dev/null || { echo "bitcoind not found" >&2; exit 1; }
@@ -94,7 +94,7 @@ if $CLI getblockcount >/dev/null 2>&1; then
   echo "Core still running after e-lite shutdown" >&2
   exit 1
 fi
-echo "core tip was: $($CLI -datadir=$DATA/bitcoin getblockcount 2>/dev/null || echo stopped)"
+echo "core tip was: $($CLI -datadir="$DATA"/bitcoin getblockcount 2>/dev/null || echo stopped)"
 INDEX_TIP=$("$BIN" export-snapshot --config "$CONF" | python3 -c 'import sys
 for line in sys.stdin:
     if line.startswith("tip:"): print(line.split()[1]); break')

@@ -4,7 +4,7 @@ These are the measurements that decide the remaining tuning defaults. e-lite
 does not change them automatically; run one variant at a time on any test
 machine and keep the previous CSV. On a closed box (Umbrel, appliance) the
 protocol is the same: run the variant, then pass the log or CSV to the
-analysis. `tests/ab_umbrel.sh` is the generic sampler despite its historical
+analysis. `tests/manual/ab_umbrel.sh` is the generic sampler despite its historical
 name.
 
 ## 0. Baseline
@@ -25,7 +25,7 @@ core_resume_ahead_gib = 7
 Start e-lite, wait for a normal Core/e-lite phase, then sample for 30-60 min:
 
 ```bash
-tests/ab_umbrel.sh baseline 1800
+tests/manual/ab_umbrel.sh baseline 1800
 ```
 
 `E_LITE_STATUS_URL` defaults to `http://127.0.0.1:55084/status` (mainnet
@@ -39,7 +39,7 @@ to `/tmp/e-lite-ab-baseline.csv`.
 readers = 6
 ```
 
-Restart, run `tests/ab_umbrel.sh readers6 1800`, compare:
+Restart, run `tests/manual/ab_umbrel.sh readers6 1800`, compare:
 `phase=core` (Core downloading) and `phase=draining` (Core paused).
 Keep 6 only if the active-phase rate improves and the drain rate does not fall.
 
@@ -56,7 +56,7 @@ Only if the baseline log shows sustained `MemAvailable` > 6 GiB and
 cache_mib = 6144     # 8 GiB boxes: 4096
 ```
 
-Run `tests/ab_umbrel.sh cache6g 1800`. Watch `memory.available_mib` in the CSV;
+Run `tests/manual/ab_umbrel.sh cache6g 1800`. Watch `memory.available_mib` in the CSV;
 if it approaches 1 GiB or the OOM killer fires, revert.
 
 ## 3. Byte watermark
@@ -69,7 +69,7 @@ max_bulk_lag_gib = 20
 core_resume_ahead_gib = 5
 ```
 
-Run `tests/ab_umbrel.sh bulk20g 1800`. Keep it only if the phase switch cost
+Run `tests/manual/ab_umbrel.sh bulk20g 1800`. Keep it only if the phase switch cost
 does not outweigh the shorter queues; the CSV's `backlog_bytes` shows the
 actual bytes.
 
@@ -96,7 +96,7 @@ max_bulk_lag_gib = 20
 core_resume_ahead_gib = 5
 ```
 
-Run `tests/ab_umbrel.sh alternate 1800`. `alternate` is only a candidate when
+Run `tests/manual/ab_umbrel.sh alternate 1800`. `alternate` is only a candidate when
 Core solo is clearly above the break-even; otherwise keep `overlap`.
 
 ## 5. Optional prefetch/memtable experiments
@@ -107,7 +107,7 @@ adaptive_memtables = true
 prefetch_deadline_ms = 2000
 ```
 
-These are **not** defaults. Run `tests/ab_umbrel.sh memtables-adaptive 1800`
+These are **not** defaults. Run `tests/manual/ab_umbrel.sh memtables-adaptive 1800`
 and watch:
 - `memtables_mib` should move only after a 10-minute persistent target;
 - `prefetch_p95` should fall;

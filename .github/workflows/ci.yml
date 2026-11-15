@@ -12,6 +12,21 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  lint:
+    runs-on: ubuntu-latest
+    container: debian:12
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install lint tools
+        run: |
+          export DEBIAN_FRONTEND=noninteractive
+          apt-get update -qq
+          apt-get install -y -qq --no-install-recommends python3 shellcheck
+      - name: Documentation links, anchors and version
+        run: ./scripts/check-docs.sh
+      - name: Shell scripts
+        run: shellcheck install.sh scripts/*.sh tests/e2e/*.sh tests/bench/*.sh tests/manual/*.sh
+
   test:
     runs-on: ubuntu-latest
     container: debian:12

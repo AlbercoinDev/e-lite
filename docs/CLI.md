@@ -229,21 +229,21 @@ e-lite run --network mainnet --allow-mainnet \
 | `--p2p-peers <a,b>` | `rawtx.p2p_peers` | discovered from Core |
 | `--no-p2p` | `rawtx.use_p2p=false` | enabled |
 | `--no-esplora` | `rawtx.use_esplora=false` | enabled |
-| `--decoys <n>` | `rawtx.decoys` | `1` (max 2 in flight) |
+| `--decoys <n>` | `rawtx.decoys` | `1` per wallet load, served one at a time in the background |
 | `--rawtx-cache-mib <n>` | `rawtx.cache_mib` | `256` |
 | `--set rawtx.cache_dir=<path>` | `rawtx.cache_dir` | `<data-dir>/rawtx-cache`; tmpfs keeps it off disk |
 | `--tor-socks <addr>` | `rawtx.tor_socks` | `127.0.0.1:9050` |
 | `--allow-clearnet` | `rawtx.allow_clearnet` | `false` |
 | `--no-rawtx-tor` / `--rawtx-tor` | `rawtx.use_tor`: fetch wallet data directly (no Tor; your IP is visible) or through Tor | `true` |
 | `--set rawtx.tor_fallback_clearnet=true` | use clearnet when Tor fails (exposes your IP to the provider) | `false` |
-| `--set rawtx.prefetch=true` | download a wallet's history blocks in the background (faster first load, no decoys) | `false` |
+| `--set rawtx.prefetch=false` | disable the background history prefetch (on by default; it owes decoys like a wallet request) | `true` |
 | `--plain-lan` / `--set server.plain_lan=true` | plain Electrum on `0.0.0.0` | `false` |
 | `--set server.advertise_electrumx_compat=true` | `server.version` banner `e-lite X (electrumx-compatible)`, so Sparrow uses JSON-RPC batches; hot-reloadable | `false` |
 | `--set core.network=auto\|private\|clearnet` | P2P networks of a Core started by e-lite | `auto` |
 | `--set core.private_broadcast=true` | broadcast wallet transactions over short-lived Tor/I2P connections (experimental in Core) | `false` |
 | `--set core.i2p_sam=auto\|host:port` , `--set core.cjdns=true` | extra private networks for Core | `auto`, `false` |
 | `--set rawtx.request_timeout_seconds=<n>` | per-provider block timeout, direct (clearnet) | `8` |
-| `--set rawtx.tor_request_timeout_seconds=<n>` | per-provider block timeout through Tor (new circuit + whole block) | `20` |
+| `--set rawtx.tor_request_timeout_seconds=<n>` | absolute per-attempt budget through Tor (new circuit + whole block) | `60` |
 | `--set rawtx.provider_cooldown_seconds=<n>` | cool down a failed provider (Tor or direct) | `300` |
 | `--set rawtx.max_parallel_fetches=<n>` | concurrent external block downloads | `16` |
 | `--set rawtx.privacy_file=<path>` | `privacy.toml` location (empty: next to config.toml) | empty |

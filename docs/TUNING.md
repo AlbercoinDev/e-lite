@@ -354,7 +354,7 @@ the tip advances. Before Core deletes blocks, e-lite now calls `SyncWAL(true)`
 instead of forcing every memtable to SST. A single `WriteBatch` is atomic across
 column families and the WAL is enabled, so the committed tip is recoverable;
 the flush was a large stall on every prune and is not needed for durability.
-`tests/e2e_pruned_ibd.sh` SIGKILLs e-lite after a prune and verifies the index
+`tests/e2e/e2e_pruned_ibd.sh` SIGKILLs e-lite after a prune and verifies the index
 recovers with the full history.
 
 ## Containers (LXC/Docker)
@@ -530,7 +530,7 @@ Conclusions applied as defaults in 0.1.0-alpha.29.4.4:
 
 ### Measured on the test LXC (4 vCPU, 8 GiB, 2026-11-07)
 
-`tests/bench_index.sh` mines a disposable regtest chain and indexes it with
+`tests/bench/bench_index.sh` mines a disposable regtest chain and indexes it with
 several variants. Indexing is measured after Core already has the blocks, so it
 isolates e-lite from download speed.
 

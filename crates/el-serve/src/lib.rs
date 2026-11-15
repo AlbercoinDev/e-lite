@@ -3713,7 +3713,7 @@ fn silent_payments(shared: &Shared, method: &str) -> RpcResult<Value> {
     // The opt-in gate exists so a future BIP352 indexer can be wired without
     // changing the protocol surface. Until then, fail explicitly.
     Err(RpcError::server(format!(
-        "{method}: silent payments are enabled but this build has no BIP352 indexer (see docs/ADR-018)"
+        "{method}: silent payments are enabled but this build has no BIP352 indexer (see docs/adr/ADR-018-SILENT-PAYMENTS.md)"
     )))
 }
 

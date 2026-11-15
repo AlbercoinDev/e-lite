@@ -4,10 +4,10 @@
 # this script for 30-60 minutes per label.
 #
 # Usage:
-#   tests/ab_umbrel.sh baseline 1800
-#   tests/ab_umbrel.sh readers6 1800
-#   tests/ab_umbrel.sh cache6g 1800
-#   tests/ab_umbrel.sh bulk20g 1800
+#   tests/manual/ab_umbrel.sh baseline 1800
+#   tests/manual/ab_umbrel.sh readers6 1800
+#   tests/manual/ab_umbrel.sh cache6g 1800
+#   tests/manual/ab_umbrel.sh bulk20g 1800
 #
 # Environment:
 #   E_LITE_STATUS_URL  default http://127.0.0.1:55084/status (mainnet metrics)

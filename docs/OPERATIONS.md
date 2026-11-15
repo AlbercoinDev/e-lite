@@ -5,14 +5,10 @@
 ```bash
 export PATH="$HOME/.local/bin:$PATH"
 
-CORE="$HOME/.bitcoin-signet"
-DATA="$HOME/.local/share/e-lite/signet"
-mkdir -p "$CORE" "$DATA"
-
-e-lite doctor --network signet --core-datadir "$CORE" --data-dir "$DATA"
-
-e-lite run --network signet --manage managed \
-  --core-datadir "$CORE" --data-dir "$DATA" --prune-mib 1
+# Defaults: ~/e-lite/signet for the index/TLS/Tor/logs and
+# ~/e-lite/signet/bitcoin for Core. No path flags are needed.
+e-lite doctor --network signet
+e-lite run --network signet --prune-mib 1
 ```
 
 - `run` starts Core if needed, waits for RPC, initializes the DB and indexes.
@@ -35,9 +31,8 @@ Use `--min-free-gib` and a separate index disk for production.
 ### All-in-one with a local Core
 
 ```bash
-e-lite run --network signet --manage auto \
-  --core-datadir "$HOME/.bitcoin" \
-  --data-dir "$HOME/.local/share/e-lite/signet"
+# Default data dir; an external Core datadir (optional)
+e-lite run --network signet --manage auto
 ```
 
 `auto` uses a running Core read-only; otherwise starts it. Use `managed` when
@@ -46,8 +41,9 @@ e-lite must own pause/prune/stop authority.
 ### Split index/serve
 
 ```bash
-e-lite index --network signet --core-datadir "$CORE" --data-dir "$DATA" --no-follow
-e-lite serve --network signet --data-dir "$DATA"
+# Same data dir for both commands (the default ~/e-lite/signet)
+e-lite index --network signet --no-follow
+e-lite serve --network signet
 ```
 
 `serve` can run while Core is down; cached history/balances remain available.

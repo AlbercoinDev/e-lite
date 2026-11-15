@@ -2,8 +2,8 @@
 # Signet / testnet4 smoke test. This performs a real network sync, so it is
 # intentionally opt-in:
 #
-#   E_LITE_NETWORK=signet tests/e2e_networks.sh
-#   E_LITE_NETWORK=testnet4 E_LITE_CORE_DATADIR=/srv/core-t4 tests/e2e_networks.sh
+#   E_LITE_NETWORK=signet tests/e2e/e2e_networks.sh
+#   E_LITE_NETWORK=testnet4 E_LITE_CORE_DATADIR=/srv/core-t4 tests/e2e/e2e_networks.sh
 #
 # If E_LITE_CORE_DATADIR is not set, a temporary datadir is used and e-lite
 # launches Core with manual pruned IBD (prune=1). The sync can take a long time.
@@ -18,7 +18,7 @@
 #                                        (default 15 signet, 20 testnet4)
 set -euo pipefail
 
-cd "$(dirname "$0")/.."
+cd "$(dirname "$0")/../.."
 BIN="${E_LITE_BIN:-$PWD/target/debug/e-lite}"
 [ -x "$BIN" ] || { echo "build first: cargo build -p e-lite" >&2; exit 1; }
 command -v bitcoind >/dev/null || { echo "bitcoind not found" >&2; exit 1; }

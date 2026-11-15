@@ -61,8 +61,10 @@ the per-client rate limiter are implemented; client authentication is not.
   HDD/network, capped by the effective room; `cache_mib` is a maximum. The hot
   controller follows
   `MemAvailable`, shrinks below the reserve and grows only with a proportional
-  margin and slow prefetch. Memtables are fixed at startup; hot WBM resizing is
-  future work. Every knob can be overridden from the CLI or `--set`.
+  margin and slow prefetch. Memtables are fitted at startup; with
+  `[index] adaptive_memtables = true` the controller re-fits the shared WBM and
+  the per-CF buffers after a persistent target (opt-in). Every knob can be
+  overridden from the CLI or `--set`.
 - Bulk commits are bounded by 250k transactions, 512 blocks, raw bytes
   (`clamp(RAM/128, 64-256 MiB)`) or 20-60 s by disk class (minimum 8 blocks/60 s);
   live mode commits every 1.5 s. The prune gate uses the committed tip, so this
@@ -76,7 +78,11 @@ the per-client rate limiter are implemented; client authentication is not.
   the same lines as the console.
 - Ready state is `READY` at Core's validated tip and `FULLY SYNCED` at the
   network headers; the wallet banner mirrors it.
-- Rawtx external lookup is block-based, validated, Tor-first and decoy-enhanced.
+- Rawtx external lookup is local-first: per-txid by default (`privacy.toml`
+  `balanced`: Electrum batches + Esplora `/tx/:txid/raw` over Tor with decoy
+  wallets), whole blocks by hash as fallback, every transaction verified
+  against the index. `preset = "max"` never sends a txid; `use_tor = false` is
+  the explicit direct opt-out.
 
 ## Audit and release
 

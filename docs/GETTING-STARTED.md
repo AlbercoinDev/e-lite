@@ -40,15 +40,15 @@ writes `~/e-lite-test/last-report.txt`.
 ## 3. Manual regtest / signet start
 
 ```bash
-CORE="$HOME/.bitcoin-signet"
-DATA="$HOME/.local/share/e-lite/signet"
-mkdir -p "$CORE" "$DATA"
-
-e-lite doctor --network signet --core-datadir "$CORE" --data-dir "$DATA"
-
-e-lite run --network signet --manage managed \
-  --core-datadir "$CORE" --data-dir "$DATA" --prune-mib 1
+# Defaults: index/TLS/Tor/logs in ~/e-lite/signet, Core in
+# ~/e-lite/signet/bitcoin. No paths are needed.
+e-lite doctor --network signet
+e-lite run --network signet --prune-mib 1
 ```
+
+For a custom layout (separate index and Core disks, or an external Core) pass
+`--data-dir` and `--core-datadir`; e-lite never writes to a Core datadir it
+does not own.
 
 Expected:
 
@@ -66,12 +66,12 @@ Expected:
 ## 4. Automated suite
 
 ```bash
-tests/e2e_launch_core.sh
-tests/e2e_wait_core.sh
-tests/e2e_pruned_ibd.sh
-tests/e2e_regtest.sh
-tests/e2e_resilience.sh
-tests/e2e_external_pruned.sh
+tests/e2e/e2e_launch_core.sh
+tests/e2e/e2e_wait_core.sh
+tests/e2e/e2e_pruned_ibd.sh
+tests/e2e/e2e_regtest.sh
+tests/e2e/e2e_resilience.sh
+tests/e2e/e2e_external_pruned.sh
 ```
 
 Or:

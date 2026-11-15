@@ -59,12 +59,12 @@ be paused safely.
 
 ## Evidence
 
-- `tests/e2e_launch_core.sh`: from an empty datadir, e-lite starts Core, indexes
+- `tests/e2e/e2e_launch_core.sh`: from an empty datadir, e-lite starts Core, indexes
   151 blocks, serves queries and stops Core.
-- `tests/e2e_wait_core.sh`: `WAITING_FOR_CORE` → Core appears → `READY`.
-- `tests/e2e_external_pruned.sh`: external pruned Core + empty index fails
+- `tests/e2e/e2e_wait_core.sh`: `WAITING_FOR_CORE` → Core appears → `READY`.
+- `tests/e2e/e2e_external_pruned.sh`: external pruned Core + empty index fails
   without touching `networkactive`.
-- `tests/e2e_pruned_ibd.sh`: e-lite starts Core with `-prune=1 -fastprune`,
+- `tests/e2e/e2e_pruned_ibd.sh`: e-lite starts Core with `-prune=1 -fastprune`,
   indexes 2101 blocks, prunes to 1785 and keeps serving.
-- `tests/e2e_resilience.sh`: Core down → cached serve → Core returns → `READY`.
+- `tests/e2e/e2e_resilience.sh`: Core down → cached serve → Core returns → `READY`.
 - `docs/benchmarks/F2.md`.

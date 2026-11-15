@@ -142,10 +142,10 @@ Notes:
 
 ## Where things live
 
-- `privacy.toml`: next to `config.toml` (one per network), or
-  `[rawtx] privacy_file`. Created from the template on the first run and
-  never overwritten by an update; delete it and restart to get the template
-  back. The template ships in the release (`privacy.toml`) and in
+- `privacy.toml`: next to `config.toml` (one file shared by every network on
+  the host), or `[rawtx] privacy_file`. Created from the template on the first
+  run and never overwritten by an update; delete it and restart to get the
+  template back. The template ships in the release (`privacy.toml`) and in
   `/usr/share/e-lite/` or `~/.local/share/e-lite/`.
 - Electrum servers: `public-servers.toml`, `electrum = [...]` per network. A
   file from before 29.15.0 without that key uses the shipped list (logged);

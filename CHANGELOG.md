@@ -1,5 +1,45 @@
 # Changelog
 
+## 0.1.0-alpha.29.16.5 — 2026-11-15
+
+### Repository and documentation cleanup
+
+No wallet behaviour change. The tree had accumulated a pre-implementation
+specification, a handoff with 40+ duplicated release sections, a roadmap mixing
+finished work with future work and several documents describing old paths and
+defaults.
+
+- **Removed `docs/spec/`**: the original Spanish specification (marked "not
+  started", with its own `AGENTS.md` and `config.example.toml`). It described a
+  project that no longer matches the code; git history keeps it.
+- **Tests organized by purpose**: `tests/e2e/`, `tests/bench/`,
+  `tests/manual/` and `tests/lib/`, with `tests/README.md`. Scripts resolve the
+  repository root and helpers from their own location, so they run from any
+  working directory; `scripts/e-lite-all-in-one.sh` follows the new layout.
+- **Shorter, accurate state document**: `docs/HANDOFF.md` keeps the current
+  state, binding decisions, pending measurements, open risks and commands;
+  per-release history stays in this changelog.
+- **Future-only roadmap**: `docs/ROADMAP.md` no longer mixes completed work
+  (which lives in this changelog) with pending P2/P3 items.
+- **Audit split**: `docs/AUDIT.md` now lists open findings and residual risks;
+  the fixed history (AUD-001..167) moved to `docs/audit/FIXED.md`.
+- **Docs reorganized**: ADRs in `docs/adr/` with an index, benchmarks in
+  `docs/benchmarks/` with an index, new `docs/TESTS.md` and
+  `docs/RELEASING.md`.
+- **Corrected against the code**: current data layout
+  (`~/e-lite/<network>`, Core in `<data-dir>/bitcoin`) in `README`,
+  `INSTALL`, `GETTING-STARTED` and `OPERATIONS`; `privacy.toml` is one shared
+  file, not per network; rawtx is per-txid by default, not block-based;
+  `CLI.md` defaults (`prefetch = true`, `decoys` one at a time,
+  `tor_request_timeout_seconds = 60`); the update command used undefined
+  `$CORE`/`$DATA`; pinned-version examples no longer point at 29.5.0.
+- **`scripts/check-docs.sh`**: fails on broken relative links or anchors,
+  version drift between `Cargo.toml`/`README`/`HANDOFF`/`CHANGELOG`, old test
+  paths and references to moved scripts. CI runs it with `shellcheck` over
+  `install.sh` and the test/bench scripts.
+- Help text: `--decoys` and `--tor-socks` describe the current behaviour.
+
+
 ## 0.1.0-alpha.29.16.4 — 2026-11-15
 
 ### Faster CI and release pipeline
@@ -669,7 +709,7 @@ changes (see AUD-139); old cache entries remain readable.
   a 1 GiB floor with the partial restore removed.
 - **AUD-132**: `tests/log_redaction.rs` rejects any log macro that prints a
   script hash or a txid.
-- `tests/e2e_regtest.sh` waits up to 50 s (was 20 s) for `/healthz`: `run`
+- `tests/e2e/e2e_regtest.sh` waits up to 50 s (was 20 s) for `/healthz`: `run`
   waits up to 30 s for a freshly created managed Tor, so a slow Tor network
   made the test fail intermittently. It now prints the log tail on failure.
 - Tests: `entries_round_trip_and_corruption_is_dropped`,
@@ -694,7 +734,7 @@ new undo path is byte-identical to the old one (same canonical digest).
   into the `WriteBatch` and most of it was deleted again in the same or the
   next commit — an estimated third of the RocksDB write volume during IBD.
   Early commits (time/tx/byte limit, boundary, shutdown) stay fully
-  rewindable. Not yet measured on mainnet: compare `tests/bench_ibd.sh`
+  rewindable. Not yet measured on mainnet: compare `tests/bench/bench_ibd.sh`
   and the `commit-group` / WAL counters.
 - **AUD-132 (privacy, logs)**: `e-lite.log` no longer records the script
   hash of a failed `get_history`, nor the txid/block hash of a failed or
@@ -808,7 +848,7 @@ Cross-network use: run the command per network (`--network mainnet`,
 
 Tests: 9 new snapshot unit tests (manifest v2 round-trip, coherence rules,
 index/Core walk exclusions, SHA-256, gzip level, sparse acceptance, wrong
-network/unknown format rejection) and `tests/e2e_snapshot.sh` (export refusal
+network/unknown format rejection) and `tests/e2e/e2e_snapshot.sh` (export refusal
 while Core runs, index-only without `bitcoin/`, full export with hashes,
 import + digest equality, second import rejected, `--verify=full` OK).
 
@@ -1154,10 +1194,10 @@ or the `io` controller it logs a warning; `ionice` remains the fallback.
 **Prune deferral defaults.** Normal pruning now keeps a **20 GiB** free-space
 margin (`prune_defer_free_gib = 20`) and advances every **5,000** safe blocks
 (`min_gain_blocks = 5000`). Low-disk emergency pruning still bypasses both.
-`tests/e2e_pruned_ibd.sh` sets `prune_defer_free_gib = 0` explicitly because it
+`tests/e2e/e2e_pruned_ibd.sh` sets `prune_defer_free_gib = 0` explicitly because it
 must observe the gate on a small temporary disk.
 
-**A/B harness.** `tests/ab_umbrel.sh` samples `/status` for a labelled run and
+**A/B harness.** `tests/manual/ab_umbrel.sh` samples `/status` for a labelled run and
 writes a CSV with phase rate, backlog, cache/memtables, readers, p95, commit
 group/reason and state. `docs/AB_TESTS.md` defines the baseline/readers/cache/
 bulk/alternate matrix and the decision thresholds. The A/B itself must run on
@@ -1476,7 +1516,7 @@ batch size. No consensus, undo or WAL durability rule was weakened.
 readers and discarded prepared blocks roughly every 33 blocks. Supervisor
 actions (prune, disk, state) now run at commit boundaries; the 512-block
 checkpoint remains. `/status.pipeline` counts prepared, applied and discarded
-blocks, and `tests/e2e_pruned_ibd.sh` asserts discarded work stays below 5 %.
+blocks, and `tests/e2e/e2e_pruned_ibd.sh` asserts discarded work stays below 5 %.
 
 **No lag ratchet.** The bulk lag baseline was rewritten with the current lag on
 every resume, so the next pause threshold grew by `max_bulk_lag_blocks/2` per
@@ -1490,7 +1530,7 @@ commit cycle's rate, resume at half. It stays opt-in pending a mainnet A/B.
 all seven column families and then the WAL. The durability requirement is
 `SyncWAL(true)`: a single `WriteBatch` is atomic across CFs and `txids.dat` is
 fsynced before the batch. The forced SST flush was a multi-second stall on
-every prune. `tests/e2e_pruned_ibd.sh` now SIGKILLs e-lite after a prune and
+every prune. `tests/e2e/e2e_pruned_ibd.sh` now SIGKILLs e-lite after a prune and
 verifies the index recovers with the full history.
 
 **Correct RocksDB metrics.** `estimate-pending-compaction-bytes`,
@@ -1585,7 +1625,7 @@ window, and `commit/blk` uses the blocks actually committed (an 8 s commit of
 taken before a from-zero managed Core starts and released within 1000 blocks of
 Core. Separate containers are not coordinated.
 
-**Measurement.** `tests/bench_sample.py` now uses monotonic elapsed time, the
+**Measurement.** `tests/bench/bench_sample.py` now uses monotonic elapsed time, the
 real `CLK_TCK`, the simultaneous RSS peak, matching units and `stage_totals_us`;
 it reports `completed` and the shell propagates a failure instead of hiding it.
 Disk accounting no longer counts a nested Core datadir as index.
@@ -1630,7 +1670,7 @@ Defaults changed:
 - New `/status` fields for the next measurement: cumulative stage totals in
   microseconds, commit count/txs, `commit_breakdown_us` (txids fsync vs RocksDB
   write) and RocksDB pending compaction/memtable/SST counters.
-- `tests/bench_ibd.sh` + `tests/bench_sample.py` measure a joint feeder-Core
+- `tests/bench/bench_ibd.sh` + `tests/bench/bench_sample.py` measure a joint feeder-Core
   IBD with e-lite indexing, including CPU/RAM/disk, pauses and stage totals.
 
 ## 0.1.0-alpha.29.4.3 — 2026-11-07
@@ -1671,7 +1711,7 @@ Defaults changed:
   55150/55250/55350 on testnet4/signet/regtest, so several managed instances
   can start together without racing for the same socket. Explicit
   `tor.socks_port` still wins.
-- **Multi-instance test** (`tests/e2e_multi_instance.sh`): two regtest Cores and
+- **Multi-instance test** (`tests/e2e/e2e_multi_instance.sh`): two regtest Cores and
   two e-lite instances with independent plain/TLS/metrics ports and data dirs;
   verifies both heights, distinct certificates, combined RSS, and that stopping
   or restarting one does not affect the other.
@@ -1705,9 +1745,9 @@ Defaults changed:
   `tls_cert` nor `tls_key` was set, so a half-configured pair fails validation.
   Legacy Core datadirs are only detected when the chain's block directory
   exists, not merely because a `bitcoin.conf` is present.
-- **Tests**: `tests/e2e_recovery.sh` (repeated SIGKILL, reorg at the indexed
+- **Tests**: `tests/e2e/e2e_recovery.sh` (repeated SIGKILL, reorg at the indexed
   tip, write failure from a file-size limit, then clean recovery), plus TLS
-  SAN/fingerprint assertions in `tests/e2e_defaults.sh` and unit tests for the
+  SAN/fingerprint assertions in `tests/e2e/e2e_defaults.sh` and unit tests for the
   undo window, corrupt-pair regeneration, opt-out with an existing pair and
   operator certificate preservation.
 - Docs and AGENTS invariants updated.
@@ -1738,7 +1778,7 @@ Defaults changed:
   Electrum in `CORE_UNAVAILABLE` and keeps retrying Core instead of waiting
   before serving. A first run with no identity still waits for Core.
 - Tests: per-network defaults, loopback pairing, TLS on/off validation, cert
-  generation without Tor, operator cert preservation, plus `tests/e2e_defaults.sh`
+  generation without Tor, operator cert preservation, plus `tests/e2e/e2e_defaults.sh`
   (plain + TLS + metrics with no TLS/Tor configuration) alongside regtest and
   pruned-IBD.
 - Docs updated: README, CLI, OPERATIONS, TOR, INSTALL, GETTING-STARTED,
@@ -2152,7 +2192,7 @@ that ask for 1.6. 1.4 clients keep the previous responses on the same instance.
   future versions to the newest implemented version below them.
 - Tests: 1.6 negotiation and first-message cap, headers shape per version,
   `mempool.get_info`, fee modes and a real parent+child package broadcast in
-  `tests/e2e_electrum16.py`.
+  `tests/e2e/e2e_electrum16.py`.
 
 1.7 remains unimplemented and is not advertised.
 
@@ -2625,7 +2665,7 @@ requests; use a firewall, SSH/VPN or Tor for non-loopback listeners.
 - **Reorg safety:** after a rewind the indexer re-reads the committed tip
   before replaying blocks.
 - **From-zero disk requirement:** signet needs ≥15 GiB free and testnet4 ≥20 GiB
-  for a full acceptance run; `tests/e2e_networks.sh` refuses to start below
+  for a full acceptance run; `tests/e2e/e2e_networks.sh` refuses to start below
   `E_LITE_E2E_REQUIRED_FREE_GIB` and documents how to override it.
 - **Pause marker** so a crash while Core was paused is recovered on restart.
 - **Prune height** now records the height Core actually returns, not the
@@ -2698,7 +2738,7 @@ requests; use a firewall, SSH/VPN or Tor for non-loopback listeners.
   checklist.
 - `docs/benchmarks/F2.md` records the two full-sync attempts that filled the
   disk, the root cause, the fix and the remaining manual acceptance.
-- `docs/ADR-020-CORE-LIFECYCLE.md` documents the Core lifecycle and guards.
+- `docs/adr/ADR-020-CORE-LIFECYCLE.md` documents the Core lifecycle and guards.
 
 ## 0.1.0-alpha.10 — 2026-11-02
 

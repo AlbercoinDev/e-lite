@@ -7,3 +7,6 @@
 /.cache
 *.zip
 __pycache__/
+/.claude/
+.DS_Store
+*.orig

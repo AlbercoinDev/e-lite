@@ -89,7 +89,7 @@ Never treat a version number in this file as authoritative over the code/tag.
   `prune_height <= index tip - 288`; `--verify` checks the per-file SHA-256
   table and `--verify=full` opens the restored Core with `-connect=0`
   `-listen=0`, checks both tips and runs `verifychain(2, 288)`. Cover:
-  `tests/e2e_snapshot.sh`.
+  `tests/e2e/e2e_snapshot.sh`.
 - Long bulk catch-up pauses Core by default and resumes at 7 GiB of unindexed
   backlog (legacy: 5,000 blocks) to pre-warm peers; normal pruning keeps a
   20 GiB free-space margin by default (`prune_defer_free_gib = 20`) and runs
@@ -108,16 +108,16 @@ Never treat a version number in this file as authoritative over the code/tag.
   window is `NEEDS_RECOVERY`, never a silent reindex.
 - Crash recovery: SIGKILL during indexing, a write failure and a reorg at the
   indexed tip must all recover through RocksDB/WAL and undo. Covered by
-  `tests/e2e_recovery.sh`; run it after touching commit, undo or rewind.
+  `tests/e2e/e2e_recovery.sh`; run it after touching commit, undo or rewind.
 - Real mainnet default baseline (alpha.29.4.3): ~4.2–4.8 blocks/s at ~640k;
   per-block cost dominated by prevout prefetch (100–1500 ms), then decode
   (~25 ms), apply (20–100 ms) and commit (~7–8 ms/block amortised); read
   1–10 ms. The block cache oscillated 6.6 GiB → 256 MiB. Re-measure with
-  `tests/bench_ibd.sh` and `/status` stage/commit/rocksdb counters after any
+  `tests/bench/bench_ibd.sh` and `/status` stage/commit/rocksdb counters after any
   change to the prefetch, cache or commit path.
 - Multi-instance: one Core datadir per network, per-network Electrum/TLS/metrics
   ports and per-network managed-Tor SOCKS ports (9050 mainnet; 55150/55250/
-  55350 for testnet4/signet/regtest). `tests/e2e_multi_instance.sh` covers two
+  55350 for testnet4/signet/regtest). `tests/e2e/e2e_multi_instance.sh` covers two
   simultaneous instances, distinct certificates and independent shutdown.
   Only one **intensive sync** per user runs at a time: a `flock` in
   `$XDG_RUNTIME_DIR/e-lite/ibd.lock` (or `/tmp/e-lite-<uid>/ibd.lock`) makes a
@@ -163,7 +163,7 @@ Never treat a version number in this file as authoritative over the code/tag.
   cores, at least 2.
 - The pre-prune durability barrier is `SyncWAL(true)`, not `flush_all`: a
   single `WriteBatch` is atomic across CFs and `txids.dat` is fsynced first.
-  Never prune if the barrier fails. `tests/e2e_pruned_ibd.sh` covers
+  Never prune if the barrier fails. `tests/e2e/e2e_pruned_ibd.sh` covers
   prune + SIGKILL + restart. `pruneblockchain` then runs in `el-prune` with a
   120 s RPC timeout; the apply thread continues.
 - Machine defaults come from `MachinePlan` (`tuning.rs`): physical cores
@@ -650,6 +650,8 @@ Before claiming completion:
 cargo fmt --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
+scripts/check-docs.sh
+shellcheck install.sh scripts/*.sh tests/e2e/*.sh tests/bench/*.sh tests/manual/*.sh
 ```
 
 Focused checks when touching a subsystem:
@@ -659,19 +661,20 @@ cargo test -p el-serve tls   # TLS config, watcher reload
 cargo test -p e-lite tls     # TLS config validation, Tor auto-cert
 ```
 
-Plus the relevant integration tests (`tests/e2e_*.sh`) and the install/update
+Plus the relevant integration tests (`tests/e2e/*.sh`) and the install/update
 commands on a clean environment.
 
 Environment facts:
 
 - Build needs `build-essential clang libclang-dev pkg-config` (RocksDB bindgen),
   matching the `debian:12` CI container.
-- Each `tests/e2e_*.sh` needs `bitcoind` in `PATH` and a debug binary first
+- Each `tests/e2e/*.sh` needs `bitcoind` in `PATH` and a debug binary first
   (`cargo build -p e-lite`); they create their own regtest datadir and ports.
 
 ## Code review rule
 
-Audit before rewriting. Record findings in `docs/AUDIT.md` with severity,
+Audit before rewriting. Record findings in `docs/AUDIT.md` (open findings and
+residual risks) and, once fixed, in `docs/audit/FIXED.md` with severity,
 file:line, impact, reproduction/test, status and fix commit. Fix P0
 (data-loss/security/crash) and P1 (functional/race) before publishing docs that
 depend on the affected behaviour.

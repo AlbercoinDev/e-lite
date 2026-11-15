@@ -61,16 +61,20 @@ export PATH="$HOME/.local/bin:$PATH"
 
 ## Pinned version
 
+Pick any published tag (the leading `v` is not part of `--version`):
+
 ```bash
-curl -fsSL https://github.com/AlbercoinDev/e-lite/releases/download/v0.1.0-alpha.29.5.0/install.sh \
-  | sh -s -- --version 0.1.0-alpha.29.5.0 --yes
+VERSION=0.1.0-alpha.29.16.5          # replace with the tag you want
+curl -fsSL "https://github.com/AlbercoinDev/e-lite/releases/download/v$VERSION/install.sh" \
+  | sh -s -- --version "$VERSION" --yes
 ```
 
 With Core:
 
 ```bash
-curl -fsSL https://github.com/AlbercoinDev/e-lite/releases/download/v0.1.0-alpha.29.5.0/install.sh \
-  | sh -s -- --version 0.1.0-alpha.29.5.0 --with-core --yes
+VERSION=0.1.0-alpha.29.16.5          # replace with the tag you want
+curl -fsSL "https://github.com/AlbercoinDev/e-lite/releases/download/v$VERSION/install.sh" \
+  | sh -s -- --version "$VERSION" --with-core --yes
 ```
 
 ## System-wide .deb
@@ -157,9 +161,9 @@ creation.
 ## Privacy settings
 
 How pruned transactions are fetched is set in `privacy.toml`, next to
-`config.toml` (one per network). e-lite creates it from the template on the
-first run and an update never overwrites it; delete it and restart to get the
-template back. `e-lite privacy check` validates it and prints the effective
+`config.toml` (one file shared by all networks on the host). e-lite creates it
+from the template on the first run and an update never overwrites it; delete it
+and restart to get the template back. `e-lite privacy check` validates it and prints the effective
 values. The default (`preset = "balanced"`) fetches loose transactions by
 txid through Tor with decoy wallets; `preset = "max"` fetches only whole
 blocks. Every setting and its range: [`PRIVACY-TUNING.md`](PRIVACY-TUNING.md).
@@ -174,8 +178,7 @@ kill -TERM "$(pgrep -f 'e-lite run')"
 
 curl -fsSL https://github.com/AlbercoinDev/e-lite/releases/latest/download/install.sh | sh
 
-e-lite run --network signet --manage managed \
-  --core-datadir "$CORE" --data-dir "$DATA" --prune-mib 1
+e-lite run --network signet --prune-mib 1
 ```
 
 Core can stay running; e-lite adopts a Core it started previously. If you use an

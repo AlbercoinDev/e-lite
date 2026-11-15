@@ -4,7 +4,7 @@
 # the server keeps answering from its local index.
 set -euo pipefail
 
-cd "$(dirname "$0")/.."
+cd "$(dirname "$0")/../.."
 BIN="${E_LITE_BIN:-$PWD/target/debug/e-lite}"
 [ -x "$BIN" ] || { echo "build first: cargo build -p e-lite" >&2; exit 1; }
 command -v bitcoind >/dev/null || { echo "bitcoind not found" >&2; exit 1; }
@@ -127,7 +127,7 @@ if $CLI getblock "$OLD_HASH" >/dev/null 2>&1; then
 fi
 echo "old block is pruned from Core (expected)"
 
-ENTRIES=$(python3 tests/query_history.py "$ELECTRUM" "$SH")
+ENTRIES=$(python3 tests/lib/query_history.py "$ELECTRUM" "$SH")
 echo "history from e-lite index: $ENTRIES entries"
 [ "$ENTRIES" -ge 2000 ] || { echo "history incomplete" >&2; exit 1; }
 [ "$(state)" = READY ] || { echo "server not READY: $(state)"; exit 1; }
@@ -159,7 +159,7 @@ for _ in $(seq 1 180); do
 done
 echo "after SIGKILL: height $(height) state $(state)"
 [ "$(height)" -ge 2101 ] || { tail -60 "$RUN/serve2.log"; exit 1; }
-ENTRIES2=$(python3 tests/query_history.py "$ELECTRUM" "$SH")
+ENTRIES2=$(python3 tests/lib/query_history.py "$ELECTRUM" "$SH")
 echo "history after recovery: $ENTRIES2 entries"
 [ "$ENTRIES2" -ge 2000 ] || { echo "history lost after recovery" >&2; exit 1; }
 

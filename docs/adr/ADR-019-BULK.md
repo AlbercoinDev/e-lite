@@ -75,7 +75,7 @@ Implement a **read-only bulk reader** with RPC as the permanent fallback:
   digest.
 - Crash/restart parity: `SIGKILL` during a 20 000-block index, restart, same
   digest as a continuous run.
-- `tests/e2e_regtest.sh` and `tests/e2e_pruned_ibd.sh` pass with bulk enabled.
+- `tests/e2e/e2e_regtest.sh` and `tests/e2e/e2e_pruned_ibd.sh` pass with bulk enabled.
 - Regtest bulk throughput: ~20 000 blocks/s for 1-transaction blocks.
 
 ## Migration

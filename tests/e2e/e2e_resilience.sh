@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # Core outage resilience + cookie rotation + clean shutdown.
-# Self-cleaning. Run with: tests/e2e_resilience.sh
+# Self-cleaning. Run with: tests/e2e/e2e_resilience.sh
 set -euo pipefail
 
-cd "$(dirname "$0")/.."
+cd "$(dirname "$0")/../.."
 BIN="${E_LITE_BIN:-$PWD/target/debug/e-lite}"
 [ -x "$BIN" ] || { echo "build first: cargo build -p e-lite" >&2; exit 1; }
 command -v bitcoind >/dev/null || { echo "bitcoind not found" >&2; exit 1; }
@@ -72,7 +72,7 @@ for _ in $(seq 1 30); do [ "$(status_state)" = CORE_UNAVAILABLE ] && break; slee
 echo "state while Core down: $(status_state)"
 
 # Confirmed reads must keep working from the local index.
-ENTRIES=$(python3 tests/query_history.py "$ELECTRUM" "$SH")
+ENTRIES=$(python3 tests/lib/query_history.py "$ELECTRUM" "$SH")
 [ "$ENTRIES" -ge 101 ] || { echo "history missing while Core down: $ENTRIES" >&2; exit 1; }
 echo "history while Core down: $ENTRIES entries"
 
@@ -98,7 +98,7 @@ for _ in $(seq 1 30); do
   sleep 0.5
 done
 echo "offline start state: $(status_state)"
-ENTRIES=$(python3 tests/query_history.py "$ELECTRUM" "$SH")
+ENTRIES=$(python3 tests/lib/query_history.py "$ELECTRUM" "$SH")
 [ "$ENTRIES" -ge 101 ] || { echo "offline start history missing: $ENTRIES" >&2; tail -20 "$RUN/serve2.log"; exit 1; }
 echo "offline start history: $ENTRIES entries"
 

@@ -1606,9 +1606,9 @@ RAWTX, SERVER AND TLS:
     --p2p-peers <a,b>       comma-separated P2P peers for rawtx/repair
     --no-p2p                disable the P2P rawtx/repair source
     --no-esplora            disable the Esplora rawtx/repair source
-    --decoys <n>            extra blocks fetched per external lookup
+    --decoys <n>            decoy wallets per wallet load (0 disables)
     --rawtx-cache-mib <n>   validated rawtx cache size (0 = disabled)
-    --tor-socks <addr>      SOCKS5h proxy for rawtx (empty requires --allow-clearnet)
+    --tor-socks <addr>      SOCKS5h proxy for rawtx (see --no-rawtx-tor for direct)
 
 TOR / ONION:
     --tor-mode <mode>       managed | off (default managed)

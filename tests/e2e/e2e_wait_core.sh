@@ -3,7 +3,7 @@
 # and e-lite auto-initializes and indexes without a restart.
 set -euo pipefail
 
-cd "$(dirname "$0")/.."
+cd "$(dirname "$0")/../.."
 BIN="${E_LITE_BIN:-$PWD/target/debug/e-lite}"
 [ -x "$BIN" ] || { echo "build first: cargo build -p e-lite" >&2; exit 1; }
 command -v bitcoind >/dev/null || { echo "bitcoind not found" >&2; exit 1; }
@@ -102,7 +102,7 @@ echo "state after Core: $(state) height $(height)"
 [ "$(state)" = READY ] || { tail -40 "$RUN/serve.log"; exit 1; }
 [ "$(height)" -ge 101 ] || { tail -40 "$RUN/serve.log"; exit 1; }
 
-ENTRIES=$(python3 tests/query_history.py "$ELECTRUM" "$SH")
+ENTRIES=$(python3 tests/lib/query_history.py "$ELECTRUM" "$SH")
 echo "history: $ENTRIES entries"
 [ "$ENTRIES" -ge 101 ] || { echo "history incomplete" >&2; exit 1; }
 

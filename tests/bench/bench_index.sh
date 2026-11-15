@@ -2,14 +2,14 @@
 # Indexing benchmark. Mines a disposable regtest chain and indexes it with
 # several tuning variants, printing one CSV row per run.
 #
-#   BLOCKS=5000 tests/bench_index.sh
-#   VARIANTS="default readers-4 batch-64" tests/bench_index.sh
+#   BLOCKS=5000 tests/bench/bench_index.sh
+#   VARIANTS="default readers-4 batch-64" tests/bench/bench_index.sh
 #
 # Never point this at an existing datadir: it creates and deletes its own.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-cd "$SCRIPT_DIR/.."
+cd "$SCRIPT_DIR/../.."
 BIN="${E_LITE_BIN:-$PWD/target/release/e-lite}"
 [ -x "$BIN" ] || { echo "build first: cargo build --release -p e-lite" >&2; exit 1; }
 command -v bitcoind >/dev/null || { echo "bitcoind not found" >&2; exit 1; }

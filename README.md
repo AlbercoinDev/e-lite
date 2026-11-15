@@ -4,7 +4,7 @@
 any `scriptPubKey` in the active chain without registering wallets. Core remains
 the authority for consensus and the active chain; e-lite never invents data.
 
-> **Status: `v0.1.0-alpha.29.5.0` — experimental, no funds.**
+> **Status: `v0.1.0-alpha.29.16.5` — experimental, no funds.**
 > Test on regtest/signet/testnet4 before mainnet.
 > Electrum is plain TCP on loopback by default. Optional TLS is available on a
 > separate listener; e-lite also runs its own Tor and publishes an onion service
@@ -32,13 +32,14 @@ variants (pinned version, `.deb`, from source) are in
 ```bash
 export PATH="$HOME/.local/bin:$PATH"
 
-CORE="$HOME/.bitcoin-signet"
-DATA="$HOME/.local/share/e-lite/signet"
-
-e-lite doctor --network signet --core-datadir "$CORE" --data-dir "$DATA"
-e-lite run    --network signet --manage managed \
-  --core-datadir "$CORE" --data-dir "$DATA" --prune-mib 1
+e-lite doctor --network signet
+e-lite run    --network signet --prune-mib 1
 ```
+
+One self-contained folder per network: the index, TLS, Tor and logs live in
+`~/e-lite/<network>`, and that network's Core datadir is
+`<data-dir>/bitcoin`. No `--data-dir`/`--core-datadir` is needed for the
+defaults; use them only for a custom layout or an external Core.
 
 Electrum/Sparrow: `0.0.0.0:55022` TLS on the network and `127.0.0.1:55011`
 plain on this host only for mainnet (`--plain-lan` also offers plain on the LAN)
@@ -76,7 +77,7 @@ See [`docs/CLI.md`](docs/CLI.md) for every flag and `--set` example.
 
 | Document | Contents |
 |---|---|
-| [`docs/HANDOFF.md`](docs/HANDOFF.md) | Current state, release, open risks, next steps |
+| [`docs/HANDOFF.md`](docs/HANDOFF.md) | Current state, open risks, next steps |
 | [`docs/INSTALL.md`](docs/INSTALL.md) | Install/update, Core, `.deb`, source, first run |
 | [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) | Components, execution modes, local/LAN/WAN Core |
 | [`docs/OPERATIONS.md`](docs/OPERATIONS.md) | Pruning, disks, remote Core, monitoring, troubleshooting |
@@ -86,9 +87,16 @@ See [`docs/CLI.md`](docs/CLI.md) for every flag and `--set` example.
 | [`docs/ROADMAP.md`](docs/ROADMAP.md) | Future features and proposed improvements |
 | [`docs/CLI.md`](docs/CLI.md) | All command-line flags, `--set`, tuning examples |
 | [`docs/TUNING.md`](docs/TUNING.md) | HDD/SSD/NVMe profiles, adaptive tuning, hot reload |
-| [`docs/AUDIT.md`](docs/AUDIT.md) | Code audit findings and residual risks |
+| [`docs/ELECTRUM_PROTOCOL.md`](docs/ELECTRUM_PROTOCOL.md) | Methods, versions, notifications and limits |
+| [`docs/TOR.md`](docs/TOR.md) | Managed Tor, onion access, TLS certificate and reset |
 | [`docs/GETTING-STARTED.md`](docs/GETTING-STARTED.md) | Acceptance tests from scratch |
+| [`docs/TESTS.md`](docs/TESTS.md) | Test suites, prerequisites, CI vs local |
+| [`docs/RELEASING.md`](docs/RELEASING.md) | Version bump, tag, workflows and artifacts |
+| [`docs/AUDIT.md`](docs/AUDIT.md) | Open findings and residual risks |
 | [`docs/PROJECT_MEMORY.md`](docs/PROJECT_MEMORY.md) | Project invariants and documentation rules |
+
+Architecture decisions are in [`docs/adr/`](docs/adr/README.md); dated
+measurements in [`docs/benchmarks/`](docs/benchmarks/README.md).
 
 ## Networks and requirements
 
@@ -110,11 +118,13 @@ See [`docs/CLI.md`](docs/CLI.md) for every flag and `--set` example.
   listener follows the same host). Each network has its own ports, so several
   instances can run side by side.
 - Core RPC is HTTP. LAN/WAN use requires SSH/VPN; never expose the RPC port.
-- External rawtx lookup is local-first and Tor-first; it validates everything it
-  gets (whole blocks by hash, or loose transactions by txid in the default
-  mode, with decoy wallets). Public providers live in the editable
-  `public-servers.toml` (next to `config.toml`), never in the binary. See
-  [`docs/PRIVACY.md`](docs/PRIVACY.md).
+- External rawtx lookup is local-first and Tor-first by default. Pruned
+  transactions are fetched by txid with decoy wallets (`privacy.toml` preset
+  `balanced`), or whole blocks only with `preset = "max"`; every transaction is
+  verified against the index. `[rawtx] use_tor = false` is an explicit opt-out
+  that exposes this machine's IP to providers and peers. Public providers live
+  in the editable `public-servers.toml` (next to `config.toml`), never in the
+  binary. See [`docs/PRIVACY.md`](docs/PRIVACY.md).
 
 ## Tests and release
 
@@ -122,15 +132,18 @@ See [`docs/CLI.md`](docs/CLI.md) for every flag and `--set` example.
 cargo fmt --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
-tests/e2e_launch_core.sh
-tests/e2e_pruned_ibd.sh
-tests/e2e_regtest.sh
+scripts/check-docs.sh
+tests/e2e/e2e_defaults.sh
+tests/e2e/e2e_launch_core.sh
+tests/e2e/e2e_pruned_ibd.sh
+tests/e2e/e2e_regtest.sh
 ```
 
-The all-in-one harness is in
-[`scripts/e-lite-all-in-one.sh`](scripts/e-lite-all-in-one.sh); it can install,
-run and write a report. The installer and artifacts are published in GitHub
-Releases with `SHA256SUMS`.
+See [`docs/TESTS.md`](docs/TESTS.md) for every suite and
+[`docs/RELEASING.md`](docs/RELEASING.md) for the tag/publish flow. The
+all-in-one harness is in
+[`scripts/e-lite-all-in-one.sh`](scripts/e-lite-all-in-one.sh). The installer and
+artifacts are published in GitHub Releases with `SHA256SUMS`.
 
 ## License
 
