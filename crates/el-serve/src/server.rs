@@ -46,13 +46,33 @@ pub fn start_listener_on(
                 }
             };
             let client = shared.clients.register(wire);
-            let shared = Arc::clone(&shared);
+            let slot = ClientSlot {
+                shared: Arc::clone(&shared),
+                client,
+            };
             std::thread::spawn(move || {
-                let _ = handle_client(&shared, client);
-                shared.stats.clients.fetch_sub(1, Ordering::SeqCst);
+                let _ = handle_client(&slot.shared, Arc::clone(&slot.client));
             });
         }
     })
+}
+
+/// One accepted connection: its `max_clients` slot and its registry entry.
+/// Released on drop, so a connection thread that unwinds cannot leak the slot
+/// (the listener would otherwise refuse clients forever once enough had
+/// leaked). Release builds abort on panic; this covers every other exit.
+struct ClientSlot {
+    shared: Arc<Shared>,
+    client: Arc<ClientState>,
+}
+
+impl Drop for ClientSlot {
+    fn drop(&mut self) {
+        self.client.alive.store(false, Ordering::SeqCst);
+        self.shared.clients.unregister(self.client.id);
+        self.shared.resolver.forget_client(self.client.id);
+        self.shared.stats.clients.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 /// Reads from the client while releasing the connection lock between attempts,
@@ -64,7 +84,7 @@ pub(crate) struct WireReader {
 }
 
 impl WireReader {
-    fn new(client: Arc<ClientState>) -> Self {
+    pub(crate) fn new(client: Arc<ClientState>) -> Self {
         Self {
             client,
             idle_deadline: Instant::now() + CLIENT_IDLE_TIMEOUT,
@@ -79,6 +99,14 @@ impl Read for WireReader {
             return Ok(0);
         }
         loop {
+            // Marked dead by a failed write or by the notifier: stop here
+            // instead of idling until the 600 s timeout.
+            if !self.client.alive.load(Ordering::Relaxed) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::ConnectionAborted,
+                    "connection closed",
+                ));
+            }
             {
                 let mut wire = self
                     .client
@@ -168,9 +196,9 @@ pub(crate) fn handle_client(shared: &Shared, client: Arc<ClientState>) -> std::i
         );
     }
     let result = client_loop(shared, &client);
+    // The slot, the registry entry and the resolver state are released by
+    // `ClientSlot` when the connection thread ends.
     client.alive.store(false, Ordering::SeqCst);
-    shared.clients.unregister(client.id);
-    shared.resolver.forget_client(client.id);
     client.log_close(shared);
     result
 }
@@ -230,11 +258,22 @@ pub(crate) fn client_loop(shared: &Shared, client: &Arc<ClientState>) -> std::io
                 }
                 Err(_) => break,
             }
-            let line = String::from_utf8_lossy(&buf).into_owned();
+            let line = String::from_utf8_lossy(&buf);
             if line.trim().is_empty() {
                 continue;
             }
-            if may_wait_on_network(&line) {
+            let request = match parse_line(shared, &line) {
+                Ok(request) => request,
+                Err(outcome) => {
+                    if let Some(response) = outcome.response {
+                        if !client.send(&response) {
+                            break;
+                        }
+                    }
+                    continue;
+                }
+            };
+            if may_wait_on_network(&request) {
                 let mut n = wait_below(PIPELINE_DEPTH);
                 *n += 1;
                 drop(n);
@@ -242,7 +281,7 @@ pub(crate) fn client_loop(shared: &Shared, client: &Arc<ClientState>) -> std::io
                 let in_flight = &in_flight;
                 let closing = &closing;
                 scope.spawn(move || {
-                    let outcome = process_line_for(shared, Some(client), &line);
+                    let outcome = process_parsed(shared, Some(client), request);
                     let sent = outcome
                         .response
                         .as_ref()
@@ -259,10 +298,10 @@ pub(crate) fn client_loop(shared: &Shared, client: &Arc<ClientState>) -> std::io
             }
             // `server.version` fixes the protocol of everything after it:
             // let the background lines finish first.
-            if line.contains("server.version") {
+            if names_method(&request, "server.version") {
                 drop(wait_below(1));
             }
-            let outcome = process_line_for(shared, Some(client), &line);
+            let outcome = process_parsed(shared, Some(client), request);
             if let Some(response) = outcome.response {
                 if !client.send(&response) {
                     break;
@@ -280,9 +319,20 @@ pub(crate) fn client_loop(shared: &Shared, client: &Arc<ClientState>) -> std::io
 /// an external block download.
 pub const PIPELINE_DEPTH: usize = 4;
 
-/// Whether a request line may wait on an external block download.
-pub(crate) fn may_wait_on_network(line: &str) -> bool {
-    line.contains("blockchain.transaction.get\"")
+/// Whether a request (or any item of a batch) calls `method`. Decided from
+/// the parsed request, never from the raw text: a parameter that happens to
+/// contain a method name does not count.
+pub(crate) fn names_method(request: &Value, method: &str) -> bool {
+    let calls = |item: &Value| item.get("method").and_then(Value::as_str) == Some(method);
+    match request {
+        Value::Array(items) => items.iter().any(calls),
+        item => calls(item),
+    }
+}
+
+/// Whether a request may wait on an external block download.
+pub(crate) fn may_wait_on_network(request: &Value) -> bool {
+    names_method(request, "blockchain.transaction.get")
 }
 
 /// Result of one line from the wire. Notifications have no response; a fatal
@@ -326,22 +376,36 @@ pub fn process_line_for(
     client: Option<&Arc<ClientState>>,
     line: &str,
 ) -> LineOutcome {
+    match parse_line(shared, line) {
+        Ok(request) => process_parsed(shared, client, request),
+        Err(outcome) => outcome,
+    }
+}
+
+/// Parse one line from the wire. The error is the JSON-RPC parse-error
+/// response, ready to send.
+pub(crate) fn parse_line(shared: &Shared, line: &str) -> Result<Value, LineOutcome> {
     shared.stats.lines_total.fetch_add(1, Ordering::Relaxed);
-    let request: Value = match serde_json::from_str(line) {
-        Ok(v) => v,
-        Err(e) => {
-            shared.stats.requests_total.fetch_add(1, Ordering::Relaxed);
-            shared.stats.errors_total.fetch_add(1, Ordering::Relaxed);
-            return LineOutcome {
-                response: Some(json!({
-                    "jsonrpc": "2.0",
-                    "id": Value::Null,
-                    "error": {"code": -32700, "message": format!("parse error: {e}")},
-                })),
-                close: false,
-            };
+    serde_json::from_str(line).map_err(|e| {
+        shared.stats.requests_total.fetch_add(1, Ordering::Relaxed);
+        shared.stats.errors_total.fetch_add(1, Ordering::Relaxed);
+        LineOutcome {
+            response: Some(json!({
+                "jsonrpc": "2.0",
+                "id": Value::Null,
+                "error": {"code": -32700, "message": format!("parse error: {e}")},
+            })),
+            close: false,
         }
-    };
+    })
+}
+
+/// Serve a parsed line: a single request or a batch.
+pub(crate) fn process_parsed(
+    shared: &Shared,
+    client: Option<&Arc<ClientState>>,
+    request: Value,
+) -> LineOutcome {
     match request {
         Value::Array(items) => process_batch(shared, client, items),
         request => process_request(shared, client, &request),

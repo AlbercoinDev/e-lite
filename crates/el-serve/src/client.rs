@@ -387,7 +387,10 @@ impl ClientState {
             .and_then(|_| writer.flush())
             .is_err()
         {
+            // A partial frame may be on the wire: the stream is unusable.
+            // Close it so the peer and this connection's reader see it now.
             self.alive.store(false, Ordering::SeqCst);
+            let _ = writer.socket().shutdown(std::net::Shutdown::Both);
             return false;
         }
         drop(writer);

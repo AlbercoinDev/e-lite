@@ -1194,3 +1194,74 @@ fn listunspent_follows_block_order_not_txid_order() {
         .collect();
     assert_eq!(order, vec![txid.to_hex(), middle.to_hex(), late.to_hex()]);
 }
+
+/// AUD-170: the `max_clients` slot and the registry entry are released when
+/// a connection ends, however it ends. With a leak the listener would refuse
+/// every client after `max_clients` connections.
+#[test]
+fn closed_connections_release_their_slot_and_registry_entry() {
+    use std::io::{BufRead, BufReader, Write};
+    use std::net::{TcpListener, TcpStream};
+    use std::sync::atomic::Ordering;
+
+    let (fx, _script, _txid) = fixture();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    el_serve::start_listener_on(listener, Arc::clone(&fx.shared), None);
+    let ping = |sock: &TcpStream| {
+        sock.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let mut writer = sock.try_clone().unwrap();
+        writer
+            .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"server.ping\",\"params\":[]}\n")
+            .unwrap();
+        let mut line = String::new();
+        BufReader::new(sock.try_clone().unwrap())
+            .read_line(&mut line)
+            .unwrap();
+        assert!(line.contains("\"id\":1"), "{line}");
+    };
+    let settled = |shared: &Shared| {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while std::time::Instant::now() < deadline {
+            if shared.clients.is_empty() && shared.stats.clients.load(Ordering::SeqCst) == 0 {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        false
+    };
+
+    // Three times `max_clients` (4), one after another.
+    for _ in 0..12 {
+        let sock = TcpStream::connect(addr).unwrap();
+        ping(&sock);
+        drop(sock);
+        assert!(settled(&fx.shared), "slot or registry entry not released");
+    }
+    // A full house still closes down to zero.
+    let socks: Vec<TcpStream> = (0..4).map(|_| TcpStream::connect(addr).unwrap()).collect();
+    socks.iter().for_each(ping);
+    assert_eq!(fx.shared.stats.clients.load(Ordering::SeqCst), 4);
+    drop(socks);
+    assert!(settled(&fx.shared), "slots not released after a full house");
+    ping(&TcpStream::connect(addr).unwrap());
+}
+
+/// The once-a-minute error log is keyed by method: a client inventing method
+/// names must not grow it, and its text must not reach the log.
+#[test]
+fn unknown_methods_do_not_grow_the_error_log() {
+    let (fx, _script, _txid) = fixture();
+    for i in 0..2_000 {
+        let r = call(
+            &fx.shared,
+            i,
+            &format!("made.up.method.{i}\nforged log line"),
+            json!([]),
+        );
+        assert_eq!(r["error"]["code"], -32601, "{r}");
+    }
+    let seen = fx.shared.error_log.lock().unwrap();
+    assert_eq!(seen.len(), 1, "{:?}", seen.keys().collect::<Vec<_>>());
+    assert!(seen.keys().all(|k| !k.contains("made.up")));
+}

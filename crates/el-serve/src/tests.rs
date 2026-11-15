@@ -323,3 +323,53 @@ fn notifier_wakes_on_a_mark_instead_of_polling() {
     dirty.wait(Duration::from_millis(100));
     assert!(started.elapsed() >= Duration::from_millis(90));
 }
+
+#[test]
+fn the_method_is_read_from_the_request_not_from_its_text() {
+    let get = json!({"id": 1, "method": "blockchain.transaction.get", "params": ["00"]});
+    let ping = json!({"id": 2, "method": "server.ping", "params": []});
+    assert!(may_wait_on_network(&get));
+    assert!(!may_wait_on_network(&ping));
+    // A batch counts if any item calls the method.
+    assert!(may_wait_on_network(&json!([ping.clone(), get.clone()])));
+    assert!(!may_wait_on_network(&json!([ping.clone(), ping.clone()])));
+    // A method name inside a parameter (or a longer method that starts with
+    // it) is not that method.
+    let decoy = json!({
+        "id": 3,
+        "method": "server.ping",
+        "params": ["blockchain.transaction.get\"", "server.version"],
+    });
+    assert!(!may_wait_on_network(&decoy));
+    assert!(!names_method(&decoy, "server.version"));
+    let merkle = json!({"id": 4, "method": "blockchain.transaction.get_merkle", "params": []});
+    assert!(!may_wait_on_network(&merkle));
+    assert!(names_method(
+        &json!({"id": 5, "method": "server.version", "params": []}),
+        "server.version"
+    ));
+    // Not a request at all.
+    assert!(!may_wait_on_network(&json!("blockchain.transaction.get")));
+}
+
+#[test]
+fn a_dead_connection_stops_reading_at_once() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    // The peer stays connected and silent: only `alive` can end the read.
+    let _peer = std::net::TcpStream::connect(addr).unwrap();
+    let (server_side, _) = listener.accept().unwrap();
+    let registry = ClientRegistry::new();
+    let client = registry.register(Wire::plain(server_side).unwrap());
+    let mut reader = WireReader::new(Arc::clone(&client));
+
+    client.alive.store(false, Ordering::SeqCst);
+    let started = Instant::now();
+    let mut buf = [0u8; 16];
+    let err = reader.read(&mut buf).unwrap_err();
+    assert_eq!(err.kind(), std::io::ErrorKind::ConnectionAborted);
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "must not wait for the idle timeout"
+    );
+}

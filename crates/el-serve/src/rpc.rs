@@ -38,17 +38,38 @@ pub(crate) type RpcResult<T> = std::result::Result<T, RpcError>;
 
 pub const METHOD_NOT_FOUND: i64 = -32601;
 
+/// Most distinct `method:code` pairs remembered for the once-a-minute limit.
+/// Known methods are a fixed set, so this is never reached in practice; it is
+/// the bound that keeps the map small whatever a client sends.
+pub(crate) const ERROR_LOG_MAX: usize = 256;
+
+/// One INFO line per method and error code, at most once a minute. An unknown
+/// method is logged without its name: the name is client text (unbounded
+/// distinct values, and it may carry control characters into the log).
 pub(crate) fn log_rpc_error(shared: &Shared, method: &str, code: i64) {
-    let key = format!("{method}:{code}");
-    let Ok(mut seen) = shared.error_log.lock() else {
-        return;
+    let method = if code == METHOD_NOT_FOUND {
+        "<unknown>"
+    } else {
+        method
     };
-    if let Some(at) = seen.get(&key) {
-        if at.elapsed() < Duration::from_secs(60) {
+    let key = format!("{method}:{code}");
+    {
+        let Ok(mut seen) = shared.error_log.lock() else {
             return;
+        };
+        if let Some(at) = seen.get(&key) {
+            if at.elapsed() < Duration::from_secs(60) {
+                return;
+            }
         }
+        if seen.len() >= ERROR_LOG_MAX {
+            seen.retain(|_, at| at.elapsed() < Duration::from_secs(60));
+            if seen.len() >= ERROR_LOG_MAX {
+                return;
+            }
+        }
+        seen.insert(key, Instant::now());
     }
-    seen.insert(key, Instant::now());
     eprintln!("[e-lite] rpc error: method={method} code={code}");
 }
 
