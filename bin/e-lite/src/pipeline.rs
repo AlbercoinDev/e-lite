@@ -757,8 +757,8 @@ impl Indexer {
         );
     }
 
-    /// Pause/resume e-lite indexing for the `alternate` scheduler. Serving
-    /// (Electrum, Tor, metrics) continues; only block application stops.
+    /// A watermark acts only after it has held for `secs`: `true` once
+    /// `active` has been continuously set that long. `false` resets it.
     fn dwell_reached(&self, slot: &Mutex<Option<Instant>>, active: bool, secs: u64) -> bool {
         let Ok(mut state) = slot.lock() else {
             return false;
@@ -830,6 +830,8 @@ impl Indexer {
         }
     }
 
+    /// Pause/resume e-lite indexing for the `alternate` scheduler. Serving
+    /// (Electrum, Tor, metrics) continues; only block application stops.
     fn set_index_paused(&self, paused: bool) {
         if !self.scheduler_alternate {
             if self.index_paused.swap(false, Ordering::SeqCst) {
@@ -857,6 +859,21 @@ impl Indexer {
             );
         } else {
             eprintln!("[e-lite] scheduler alternate: Core paused; e-lite indexing");
+        }
+    }
+
+    /// The lag guard no longer applies (no pruning to protect, IBD finished):
+    /// hand the network back to Core if this guard was the one holding it.
+    /// A disk pause keeps it; a failed RPC is retried on the next call.
+    fn release_lag_pause(&self, paused: bool, message: &str) {
+        if paused && !self.downloads_paused() && self.core.set_network_active(true).is_ok() {
+            self.lag_paused.store(false, Ordering::Relaxed);
+            self.mark_paused(false);
+            if let Some(sh) = &self.shared {
+                sh.stats.core_network_active.store(true, Ordering::Relaxed);
+                refresh_ready_state(sh);
+            }
+            eprintln!("[e-lite] {message}");
         }
     }
 
@@ -916,15 +933,7 @@ impl Indexer {
         if !bulk && !auto_enabled {
             self.bulk_lag_baseline.store(u64::MAX, Ordering::Relaxed);
             self.set_index_paused(false);
-            if paused && !self.downloads_paused() && self.core.set_network_active(true).is_ok() {
-                self.lag_paused.store(false, Ordering::Relaxed);
-                self.mark_paused(false);
-                if let Some(sh) = &self.shared {
-                    sh.stats.core_network_active.store(true, Ordering::Relaxed);
-                    refresh_ready_state(sh);
-                }
-                eprintln!("[e-lite] resumed Core downloads");
-            }
+            self.release_lag_pause(paused, "resumed Core downloads");
             return;
         }
 
@@ -942,16 +951,7 @@ impl Indexer {
                 self.bulk_started.store(false, Ordering::Relaxed);
                 self.bulk_full_pause.store(false, Ordering::Relaxed);
                 self.set_index_paused(false);
-                if paused && !self.downloads_paused() && self.core.set_network_active(true).is_ok()
-                {
-                    self.lag_paused.store(false, Ordering::Relaxed);
-                    self.mark_paused(false);
-                    if let Some(sh) = &self.shared {
-                        sh.stats.core_network_active.store(true, Ordering::Relaxed);
-                        refresh_ready_state(sh);
-                    }
-                    eprintln!("[e-lite] resumed Core downloads after IBD");
-                }
+                self.release_lag_pause(paused, "resumed Core downloads after IBD");
                 return;
             }
             if let (Some(high), Some(low)) = (high_bytes, low_bytes) {
@@ -1025,30 +1025,12 @@ impl Indexer {
         } else {
             if !info.pruned {
                 self.set_index_paused(false);
-                if paused && !self.downloads_paused() && self.core.set_network_active(true).is_ok()
-                {
-                    self.lag_paused.store(false, Ordering::Relaxed);
-                    self.mark_paused(false);
-                    if let Some(sh) = &self.shared {
-                        sh.stats.core_network_active.store(true, Ordering::Relaxed);
-                        refresh_ready_state(sh);
-                    }
-                    eprintln!("[e-lite] Core is no longer pruned: resumed downloads");
-                }
+                self.release_lag_pause(paused, "Core is no longer pruned: resumed downloads");
                 return;
             }
             if info.pruneheight == 0 {
                 self.set_index_paused(false);
-                if paused && !self.downloads_paused() && self.core.set_network_active(true).is_ok()
-                {
-                    self.lag_paused.store(false, Ordering::Relaxed);
-                    self.mark_paused(false);
-                    if let Some(sh) = &self.shared {
-                        sh.stats.core_network_active.store(true, Ordering::Relaxed);
-                        refresh_ready_state(sh);
-                    }
-                    eprintln!("[e-lite] Core has no pruned blocks: resumed downloads");
-                }
+                self.release_lag_pause(paused, "Core has no pruned blocks: resumed downloads");
                 return;
             }
             limit = el_chain::lag_limit(
@@ -1318,20 +1300,29 @@ impl Indexer {
         }
     }
 
-    /// Index at most `max_blocks` before returning. The supervisor runs at
-    /// commit boundaries, so a long catch-up does not need to tear the
-    /// pipeline down to prune or check the disk.
-    fn catch_up_limited(
-        &self,
-        max_blocks: u64,
-        supervisor: &mut el_chain::Supervisor,
-        last_tick: &mut Instant,
-    ) -> R<u64> {
+    /// Publish Core's chain state for `/status` and the wallet path.
+    fn publish_core_state(&self, info: &BlockchainInfo) {
+        if let Some(sh) = &self.shared {
+            sh.stats
+                .core_pruneheight
+                .store(info.pruneheight, Ordering::Relaxed);
+            sh.stats.core_pruned.store(info.pruned, Ordering::Relaxed);
+            sh.stats
+                .core_ibd
+                .store(info.initialblockdownload, Ordering::Relaxed);
+        }
+    }
+
+    /// Everything a catch-up call checks before it reads a block: disks,
+    /// Core's state, a pause left by a crashed run, pruning coherence, reorgs
+    /// and the scheduler. `Idle` means there is nothing to index right now.
+    fn preflight(&self) -> R<Preflight> {
         let tip_at_start = self.store.committed_tip()?;
+        let height_at_start = tip_at_start.map(|t| t.height as u64).unwrap_or(0);
         // Check the disks before any Core RPC or block write. If Core is slow
         // or unreachable, this still stops the indexer before the disk fills.
         if self.disk_guard() {
-            return Ok(tip_at_start.map(|t| t.height as u64).unwrap_or(0));
+            return Ok(Preflight::Idle(height_at_start));
         }
         // The alternate scheduler is the only phase that polls while e-lite is
         // not indexing. Use the 1 Hz observation there to avoid an RPC every
@@ -1349,15 +1340,7 @@ impl Indexer {
         self.tunables
             .set_core_state(core_tip, info.initialblockdownload);
         self.stats_core_height(core_tip);
-        if let Some(sh) = &self.shared {
-            sh.stats
-                .core_pruneheight
-                .store(info.pruneheight, Ordering::Relaxed);
-            sh.stats.core_pruned.store(info.pruned, Ordering::Relaxed);
-            sh.stats
-                .core_ibd
-                .store(info.initialblockdownload, Ordering::Relaxed);
-        }
+        self.publish_core_state(&info);
         // A previous e-lite run may have paused Core and crashed. The marker
         // is only written by e-lite, so resuming is safe. Do not consume a
         // marker written by a *live* lag pause: the guard owns that state and
@@ -1376,7 +1359,7 @@ impl Indexer {
             eprintln!("[e-lite] resumed Core downloads after a previous pause");
         }
         if self.is_paused() {
-            return Ok(tip_at_start.map(|t| t.height as u64).unwrap_or(0));
+            return Ok(Preflight::Idle(height_at_start));
         }
         let repair_limit = self
             .resolver
@@ -1404,12 +1387,11 @@ impl Indexer {
 
         // `handle_reorg` may have rewound the database; always continue from
         // the committed tip after the rewind, not from the pre-reorg tip.
-        let mut tip = self.store.committed_tip()?;
-        let mut committed_height = tip.map(|t| t.height as u64).unwrap_or(0);
+        let tip = self.store.committed_tip()?;
+        let committed = tip.map(|t| t.height as u64).unwrap_or(0);
 
         // Automatic pruning (`-prune=NNN`) is decided by Core's own tip. If we
         // fall too far behind, stop new downloads while the backlog is drained.
-        let committed = committed_height;
         self.lag_guard(&info, committed);
         let phase = if self.lag_paused.load(Ordering::Relaxed) {
             1
@@ -1422,8 +1404,299 @@ impl Indexer {
         if self.index_paused.load(Ordering::SeqCst) {
             // Alternate scheduler: Core is downloading. Keep serving the
             // current index; the next call re-checks the backlog.
-            return Ok(committed_height);
+            return Ok(Preflight::Idle(committed));
         }
+        Ok(Preflight::Ready { info, tip })
+    }
+
+    /// Start the readers of one call: each fetches a block, decodes it and
+    /// resolves its prevouts in parallel with the apply thread.
+    fn spawn_readers(
+        &self,
+        start: u64,
+        hashes: Vec<String>,
+        pruneheight: u64,
+    ) -> ReaderPool<FetchResult> {
+        // At the tip a call asks for one or two blocks every 500 ms: spawning
+        // the full reader pool for that was pure thread churn (AUD-146).
+        let workers = self.tunables.readers().min(hashes.len()).max(1);
+        // Bound prepared blocks (fetched/decoded/prevout-mapped) to a small
+        // window, by both worker count and the configured prefetch depth. The
+        // result channel alone only bounds queued results; the apply thread
+        // can keep draining out-of-order results into `pending`. A window
+        // measured only in blocks ignores that a full block can be 100x
+        // heavier than an empty one.
+        let default_window = (workers * 2).clamp(4, 32);
+        let configured = self.tunables.prefetch_blocks();
+        let window = if configured == 0 {
+            default_window
+        } else {
+            default_window.min(configured.clamp(2, 64))
+        };
+        let items = hashes.len();
+        let hashes = Arc::new(hashes);
+        let core = self.core.clone();
+        let bulk = self.bulk.clone();
+        let resolver = self.resolver.clone();
+        let store = Arc::clone(&self.store);
+        let tunables = Arc::clone(&self.tunables);
+        let prefetch_deadline_ms = self.cfg.index.prefetch_deadline_ms;
+        ReaderPool::spawn(workers, window, items, move |i| {
+            let read_started = Instant::now();
+            let fetched = fetch_block(
+                &core,
+                &bulk,
+                resolver.as_deref(),
+                pruneheight,
+                start + i as u64,
+                &hashes[i],
+            );
+            tunables.record_read(read_started.elapsed());
+            let (height, expected_hash, bytes) = fetched?;
+            let decode_started = Instant::now();
+            let prepared = prepare_block_bytes(&bytes, &expected_hash, height as u32);
+            tunables.record_decode(decode_started.elapsed());
+            let prepared = prepared.map_err(|e| e.to_string())?;
+            // Resolve prevouts here, in parallel with the apply thread, so
+            // random UTXO reads do not serialise the whole pipeline. Missing
+            // entries fall back to the overlay/point lookup during apply.
+            let prefetch_started = Instant::now();
+            let prevouts = if prefetch_deadline_ms > 0 {
+                prefetch_prevouts_with_deadline(
+                    &store,
+                    &prepared,
+                    Duration::from_millis(prefetch_deadline_ms),
+                )
+            } else {
+                prefetch_prevouts(&store, &prepared)
+            };
+            tunables.record_prefetch(prefetch_started.elapsed());
+            prevouts
+                .map(|m| (height, prepared, m))
+                .map_err(|e| e.to_string())
+        })
+    }
+
+    /// Wait for block `index` of the call. Readers finish out of order, so
+    /// later blocks are parked in `pending`. `None` ends the call: the readers
+    /// are gone, or none of them produced this block in 10 s.
+    fn next_prepared(
+        &self,
+        pool: &ReaderPool<FetchResult>,
+        pending: &mut PendingMap,
+        index: usize,
+        start: u64,
+    ) -> Option<FetchResult> {
+        let wait_started = Instant::now();
+        // Bound the wait: a wedged reader (a panic dies silently, an RPC can
+        // stall) must not block the apply loop forever. The next call has
+        // fresh readers; the timeout only makes the stall loud.
+        let wait_deadline = wait_started + Duration::from_secs(10);
+        while !pending.contains_key(&index) {
+            let Some(remaining) = wait_deadline.checked_duration_since(Instant::now()) else {
+                crate::debug_log!(
+                    "pipeline: 10 s without block {} from the readers; \
+                     ending the call (items pending {})",
+                    start + index as u64,
+                    pending.len()
+                );
+                break;
+            };
+            match pool.recv_timeout(remaining) {
+                Ok((i, item)) => {
+                    pending.insert(i, item);
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+            }
+        }
+        self.tunables.record_wait(wait_started.elapsed());
+        pending.remove(&index)
+    }
+
+    /// Re-evaluate the lag guard between blocks of a long call, from the 1 Hz
+    /// Core observation, so a pruning Core cannot outrun the index while a
+    /// 512-block call is in progress.
+    fn live_lag_check(&self, info: &BlockchainInfo, committed: u64, last_check: &mut Instant) {
+        let auto_prune = self.cfg.core.prune_mib >= 550;
+        let guarded = auto_prune
+            || (self.cfg.core.prune_mib == 1 && self.cfg.pruning.max_bulk_lag_blocks > 0);
+        if !guarded || !info.pruned || last_check.elapsed() < Duration::from_millis(100) {
+            return;
+        }
+        // Use the 1 Hz observation. Auto-prune keeps a synchronous fallback
+        // (at most every 2 s) because Core could otherwise outrun a stale
+        // snapshot.
+        let max_age = if auto_prune {
+            Duration::from_secs(2)
+        } else {
+            Duration::from_secs(5)
+        };
+        let live = self.observed_core(max_age).or_else(|| {
+            if auto_prune {
+                self.core.blockchain_info().ok()
+            } else {
+                None
+            }
+        });
+        if let Some(live) = live {
+            self.stats_core_height(live.blocks);
+            self.publish_core_state(&live);
+            // Pause decisions use the last *committed* tip, not
+            // applied-but-uncommitted progress.
+            if live.pruneheight > committed.saturating_add(1) {
+                eprintln!(
+                    "[e-lite] WARNING: Core pruned to {} but the index is at {}; \
+                     blocks {}..{} are no longer available",
+                    live.pruneheight,
+                    committed,
+                    committed + 1,
+                    live.pruneheight.saturating_sub(1)
+                );
+            }
+            self.lag_guard(&live, committed);
+        }
+        *last_check = Instant::now();
+    }
+
+    /// Whether the group must be committed now, and why. Bulk commits are
+    /// deliberately infrequent: the prune gate uses the *committed* tip, so a
+    /// 20-60 s interval cannot lose data that Core has already pruned. A tiny
+    /// group is not committed on the timer; it waits for a useful minimum (or
+    /// 60 s) to avoid 1-block commits.
+    fn commit_reason(&self, group: &CommitGroup) -> Option<CommitReason> {
+        let elapsed = group.started.elapsed();
+        if group.blocks >= self.tunables.batch_blocks().max(1) {
+            Some(CommitReason::Blocks)
+        } else if group.txids.len() >= self.tunables.max_group_txs() {
+            Some(CommitReason::Txs)
+        } else if group.bytes >= self.tunables.max_group_bytes() {
+            Some(CommitReason::Bytes)
+        } else if elapsed >= self.tunables.commit_interval()
+            && (group.blocks >= self.tunables.commit_min_blocks()
+                || elapsed >= Duration::from_secs(60))
+        {
+            Some(CommitReason::Time)
+        } else {
+            None
+        }
+    }
+
+    /// Commit the group at `tip`, publish the new state (rates, `/status`,
+    /// progress line, subscriptions) and leave the group empty.
+    fn flush_group(
+        &self,
+        group: &mut CommitGroup,
+        tip: &IndexedTip,
+        info: &BlockchainInfo,
+        reason: CommitReason,
+    ) -> R<()> {
+        let sync = self.commit_sync(info.initialblockdownload, tip.height as u64, info.blocks);
+        self.commit_group(
+            std::mem::take(&mut group.batch),
+            tip,
+            &group.txids,
+            group.blocks,
+            group.bytes as u64,
+            group.last_ms,
+            group.undo.make_contiguous(),
+            sync,
+            reason,
+        )?;
+        let (live_core, live_prune) = self.live_core_and_prune(info.blocks, info.pruneheight);
+        let rate_secs = self.progress_started.elapsed().as_secs_f64().max(0.001);
+        self.tunables.record_tx_rate(
+            ((tip.txnum.saturating_sub(self.progress_start_txnum)) as f64 / rate_secs) as u64,
+        );
+        self.tunables.record_blocks_rate(
+            ((tip.height as u64).saturating_sub(self.progress_start_height) as f64 / rate_secs)
+                as u64,
+        );
+        if let Some(sh) = &self.shared {
+            self.tunables.publish(&self.store, &sh.stats);
+        }
+        self.print_progress(
+            tip,
+            live_core,
+            live_prune,
+            info.headers,
+            info.verificationprogress,
+            info.initialblockdownload,
+        );
+        self.maybe_milestone(tip);
+        if let Some(sh) = &self.shared {
+            for script in group.scripts.drain() {
+                sh.dirty_scripts.mark(script);
+            }
+        }
+        group.reset();
+        Ok(())
+    }
+
+    /// Count the work of one call and make a call without progress visible.
+    fn account_call(&self, call: &CallSummary) {
+        if let Some(sh) = &self.shared {
+            sh.stats
+                .pipeline_prepared
+                .fetch_add(call.applied + call.discarded, Ordering::Relaxed);
+            sh.stats
+                .pipeline_applied
+                .fetch_add(call.applied, Ordering::Relaxed);
+            sh.stats
+                .pipeline_discarded
+                .fetch_add(call.discarded, Ordering::Relaxed);
+        }
+        // Make a no-progress call impossible to miss: this is exactly the tail
+        // signature (calls every 500 ms, wanted 2, applied 0, no commits, no
+        // READY). Rate-limited so a real stall prints ~6 lines per minute.
+        if call.wanted < 64 && call.applied == 0 {
+            let note_at = self.last_pipeline_note.lock().map(|mut s| {
+                let due = s
+                    .map(|at| at.elapsed() >= Duration::from_secs(10))
+                    .unwrap_or(true);
+                if due {
+                    *s = Some(Instant::now());
+                }
+                due
+            });
+            if note_at.unwrap_or(false) {
+                crate::debug_log!(
+                    "pipeline: no progress: committed {} of target {} (wanted {}, \
+                     applied 0, discarded {}, paused_by_disk {}, disk_guard {})",
+                    call.committed,
+                    call.target,
+                    call.wanted,
+                    call.discarded,
+                    call.paused_by_disk,
+                    self.disk_guard()
+                );
+            }
+        } else if call.wanted >= 64 {
+            crate::debug_log!(
+                "pipeline: call end committed {} (wanted {}, applied {}, discarded {})",
+                call.committed,
+                call.wanted,
+                call.applied,
+                call.discarded
+            );
+        }
+    }
+
+    /// Index at most `max_blocks` before returning. The supervisor runs at
+    /// commit boundaries, so a long catch-up does not need to tear the
+    /// pipeline down to prune or check the disk.
+    fn catch_up_limited(
+        &self,
+        max_blocks: u64,
+        supervisor: &mut el_chain::Supervisor,
+        last_tick: &mut Instant,
+    ) -> R<u64> {
+        let (info, mut tip) = match self.preflight()? {
+            Preflight::Idle(height) => return Ok(height),
+            Preflight::Ready { info, tip } => (info, tip),
+        };
+        let core_tip = info.blocks;
+        let mut committed_height = tip.map(|t| t.height as u64).unwrap_or(0);
 
         let start = tip.map(|t| t.height as u64 + 1).unwrap_or(0);
         if start > core_tip || max_blocks == 0 {
@@ -1452,136 +1725,18 @@ impl Indexer {
             );
         }
         let hashes_len = hashes.len();
+        let pool = self.spawn_readers(start, hashes, info.pruneheight);
 
-        // At the tip a call asks for one or two blocks every 500 ms: spawning
-        // the full reader pool for that was pure thread churn (AUD-146).
-        let workers = self.tunables.readers().min(hashes_len).max(1);
-        let hashes = Arc::new(hashes);
-        let next_index = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let (tx, rx) = std::sync::mpsc::sync_channel::<(usize, FetchResult)>(workers * 2);
-        // Bound prepared blocks (fetched/decoded/prevout-mapped) to a small
-        // window. The channel alone only bounds queued results; the apply
-        // thread can keep draining out-of-order results into `pending`, so an
-        // explicit window is needed to cap memory.
-        // Bound prepared blocks by both worker count and the configured
-        // prefetch depth. A window measured only in blocks ignores that a
-        // full block can be 100x heavier than an empty one.
-        let default_window = (workers * 2).clamp(4, 32);
-        let configured = self.tunables.prefetch_blocks();
-        let window = if configured == 0 {
-            default_window
-        } else {
-            default_window.min(configured.clamp(2, 64))
-        };
-        let (permit_tx, permit_rx) = std::sync::mpsc::sync_channel::<()>(window);
-        for _ in 0..window {
-            let _ = permit_tx.send(());
-        }
-        let permit_rx = Arc::new(Mutex::new(permit_rx));
-        let stop = Arc::new(AtomicBool::new(false));
-        let prefetch_deadline_ms = self.cfg.index.prefetch_deadline_ms;
-        let mut readers = Vec::with_capacity(workers);
-        for _ in 0..workers {
-            let core = self.core.clone();
-            let bulk = self.bulk.clone();
-            let resolver = self.resolver.clone();
-            let store = Arc::clone(&self.store);
-            let tunables = Arc::clone(&self.tunables);
-            let pruneheight = info.pruneheight;
-            let hashes = Arc::clone(&hashes);
-            let next_index = Arc::clone(&next_index);
-            let stop_thread = Arc::clone(&stop);
-            let permit_rx = Arc::clone(&permit_rx);
-            let permit_tx = permit_tx.clone();
-            let tx = tx.clone();
-            readers.push(std::thread::spawn(move || loop {
-                if stop_thread.load(Ordering::Relaxed) {
-                    break;
-                }
-                let acquired = permit_rx
-                    .lock()
-                    .map(|rx| rx.recv().is_ok())
-                    .unwrap_or(false);
-                if !acquired || stop_thread.load(Ordering::Relaxed) {
-                    break;
-                }
-                let i = next_index.fetch_add(1, Ordering::Relaxed);
-                if i >= hashes.len() {
-                    // Give the permit back: the apply loop is the only other
-                    // producer and this reader is done.
-                    let _ = permit_tx.send(());
-                    break;
-                }
-                let h = start + i as u64;
-                let read_started = Instant::now();
-                let fetched = fetch_block(
-                    &core,
-                    &bulk,
-                    resolver.as_deref(),
-                    pruneheight,
-                    h,
-                    &hashes[i],
-                );
-                tunables.record_read(read_started.elapsed());
-                let item = match fetched {
-                    Ok((height, expected_hash, bytes)) => {
-                        let decode_started = Instant::now();
-                        let prepared = prepare_block_bytes(&bytes, &expected_hash, height as u32);
-                        tunables.record_decode(decode_started.elapsed());
-                        match prepared {
-                            // Resolve prevouts here, in parallel with the apply
-                            // thread, so random UTXO reads do not serialise the
-                            // whole pipeline. Missing entries fall back to the
-                            // overlay/point lookup during apply.
-                            Ok(p) => {
-                                let prefetch_started = Instant::now();
-                                let prevouts = if prefetch_deadline_ms > 0 {
-                                    prefetch_prevouts_with_deadline(
-                                        &store,
-                                        &p,
-                                        Duration::from_millis(prefetch_deadline_ms),
-                                    )
-                                } else {
-                                    prefetch_prevouts(&store, &p)
-                                };
-                                tunables.record_prefetch(prefetch_started.elapsed());
-                                prevouts.map(|m| (height, p, m)).map_err(|e| e.to_string())
-                            }
-                            Err(e) => Err(e.to_string()),
-                        }
-                    }
-                    Err(e) => Err(e),
-                };
-                if tx.send((i, item)).is_err() {
-                    break;
-                }
-            }));
-        }
-        drop(tx);
-
-        let mut overlay = GroupOverlay::new();
-        let mut batch = WriteBatch::default();
-        let mut group_txids: Vec<Hash32> = Vec::new();
-        let mut group_scripts: std::collections::HashSet<ScriptHash> =
-            std::collections::HashSet::new();
-        let mut count = 0u32;
+        let mut group = CommitGroup::new();
         let mut applied_total = 0u64;
-        let mut group_bytes = 0usize;
-        let mut last_ms = 0u64;
-        // Undo records of the applied-but-uncommitted blocks, trimmed to the
-        // reorg window as the group grows. Only these are written at commit
-        // (AUD-131); bulk blocks far below the tip never reach RocksDB.
-        let mut group_undo: std::collections::VecDeque<el_model::UndoRecord> =
-            std::collections::VecDeque::new();
-        let undo_window = self.cfg.index.reorg_window;
         let mut result: R<()> = Ok(());
         let mut paused_by_disk = false;
-        let mut group_started = Instant::now();
         let mut last_lag_check = Instant::now();
         // Give the supervisor a chance to prune/act even when a 512-block
         // catch-up call is slow; this bounds prune latency independently of
         // the number of blocks processed.
         let supervisor_poll = Duration::from_secs(self.cfg.pruning.poll_seconds.max(1));
+        let track_scripts = self.shared.is_some();
 
         let mut pending: PendingMap = PendingMap::new();
         let mut next_apply = 0usize;
@@ -1590,31 +1745,7 @@ impl Indexer {
             // after the commit and its WAL barrier. It never runs in the middle
             // of an uncommitted group.
             self.run_deferred_prune(supervisor);
-            let wait_started = Instant::now();
-            // Bound the wait: a wedged reader (a panic dies silently, an RPC
-            // can stall) must not block the apply loop forever. The next
-            // call has fresh readers; the timeout only makes the stall loud.
-            let wait_deadline = wait_started + Duration::from_secs(10);
-            while !pending.contains_key(&next_apply) {
-                let Some(remaining) = wait_deadline.checked_duration_since(Instant::now()) else {
-                    crate::debug_log!(
-                        "pipeline: 10 s without block {} from the readers; \
-                         ending the call (items pending {})",
-                        start + next_apply as u64,
-                        pending.len()
-                    );
-                    break;
-                };
-                match rx.recv_timeout(remaining) {
-                    Ok((i, item)) => {
-                        pending.insert(i, item);
-                    }
-                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
-                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
-                }
-            }
-            self.tunables.record_wait(wait_started.elapsed());
-            let Some(item) = pending.remove(&next_apply) else {
+            let Some(item) = self.next_prepared(&pool, &mut pending, next_apply, start) else {
                 break;
             };
             next_apply += 1;
@@ -1633,176 +1764,52 @@ impl Indexer {
             let (height, prepared, prevouts) = match item {
                 Ok(v) => v,
                 Err(e) => {
-                    let _ = permit_tx.send(());
                     result = Err(e.into());
                     break;
                 }
             };
             let t0 = Instant::now();
-            // Always generate undo. The previous rule guessed the end of the
-            // commit group, but a time limit, a transaction limit or a
-            // supervisor-deadline break could commit at a lower height and
-            // leave the new tip without its reorg window (or without undo at
-            // all). Extra records are pruned inside the same commit.
-            let undo_ready = true;
+            // Undo is built for every block: a commit forced by a time or
+            // transaction limit, a boundary or shutdown must be as rewindable
+            // as a full batch. Only the reorg window is written at commit.
             match apply_prepared_deferred_undo(
                 &self.store,
                 height as u32,
                 &prepared,
                 tip,
-                &mut overlay,
-                &mut batch,
+                &mut group.overlay,
+                &mut group.batch,
                 Some(&prevouts),
             ) {
                 Ok(out) => {
-                    group_txids.extend_from_slice(&out.txids);
-                    let floor = (height as u32).saturating_sub(undo_window);
-                    while group_undo.front().is_some_and(|u| u.height < floor) {
-                        group_undo.pop_front();
-                    }
-                    group_undo.push_back(out.undo);
-                    if self.shared.is_some() {
-                        group_scripts.extend(out.touched_scripts.iter().copied());
-                    }
                     tip = Some(out.tip);
-                    count += 1;
+                    let raw_size = prepared.raw_size();
+                    group.push(
+                        height as u32,
+                        out,
+                        raw_size,
+                        self.cfg.index.reorg_window,
+                        track_scripts,
+                    );
                     applied_total += 1;
-                    group_bytes = group_bytes.saturating_add(prepared.raw_size());
-                    self.tunables.record_block_bytes(prepared.raw_size());
-                    last_ms = t0.elapsed().as_millis() as u64;
+                    self.tunables.record_block_bytes(raw_size);
+                    group.last_ms = t0.elapsed().as_millis() as u64;
                     self.tunables.record_apply(t0.elapsed());
-                    if (self.cfg.core.prune_mib >= 550
-                        || (self.cfg.core.prune_mib == 1
-                            && self.cfg.pruning.max_bulk_lag_blocks > 0))
-                        && info.pruned
-                        && last_lag_check.elapsed() >= Duration::from_millis(100)
-                    {
-                        // Use the 1 Hz observation. Auto-prune keeps a
-                        // synchronous fallback (at most every 2 s) because
-                        // Core could otherwise outrun a stale snapshot.
-                        let max_age = if self.cfg.core.prune_mib >= 550 {
-                            Duration::from_secs(2)
-                        } else {
-                            Duration::from_secs(5)
-                        };
-                        let live = self.observed_core(max_age).or_else(|| {
-                            if self.cfg.core.prune_mib >= 550 {
-                                self.core.blockchain_info().ok()
-                            } else {
-                                None
-                            }
-                        });
-                        if let Some(live) = live {
-                            self.stats_core_height(live.blocks);
-                            if let Some(sh) = &self.shared {
-                                sh.stats
-                                    .core_pruneheight
-                                    .store(live.pruneheight, Ordering::Relaxed);
-                                sh.stats.core_pruned.store(live.pruned, Ordering::Relaxed);
-                                sh.stats
-                                    .core_ibd
-                                    .store(live.initialblockdownload, Ordering::Relaxed);
-                            }
-                            // Pause decisions use the last *committed* tip, not
-                            // applied-but-uncommitted progress.
-                            let committed = committed_height;
-                            if live.pruneheight > committed.saturating_add(1) {
-                                eprintln!(
-                                    "[e-lite] WARNING: Core pruned to {} but the index is at {}; \
-                                     blocks {}..{} are no longer available",
-                                    live.pruneheight,
-                                    committed,
-                                    committed + 1,
-                                    live.pruneheight.saturating_sub(1)
-                                );
-                            }
-                            self.lag_guard(&live, committed);
-                        }
-                        last_lag_check = Instant::now();
-                    }
+                    self.live_lag_check(&info, committed_height, &mut last_lag_check);
                 }
                 Err(e) => {
-                    let _ = permit_tx.send(());
                     result = Err(e.into());
                     break;
                 }
             }
-            let _ = permit_tx.send(());
-            // Bulk commits are deliberately infrequent: the prune gate uses the
-            // *committed* tip, so a 20-60 s interval cannot lose data that Core
-            // has already pruned. A tiny group is not committed on the timer;
-            // it waits for a useful minimum (or 60 s) to avoid 1-block commits.
-            let commit_elapsed = group_started.elapsed();
-            let commit_reason = if count >= self.tunables.batch_blocks().max(1) {
-                Some(CommitReason::Blocks)
-            } else if group_txids.len() >= self.tunables.max_group_txs() {
-                Some(CommitReason::Txs)
-            } else if group_bytes >= self.tunables.max_group_bytes() {
-                Some(CommitReason::Bytes)
-            } else if commit_elapsed >= self.tunables.commit_interval()
-                && (count >= self.tunables.commit_min_blocks()
-                    || commit_elapsed >= Duration::from_secs(60))
-                && undo_ready
-            {
-                Some(CommitReason::Time)
-            } else {
-                None
-            };
-            if let Some(reason) = commit_reason {
+            pool.release();
+            if let Some(reason) = self.commit_reason(&group) {
                 let current = tip.expect("tip set");
-                let sync =
-                    self.commit_sync(info.initialblockdownload, current.height as u64, core_tip);
-                if let Err(e) = self.commit_group(
-                    std::mem::take(&mut batch),
-                    &current,
-                    &group_txids,
-                    count,
-                    group_bytes as u64,
-                    last_ms,
-                    group_undo.make_contiguous(),
-                    sync,
-                    reason,
-                ) {
+                if let Err(e) = self.flush_group(&mut group, &current, &info, reason) {
                     result = Err(e);
                     break;
                 }
-                group_undo.clear();
                 committed_height = current.height as u64;
-                let (live_core, live_prune) =
-                    self.live_core_and_prune(info.blocks, info.pruneheight);
-                let rate_secs = self.progress_started.elapsed().as_secs_f64().max(0.001);
-                self.tunables.record_tx_rate(
-                    ((current.txnum.saturating_sub(self.progress_start_txnum)) as f64 / rate_secs)
-                        as u64,
-                );
-                self.tunables.record_blocks_rate(
-                    ((current.height as u64).saturating_sub(self.progress_start_height) as f64
-                        / rate_secs) as u64,
-                );
-                if let Some(sh) = &self.shared {
-                    self.tunables.publish(&self.store, &sh.stats);
-                }
-                self.print_progress(
-                    &current,
-                    live_core,
-                    live_prune,
-                    info.headers,
-                    info.verificationprogress,
-                    info.initialblockdownload,
-                );
-                self.maybe_milestone(&current);
-                if let Some(sh) = &self.shared {
-                    for script in group_scripts.drain() {
-                        sh.dirty_scripts.mark(script);
-                    }
-                } else {
-                    group_scripts.clear();
-                }
-                group_txids.clear();
-                overlay.clear();
-                count = 0;
-                group_bytes = 0;
-                group_started = Instant::now();
                 if last_tick.elapsed() >= supervisor_poll {
                     self.supervisor_step(supervisor);
                     *last_tick = Instant::now();
@@ -1811,68 +1818,29 @@ impl Indexer {
         }
 
         // A clean end-of-call always commits the applied prefix. The batch is
-        // already built and undo is written for every applied block, so the
+        // already built and undo is kept for every applied block, so the
         // commit is the cheap step; skipping it made the tail refetch the same
         // blocks every 500 ms call and stall forever a few blocks behind the
         // tip (no commits, no READY). The disk guard still stops the *next*
         // call from fetching more.
-        if result.is_ok() && count > 0 {
+        if result.is_ok() && group.blocks > 0 {
             if paused_by_disk || self.disk_guard() {
                 crate::debug_log!(
                     "pipeline: committing the applied prefix ({} blocks) under \
                      disk pressure before pausing",
-                    count
+                    group.blocks
                 );
             }
             let current = tip.expect("tip set");
-            let sync = self.commit_sync(info.initialblockdownload, current.height as u64, core_tip);
-            let reason = if self.shutdown.load(Ordering::SeqCst) {
+            let shutting_down = self.shutdown.load(Ordering::SeqCst);
+            let reason = if shutting_down {
                 CommitReason::Shutdown
             } else {
                 CommitReason::Boundary
             };
-            self.commit_group(
-                std::mem::take(&mut batch),
-                &current,
-                &group_txids,
-                count,
-                group_bytes as u64,
-                last_ms,
-                group_undo.make_contiguous(),
-                sync,
-                reason,
-            )?;
+            self.flush_group(&mut group, &current, &info, reason)?;
             committed_height = current.height as u64;
-            let (live_core, live_prune) = self.live_core_and_prune(info.blocks, info.pruneheight);
-            let rate_secs = self.progress_started.elapsed().as_secs_f64().max(0.001);
-            self.tunables.record_tx_rate(
-                ((current.txnum.saturating_sub(self.progress_start_txnum)) as f64 / rate_secs)
-                    as u64,
-            );
-            self.tunables.record_blocks_rate(
-                ((current.height as u64).saturating_sub(self.progress_start_height) as f64
-                    / rate_secs) as u64,
-            );
-            if let Some(sh) = &self.shared {
-                self.tunables.publish(&self.store, &sh.stats);
-            }
-            self.print_progress(
-                &current,
-                live_core,
-                live_prune,
-                info.headers,
-                info.verificationprogress,
-                info.initialblockdownload,
-            );
-            self.maybe_milestone(&current);
-            if let Some(sh) = &self.shared {
-                for script in group_scripts.drain() {
-                    sh.dirty_scripts.mark(script);
-                }
-            } else {
-                group_scripts.clear();
-            }
-            if self.shutdown.load(Ordering::SeqCst) {
+            if shutting_down {
                 eprintln!(
                     "[e-lite] shutdown requested; flushed at height {}",
                     current.height
@@ -1880,65 +1848,109 @@ impl Indexer {
             }
         }
 
-        stop.store(true, Ordering::Relaxed);
-        drop(permit_tx);
-        for reader in readers {
-            let _ = reader.join();
-        }
         // Work prepared but never applied is waste. It is expected at the end
         // of a 512-block call (the window in flight), not every 10 s.
-        let mut discarded = pending.len() as u64;
-        while rx.try_recv().is_ok() {
-            discarded += 1;
-        }
-        if let Some(sh) = &self.shared {
-            sh.stats
-                .pipeline_prepared
-                .fetch_add(applied_total + discarded, Ordering::Relaxed);
-            sh.stats
-                .pipeline_applied
-                .fetch_add(applied_total, Ordering::Relaxed);
-            sh.stats
-                .pipeline_discarded
-                .fetch_add(discarded, Ordering::Relaxed);
-        }
-        // Make a no-progress call impossible to miss: this is exactly the tail
-        // signature (calls every 500 ms, wanted 2, applied 0, no commits, no
-        // READY). Rate-limited so a real stall prints ~6 lines per minute.
-        if wanted < 64 && applied_total == 0 {
-            let note_at = self.last_pipeline_note.lock().map(|mut s| {
-                let due = s
-                    .map(|at| at.elapsed() >= Duration::from_secs(10))
-                    .unwrap_or(true);
-                if due {
-                    *s = Some(Instant::now());
-                }
-                due
-            });
-            if note_at.unwrap_or(false) {
-                crate::debug_log!(
-                    "pipeline: no progress: committed {} of target {} (wanted {}, \
-                     applied 0, discarded {}, paused_by_disk {}, disk_guard {})",
-                    committed_height,
-                    target,
-                    wanted,
-                    discarded,
-                    paused_by_disk,
-                    self.disk_guard()
-                );
-            }
-        } else if wanted >= 64 {
-            crate::debug_log!(
-                "pipeline: call end committed {} (wanted {}, applied {}, discarded {})",
-                committed_height,
-                wanted,
-                applied_total,
-                discarded
-            );
-        }
+        let discarded = pending.len() as u64 + pool.finish();
+        self.account_call(&CallSummary {
+            wanted,
+            target,
+            applied: applied_total,
+            discarded,
+            committed: committed_height,
+            paused_by_disk,
+        });
         result?;
         self.refresh_core_height();
         Ok(committed_height)
+    }
+}
+
+/// Outcome of the checks that precede a catch-up call.
+enum Preflight {
+    /// Nothing to index now; the committed height.
+    Idle(u64),
+    Ready {
+        info: BlockchainInfo,
+        tip: Option<IndexedTip>,
+    },
+}
+
+/// What one catch-up call did, for the counters and the debug notes.
+struct CallSummary {
+    wanted: u64,
+    target: u64,
+    applied: u64,
+    discarded: u64,
+    committed: u64,
+    paused_by_disk: bool,
+}
+
+/// Blocks applied but not yet committed: one RocksDB batch plus what the
+/// commit needs besides it.
+struct CommitGroup {
+    batch: WriteBatch,
+    overlay: GroupOverlay,
+    txids: Vec<Hash32>,
+    /// Scripts touched by the group, marked dirty for subscriptions at commit.
+    scripts: std::collections::HashSet<ScriptHash>,
+    /// Undo of the applied blocks, trimmed to the reorg window as the group
+    /// grows. Only these are written at commit (AUD-131); bulk blocks far
+    /// below the tip never reach RocksDB.
+    undo: std::collections::VecDeque<el_model::UndoRecord>,
+    blocks: u32,
+    bytes: usize,
+    /// Apply time of the last block, for `/status`.
+    last_ms: u64,
+    started: Instant,
+}
+
+impl CommitGroup {
+    fn new() -> Self {
+        CommitGroup {
+            batch: WriteBatch::default(),
+            overlay: GroupOverlay::new(),
+            txids: Vec::new(),
+            scripts: std::collections::HashSet::new(),
+            undo: std::collections::VecDeque::new(),
+            blocks: 0,
+            bytes: 0,
+            last_ms: 0,
+            started: Instant::now(),
+        }
+    }
+
+    /// Account one applied block (its writes are already in `batch`).
+    fn push(
+        &mut self,
+        height: u32,
+        out: el_index::ApplyOutcome,
+        raw_size: usize,
+        undo_window: u32,
+        track_scripts: bool,
+    ) {
+        self.txids.extend_from_slice(&out.txids);
+        let floor = height.saturating_sub(undo_window);
+        while self.undo.front().is_some_and(|u| u.height < floor) {
+            self.undo.pop_front();
+        }
+        self.undo.push_back(out.undo);
+        if track_scripts {
+            self.scripts.extend(out.touched_scripts);
+        }
+        self.blocks += 1;
+        self.bytes = self.bytes.saturating_add(raw_size);
+    }
+
+    /// Start the next group after a commit.
+    fn reset(&mut self) {
+        self.batch = WriteBatch::default();
+        self.overlay.clear();
+        self.txids.clear();
+        self.scripts.clear();
+        self.undo.clear();
+        self.blocks = 0;
+        self.bytes = 0;
+        self.started = Instant::now();
     }
 }
 
@@ -3254,28 +3266,7 @@ pub(crate) fn index_loop(
             // free space; without this the system cannot recover on its own.
             // Check every second, not every poll, because the disk is critical.
             if last_tick.elapsed() >= Duration::from_secs(1) {
-                idx.poll_prune(&mut supervisor);
-                idx.run_deferred_prune(&mut supervisor);
-                match supervisor_tick(
-                    &mut supervisor,
-                    &idx.core,
-                    &idx.store,
-                    idx.readers.as_deref(),
-                    &cfg.data_dir(chain),
-                    &cfg.core_datadir(chain),
-                    &cfg.blocks_dir(chain),
-                    shared.as_ref(),
-                ) {
-                    Ok(actions) => apply_supervisor_actions(
-                        &mut supervisor,
-                        &idx.core,
-                        actions,
-                        shared.as_ref(),
-                        Some(&idx),
-                        can_control,
-                    ),
-                    Err(e) => eprintln!("[e-lite] supervisor: {e}"),
-                }
+                idx.supervisor_step(&mut supervisor);
                 last_tick = Instant::now();
             } else {
                 std::thread::sleep(Duration::from_millis(200));
@@ -3283,28 +3274,7 @@ pub(crate) fn index_loop(
         } else if last_tick.elapsed() >= poll
             || (idx.downloads_paused() && last_tick.elapsed() >= Duration::from_secs(1))
         {
-            idx.poll_prune(&mut supervisor);
-            idx.run_deferred_prune(&mut supervisor);
-            match supervisor_tick(
-                &mut supervisor,
-                &idx.core,
-                &idx.store,
-                idx.readers.as_deref(),
-                &cfg.data_dir(chain),
-                &cfg.core_datadir(chain),
-                &cfg.blocks_dir(chain),
-                shared.as_ref(),
-            ) {
-                Ok(actions) => apply_supervisor_actions(
-                    &mut supervisor,
-                    &idx.core,
-                    actions,
-                    shared.as_ref(),
-                    Some(&idx),
-                    can_control,
-                ),
-                Err(e) => eprintln!("[e-lite] supervisor: {e}"),
-            }
+            idx.supervisor_step(&mut supervisor);
             last_tick = Instant::now();
         }
     }
