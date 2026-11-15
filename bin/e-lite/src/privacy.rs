@@ -61,7 +61,7 @@ struct BlocksSection {
 pub struct Origin {
     pub key: &'static str,
     pub value: String,
-    /// `preset`, `file`, `--set` or `config.toml`.
+    /// `preset`, `file`, `--set` or `rawtx.decoys` (the `[rawtx] decoys` setting).
     pub from: &'static str,
     pub range: &'static str,
 }
@@ -312,7 +312,9 @@ pub fn parse(text: &str, overrides: &[String], config_decoys: u32) -> Result<Loa
         "0..1000"
     );
 
-    // Block decoys default to [rawtx] decoys from config.toml.
+    // Block decoys default to `[rawtx] decoys`: the built-in default, the
+    // value in config.toml or `--decoys`. Name the setting, not a file: this
+    // code cannot tell which of the three it was.
     p.block_decoys = config_decoys.min(8);
     let block_from_file = file.blocks.decoys.is_some();
     int!(
@@ -325,7 +327,7 @@ pub fn parse(text: &str, overrides: &[String], config_decoys: u32) -> Result<Loa
     );
     if !block_from_file {
         if let Some(last) = origins.last_mut() {
-            last.from = "config.toml";
+            last.from = "rawtx.decoys";
         }
     }
 
@@ -570,7 +572,7 @@ mod tests {
             .iter()
             .find(|o| o.key == "blocks.decoys")
             .unwrap();
-        assert_eq!(o.from, "config.toml");
+        assert_eq!(o.from, "rawtx.decoys");
         assert_eq!(
             parse("[blocks]\ndecoys = 0\n", &[], 3)
                 .unwrap()

@@ -26,8 +26,11 @@ const CLIENT_NAME: &str = "4.5.5";
 /// Longest response line accepted (a batch of 500 large transactions).
 const MAX_LINE: u64 = 64 * 1024 * 1024;
 
-/// One configured server: `host:port:s` (TLS) or `host:port:t` (plain;
-/// normally a `.onion`, where Tor already encrypts end to end).
+/// One configured server: `host:port:s` (TLS) or `host:port:t` (plain).
+/// Plain is accepted only where nothing can read the stream on the way: a
+/// `.onion` (Tor encrypts end to end) or this host. A clearnet server must
+/// use `:s`, like the Esplora list, which requires HTTPS outside `.onion`:
+/// in clear text the exit node or the network would read the txids.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ElectrumServer {
     pub host: String,
@@ -47,11 +50,26 @@ impl ElectrumServer {
         if host.is_empty() {
             return Err(format!("{entry}: empty host"));
         }
-        Ok(ElectrumServer {
+        let server = ElectrumServer {
             host: host.to_string(),
             port,
             tls: proto,
-        })
+        };
+        if !server.tls && !server.is_onion() && !server.is_loopback() {
+            return Err(format!(
+                "{entry}: plain text (:t) is only accepted for .onion or local servers; use :s"
+            ));
+        }
+        Ok(server)
+    }
+
+    /// This host: `localhost` or a loopback address.
+    pub fn is_loopback(&self) -> bool {
+        let host = self.host.trim_start_matches('[').trim_end_matches(']');
+        host.eq_ignore_ascii_case("localhost")
+            || host
+                .parse::<std::net::IpAddr>()
+                .is_ok_and(|ip| ip.is_loopback())
     }
 
     pub fn key(&self) -> String {
@@ -426,5 +444,25 @@ mod tests {
         assert!(o.is_onion() && !o.tls);
         assert!(ElectrumServer::parse("host:50002").is_err());
         assert!(ElectrumServer::parse(":50002:s").is_err());
+    }
+
+    #[test]
+    fn plain_text_is_only_for_onion_and_local_servers() {
+        // Clear text to a clearnet host would show the txids to the exit node.
+        let err = ElectrumServer::parse("electrum.example.org:50001:t").unwrap_err();
+        assert!(err.contains("use :s"), "{err}");
+        assert!(ElectrumServer::parse("203.0.113.7:50001:t").is_err());
+        for ok in [
+            "abcdefgh.onion:50001:t",
+            "ABCDEFGH.ONION:50001:t",
+            "127.0.0.1:50001:t",
+            "localhost:50001:t",
+            "[::1]:50001:t",
+        ] {
+            let s = ElectrumServer::parse(ok).unwrap_or_else(|e| panic!("{ok}: {e}"));
+            assert!(!s.tls, "{ok}");
+        }
+        // TLS is accepted anywhere.
+        assert!(ElectrumServer::parse("203.0.113.7:50002:s").is_ok());
     }
 }
