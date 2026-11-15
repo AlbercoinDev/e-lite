@@ -1,6 +1,6 @@
 # Session handoff
 
-**Updated:** 2026-11-15
+**Updated:** 2026-11-15 (after the code and documentation review)
 **Latest published release:** `0.1.0-alpha.29.17.0`
 **Release:** https://github.com/AlbercoinDev/e-lite/releases/tag/v0.1.0-alpha.29.17.0
 **Main commit at handoff:** tag `v0.1.0-alpha.29.17.0`
@@ -91,6 +91,33 @@ no repitas contexto ni rehagas decisiones ya documentadas.
   `docs/ROADMAP.md` is future work only, and `docs/AUDIT.md` holds the open
   findings (`docs/audit/FIXED.md` is the fixed history).
 
+## Unreleased: 2026-11-15 review (branch `review/analisis-2026-11`)
+
+Not tagged, not pushed; version unchanged. Full write-up in Spanish:
+[`ANALISIS.md`](ANALISIS.md).
+
+- **Fixed (AUD-169, P1)**: the reader teardown of a catch-up call could hang
+  forever when the call ended early with the prepared window full (shutdown,
+  disk pause, alternate scheduler, error). `bin/e-lite/src/reader_pool.rs`
+  owns the readers now and always stops them.
+- **Refactor, no behaviour change**: `catch_up_limited` (620 lines) is a short
+  loop over `preflight`, `ReaderPool`, `CommitGroup`, `flush_group` and
+  `account_call`; `lag_guard` and `index_loop` lost their repeated blocks.
+- **Fixed (AUD-170..172)**: client slots released by a drop guard, dead
+  connections stop at once, request lines parsed once, bounded error log;
+  `:t` Electrum entries only for `.onion`/local servers; `privacy check`
+  origin; a failed snapshot export removes its partial archive.
+- **Docs**: `AUDIT.md` holds only open findings (AUD-091..125 moved to
+  `audit/FIXED.md`), `ROADMAP.md` points at the files that exist after the
+  29.17.0 split, and `scripts/check-docs.sh` now fails when a document names a
+  source file or an identifier that is no longer there.
+- **New open findings**: AUD-173 (`panic = "abort"` vs code written for
+  unwinding), AUD-174 (threads per connection), AUD-175 (errors classified by
+  message text), AUD-176 (snapshot digest cost), AUD-177 (commit holds the
+  global lock), AUD-178 (negotiation rule), AUD-179 (reader pool per call),
+  AUD-180 (managed Tor orphaned after an unclean exit), AUD-181 (default
+  ports inside the ephemeral range; one flaky bind in `e2e_multi_instance`).
+
 ## Last change (alpha.29.17.0)
 
 Module reorganization and drift guards; no behaviour change. `main.rs` went
@@ -164,7 +191,7 @@ Full detail: `CHANGELOG.md`.
 - `prune_mib = 1` for from-zero pruned IBD; snapshots are manual only.
 - Public providers fail closed; the shipped Electrum list never stands in for
   a missing or invalid `public-servers.toml`.
-- TLScert identity is one CA + leaf per instance (no SNI); a domain
+- The TLS identity is one CA + leaf per instance (no SNI); a domain
   certificate and `.onion` access are mutually exclusive per instance.
 
 ## Open risks / next priorities
@@ -177,11 +204,14 @@ P1 (before any public exposure or mainnet production claim):
 3. Close or document the residual audit risks (snapshot archive size limits,
    per-client threads, provider trust); see `AUDIT.md`.
 
-P2/P3: the verified list (20 items) is in `ROADMAP.md`; the short version:
-leader-verifies-before-notify, Tor retry by blame, no provider penalty on a
-reorg, `catch_unwind` + slot release, connection teardown, subscription caps,
-`get_merkle` tree cache, `client_min`, `privacy.toml` per network, `:t` only
-for onion, per-network e2e.
+4. Decide the panic policy (AUD-173): the release binary aborts on any panic
+   and nothing restarts it.
+
+P2/P3: the verified list (13 items left) is in `ROADMAP.md`; the short
+version: leader-verifies-before-notify, Tor retry by blame, no provider
+penalty on a reorg, interruptible pipeline wait, subscription caps,
+`get_merkle` tree cache, one snapshot for verbose `transaction.get`,
+`privacy.toml` per network, per-network e2e. New in `AUDIT.md`: AUD-174..181.
 
 ## Commands
 
@@ -217,6 +247,9 @@ kill -USR1 "$(pgrep -f 'e-lite run')"
   `NEEDS_RECOVERY`/snapshot options.
 
 ## Known working baseline at handoff
+
+The review branch was checked with the same gates (see `ANALISIS.md` for the
+exact list and what could not be run locally).
 
 On the `v0.1.0-alpha.29.17.0` tree: `cargo fmt --check`, `clippy -D warnings`,
 `cargo test --workspace` (350 tests), `scripts/check-docs.sh`, `shellcheck`

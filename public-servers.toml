@@ -35,7 +35,8 @@ esplora = [
     # it is intentionally not enabled.
 ]
 # Public Electrum servers for the per-txid mode (privacy.toml, AUD-163):
-# host:port:s (TLS) or host:port:t (plain, for .onion). Only txids are sent,
+# host:port:s (TLS) or host:port:t (plain; accepted only for .onion and
+# local servers, any other :t entry is ignored). Only txids are sent,
 # always through Tor, mixed with decoy wallets and spread over several
 # servers; every answer is verified against the local index. Checked over Tor
 # on 2026-11-14 with server.version + a JSON-RPC batch of transaction.get.

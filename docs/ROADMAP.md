@@ -5,31 +5,28 @@ current behaviour in [`FEATURES.md`](FEATURES.md), open defects and residual
 risks in [`AUDIT.md`](AUDIT.md). Each item states priority, where it lives and
 the signal that would move it to `FEATURES.md`. No dates are promised.
 
-## Near-term fixes (verified in code, 2026-11-14)
+## Near-term fixes (verified in code)
 
-These are the P2/P3 findings left by the 29.15.0 audit (AUD-167); each was
-confirmed by reading the code.
+What is left of the 29.15.0 audit (AUD-167) after the 2026-11-15 review, which
+fixed items 4, 5, 12, 14 and 15 (AUD-169..172 in
+[`audit/FIXED.md`](audit/FIXED.md)) and documented item 16. Numbers are kept so
+older notes still match. New findings of that review are AUD-173..181 in
+[`AUDIT.md`](AUDIT.md).
 
 | # | Pri | Item | Where |
 |---|---|---|---|
-| 1 | P2 | Followers of a shared block download re-verify it: the leader sets `done`/`notify_all` before the caller runs `verify_full`. Publish the verified block (or the `Arc<Block>`) before waking them. | `crates/el-rawtx/src/lib.rs` (`fetch_external_block`, `external_block`) |
-| 2 | P2 | The documented "one retry on a new circuit" never happens after a transient/unreachable failure: the retry is decided from `endpoints()`, which already excludes the cooled endpoint. Decide from the blame. | `crates/el-rawtx/src/lib.rs` (race), `esplora.rs`, `p2p.rs` |
-| 3 | P2 | An index-side error after a verified transaction (reorg moved its position, block not indexed) calls `penalize()` and cools up to three healthy providers for 300 s. Treat it as local and go straight to the block path. | `crates/el-rawtx/src/txbatch.rs` (`verify`, `run_session`) |
-| 4 | P2 | A panic in a connection thread skips `clients.fetch_sub` and `unregister`: the `max_clients` slot and the registry entry leak forever. Use a drop guard and `catch_unwind`. | `crates/el-serve/src/lib.rs` (`start_listener_on`, `handle_client`) |
-| 5 | P2 | A logically dead connection stays up to 600 s (`WireReader::read` never checks `alive`; `send` fails without shutting the socket). Check `alive` per poll and kill on a failed write. | `crates/el-serve/src/lib.rs` (`WireReader`, `send`, `kill`) |
-| 6 | P2 | `wait_below(PIPELINE_DEPTH)` blocks the reader without a timeout, and a disconnect waits for in-flight downloads (up to 60 s) before unregistering. Make the wait interruptible and cancel on disconnect. | `crates/el-serve/src/lib.rs` (`client_loop`) |
-| 7 | P2 | `scripthash`/`scriptpubkey` subscriptions are unbounded (only outpoints have a cap) and the notifier clones every subscription each pass. Cap them and iterate under the lock. | `crates/el-serve/src/lib.rs` (subscriptions, notifier) |
-| 8 | P2 | `get_merkle` rebuilds the whole merkle tree per call under the read lock. Cache the tree with the 64-block txid ring. | `crates/el-serve/src/lib.rs` (`transaction_merkle`), `el-model/src/merkle.rs` |
-| 9 | P2 | Verbose `transaction.get` can mix two tips across a reorg (two separate read guards) and serve raw bytes that are not in the announced block. Resolve and decorate under one snapshot. | `crates/el-serve/src/lib.rs` (`transaction_get`, `decorate_verbose_tx`) |
-| 10 | P2 | `negotiate_protocol` ignores `client_min`: a client asking `[1.4.3,1.4.3]` gets 1.4.2, below its minimum. Filter the available set by both ends. | `crates/el-serve/src/lib.rs` |
-| 11 | P2 | `privacy.toml` is one shared file next to the global `config.toml`. Docs now say so; a per-network file (in the data dir, with migration) remains an option. | `bin/e-lite/src/privacy.rs`, `config.rs` |
-| 12 | P2 | The Electrum list accepts `:t` (cleartext) for clearnet hosts; Esplora already requires HTTPS for clearnet. Reject `:t` outside `.onion`. | `crates/el-rawtx/src/electrum.rs`, `bin/e-lite/src/public_servers.rs` |
+| 1 | P2 | Followers of a shared block download re-verify it: the leader sets `done`/`notify_all` before the caller runs `verify_full`, so a batch of 32 `transaction.get` on one block can verify it up to 32 times. Publish the verified `Arc<Block>` before waking them. | `crates/el-rawtx/src/lib.rs` (`fetch_external_block`, `external_block`) |
+| 2 | P2 | The documented "one retry on a new circuit" never happens after a transient/unreachable failure: the retry is decided from `endpoints()`, which already excludes the cooled endpoint. Decide from the blame. | `crates/el-rawtx/src/lib.rs` (`race`), `crates/el-rawtx/src/esplora.rs`, `crates/el-rawtx/src/p2p.rs` |
+| 3 | P2 | An index-side error after a verified transaction (reorg moved its position, block not indexed) calls `penalize()` and cools up to three healthy providers for 300 s. Once the txid matches, everything else in `verify` is local: go straight to the block path. Needs a fake source that records `penalize` (the current one ignores it). | `crates/el-rawtx/src/txbatch.rs` (`verify`, `run_session`) |
+| 6 | P2 | `wait_below(PIPELINE_DEPTH)` blocks the reader without a timeout, and a disconnect waits for in-flight downloads (up to 60 s) before the connection thread ends. Make the wait interruptible and cancel on disconnect. | `crates/el-serve/src/server.rs` (`client_loop`) |
+| 7 | P2 | `scripthash`/`scriptpubkey` subscriptions are unbounded (only outpoints have a cap) and the notifier clones every subscription each pass. Cap them (a generous limit: a large wallet subscribes tens of thousands of scripts) and iterate under the lock. | `crates/el-serve/src/protocol.rs`, `crates/el-serve/src/notify.rs` |
+| 8 | P2 | `get_merkle` rebuilds the whole merkle tree per call under the read lock. Cache the tree with the 64-block txid ring. | `crates/el-serve/src/protocol.rs` (`transaction_merkle`), `crates/el-model/src/merkle.rs` |
+| 9 | P2 | Verbose `transaction.get` can mix two tips across a reorg (two separate read guards) and serve raw bytes that are not in the announced block. Resolve and decorate under one snapshot. | `crates/el-serve/src/protocol.rs` (`transaction_get`, `decorate_verbose_tx`) |
+| 10 | P2 | `negotiate_protocol` ignores `client_min`. **Conflicts with AUD-041**, which keeps that downgrade on purpose; see AUD-178 for the proposed rule. Not to be changed before that decision. | `crates/el-serve/src/protocol.rs` (`negotiate_protocol`) |
+| 11 | P2 | `privacy.toml` is one shared file next to the global `config.toml`. A per-network file (in the data dir, with migration) remains an option. | `bin/e-lite/src/privacy.rs`, `bin/e-lite/src/config.rs` |
 | 13 | P3 | A one-off `transaction.get` may chain the txid budget and a whole-block budget (~180 s worst case). One deadline per request. | `crates/el-rawtx/src/lib.rs` (`raw_tx_inner`) |
-| 14 | P3 | `privacy check` labels the origin of `blocks.decoys` as `config.toml` even when it is the default or `--decoys`. | `bin/e-lite/src/privacy.rs` |
-| 15 | P3 | `error_log` is keyed by the client's method name and never evicted (memory growth + log flood); `log_rpc_error` prints under the mutex. | `crates/el-serve/src/lib.rs` |
-| 16 | P3 | `server.features.pruning` is always `null`; document the deviation or return the effective retention. | `crates/el-serve/src/lib.rs` |
-| 17 | P3 | Slowloris: the idle deadline resets on every byte, and an unterminated line at EOF is executed. | `crates/el-serve/src/lib.rs` (`WireReader`, `read_line_limited`) |
-| 18 | P3 | Tests: no e2e for the per-network listeners, `esplora=[]` + Electrum, signet snapshot, `privacy check`, or `server.features.genesis_hash` per network; the snapshot fixture uses a fabricated regtest genesis. | `tests/e2e/`, `snapshot.rs` |
+| 17 | P3 | Slowloris: the idle deadline resets on every byte. (The other half of this item, "an unterminated line at EOF is executed", is not a defect: only a complete JSON document parses, and wallets or scripts that close after their last request rely on it.) | `crates/el-serve/src/server.rs` (`WireReader`) |
+| 18 | P3 | Tests: no e2e for the per-network listeners, `esplora=[]` + Electrum, signet snapshot, `privacy check`, or `server.features.genesis_hash` per network; the snapshot fixture uses a fabricated regtest genesis. | `tests/e2e/`, `bin/e-lite/src/snapshot.rs` |
 
 ## Security and network compatibility
 
@@ -59,7 +56,9 @@ confirmed by reading the code.
 | P1 | History compaction / deduplication (schema v3, AUD-130) | reduce the index from ~260 GiB to an estimated ~130-150 GiB: `txnum` u40 references, 16-byte scripthash and 8-byte txid prefixes verified against `txids.dat`, 1-byte history value, trimmed UTXO values, zstd bottommost. Design and per-table bytes in AUDIT AUD-130. **Decision: from-zero reindex, no in-place migration; deferred by the owner.** First step: measure per-CF SST size (`/status.rocksdb.cf`) and row counts on the owner's node and reindex testnet4 with both schemas; proceed only if it saves >= 35 %. |
 | P2 | 40-bit tx refs / compact occurrence encoding | storage reduction with migration and BIP30 tests. |
 | P2 | zstd/bottommost compression experiments | measure size vs CPU on HDD/SSD; no silent format change; applies to newly compacted data. |
-| P2 | Incremental/encrypted snapshots | per-file sizes/SHA-256 and `--verify=full` are delivered; still missing incremental backups and optional confidentiality. |
+| P2 | Online snapshot export (AUD-140) | today a backup needs the service stopped. A RocksDB checkpoint (hard links) plus `txids.dat` copied up to the committed `txnum` gives a consistent copy while serving; do this before incremental backups. |
+| P2 | Identity backup (AUD-143) | a small, separate, encrypted archive of `tls/`, `tor/`, `decoy.key` and the three config files, so a restore keeps the onion address, the CA wallets trust and the decoy wallets. Kept apart from the snapshot on purpose: the snapshot is public chain data and `import-snapshot` refuses secrets. |
+| P3 | Incremental/encrypted snapshots | per-file sizes/SHA-256 and `--verify=full` are delivered; incremental backups and confidentiality of the chain-data archive are less urgent than the two rows above. |
 | P3 | Undo retention policy | the bounded reorg window is conservative; tune only with recovery tests. |
 
 ## Privacy
@@ -78,7 +77,7 @@ confirmed by reading the code.
 | P2 | Container image (Docker/Podman) | reproducible runtime, mounts for Core/index; no secrets baked in. UmbrelOS notes are in `TUNING.md`. |
 | P2 | Electrum/Sparrow matrix | scripted versions for 1.4; document known limitations. |
 | P2 | Core version matrix | test the oldest supported and the latest official Core; fail clearly. |
-| P3 (optional) | Systemd unit and service hardening | `Restart=always`, resource limits, no privileges; optional, not a release blocker. |
+| P2 | Systemd unit and service hardening | `Restart=on-failure`, resource limits, no privileges. Raised from P3: the release binary aborts on any panic (AUD-173) and nothing restarts it today. |
 | P3 | Cross-container sync coordination | the per-user IBD lock does not cross mount namespaces; needs a shared lock medium or orchestrator policy. |
 | P3 | Plugin/extension surface | only after core stability; avoid freezing unstable APIs. |
 

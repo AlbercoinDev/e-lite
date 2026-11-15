@@ -347,7 +347,10 @@ e-lite import-snapshot --network mainnet --allow-mainnet \
 - Run the command once per network: `mainnet`, `testnet4` and `signet` each
   produce their own archive with their own manifest identity checks.
 - A restored instance starts with a new onion address (`tor/` is excluded)
-  and no TLS change (`tls/` is excluded too).
+  and a new TLS identity (`tls/` is excluded too): wallets must be pointed at
+  the new onion and import the new `ca.crt`. To keep both, copy
+  `<data-dir>/tor/` and `<data-dir>/tls/` yourself (they are secrets: keep
+  them off shared storage) and put them back before the first start.
 
 ## Disks and LXC
 

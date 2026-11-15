@@ -12,7 +12,7 @@ explicitly an operator-driven network test.
 cargo fmt --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace          # 350 tests: unit, resolver, txmode, protocol
-scripts/check-docs.sh           # relative links, anchors, version, test paths
+scripts/check-docs.sh           # links, anchors, version, test paths, source references
 shellcheck install.sh scripts/*.sh tests/e2e/*.sh tests/bench/*.sh tests/manual/*.sh
 ```
 

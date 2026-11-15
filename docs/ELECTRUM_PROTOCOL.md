@@ -115,13 +115,21 @@ opt-in error until a BIP352 indexer is wired; it is not advertised as available.
   wallets.
 - **No client authentication**: rate limiting is a throttle, not access
   control. Use firewall/VPN/Tor/onion.
+- **`server.features.pruning` is always `null`**: the field describes history
+  pruning, and e-lite keeps the full history of every script whatever Core
+  prunes. A pruned Core only changes where a raw transaction comes from.
+- **Plain-text upstream Electrum servers** (`host:port:t` in
+  `public-servers.toml`) are accepted only for `.onion` and local hosts.
 
 ## Performance and safety notes
 
-- Whole raw blocks are fetched by hash. P2P requests `MSG_WITNESS_BLOCK`
+- A pruned transaction is fetched by txid (default) or as a whole block by
+  hash, and verified against the index either way. P2P requests `MSG_WITNESS_BLOCK`
   (BIP144), requires `NODE_WITNESS`, and validates hash, merkle root and the
   BIP141 witness commitment before returning a block.
 - Concurrent requests for the same block share one download; decoys and prefetch
   are bounded. `rawtx.cache_dir` may point at tmpfs to keep block data off
   persistent disk.
-- The external source deadline is 30 s and an inflight wait is capped at 45 s.
+- One block download has a 60 s network budget (`EXTERNAL_BUDGET`) after a
+  slot wait of at most 120 s; requests sharing it wait 5 s past the leader's
+  deadline.

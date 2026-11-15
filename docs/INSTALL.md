@@ -151,7 +151,8 @@ The installer copies the shipped template if the file does not exist; e-lite
 also creates it on a first run. Existing files are never overwritten. Edit it to
 add, remove or reorder providers. Esplora entries (`esplora = [...]`) serve
 whole blocks by hash and loose transactions by txid; Electrum entries
-(`electrum = [...]`, `host:port:s` or `host.onion:port:t`) serve loose
+(`electrum = [...]`, `host:port:s`; plain `host.onion:port:t` only for
+`.onion` or local servers) serve loose
 transactions in batches. Clearnet Esplora entries must be `https://`;
 `.onion` entries use Tor. If the file and
 the template are both missing, e-lite uses local data only (fail closed). Set

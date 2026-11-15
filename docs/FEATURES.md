@@ -44,7 +44,7 @@ available**.
 | Merkle proofs, tx id-from-pos | experimental | local index |
 | Block stats | experimental | local |
 | Broadcast | experimental | via Core |
-| Raw transaction get | experimental | local Core -> cache -> P2P/Esplora |
+| Raw transaction get | experimental | transaction cache -> recent/local Core block -> by txid (Electrum/Esplora, default) -> whole block (P2P/Esplora) |
 | Electrum 1.4–1.7 negotiation | experimental | negotiates 1.4–1.7 numerically; 1.6 clients get `headers` arrays; 1.7 adds scriptpubkey/outpoint/ping shapes; future/skipped versions fall back to the newest implemented version below |
 | Broadcast package | experimental | Core `submitpackage`, stable success/errors result; protocol 1.6 |
 | Outpoint status/subscriptions | experimental | protocol 1.7; on-demand history scan, no extra index writes |
@@ -116,7 +116,7 @@ available**.
 | Adaptive memory budget | experimental | fitted to available RAM; hot cache ceiling and opt-in hot memtables; 75 % ceiling; reserve |
 | READY / FULLY SYNCED status | experimental | log, `/status`, `/metrics`, `e-lite status` |
 | Ordered startup/shutdown | experimental | `run` waits for Core; threads joined before Core stop |
-| Snapshot export (index only) | experimental | `export-snapshot --output`: manifest format 3 (network/genesis/tip/schema/digest; manifest first, index stored, formats 1-2 still import); the nested Core datadir is excluded |
+| Snapshot export (index only) | experimental | needs the instance stopped (it takes the database lock); a failed export removes its partial archive. `export-snapshot --output`: manifest format 3 (network/genesis/tip/schema/digest; manifest first, index stored, formats 1-2 still import); the nested Core datadir is excluded |
 | Snapshot export (index + Core) | experimental | `--with-core`: probes Core (start + RPC + stop), bundles its chain data only (`blocks/`, `chainstate/`, `indexes/`; wallets, keys and config are never copied) with tip/prune/version in the manifest; refuses while Core runs; SHA-256 per file by default (`--no-hash-files`); gzip index 0 / Core 3 (`--compress-level` sets both) |
 | Snapshot import + verification | experimental | `import-snapshot`: empty target, staged extraction renamed into place only after every check, optional `--expect-digest`, digest/tip/genesis validation, Core coherence (`index tip <= Core tip`, 288-block prune margin); `--verify` checks file hashes; `--verify=full` opens the restored Core and runs a bounded `verifychain` |
 | CLI overrides and `--set` | stable | every TOML field; see `docs/CLI.md` |

@@ -135,7 +135,8 @@ Notes:
 - **Slow or busy Tor:** `[sessions] size = 40` and `parallel = 12`: fewer
   circuits to build, each one carries more.
 - **Few servers:** add servers to `public-servers.toml` (`electrum = [...]`,
-  `host:port:s`, onion servers as `host.onion:port:t`). `min_servers` is
+  `host:port:s`, onion servers as `host.onion:port:t`; a clearnet server
+  listed with `:t` is ignored with a warning). `min_servers` is
   capped by what is configured.
 - **No decoys (not recommended):** `[decoys] wallets = 0`. The fastest `tx`
   mode, and servers see your wallet's transactions without cover.

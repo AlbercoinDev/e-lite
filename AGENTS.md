@@ -134,6 +134,14 @@ Never treat a version number in this file as authoritative over the code/tag.
   provider outage cannot stop local block progress.
 - `commit_sync = auto` relaxes the RocksDB fsync in bulk; `txids.dat` is always
   fsynced and live mode is strict.
+- The readers of a catch-up call live in `ReaderPool`
+  (`bin/e-lite/src/reader_pool.rs`). They hold clones of the permit sender, so
+  the permit channel never disconnects on its own: stop them only through the
+  pool (`finish`/drop), which hands out wake-up permits and drains the results.
+  A bare stop flag + join hangs when the prepared window is full (AUD-169).
+- The release profile is `panic = "abort"`: `catch_unwind` and lock-poison
+  recovery do nothing in the published binary. Do not add `catch_unwind` as a
+  fix, and keep parsers of untrusted bytes panic-free (AUD-173).
 - The supervisor runs at commit boundaries inside the catch-up pipeline; the
   only teardown left is the 512-block checkpoint. Do not reintroduce a time
   deadline that drops prepared blocks/readers. Disk and shutdown checks stay
@@ -210,7 +218,9 @@ Never treat a version number in this file as authoritative over the code/tag.
   fallback list. The default `balanced` preset asks for loose transactions by
   txid (with decoy wallets, AUD-163); `preset = "max"` requests only whole
   blocks by hash. Scripts, addresses and xpubs never leave. Clearnet entries
-  must be HTTPS (`.onion` over Tor is the only plain-HTTP exception).
+  must be HTTPS (`.onion` over Tor is the only plain-HTTP exception), and an
+  Electrum entry may be plain (`:t`) only for `.onion` or a local server
+  (AUD-171).
   `[rawtx] use_tor = false` (`--no-rawtx-tor`) is the **explicit** direct
   opt-out (AUD-168): no SOCKS for any external fetch, clearnet implied, never
   the default, logged at startup and in `/status.rawtx.path`. It does not
@@ -650,7 +660,7 @@ Before claiming completion:
 cargo fmt --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
-scripts/check-docs.sh
+scripts/check-docs.sh   # links, versions and source references in the docs
 shellcheck install.sh scripts/*.sh tests/e2e/*.sh tests/bench/*.sh tests/manual/*.sh
 ```
 

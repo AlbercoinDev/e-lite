@@ -5,7 +5,11 @@
 #   2. every "#anchor" exists in the target Markdown file;
 #   3. the version in Cargo.toml is the one in README, HANDOFF and CHANGELOG;
 #   4. no old test layout (tests/e2e_*.sh, tests/bench_*.sh, ...) survives;
-#   5. files referenced as tests/<something> actually exist.
+#   5. files referenced as tests/<something> actually exist;
+#   6. source files named in the living documents exist, and the identifiers
+#      listed after one, as in `crates/x/src/y.rs` (`function`, `Type`), are
+#      still in that file. Moving code without updating the documents fails
+#      here (the 29.17.0 module split left a dozen such references behind).
 #
 # Run from anywhere: the repo root is resolved from this script.
 set -euo pipefail
@@ -121,6 +125,31 @@ for path in files:
     for ref in sorted(set(test_ref.findall(text))):
         if not os.path.exists(ref):
             problems.append(f"{path}: references missing script {ref}")
+
+# Source references ----------------------------------------------------------
+# Histories describe the tree of their time and are not checked.
+historical = ("CHANGELOG.md", os.path.join("docs", "audit", "FIXED.md"))
+historical_dirs = (os.path.join("docs", "adr"), os.path.join("docs", "benchmarks"))
+source_ref = re.compile(r"`((?:crates|bin)/[A-Za-z0-9_\-/]+\.rs)`(?: \(([^)]*)\))?")
+identifier = re.compile(r"`([A-Za-z_][A-Za-z0-9_:]*)`")
+sources = {}
+for path in files:
+    if path in historical or path.startswith(historical_dirs):
+        continue
+    with open(path, encoding="utf-8", errors="replace") as fh:
+        for number, line in enumerate(fh, 1):
+            for source, listed in source_ref.findall(line):
+                if not os.path.isfile(source):
+                    problems.append(f"{path}:{number}: source file {source} does not exist")
+                    continue
+                if source not in sources:
+                    with open(source, encoding="utf-8", errors="replace") as src:
+                        sources[source] = src.read()
+                for name in identifier.findall(listed):
+                    if name.split("::")[-1] not in sources[source]:
+                        problems.append(
+                            f"{path}:{number}: `{name}` is not in {source} (moved or renamed?)"
+                        )
 
 if problems:
     print(f"check-docs: {len(problems)} problem(s)")

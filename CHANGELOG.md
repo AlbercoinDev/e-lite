@@ -1,5 +1,57 @@
 # Changelog
 
+## Unreleased — 2026-11-15 review
+
+Code and documentation review; not tagged. Write-up:
+[`docs/ANALISIS.md`](docs/ANALISIS.md).
+
+### Fixed
+
+- **Indexing could hang on shutdown or on a disk pause (AUD-169).** The reader
+  threads of a catch-up call slept on a permit channel they kept alive
+  themselves. When the call ended early with the prepared window full
+  (shutdown, disk pause, the alternate scheduler, an error), nothing woke them
+  and the join never returned. The readers now live in
+  `bin/e-lite/src/reader_pool.rs`, which wakes and drains them on every exit.
+- **Electrum connections (AUD-170).** The `max_clients` slot and the registry
+  entry are released by a drop guard; a connection marked dead stops at the
+  next poll instead of idling up to 600 s, and a failed write closes the
+  socket; the once-a-minute `rpc error` log is bounded and no longer prints
+  the method name of an unknown method (client text).
+- **Plain-text Electrum upstreams (AUD-171).** `host:port:t` in
+  `public-servers.toml` is accepted only for `.onion` and local servers; a
+  clearnet `:t` entry is ignored with a warning (it would show the txids to
+  the Tor exit). The shipped template has none. **If you added one, change it
+  to `:s`.**
+- `e-lite privacy check` reports the default of `blocks.decoys` as coming from
+  `rawtx.decoys`, not always from `config.toml`.
+- A failed `export-snapshot` removes its partial `.tmp` archive (AUD-172).
+
+### Changed (no behaviour change)
+
+- `catch_up_limited` (620 lines) is split into `preflight`, `spawn_readers`,
+  `next_prepared`, `live_lag_check`, `commit_reason`, `flush_group` and
+  `account_call`, with `ReaderPool` and `CommitGroup` holding the state. The
+  two copies of the post-commit code are one; `lag_guard`'s four copies of
+  "resume Core" are one helper; `index_loop` calls `supervisor_step` instead
+  of carrying two copies of it.
+- The Electrum connection loop parses each line once and decides by the
+  request's method instead of searching the raw text.
+
+### Documentation
+
+- `docs/ANALISIS.md` (Spanish): functionality, analysis in three parts
+  (sync/IBD/indexing, wallet service, backup/restore), the written improvement
+  plan and new proposals.
+- `docs/AUDIT.md` keeps only open findings and residual risks; AUD-016 and
+  AUD-091..125 moved to `docs/audit/FIXED.md`. New open findings AUD-173..181.
+- `docs/ROADMAP.md` points at the modules that exist after the 29.17.0 split;
+  item 10 is marked as conflicting with AUD-041; the systemd unit is P2.
+- `docs/FEATURES.md`, `docs/ELECTRUM_PROTOCOL.md`: raw-transaction source
+  order, download budgets and `server.features.pruning` match the code.
+- `scripts/check-docs.sh` fails when a document names a source file that does
+  not exist or an identifier that is no longer in the file it is listed under.
+
 ## 0.1.0-alpha.29.17.0 — 2026-11-15
 
 ### Module reorganization and documentation drift guards
