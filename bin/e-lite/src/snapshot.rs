@@ -272,7 +272,7 @@ pub fn export(
     }
     let tmp = output.with_extension("tmp");
     let mut core_skipped = Vec::new();
-    {
+    let written = (|| -> Result<(), E> {
         let file = File::create(&tmp)?;
         let mut builder = tar::Builder::new(LeveledGz::new(file, options.index_level));
         // First entry: everything the importer can check before extracting.
@@ -294,6 +294,13 @@ pub fn export(
         }
         append_manifest(&mut builder, MANIFEST_NAME, &manifest)?;
         builder.into_inner()?.finish()?.sync_all()?;
+        Ok(())
+    })();
+    if let Err(e) = written {
+        // A failed export must not leave a partial archive behind: with
+        // `--with-core` it can be hundreds of GiB on the backup disk.
+        let _ = fs::remove_file(&tmp);
+        return Err(e);
     }
     fs::rename(&tmp, output)?;
     let bytes = fs::metadata(output)?.len();
@@ -1287,6 +1294,58 @@ mod tests {
         let archive = dir.join("snap.tar.gz");
         let info = export(&store, Chain::Regtest, &archive, &ExportOptions::default()).unwrap();
         (archive, info.digest)
+    }
+
+    #[test]
+    fn a_failed_export_leaves_no_partial_archive() {
+        let dir = std::env::temp_dir().join(format!(
+            "e-lite-snapshot-failed-export-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = Store::open(dir.join("source")).unwrap();
+        store
+            .init_identity(&el_model::NetworkIdentity::new(
+                Chain::Regtest,
+                Chain::Regtest.known_genesis().unwrap(),
+            ))
+            .unwrap();
+        let tip = el_model::IndexedTip {
+            height: 5,
+            block_hash: Hash32([0x5a; 32]),
+            schema_version: SCHEMA_VERSION,
+            txnum: 0,
+        };
+        store.commit_tip_only(Store::batch(), &tip).unwrap();
+        // The Core datadir disappears (unmounted disk): the walk fails after
+        // the index section is already in the temporary archive.
+        let options = ExportOptions {
+            with_core: true,
+            core: Some(CoreSnapshot {
+                version: "/Satoshi:30.0.0/".to_string(),
+                tip_height: 5,
+                tip_hash: "cc".repeat(32),
+                pruned: false,
+                prune_height: 0,
+                bytes: 0,
+            }),
+            core_dir: Some(dir.join("no-such-core-datadir")),
+            ..Default::default()
+        };
+        let archive = dir.join("snap.tar.gz");
+        assert!(export(&store, Chain::Regtest, &archive, &options).is_err());
+        assert!(!archive.exists());
+        let left: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .filter(|n| n != "source")
+            .collect();
+        assert!(left.is_empty(), "left behind: {left:?}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
