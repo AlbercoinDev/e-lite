@@ -11,7 +11,7 @@ explicitly an operator-driven network test.
 ```bash
 cargo fmt --check
 cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace          # 348 tests: unit, resolver, txmode, protocol
+cargo test --workspace          # 350 tests: unit, resolver, txmode, protocol
 scripts/check-docs.sh           # relative links, anchors, version, test paths
 shellcheck install.sh scripts/*.sh tests/e2e/*.sh tests/bench/*.sh tests/manual/*.sh
 ```

@@ -1,5 +1,38 @@
 # Changelog
 
+## 0.1.0-alpha.29.17.0 — 2026-11-15
+
+### Module reorganization and documentation drift guards
+
+No behaviour change: code moved between files and two tests were added.
+
+- **`bin/e-lite/src/main.rs` 7,843 → 298 lines**, split into:
+  - `cli.rs` (command/args, parse, help text),
+  - `setup.rs` (config resolution, chain detection, Core client, store open,
+    preflight, resolver, transports, startup diagnostics),
+  - `pipeline.rs` (`Indexer`, catch-up, commit, supervisor, prune gate),
+  - `serve.rs` (`cmd_run`, `cmd_serve`),
+  - `diagnostics.rs` (doctor, status, core/onion/cache, snapshots),
+  - `tests.rs` (unit tests).
+- **`crates/el-serve/src/lib.rs` 5,388 → 229 lines**, split into `stats`,
+  `wire`, `tls`, `client`, `prefetch`, `shared`, `rpc`, `protocol`, `notify`,
+  `server`, `metrics` and `tests`, with `lib.rs` as the public facade.
+- Visibility is `pub(crate)` only where a module boundary requires it; no
+  public API, no wire behaviour and no default changed. `cargo test
+  --workspace` stays green throughout.
+- **Drift tests**:
+  - `config_example_matches_defaults` parses `config.example.toml` and compares
+    it with `Config::default()` (config structs derive `PartialEq` now), so a
+    value that drifts fails with the field name.
+  - `help_flags_are_documented` checks every `--flag` in `e-lite help` against
+    `docs/CLI.md`; `print_help` now uses a `help_text()` string.
+- Test-only helpers in `tuning.rs` use `#[cfg(test)]` instead of
+  `#[allow(dead_code)]`; the unused `is_rotational` helper was removed.
+- Fix the `SC2015` shellcheck finding in `tests/e2e/e2e_regtest.sh` that made
+  the 29.16.5 `ci` lint job fail (the release itself was unaffected).
+- Tests: 350.
+
+
 ## 0.1.0-alpha.29.16.5 — 2026-11-15
 
 ### Repository and documentation cleanup

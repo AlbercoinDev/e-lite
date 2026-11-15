@@ -249,7 +249,10 @@ SNAP="$RUN/snapshot.tar.gz"
 D1=$("$BIN" export-snapshot --network regtest --data-dir "$DATA" | sed -n 's/^logical_snapshot_hash: //p')
 "$BIN" import-snapshot --network regtest --data-dir "$RUN/imported" --input "$SNAP"
 D2=$("$BIN" export-snapshot --network regtest --data-dir "$RUN/imported" | sed -n 's/^logical_snapshot_hash: //p')
-[ -n "$D1" ] && [ "$D1" = "$D2" ] || { echo "snapshot digest mismatch: $D1 vs $D2" >&2; exit 1; }
+if [ -z "$D1" ] || [ "$D1" != "$D2" ]; then
+  echo "snapshot digest mismatch: $D1 vs $D2" >&2
+  exit 1
+fi
 echo "snapshot digest: $D1"
 
 echo "e2e regtest OK (height $HEIGHT)"

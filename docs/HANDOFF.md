@@ -1,9 +1,9 @@
 # Session handoff
 
 **Updated:** 2026-11-15
-**Latest published release:** `0.1.0-alpha.29.16.5`
-**Release:** https://github.com/AlbercoinDev/e-lite/releases/tag/v0.1.0-alpha.29.16.5
-**Main commit at handoff:** tag `v0.1.0-alpha.29.16.5`
+**Latest published release:** `0.1.0-alpha.29.17.0`
+**Release:** https://github.com/AlbercoinDev/e-lite/releases/tag/v0.1.0-alpha.29.17.0
+**Main commit at handoff:** tag `v0.1.0-alpha.29.17.0`
 
 This is the short “where we are”. The invariants live in
 [`AGENTS.md`](../AGENTS.md) and [`PROJECT_MEMORY.md`](PROJECT_MEMORY.md); the
@@ -91,7 +91,18 @@ no repitas contexto ni rehagas decisiones ya documentadas.
   `docs/ROADMAP.md` is future work only, and `docs/AUDIT.md` holds the open
   findings (`docs/audit/FIXED.md` is the fixed history).
 
-## Last change (alpha.29.16.5)
+## Last change (alpha.29.17.0)
+
+Module reorganization and drift guards; no behaviour change. `main.rs` went
+from 7,843 to 298 lines (`cli`, `setup`, `pipeline`, `serve`, `diagnostics`,
+`tests`) and `el-serve/lib.rs` from 5,388 to 229 (`stats`, `wire`, `tls`,
+`client`, `prefetch`, `shared`, `rpc`, `protocol`, `notify`, `server`,
+`metrics`, `tests`). Two tests now guard documentation drift:
+`config_example_matches_defaults` and `help_flags_are_documented`. Test-only
+helpers use `#[cfg(test)]`; the unused `is_rotational` helper was removed. The
+`SC2015` shellcheck finding that failed the 29.16.5 `ci` lint job is fixed.
+
+## Previous change (alpha.29.16.5)
 
 Repository and documentation hygiene only; no wallet behaviour change.
 
@@ -207,9 +218,12 @@ kill -USR1 "$(pgrep -f 'e-lite run')"
 
 ## Known working baseline at handoff
 
-On the `v0.1.0-alpha.29.16.5` tree: `cargo fmt --check`, `clippy -D warnings`,
-`cargo test --workspace` (348 tests), `scripts/check-docs.sh`, `shellcheck`
-over the shell scripts, `e2e_defaults` (TLS trust/hostname, loopback plain,
-`/status.rawtx.path`), `e2e_regtest` (plain + TLS, 1.6/1.7, Sparrow sequence)
-and `e2e_snapshot`. Full signet/testnet4 acceptance is still operator-run;
-record results in the release notes when available.
+On the `v0.1.0-alpha.29.17.0` tree: `cargo fmt --check`, `clippy -D warnings`,
+`cargo test --workspace` (350 tests), `scripts/check-docs.sh`, `shellcheck`
+over the shell scripts, and the full local regtest set: `e2e_defaults` (TLS
+trust/hostname, loopback plain, `/status.rawtx.path`), `e2e_launch_core`,
+`e2e_wait_core`, `e2e_external_pruned`, `e2e_pruned_ibd` (prune + SIGKILL),
+`e2e_regtest` (plain + TLS, 1.6/1.7, Sparrow sequence), `e2e_resilience`,
+`e2e_recovery`, `e2e_multi_instance` and `e2e_snapshot`. Full signet/testnet4
+acceptance is still operator-run; record results in the release notes when
+available.

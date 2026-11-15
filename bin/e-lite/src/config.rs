@@ -14,7 +14,7 @@ pub enum CoreManage {
     Managed,
 }
 
-#[derive(Debug, Clone, serde::Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, serde::Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
     #[serde(default)]
@@ -43,7 +43,7 @@ pub struct Config {
     pub public_servers: PublicServersCfg,
 }
 
-#[derive(Debug, Clone, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PublicServersCfg {
     /// Explicit `public-servers.toml` path. Empty uses the file next to the
@@ -85,7 +85,7 @@ impl Default for PublicServersCfg {
     }
 }
 
-#[derive(Debug, Clone, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NetworkCfg {
     /// `auto`, `mainnet`, `testnet4`, `signet` or `regtest`.
@@ -104,7 +104,7 @@ impl Default for NetworkCfg {
     }
 }
 
-#[derive(Debug, Clone, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CoreCfg {
     #[serde(default)]
@@ -209,7 +209,7 @@ impl Default for CoreCfg {
     }
 }
 
-#[derive(Debug, Clone, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct IndexCfg {
     /// `auto` (files if readable, else RPC), `rpc`, or `files`.
@@ -326,7 +326,7 @@ impl Default for IndexCfg {
     }
 }
 
-#[derive(Debug, Clone, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ServerCfg {
     /// Plain (unencrypted) Electrum listener. Empty = the network default
@@ -401,7 +401,7 @@ impl Default for ServerCfg {
     }
 }
 
-#[derive(Debug, Clone, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TorCfg {
     /// `managed` runs e-lite's own Tor; `off` disables it.
@@ -486,7 +486,7 @@ fn d_tor_timeout() -> u64 {
     120
 }
 
-#[derive(Debug, Clone, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MetricsCfg {
     #[serde(default = "d_true")]
@@ -505,7 +505,7 @@ impl Default for MetricsCfg {
     }
 }
 
-#[derive(Debug, Clone, serde::Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, serde::Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 pub struct SilentPaymentsCfg {
     /// Opt-in gate. The BIP352 indexer is not included yet; when disabled the
@@ -514,7 +514,7 @@ pub struct SilentPaymentsCfg {
     pub enabled: bool,
 }
 
-#[derive(Debug, Clone, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct LoggingCfg {
     /// Application log path. Empty/None uses `<data-dir>/e-lite.log`.
@@ -545,7 +545,7 @@ impl Default for LoggingCfg {
     }
 }
 
-#[derive(Debug, Clone, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PruningCfg {
     /// Pause Core downloads when free space is below this. The indexer keeps
@@ -642,7 +642,7 @@ impl Default for PruningCfg {
     }
 }
 
-#[derive(Debug, Clone, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RawtxCfg {
     #[serde(default = "d_true")]
@@ -785,7 +785,7 @@ impl Default for RawtxCfg {
     }
 }
 
-#[derive(Debug, Clone, serde::Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, serde::Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 pub struct SafetyCfg {
     #[serde(default)]
@@ -1689,6 +1689,16 @@ mod tests {
         assert!(cg.validate().is_err());
         cg.core.cgroup_io_weight = Some(100);
         assert!(cg.validate().is_ok());
+    }
+
+    #[test]
+    fn config_example_matches_defaults() {
+        // `config.example.toml` says every shown value is the default. Keep it
+        // true: unknown keys fail through deny_unknown_fields, and any value
+        // that drifted shows here with the field name.
+        let text = include_str!("../../../config.example.toml");
+        let example: Config = toml::from_str(text).expect("config.example.toml must parse");
+        assert_eq!(example, Config::default());
     }
 
     #[test]

@@ -2,7 +2,7 @@
 
 **Base:** `0.1.0-alpha.29.4.5` → current release · **Scope:** `bin/e-lite`,
 `crates/*`, snapshots, the Electrum server and the external path.
-**Status:** open findings and residual risks as of `0.1.0-alpha.29.16.5`.
+**Status:** open findings and residual risks as of `0.1.0-alpha.29.17.0`.
 
 This audit is not a claim of formal verification. It records static checks,
 manual review areas, concrete findings and residual risks. Fixed findings
@@ -13,7 +13,7 @@ manual review areas, concrete findings and residual risks. Fixed findings
 ```text
 cargo fmt --check                                      OK
 cargo clippy --workspace --all-targets -- -D warnings  OK
-cargo test --workspace                                 348 tests OK
+cargo test --workspace                                 350 tests OK
 scripts/check-docs.sh                                  OK
 tests/e2e/e2e_launch_core.sh                           OK
 tests/e2e/e2e_pruned_ibd.sh                            OK

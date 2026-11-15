@@ -642,7 +642,7 @@ impl MachinePlan {
     /// 4C/8T machine. Conservative: reserves the fitted Core cache when e-lite
     /// manages Core; callers that know Core is already running use
     /// `from_parts_with_core_reserve`.
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn from_parts(
         cpu: CpuInfo,
         mem: MemoryInfo,
@@ -1007,7 +1007,7 @@ pub struct Tunables {
 }
 
 impl Tunables {
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn new(cfg: &Config, rotational: bool) -> Self {
         Self::new_with_plan(cfg, rotational, None)
     }
@@ -3278,7 +3278,7 @@ pub fn memory_budget(cfg: &Config) -> MemoryBudget {
     )
 }
 
-#[allow(dead_code)]
+#[cfg(test)]
 pub fn budget_from(
     cfg: &Config,
     total_mib: u64,
@@ -3446,42 +3446,6 @@ pub fn cache_action(
     } else {
         CacheAction::Hold
     }
-}
-
-/// `rotational` hint for the device holding `path`. Falls back to false.
-/// Uses mountinfo's major:minor and walks sysfs to the parent block device, so
-/// partitions and device-mapper volumes are handled too.
-#[allow(dead_code)]
-pub fn is_rotational(path: &std::path::Path) -> bool {
-    let Ok(info) = std::fs::read_to_string("/proc/self/mountinfo") else {
-        return false;
-    };
-    let mut best: Option<(usize, String)> = None;
-    for line in info.lines() {
-        let Some((pre, _post)) = line.split_once(" - ") else {
-            continue;
-        };
-        let fields: Vec<&str> = pre.split_whitespace().collect();
-        if fields.len() < 5 {
-            continue;
-        }
-        let mount = fields[4];
-        if path.starts_with(mount) && best.as_ref().map(|(n, _)| mount.len() > *n).unwrap_or(true) {
-            best = Some((mount.len(), fields[2].to_string()));
-        }
-    }
-    let Some((_, dev)) = best else {
-        return false;
-    };
-    let Ok(link) = std::fs::canonicalize(format!("/sys/dev/block/{dev}")) else {
-        return false;
-    };
-    for dir in link.ancestors() {
-        if let Ok(v) = std::fs::read_to_string(dir.join("queue/rotational")) {
-            return v.trim() == "1";
-        }
-    }
-    false
 }
 
 #[cfg(test)]
