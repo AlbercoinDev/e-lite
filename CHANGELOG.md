@@ -1,5 +1,31 @@
 # Changelog
 
+## 0.1.0-alpha.29.16.4 — 2026-11-15
+
+### Faster CI and release pipeline
+
+No code change. Every push paid a full release build (LTO, `codegen-units = 1`)
+that nothing consumed, and every release rebuilt the workspace from scratch in
+a Docker volume that dies with the runner: 14-18 minutes per push, ~10 per
+release.
+
+- **Cache**: `ci` restores `target/` and the cargo registry with
+  `Swatinem/rust-cache`; `release` caches the packaging container's
+  `CARGO_TARGET_DIR`, `~/.cargo` and `~/.rustup` (`actions/cache`, keyed on
+  `Cargo.lock`). `scripts/package.sh` takes `E_LITE_TARGET_DIR`,
+  `E_LITE_CARGO_HOME` and `E_LITE_RUSTUP_HOME`; locally the named Docker volume
+  is unchanged.
+- **No release build on every push**: `ci` runs `cargo check --release`
+  (type/cfg of the shipped profile) and the real binary is built once in
+  `release`, where it is published.
+- **`concurrency`** on `ci`: a new push to a branch cancels the superseded run.
+- **Smoke test before publishing**: the release job extracts the tarball, runs
+  `--version` and `help`, and checks the `.deb` control fields before
+  `action-gh-release`.
+
+Expected: ~3-5 minutes per push, ~4-6 per release once the cache is warm.
+
+
 ## 0.1.0-alpha.29.16.3 — 2026-11-15
 
 ### `rawtx.use_tor`: an explicit direct-fetch opt-out

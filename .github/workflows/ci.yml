@@ -5,10 +5,20 @@ on:
     branches: [main]
   pull_request:
 
+# A new push to the same branch cancels the previous run: the queue no longer
+# waits behind a superseded build.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   test:
     runs-on: ubuntu-latest
     container: debian:12
+    env:
+      # Incremental artefacts are useless when the cache is restored as a
+      # whole; disabling them makes the cached target smaller and faster.
+      CARGO_INCREMENTAL: "0"
     steps:
       - uses: actions/checkout@v4
       - name: Install build dependencies
@@ -21,15 +31,19 @@ jobs:
         run: |
           curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+      - name: Cache cargo and target
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "."
+          cache-on-failure: true
       - name: Format
         run: cargo fmt --all --check
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Tests
         run: cargo test --workspace
-      - name: Build release binary
-        run: cargo build --release --locked -p e-lite
-      - name: Smoke test binary
-        run: |
-          ./target/release/e-lite --version
-          ./target/release/e-lite help | head -n 5
+      # The release binary is built once, in the release workflow, where it is
+      # actually published. Checking the release profile here catches
+      # type/cfg errors without paying for the LTO link on every push.
+      - name: Check release profile
+        run: cargo check --release --locked -p e-lite

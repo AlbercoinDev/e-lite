@@ -3,6 +3,9 @@ name: release
 on:
   push:
     tags: ["v*"]
+  # Manual run: builds and smoke-tests the artifacts without publishing. It
+  # also warms the build cache before a real tag.
+  workflow_dispatch:
 
 permissions:
   contents: write
@@ -12,9 +15,34 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Restore the packaging cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.e-lite/target
+            ~/.e-lite/cargo
+            ~/.e-lite/rustup
+          key: release-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            release-${{ runner.os }}-
       - name: Build Debian artifacts
-        run: ./scripts/package.sh
+        # The packaging container builds with its own CARGO_TARGET_DIR; point
+        # it at the cached directory so a release does not compile the
+        # workspace from scratch every time.
+        run: |
+          export E_LITE_TARGET_DIR="$HOME/.e-lite/target"
+          export E_LITE_CARGO_HOME="$HOME/.e-lite/cargo"
+          export E_LITE_RUSTUP_HOME="$HOME/.e-lite/rustup"
+          ./scripts/package.sh
+      - name: Smoke test the artifacts
+        run: |
+          mkdir -p "$RUNNER_TEMP/smoke"
+          tar -xzf dist/e-lite-v*-x86_64-unknown-linux-gnu.tar.gz -C "$RUNNER_TEMP/smoke"
+          "$RUNNER_TEMP/smoke/e-lite" --version
+          "$RUNNER_TEMP/smoke/e-lite" help | head -n 3
+          dpkg-deb --info dist/e-lite_amd64.deb | grep -E 'Package|Version|Depends'
       - name: Publish release
+        if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
           files: |

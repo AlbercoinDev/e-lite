@@ -1,9 +1,9 @@
 # Session handoff
 
 **Updated:** 2026-11-14
-**Latest published release:** `0.1.0-alpha.29.16.3`
-**Release:** https://github.com/AlbercoinDev/e-lite/releases/tag/v0.1.0-alpha.29.16.3
-**Main commit at handoff:** tag `v0.1.0-alpha.29.16.3` (wallet-path audit, AUD-167)
+**Latest published release:** `0.1.0-alpha.29.16.4`
+**Release:** https://github.com/AlbercoinDev/e-lite/releases/tag/v0.1.0-alpha.29.16.4
+**Main commit at handoff:** tag `v0.1.0-alpha.29.16.4` (wallet-path audit, AUD-167)
 
 alpha.29.14.1: fixes AUD-161 (aborted P2P race losers spun at 100 % CPU) and
 AUD-162 (tx cache temporary-file race). Owner's 29.14.0 run (2026-11-14,
@@ -153,7 +153,15 @@ the dynamic ARC to work, e-lite needs write access to
 `/sys/module/zfs/parameters/zfs_arc_max` (root, group-writable parameter or a
 non-read-only mount).
 
-## Last change (alpha.29.16.3)
+## Last change (alpha.29.16.4)
+
+CI and release pipeline only. `ci` caches `target/` (Swatinem/rust-cache),
+cancels superseded runs and checks the release profile with `cargo check
+--release` instead of building it; `release` caches the packaging container's
+target/cargo/rustup and smoke-tests the artifacts before publishing. Expected
+3-5 min per push and 4-6 per release warm.
+
+## Previous change (alpha.29.16.3)
 
 `[rawtx] use_tor` (default `true`, `--no-rawtx-tor`): `false` fetches wallet
 data directly, without opening any Tor circuit, and implies clearnet. It does

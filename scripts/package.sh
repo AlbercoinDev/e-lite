@@ -13,11 +13,32 @@ echo "== building e-lite $VERSION inside debian:12 =="
 rm -rf dist
 mkdir -p dist
 
+# Build cache. Locally it defaults to the named Docker volume; CI points
+# E_LITE_TARGET_DIR at a directory restored from actions/cache, and optionally
+# mounts the cargo/rustup homes so the container does not reinstall the
+# toolchain on every run.
+MOUNTS=(
+  -v "$ROOT":/src:ro
+  -v "$ROOT/dist":/out
+  -v "$ROOT/scripts/container-build.sh":/container-build.sh:ro
+)
+if [ -n "${E_LITE_TARGET_DIR:-}" ]; then
+  mkdir -p "$E_LITE_TARGET_DIR"
+  MOUNTS+=(-v "$E_LITE_TARGET_DIR":/target)
+else
+  MOUNTS+=(-v e-lite-cargo-target:/target)
+fi
+if [ -n "${E_LITE_CARGO_HOME:-}" ]; then
+  mkdir -p "$E_LITE_CARGO_HOME"
+  MOUNTS+=(-v "$E_LITE_CARGO_HOME":/root/.cargo)
+fi
+if [ -n "${E_LITE_RUSTUP_HOME:-}" ]; then
+  mkdir -p "$E_LITE_RUSTUP_HOME"
+  MOUNTS+=(-v "$E_LITE_RUSTUP_HOME":/root/.rustup)
+fi
+
 docker run --rm \
-  -v "$ROOT":/src:ro \
-  -v "$ROOT/dist":/out \
-  -v "$ROOT/scripts/container-build.sh":/container-build.sh:ro \
-  -v e-lite-cargo-target:/target \
+  "${MOUNTS[@]}" \
   -e VERSION="$VERSION" \
   -e DEB_VERSION="$DEB_VERSION" \
   -w /src \
