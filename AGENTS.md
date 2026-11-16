@@ -198,7 +198,7 @@ Never treat a version number in this file as authoritative over the code/tag.
   Never prune if the barrier fails. `tests/e2e/e2e_pruned_ibd.sh` covers
   prune + SIGKILL + restart. `pruneblockchain` then runs in `el-prune` with a
   120 s RPC timeout; the apply thread continues.
-- Machine defaults come from `MachinePlan` (`tuning.rs`): physical cores
+- Machine defaults come from `MachinePlan` (`tuning/machine.rs`): physical cores
   (not logical SMT), cgroup CPU quota, data/Core disk class and the memory
   hierarchy. Readers and background jobs are `physical.clamp(2, cap)` by
   data-disk class (readers: NVMe 8, SATA/ZFS/virtual 4, HDD/network 2; jobs:

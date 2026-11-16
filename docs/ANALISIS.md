@@ -46,11 +46,12 @@ los puntos de entrada del resolver de transacciones crudas, la verificación
 por txid, el commit del almacén y la exportación/importación de copias.
 
 Revisado por estructura, búsquedas dirigidas y tests, **no línea a línea**:
-`tuning.rs` (controlador adaptativo y plan de memoria), `el-blocks`, `el-chain`,
+`tuning/` (controlador adaptativo y plan de memoria), `el-blocks`, `el-chain`,
 `el-mempool`, las fuentes P2P/Esplora por dentro, Tor/TLS, `setup.rs` y
 `config.rs`. Las conclusiones sobre esas piezas se apoyan en su documentación,
 en sus tests y en los e2e, y así hay que leerlas. Una segunda pasada debería
-empezar por `tuning.rs` (3.965 líneas) y por `el-rawtx/src/p2p.rs`.
+empezar por `tuning/` (3.990 líneas, ya partido en `machine.rs`, `memory.rs`,
+`controller.rs` y `mod.rs`) y por `el-rawtx/src/p2p.rs`.
 
 ## 1. Qué es e-lite y qué hace hoy
 
