@@ -45,7 +45,7 @@ su casilla aquí y haz commit; cuando no quede ninguna, borra este fichero.
 | Línea de comandos | Reducirla (bloque C). |
 | Mediciones | No se tratan en este encargo. |
 | Variantes opcionales | Pendiente: el dueño decide una a una (bloque D). |
-| AUD-178 | Pendiente: decidir con el dueño (bloque D). |
+| AUD-178 | **Se deja como está** (tolerante). Solo documentación (tarea B0b). |
 
 ---
 
@@ -107,6 +107,21 @@ Un commit por tarea. Los números `#n` son las filas de "Near-term fixes" de
     export: a backup is taken with the service stopped."
   - Comprueba que `docs/OPERATIONS.md` dice claramente que hay que parar el
     servicio para exportar.
+
+- [ ] **B0b. Cerrar AUD-178 (negociación de versión).** Decisión del dueño
+  (2026-11-16): se mantiene el comportamiento actual. No cambies código ni
+  tests de `negotiate_protocol` (`crates/el-serve/src/protocol.rs`).
+  - Hoy el servidor sirve la versión más alta que implementa igual o por
+    debajo del máximo del cliente e ignora el mínimo; la respuesta de
+    `server.version` incluye la versión negociada, así que un cliente
+    estricto puede cerrar él mismo.
+  - `docs/AUDIT.md`: quita la fila AUD-178 de abiertos; en AUD-041 (riesgo
+    residual) añade "confirmed by the owner on 2026-11-16; `client_min` is
+    not enforced".
+  - `docs/ROADMAP.md`: borra la fila #10.
+  - `docs/ELECTRUM_PROTOCOL.md`: que conste como desviación documentada de
+    la especificación (compruébalo; añádelo si falta).
+  - `docs/ANALISIS.md`: actualiza la mención de ROADMAP #10 en la sección 5.
 
 - [ ] **B1. #1 — Los seguidores vuelven a verificar el bloque.**
   - Dónde: `crates/el-rawtx/src/lib.rs`, `external_block` (≈1363) y
@@ -338,7 +353,7 @@ Hoy hay 115 opciones; la mayoría duplica lo que ya hace
 
 ---
 
-## Bloque D — Pendiente de decisión del dueño
+## Bloque D — Pendiente de decisión del dueño: variantes opcionales
 
 **No toques nada de este bloque sin su respuesta.** Pregúntale con las
 opciones de abajo.
@@ -363,28 +378,6 @@ código, tests, líneas de `config.example.toml`, `docs/TUNING.md`,
 `docs/CLI.md`, `AGENTS.md` y campos de `/status`; una clave retirada presente
 en un `config.toml` existente debe dar un aviso que nombre la clave, no
 impedir el arranque. `tests/run-e2e.sh` completo después.
-
-### D2. AUD-178 — negociación de versión
-
-- Hoy (`crates/el-serve/src/protocol.rs`, `negotiate_protocol`): el servidor
-  sirve la versión más alta que implementa **igual o por debajo** del máximo
-  del cliente e ignora el mínimo. Un cliente que pide solo `1.4.3` (versión
-  que e-lite no implementa: solo añade un método de Namecoin) recibe `1.4.2`.
-  La especificación dice que, si los rangos no se cruzan, hay que cerrar.
-- `docs/ROADMAP.md` #10 pide respetar el mínimo; AUD-041 dice que la
-  tolerancia es deliberada y los tests la fijan.
-- Opciones:
-  1. **Dejarlo como está** (recomendada): la respuesta de `server.version`
-     incluye la versión negociada, así que un cliente estricto puede cerrar
-     él mismo; ninguna wallet conocida envía un rango que hoy falle. Se
-     cierra AUD-178, se borra ROADMAP #10 y no cambia código.
-  2. Estricto: cerrar si lo negociado queda por debajo del mínimo. Cumple la
-     especificación, pero rechaza a un cliente que hoy funciona.
-  3. Mixto: tolerante con una versión suelta y estricto con un rango
-     `[min, max]` con `min < max`. Añade una regla para un caso que ninguna
-     wallet produce.
-- Con la opción 1: solo documentación (`AUDIT.md`, `ROADMAP.md`,
-  `ELECTRUM_PROTOCOL.md` como desviación documentada).
 
 ---
 
