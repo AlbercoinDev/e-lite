@@ -103,6 +103,12 @@ Not tagged, not pushed; version unchanged. Full write-up in Spanish:
 - **Refactor, no behaviour change**: `catch_up_limited` (620 lines) is a short
   loop over `preflight`, `ReaderPool`, `CommitGroup`, `flush_group` and
   `account_call`; `lag_guard` and `index_loop` lost their repeated blocks.
+- **Refactor, no behaviour change (2026-11-16)**: `tuning.rs` is now
+  `bin/e-lite/src/tuning/` (`machine.rs`, `memory.rs`, `controller.rs`,
+  `mod.rs`); `/metrics` is a table over the `/status` document. The ranked
+  list of further simplifications (optional variants to decide or delete,
+  CLI flags that duplicate `--set`, persistent readers, bounded server
+  threads) is section 7.10 of `ANALISIS.md`.
 - **Fixed (AUD-170..172)**: client slots released by a drop guard, dead
   connections stop at once, request lines parsed once, bounded error log;
   `:t` Electrum entries only for `.onion`/local servers; `privacy check`

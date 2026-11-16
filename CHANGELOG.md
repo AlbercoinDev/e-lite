@@ -93,6 +93,13 @@ Code and documentation review; not tagged. Write-up:
   of carrying two copies of it.
 - The Electrum connection loop parses each line once and decides by the
   request's method instead of searching the raw text.
+- `tuning.rs` (3,965 lines) is a directory: `tuning/machine.rs` (CPU and disk
+  detection, `MachinePlan`), `tuning/memory.rs` (host and cgroup memory, the
+  budget), `tuning/controller.rs` (the adaptive steps) and `tuning/mod.rs`
+  (knobs, recorders, status). Code and tests moved as they were.
+- `/metrics` is one table (name, type, status path, help) over the `/status`
+  document instead of 39 repeated calls; same names, types and values, now
+  checked by a test.
 
 ### Documentation
 

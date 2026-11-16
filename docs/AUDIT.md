@@ -15,7 +15,7 @@ Spanish, is [`ANALISIS.md`](ANALISIS.md).
 ```text
 cargo fmt --check                                      OK
 cargo clippy --workspace --all-targets -- -D warnings  OK
-cargo test --workspace                                 372 tests OK (6 ignored)
+cargo test --workspace                                 373 tests OK (6 ignored)
 tests/run-e2e.sh --release launch_core regtest          OK
 scripts/check-docs.sh                                  OK
 tests/e2e/e2e_regtest.sh                               OK

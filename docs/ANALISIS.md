@@ -259,6 +259,7 @@ tema (`git log main..review/analisis-2026-11`).
 | Reinicio automático integrado, sin systemd; Tor gestionado sin huérfanos (AUD-180) | decisión del dueño | `bin/e-lite/src/supervisor.rs`, `bin/e-lite/src/tor.rs`, `tests/e2e/e2e_launch_core.sh` |
 | `bind` de los puertos que espera si solo los ocupa una conexión saliente; los tests esperan a que e-lite termine (AUD-181) | arreglo P2 | `crates/el-serve/src/server.rs`, `bin/e-lite/src/setup.rs`, `tests/e2e/` |
 | Tests simplificados y reunificados: biblioteca común para los e2e (`tests/lib/e2e.sh`, `tests/lib/e2e.py`), lanzador único `tests/run-e2e.sh`, `e2e_supervisor` fusionado en `e2e_launch_core`, configuración de pruebas Rust en un solo sitio | mantenimiento | `tests/`, `crates/el-rawtx/src/lib.rs`, `crates/el-serve/tests/protocol.rs` |
+| `tuning.rs` (3.965 líneas) partido en `machine.rs`, `memory.rs`, `controller.rs` y `mod.rs`; `/metrics` como tabla sobre `/status` (313 → 133 líneas), con test | reordenación | `bin/e-lite/src/tuning/`, `crates/el-serve/src/metrics.rs` |
 | Política de panic: *unwind*, *hook* que contiene los hilos de wallet y aborta el resto, *mutex* sin envenenamiento (AUD-173) | decisión del dueño | `Cargo.toml`, `bin/e-lite/src/main.rs`, `crates/el-model/src/sync.rs`, `crates/el-serve/src/server.rs` |
 | AUDIT solo con abiertos, ROADMAP con rutas reales, FEATURES/ELECTRUM_PROTOCOL/OPERATIONS corregidos, comprobación de referencias a código | documentación | `docs/`, `scripts/check-docs.sh` |
 
@@ -293,7 +294,7 @@ automático activo y los tests ya reunificados:
 |---|---|
 | `cargo fmt --check` | correcto |
 | `cargo clippy --workspace --all-targets -- -D warnings` | correcto |
-| `cargo test --workspace` | 372 tests correctos, 6 ignorados (350 antes de la revisión) |
+| `cargo test --workspace` | 373 tests correctos, 6 ignorados (350 antes de la revisión) |
 | `tests/run-e2e.sh --release launch_core regtest` (binario release, con `panic = "unwind"`) | correcto |
 | `scripts/check-docs.sh` | correcto (38 documentos) |
 | `tests/run-e2e.sh`: las diez suites e2e de regtest (`defaults`, `external_pruned`, `launch_core`, `multi_instance`, `pruned_ibd`, `recovery`, `regtest`, `resilience`, `snapshot`, `wait_core`) | correctas en la última pasada (unos 8 minutos), sin procesos residuales |
@@ -329,8 +330,9 @@ No ejecutado: `e2e_networks.sh` (sincroniza signet y testnet4 reales y se niega
 a arrancar sin el espacio en disco que exige), el test con Tor real y el
 instalador.
 
-No verificado aquí: `shellcheck` (no está instalado en esta máquina; no se
-tocó ningún script de shell salvo el Python embebido de `check-docs.sh`), el
+No verificado aquí: `shellcheck` (no está instalado en esta máquina, así que
+los scripts de `tests/` reescritos en esta revisión no han pasado por él; CI sí
+lo ejecuta), el
 rendimiento de IBD en mainnet (la reordenación del pipeline se validó con tests
 y e2e de regtest, no con una medición) y una carga real de wallet sobre Tor.
 
@@ -479,3 +481,41 @@ cubrir las cuatro políticas con una tabla. Hoy solo tienen test las piezas
   habría detectado las 10 referencias rotas que dejó la última reorganización.
   Conviene ampliarla a los valores por defecto citados en `AGENTS.md`, que hoy
   se mantienen a mano.
+
+### 10. Simplificación: dónde sobra y en qué orden lo quitaría
+
+Medido sobre la rama el 2026-11-16 (líneas sin tests): el binario tiene
+20.400, `el-rawtx` 8.600, `el-serve` 5.600, y el núcleo que indexa (`el-index`,
+`el-store`, `el-blocks`, `el-chain`) 5.400 entre los cuatro. Lo que más ocupa
+no es indexar ni servir, sino decidir *cómo* hacerlo: 136 campos de
+configuración, 115 opciones de línea de comandos y 21 variables de entorno.
+
+Hecho en esta pasada, sin cambio de comportamiento: `tuning.rs` partido en
+cuatro módulos y `/metrics` reducido a una tabla.
+
+Dos cosas que propuse y, al leer el código, **no** hice:
+
+- "Un solo modelo de estado para `/status`, `/metrics` y `doctor`": la premisa
+  era falsa. `/metrics` ya se calcula a partir de `/status`, y `doctor` no
+  muestra el estado de un nodo en marcha sino que inspecciona la máquina y la
+  configuración antes de arrancar. Un tipo con `serde` para `/status` añadiría
+  una definición de ~150 campos sin quitar nada.
+- Partir `cmd_doctor` (503 líneas): es una lista lineal de comprobaciones que
+  se lee de arriba abajo, sin estado enredado. Trocearla movería líneas sin
+  hacerla más fácil de entender.
+
+Pendiente, por orden de valor:
+
+| # | Propuesta | Qué quita | Qué necesita |
+|---|---|---|---|
+| 1 | Decidir o borrar las variantes opcionales: política de retraso por bloques (heredada) y `drain`, planificador `alternate`, `adaptive_memtables`, `prefetch_deadline_ms`, `cgroup_io_weight`, ARC dinámico de ZFS | código, documentación y pruebas de caminos que nadie usa por defecto | una prueba A/B en mainnet por variante |
+| 2 | Línea de comandos: unas 15 opciones de uso diario; el resto solo por fichero o `--set sección.clave=valor`, que ya existe | `parse_args` (225 líneas), buena parte de `effective_config_with` (360) y de `CLI.md` | decisión del dueño: rompe compatibilidad, requiere periodo de aviso |
+| 3 | Lectores persistentes entre llamadas (AUD-179) | crear y destruir hilos cada 512 bloques y cada 500 ms al día | benchmark de IBD |
+| 4 | Grupo de hilos acotado en el servidor (AUD-174) | hasta ~128 hilos por conexión | medición de carga de wallet |
+| 5 | Fuentes externas: comprobar en `/status.rawtx.race` cuál gana las carreras antes de mantener las tres (`p2p.rs` son 1.805 líneas y la dependencia `bip324`) | una fuente entera, si los datos lo apoyan | datos reales sobre Tor; es una decisión de privacidad |
+| 6 | `AGENTS.md` (727 líneas): dejar invariantes y enlaces; los valores por defecto ya están en `TUNING.md` y `OPERATIONS.md` | duplicación que hay que mantener a mano | nada; conviene hacerlo junto con la ampliación de `check-docs.sh` |
+
+Sobre eficiencia: según la medición de mainnet anotada en `AGENTS.md`, el
+coste por bloque en la sincronización inicial lo domina la precarga de salidas
+previas (100–1.500 ms frente a ~25 ms de decodificar). Ahí está la mejora
+grande. No la he medido en esta revisión.
