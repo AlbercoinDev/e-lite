@@ -514,6 +514,18 @@ impl RawtxConfig {
 }
 
 /// A block download shared by concurrent callers asking for the same height.
+/// When the leader of a block download gives up if it never gets a slot:
+/// the slot wait (`EXTERNAL_QUEUE_MAX`) plus the network budget, or the
+/// request's own deadline when the request already spent time on the per-txid
+/// path. The network budget is never shortened: the slot wait must not eat it.
+fn block_path_deadline(now: Instant, request_deadline: Option<Instant>) -> Instant {
+    let full = now + EXTERNAL_QUEUE_MAX + EXTERNAL_BUDGET;
+    match request_deadline {
+        Some(limit) => limit.clamp(now + EXTERNAL_BUDGET, full),
+        None => full,
+    }
+}
+
 struct InflightBlock {
     done: Mutex<bool>,
     /// The leader's block, already verified against the indexed header:
@@ -1221,6 +1233,9 @@ impl Resolver {
         priority: Priority,
     ) -> Result<String> {
         let rec = self.block_record(height)?;
+        // One deadline for the whole request (AUD-187): the per-txid path and
+        // the whole-block path share it instead of each starting its own.
+        let request_deadline = Instant::now() + EXTERNAL_QUEUE_MAX + EXTERNAL_BUDGET;
         // 1) Transaction cache: one small file per transaction (AUD-139).
         if let Some(hex) = self.cached_tx(&rec, txid) {
             self.stats.cache_hits.fetch_add(1, Ordering::Relaxed);
@@ -1243,8 +1258,9 @@ impl Resolver {
                         }
                     }
                 }
-                // 4) Whole block from external sources.
-                self.external_block(&rec, priority)?.0
+                // 4) Whole block from external sources, with what is left.
+                self.external_block(&rec, priority, Some(request_deadline))?
+                    .0
             }
         };
         let hex = self
@@ -1329,7 +1345,7 @@ impl Resolver {
         if let Some(found) = self.local_block(rec) {
             return Ok(found);
         }
-        self.external_block(rec, priority)
+        self.external_block(rec, priority, None)
     }
 
     /// The block without asking anyone outside: recent blocks in memory, the
@@ -1381,6 +1397,7 @@ impl Resolver {
         &self,
         rec: &el_model::BlockRecord,
         priority: Priority,
+        request_deadline: Option<Instant>,
     ) -> Result<(Arc<bitcoin::Block>, Origin)> {
         let height = rec.height;
         if self.sources().is_empty() {
@@ -1394,7 +1411,7 @@ impl Resolver {
         if let Some(e) = self.recent_failure(&rec.hash) {
             return Err(e);
         }
-        match self.fetch_external_block(rec, priority) {
+        match self.fetch_external_block(rec, priority, request_deadline) {
             Ok((block, leader)) => {
                 // Decoys are owed once per download, by its leader (AUD-165).
                 if leader {
@@ -1477,6 +1494,7 @@ impl Resolver {
         &self,
         rec: &el_model::BlockRecord,
         priority: Priority,
+        request_deadline: Option<Instant>,
     ) -> Result<(Arc<bitcoin::Block>, bool)> {
         let hash = &rec.hash;
         if let Some(cache) = &self.cache {
@@ -1504,7 +1522,7 @@ impl Resolver {
                 }
                 None => {
                     let entry = Arc::new(InflightBlock::new(
-                        Instant::now() + EXTERNAL_QUEUE_MAX + EXTERNAL_BUDGET,
+                        block_path_deadline(Instant::now(), request_deadline),
                         priority == Priority::Wallet,
                     ));
                     map.insert(*hash, Arc::clone(&entry));
@@ -2075,6 +2093,30 @@ fn should_hedge(bytes: u64, elapsed: Duration, via_tor: bool) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// AUD-187: a request that already spent time on the per-txid path
+    /// gives the block path what is left of its one deadline, and the
+    /// network budget is never shortened.
+    #[test]
+    fn the_block_path_inherits_the_request_deadline() {
+        let now = Instant::now();
+        let full = now + EXTERNAL_QUEUE_MAX + EXTERNAL_BUDGET;
+        assert_eq!(block_path_deadline(now, None), full);
+        // Fresh request: the whole wait.
+        assert_eq!(block_path_deadline(now, Some(full)), full);
+        // A minute went to the per-txid path: a minute less, not a new 180 s.
+        let left = full - Duration::from_secs(60);
+        assert_eq!(block_path_deadline(now, Some(left)), left);
+        // Never below the network budget, never above the full wait.
+        assert_eq!(
+            block_path_deadline(now, Some(now + Duration::from_secs(1))),
+            now + EXTERNAL_BUDGET
+        );
+        assert_eq!(
+            block_path_deadline(now, Some(full + Duration::from_secs(600))),
+            full
+        );
+    }
 
     #[test]
     fn a_silent_or_slow_attempt_is_hedged() {
