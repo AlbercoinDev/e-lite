@@ -433,6 +433,7 @@ impl Shared {
                 "cache_dir": self.resolver.cache_dir().display().to_string(),
                 "fetches": rawtx.fetches.load(Ordering::Relaxed),
                 "bytes": rawtx.bytes.load(Ordering::Relaxed),
+                "verifications": rawtx.verifications.load(Ordering::Relaxed),
                 "verify_failures": rawtx.verify_failures.load(Ordering::Relaxed),
                 "decoys": rawtx.decoys.load(Ordering::Relaxed),
                 "decoys_pending": self.resolver.decoys_pending(),

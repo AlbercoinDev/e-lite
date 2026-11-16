@@ -397,6 +397,9 @@ pub struct RawtxStats {
     pub fetches: AtomicU64,
     pub bytes: AtomicU64,
     pub verify_failures: AtomicU64,
+    /// Full verifications of an externally downloaded block against the
+    /// indexed header. One per download, however many requests share it.
+    pub verifications: AtomicU64,
     pub decoys: AtomicU64,
     pub unavailable: AtomicU64,
     pub p2p_attempts: AtomicU64,
@@ -501,7 +504,9 @@ impl RawtxConfig {
 /// A block download shared by concurrent callers asking for the same height.
 struct InflightBlock {
     done: Mutex<bool>,
-    result: Mutex<Option<Result<Vec<u8>>>>,
+    /// The leader's block, already verified against the indexed header:
+    /// followers reuse it instead of verifying their own copy.
+    result: Mutex<Option<Result<Arc<bitcoin::Block>>>>,
     cv: Condvar,
     /// The leader's deadline: queue limit plus budget when it registers,
     /// then exactly `EXTERNAL_BUDGET` from the moment it gets a download
@@ -1377,8 +1382,15 @@ impl Resolver {
         if let Some(e) = self.recent_failure(&rec.hash) {
             return Err(e);
         }
-        let (bytes, leader) = match self.fetch_external_block(&rec.hash, priority) {
-            Ok(found) => found,
+        match self.fetch_external_block(rec, priority) {
+            Ok((block, leader)) => {
+                // Decoys are owed once per download, by its leader (AUD-165).
+                if leader {
+                    self.owe_decoys(rec.hash);
+                }
+                Ok((block, Origin::External))
+            }
+            Err(RawtxError::Verify(m)) => Err(RawtxError::Verify(m)),
             Err(e) => {
                 // A prefetch failure is an optimisation that did not happen;
                 // only a wallet's failure is worth an INFO line.
@@ -1394,27 +1406,27 @@ impl Resolver {
                         e.kind()
                     );
                 }
-                return Err(e);
-            }
-        };
-        // A follower uses the leader's verified block when it is already in
-        // memory; decoys are owed once per download, by its leader (AUD-165).
-        if !leader {
-            if let Some(block) = self.recent_block(&rec.hash) {
-                return Ok((block, Origin::External));
+                Err(e)
             }
         }
-        match verify_full(&bytes, rec) {
-            Ok(block) => {
-                if leader {
-                    self.owe_decoys(rec.hash);
-                }
-                Ok((self.remember(rec.hash, block), Origin::External))
-            }
+    }
+
+    /// Verify an external block against the indexed header and keep it in
+    /// memory. Runs once per download: the leader of a shared download does
+    /// it before waking the requests that wait for the same block.
+    fn verify_external(
+        &self,
+        bytes: &[u8],
+        rec: &el_model::BlockRecord,
+    ) -> Result<Arc<bitcoin::Block>> {
+        self.stats.verifications.fetch_add(1, Ordering::Relaxed);
+        match verify_full(bytes, rec) {
+            Ok(block) => Ok(self.remember(rec.hash, block)),
             Err(e) => {
                 self.stats.verify_failures.fetch_add(1, Ordering::Relaxed);
                 eprintln!(
-                    "[e-lite] external block at height {height} rejected ({})",
+                    "[e-lite] external block at height {} rejected ({})",
+                    rec.height,
                     e.kind()
                 );
                 Err(e)
@@ -1447,12 +1459,22 @@ impl Resolver {
     /// Fetch one block from the external sources, deduplicating concurrent
     /// requests for the same hash. The first caller downloads; the rest wait
     /// for its result instead of hammering the same provider.
-    /// Returns the bytes and whether this caller led the download (only the
-    /// leader owes decoys for it).
-    fn fetch_external_block(&self, hash: &Hash32, priority: Priority) -> Result<(Vec<u8>, bool)> {
+    /// Returns the verified block and whether this caller led the download
+    /// (only the leader owes decoys for it).
+    fn fetch_external_block(
+        &self,
+        rec: &el_model::BlockRecord,
+        priority: Priority,
+    ) -> Result<(Arc<bitcoin::Block>, bool)> {
+        let hash = &rec.hash;
         if let Some(cache) = &self.cache {
             if let Some(bytes) = cache.get(hash) {
-                return Ok((bytes, false));
+                if let Some(block) = self.recent_block(hash) {
+                    return Ok((block, false));
+                }
+                return self
+                    .verify_external(&bytes, rec)
+                    .map(|block| (block, false));
             }
         }
         let (entry, leader) = {
@@ -1497,6 +1519,9 @@ impl Resolver {
                     self.remember_failure(hash, e);
                 }
             }
+            // Verified before the followers wake up, so the block is
+            // checked once per download and not once per request.
+            let result = result.and_then(|bytes| self.verify_external(&bytes, rec));
             *entry
                 .result
                 .lock()
@@ -1510,7 +1535,7 @@ impl Resolver {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .remove(hash);
-            return result.map(|bytes| (bytes, true));
+            return result.map(|block| (block, true));
         }
 
         // The leader gives up at its own deadline; a follower waits a little
@@ -1545,7 +1570,7 @@ impl Resolver {
             .clone();
         result
             .unwrap_or_else(|| Err(RawtxError::Unavailable("inflight result lost".into())))
-            .map(|bytes| (bytes, false))
+            .map(|block| (block, false))
     }
 
     /// Race the endpoints of every external source for one block (AUD-160).

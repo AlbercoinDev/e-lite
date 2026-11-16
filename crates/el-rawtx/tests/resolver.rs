@@ -229,6 +229,11 @@ fn concurrent_requests_share_one_block_download() {
         1,
         "concurrent requests must share one download"
     );
+    assert_eq!(
+        resolver.stats().verifications.load(Ordering::SeqCst),
+        1,
+        "the shared block is verified once, not once per request"
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }
 
