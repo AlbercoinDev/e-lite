@@ -67,7 +67,8 @@ def cli_for(core, rpc):
 
     def cli(*args):
         out = subprocess.run(
-            ["bitcoin-cli", "-regtest", f"-datadir={core}", f"-rpcport={rpc}", *map(str, args)],
+            ["bitcoin-cli", "-regtest", f"-datadir={core}", "-rpcconnect=127.0.0.1",
+             f"-rpcport={rpc}", *map(str, args)],
             capture_output=True,
             text=True,
         )

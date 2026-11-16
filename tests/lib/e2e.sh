@@ -75,7 +75,9 @@ wait_for() {
 # `cli <datadir> <rpcport> args...`: bitcoin-cli for a regtest node.
 cli() {
   local dir=$1 rpc=$2; shift 2
-  bitcoin-cli -regtest -datadir="$dir" -rpcport="$rpc" "$@"
+  # -rpcconnect: always the JSON-RPC port, never the IPC socket newer
+  # bitcoin-cli versions try first (which fails where unix sockets are denied).
+  bitcoin-cli -regtest -datadir="$dir" -rpcconnect=127.0.0.1 -rpcport="$rpc" "$@"
 }
 
 # Start a regtest bitcoind and wait for its RPC. Extra args are passed on.

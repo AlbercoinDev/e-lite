@@ -19,7 +19,7 @@ older notes still match. New findings of that review are AUD-173..181 in
 | 7 | P2 | `scripthash`/`scriptpubkey` subscriptions are unbounded (only outpoints have a cap) and the notifier clones every subscription each pass. Cap them (a generous limit: a large wallet subscribes tens of thousands of scripts) and iterate under the lock. | `crates/el-serve/src/protocol.rs`, `crates/el-serve/src/notify.rs` |
 | 11 | P2 | `privacy.toml` is one shared file next to the global `config.toml`. A per-network file (in the data dir, with migration) remains an option. | `bin/e-lite/src/privacy.rs`, `bin/e-lite/src/config.rs` |
 | 17 | P3 | Slowloris: the idle deadline resets on every byte. (The other half of this item, "an unterminated line at EOF is executed", is not a defect: only a complete JSON document parses, and wallets or scripts that close after their last request rely on it.) | `crates/el-serve/src/server.rs` (`WireReader`) |
-| 18 | P3 | Tests: no e2e for the per-network listeners, `esplora=[]` + Electrum, signet snapshot, `privacy check`, or `server.features.genesis_hash` per network; the snapshot fixture uses a fabricated regtest genesis. | `tests/e2e/`, `bin/e-lite/src/snapshot.rs` |
+| 18 | P3 | Tests still missing because they need a real network: an e2e of the provider gate with `esplora=[]` (regtest never holds the gate; the rule is unit-tested in `provider_gate_*`) and a signet snapshot round trip. | `tests/e2e/e2e_networks.sh` |
 
 ## Security and network compatibility
 

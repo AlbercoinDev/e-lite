@@ -61,6 +61,7 @@ on a regtest-only machine.
 | `e2e_regtest.sh` | Full wallet path: plain + TLS, 1.6/1.7 negotiation, Sparrow sequence, subscriptions, broadcast, rate limit, log file. |
 | `e2e_multi_instance.sh` | Two instances at once: distinct ports, certificates, heights, independent shutdown. |
 | `e2e_snapshot.sh` | Export/import per network, index + optional Core section, digest, second import rejected, `--verify=full`. |
+| `e2e_privacy.sh` | `privacy check` as text and JSON, a `--set privacy.*` override, an out-of-range value refused; `esplora = []` plus an Electrum list reported as the per-txid mode; `server.features.genesis_hash` equals Core's genesis. |
 | `e2e_networks.sh` | Opt-in real signet/testnet4 sync and acceptance; needs network access and free disk. |
 
 Wallet protocol helpers (`e2e_electrum16.py`, `e2e_electrum17.py`,
