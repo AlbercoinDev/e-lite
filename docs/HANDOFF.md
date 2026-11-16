@@ -1,9 +1,9 @@
 # Session handoff
 
 **Updated:** 2026-11-16 (release of the code and documentation review)
-**Latest published release:** `0.1.0-alpha.29.18.0`
-**Release:** https://github.com/AlbercoinDev/e-lite/releases/tag/v0.1.0-alpha.29.18.0
-**Main commit at handoff:** tag `v0.1.0-alpha.29.18.0`
+**Latest published release:** `0.1.0-alpha.29.17.0`
+**Release:** https://github.com/AlbercoinDev/e-lite/releases/tag/v0.1.0-alpha.29.17.0
+**In `main`, not tagged yet:** `0.1.0-alpha.29.18.0` (the owner decides when to tag; see `RELEASING.md`)
 
 This is the short “where we are”. The invariants live in
 [`AGENTS.md`](../AGENTS.md) and [`PROJECT_MEMORY.md`](PROJECT_MEMORY.md); the
