@@ -397,8 +397,10 @@ Para **cada** variante:
 3. **Una clave retirada en un `config.toml` existente no impide arrancar**:
    una lista `RETIRED_KEYS` en `bin/e-lite/src/config.rs` produce un aviso
    que nombra la clave (`[index] adaptive_memtables is no longer used; remove
-   it`). Mira primero cómo trata hoy `Config` las claves desconocidas y no
-   rompas ese comportamiento para las demás. Test: un fichero con las claves
+   it`). Hoy las secciones de `Config` usan `#[serde(deny_unknown_fields)]`, así
+   que una clave desconocida es un error de arranque: las retiradas hay que
+   quitarlas del TOML antes de deserializar (y avisar), y cualquier otra
+   clave desconocida debe seguir siendo un error. Test: un fichero con las claves
    retiradas carga y avisa. Lo mismo para las opciones de línea de comandos
    retiradas: aviso, no error (encaja con la tabla `DEPRECATED_FLAGS` del
    bloque C).
