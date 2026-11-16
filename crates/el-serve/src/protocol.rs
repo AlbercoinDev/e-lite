@@ -1533,7 +1533,35 @@ pub(crate) fn scripthash_mempool(shared: &Shared, params: &Value) -> RpcResult<V
 /// (AUD-166). Txids of a block hash never change, so sharing is safe.
 pub(crate) const MERKLE_CACHE_BLOCKS: usize = 64;
 
-pub(crate) type TxidsByBlock = VecDeque<(Hash32, Arc<Vec<Hash32>>)>;
+/// The txids of one block and, once a proof was asked for, its merkle tree:
+/// the tree is built once per block, not once per proof (AUD-185).
+pub(crate) struct BlockTxids {
+    pub(crate) txids: Vec<Hash32>,
+    tree: std::sync::OnceLock<Option<el_model::MerkleTree>>,
+}
+
+impl BlockTxids {
+    pub(crate) fn new(txids: Vec<Hash32>) -> Self {
+        Self {
+            txids,
+            tree: std::sync::OnceLock::new(),
+        }
+    }
+
+    pub(crate) fn branch(&self, pos: usize) -> Option<Vec<Hash32>> {
+        self.tree
+            .get_or_init(|| el_model::MerkleTree::new(&self.txids))
+            .as_ref()?
+            .branch(pos)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn tree_built(&self) -> bool {
+        self.tree.get().is_some()
+    }
+}
+
+pub(crate) type TxidsByBlock = VecDeque<(Hash32, Arc<BlockTxids>)>;
 
 pub(crate) static BLOCK_TXIDS: std::sync::LazyLock<Mutex<TxidsByBlock>> =
     std::sync::LazyLock::new(|| Mutex::new(VecDeque::new()));
@@ -1541,18 +1569,18 @@ pub(crate) static BLOCK_TXIDS: std::sync::LazyLock<Mutex<TxidsByBlock>> =
 pub(crate) fn block_txids_cached(
     shared: &Shared,
     rec: &el_model::BlockRecord,
-) -> RpcResult<Arc<Vec<Hash32>>> {
+) -> RpcResult<Arc<BlockTxids>> {
     if let Ok(cache) = BLOCK_TXIDS.lock() {
         if let Some((_, txids)) = cache.iter().find(|(h, _)| *h == rec.hash) {
             return Ok(Arc::clone(txids));
         }
     }
-    let txids = Arc::new(
+    let txids = Arc::new(BlockTxids::new(
         shared
             .store
             .block_txids(rec)
             .map_err(|e| RpcError::server(e.to_string()))?,
-    );
+    ));
     if let Ok(mut cache) = BLOCK_TXIDS.lock() {
         cache.retain(|(h, _)| *h != rec.hash);
         cache.push_back((rec.hash, Arc::clone(&txids)));
@@ -1576,12 +1604,14 @@ pub(crate) fn transaction_merkle(shared: &Shared, params: &Value) -> RpcResult<V
         .get_block(height)
         .map_err(|e| RpcError::server(e.to_string()))?
         .ok_or_else(|| RpcError::server(format!("height {height} not indexed")))?;
-    let txids = block_txids_cached(shared, &rec)?;
-    let pos = txids
+    let block = block_txids_cached(shared, &rec)?;
+    let pos = block
+        .txids
         .iter()
         .position(|t| *t == txid_hash)
         .ok_or_else(|| RpcError::server("transaction not in that block"))?;
-    let (_, branch) = merkle_branch(&txids, pos)
+    let branch = block
+        .branch(pos)
         .ok_or_else(|| RpcError::server("cannot compute merkle branch"))?;
     Ok(json!({
         "block_height": height,
@@ -1603,14 +1633,16 @@ pub(crate) fn transaction_id_from_pos(shared: &Shared, params: &Value) -> RpcRes
         .get_block(height)
         .map_err(|e| RpcError::server(e.to_string()))?
         .ok_or_else(|| RpcError::server(format!("height {height} not indexed")))?;
-    let txids = block_txids_cached(shared, &rec)?;
-    let txid = txids
+    let block = block_txids_cached(shared, &rec)?;
+    let txid = block
+        .txids
         .get(pos as usize)
         .ok_or_else(|| RpcError::server("position out of range"))?;
     if !want_merkle {
         return Ok(json!(txid.to_hex()));
     }
-    let (_, branch) = merkle_branch(&txids, pos as usize)
+    let branch = block
+        .branch(pos as usize)
         .ok_or_else(|| RpcError::server("cannot compute merkle branch"))?;
     Ok(json!({
         "tx_hash": txid.to_hex(),

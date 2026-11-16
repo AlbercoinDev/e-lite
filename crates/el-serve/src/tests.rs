@@ -483,3 +483,25 @@ fn the_socket_table_tells_a_listener_from_a_connection() {
     assert!(!proc_table_listens(table, 1));
     assert!(!proc_table_listens("", 55468));
 }
+
+/// AUD-185: the merkle tree of a cached block is built by the first proof
+/// and reused by the next ones; the branches are the one-shot ones.
+#[test]
+fn a_cached_block_builds_its_merkle_tree_once() {
+    let txids: Vec<Hash32> = (1..=7u8)
+        .map(|n| {
+            let mut a = [0u8; 32];
+            a[0] = n;
+            Hash32(a)
+        })
+        .collect();
+    let block = BlockTxids::new(txids.clone());
+    assert!(!block.tree_built(), "no tree before the first proof");
+    for pos in 0..txids.len() {
+        let (_, expected) = el_model::merkle_branch(&txids, pos).unwrap();
+        assert_eq!(block.branch(pos).unwrap(), expected);
+        assert!(block.tree_built());
+    }
+    assert!(block.branch(txids.len()).is_none());
+    assert!(BlockTxids::new(Vec::new()).branch(0).is_none());
+}

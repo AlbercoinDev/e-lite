@@ -67,6 +67,59 @@ pub fn merkle_branch(txids: &[Hash32], pos: usize) -> Option<(Hash32, Vec<Hash32
     Some((Hash32(level[0]).reversed(), branch))
 }
 
+/// Every level of a block's merkle tree, kept so that many inclusion branches
+/// of the same block cost one tree instead of one tree each. A wallet asks
+/// for the proof of every transaction of its history, often hundreds from the
+/// same block. Costs about as much memory as the txids themselves again.
+#[derive(Debug, Clone)]
+pub struct MerkleTree {
+    /// `levels[0]` are the leaves (internal byte order), the last is the root.
+    levels: Vec<Vec<[u8; 32]>>,
+}
+
+impl MerkleTree {
+    pub fn new(txids: &[Hash32]) -> Option<Self> {
+        if txids.is_empty() {
+            return None;
+        }
+        let mut levels = vec![txids.iter().map(|h| h.reversed().0).collect::<Vec<_>>()];
+        while levels[levels.len() - 1].len() > 1 {
+            let level = &levels[levels.len() - 1];
+            let mut next = Vec::with_capacity(level.len().div_ceil(2));
+            for pair in level.chunks(2) {
+                let left = &pair[0];
+                let right = if pair.len() == 2 { &pair[1] } else { &pair[0] };
+                next.push(sha256d(left, right));
+            }
+            levels.push(next);
+        }
+        Some(Self { levels })
+    }
+
+    pub fn root(&self) -> Hash32 {
+        Hash32(self.levels[self.levels.len() - 1][0]).reversed()
+    }
+
+    /// Inclusion branch for the leaf at `pos`, as `merkle_branch` returns it.
+    pub fn branch(&self, pos: usize) -> Option<Vec<Hash32>> {
+        if pos >= self.levels[0].len() {
+            return None;
+        }
+        let mut idx = pos;
+        let mut branch = Vec::with_capacity(self.levels.len() - 1);
+        for level in &self.levels[..self.levels.len() - 1] {
+            let sibling = if idx % 2 == 0 {
+                level.get(idx + 1).unwrap_or(&level[idx])
+            } else {
+                &level[idx - 1]
+            };
+            branch.push(Hash32(*sibling).reversed());
+            idx /= 2;
+        }
+        Some(branch)
+    }
+}
+
 /// Root reached from `leaf` at `pos` through `branch` (all in display order).
 /// The inverse of `merkle_branch`: a cached transaction is authenticated by
 /// comparing this with the indexed header's merkle root.
@@ -93,6 +146,25 @@ mod tests {
         let mut a = [0u8; 32];
         a[0] = n;
         Hash32(a)
+    }
+
+    /// The kept tree gives the same root and the same branch as the
+    /// one-shot functions, for every position of every small block shape
+    /// (single transaction, odd and even levels).
+    #[test]
+    fn the_kept_tree_matches_the_one_shot_branch() {
+        for n in 1..=33u8 {
+            let txids: Vec<Hash32> = (1..=n).map(h).collect();
+            let tree = MerkleTree::new(&txids).unwrap();
+            assert_eq!(tree.root(), merkle_root(&txids).unwrap(), "n={n}");
+            for pos in 0..txids.len() {
+                let (root, branch) = merkle_branch(&txids, pos).unwrap();
+                assert_eq!(tree.branch(pos).unwrap(), branch, "n={n} pos={pos}");
+                assert_eq!(merkle_root_from_branch(txids[pos], &branch, pos), root);
+            }
+            assert!(tree.branch(txids.len()).is_none());
+        }
+        assert!(MerkleTree::new(&[]).is_none());
     }
 
     #[test]
