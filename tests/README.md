@@ -7,7 +7,8 @@ suite covers, the quality gates and CI vs local runs.
 tests/e2e/      end-to-end regtest/signet suites (bitcoind required)
 tests/bench/    synthetic benchmarks (bitcoind required)
 tests/manual/   operator-driven sampling (no bitcoind required)
-tests/lib/      shared helpers used by the scripts above
+tests/lib/      shared helpers: e2e.sh (shell suites), e2e.py (Electrum client)
+tests/run-e2e.sh  runs every regtest suite with one build and a summary
 ```
 
 Rules:
@@ -23,7 +24,8 @@ Rules:
   they can be run from any working directory:
 
 ```bash
-tests/e2e/e2e_regtest.sh
+tests/run-e2e.sh                    # all regtest suites (or: tests/run-e2e.sh regtest)
+tests/e2e/e2e_regtest.sh            # one suite on its own
 tests/bench/bench_index.sh          # BLOCKS=5000 VARIANTS="default readers-4"
 tests/manual/ab_umbrel.sh baseline 1800
 ```

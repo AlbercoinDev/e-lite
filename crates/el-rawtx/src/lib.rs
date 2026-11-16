@@ -464,6 +464,40 @@ pub struct RawtxConfig {
     pub electrum_servers: Vec<String>,
 }
 
+impl RawtxConfig {
+    /// A configuration that never contacts anything outside this host: no
+    /// P2P, no Esplora, no Electrum servers, no Tor, no cache. The starting
+    /// point for tests and offline tools; change what a case needs with
+    /// struct update syntax (`RawtxConfig { enabled: true, ..local_only(c) }`).
+    pub fn local_only(chain: Chain) -> Self {
+        RawtxConfig {
+            enabled: false,
+            cache_mib: 0,
+            decoys: 0,
+            tor_socks: None,
+            allow_clearnet: true,
+            fallback_clearnet: false,
+            request_timeout_seconds: 15,
+            tor_request_timeout_seconds: 15,
+            tor_connect_timeout_seconds: 15,
+            tor_stall_timeout_seconds: 15,
+            provider_cooldown_seconds: 120,
+            max_parallel_fetches: 4,
+            cache_dir: None,
+            use_p2p: false,
+            use_esplora: false,
+            p2p_v2: false,
+            esplora_urls: Vec::new(),
+            p2p_peers: Vec::new(),
+            p2p_timeout: Duration::from_secs(1),
+            p2p_tor_timeout: Duration::from_secs(1),
+            chain,
+            privacy: PrivacyParams::default(),
+            electrum_servers: Vec::new(),
+        }
+    }
+}
+
 /// A block download shared by concurrent callers asking for the same height.
 struct InflightBlock {
     done: Mutex<bool>,

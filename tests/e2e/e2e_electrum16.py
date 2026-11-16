@@ -4,44 +4,26 @@
 Usage: e2e_electrum16.py <electrum_port> <core_datadir> <rpc_port> <mine_address>
 """
 import json
-import socket
-import subprocess
 import sys
-import time
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
+from e2e import Electrum, cli_for  # noqa: E402
 
 port, core, rpc, _addr = int(sys.argv[1]), sys.argv[2], sys.argv[3], sys.argv[4]
-
-
-def cli(*args):
-    out = subprocess.run(
-        ["bitcoin-cli", "-regtest", f"-datadir={core}", f"-rpcport={rpc}", *args],
-        capture_output=True,
-        text=True,
-    )
-    if out.returncode != 0:
-        raise SystemExit(f"bitcoin-cli {args} failed: {out.stderr.strip()}")
-    return out.stdout.strip()
+cli = cli_for(core, rpc)
 
 
 def connect(protocol):
-    s = socket.create_connection(("127.0.0.1", port), timeout=20)
-    f = s.makefile("rwb")
+    """A connection at `protocol`; its `call` returns the whole response."""
+    el = Electrum(port)
 
-    def call(i, method, params):
-        f.write(
-            (json.dumps({"jsonrpc": "2.0", "id": i, "method": method, "params": params}) + "\n").encode()
-        )
-        f.flush()
-        while True:
-            r = json.loads(f.readline())
-            if "method" in r and "id" not in r:
-                continue
-            return r
+    def call(_id, method, params):
+        return el.request(method, params)
 
     version = call(0, "server.version", ["e2e-1.6", protocol])
     assert "error" not in version, version
-    return s, f, call, version["result"][1]
-
+    return el.sock, el.f, call, version["result"][1]
 
 # --- 1.6 connection ---
 s, f, call, negotiated = connect("1.6")

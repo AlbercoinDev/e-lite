@@ -3,52 +3,25 @@
 
 Usage: e2e_electrum17.py <electrum_port> <core_datadir> <rpc_port> <mine_address>
 """
-import hashlib
 import json
-import socket
-import subprocess
 import sys
 import time
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
+from e2e import Electrum, cli_for, script_hash  # noqa: E402
 
 port, core, rpc, mine_addr = int(sys.argv[1]), sys.argv[2], sys.argv[3], sys.argv[4]
-
-
-def cli(*args):
-    out = subprocess.run(
-        ["bitcoin-cli", "-regtest", f"-datadir={core}", f"-rpcport={rpc}", *args],
-        capture_output=True,
-        text=True,
-    )
-    if out.returncode != 0:
-        raise SystemExit(f"bitcoin-cli {args} failed: {out.stderr.strip()}")
-    return out.stdout.strip()
-
-
-def script_hash(script_hex):
-    return hashlib.sha256(bytes.fromhex(script_hex)).digest()[::-1].hex()
-
-
+cli = cli_for(core, rpc)
 script_hex = json.loads(cli("getaddressinfo", mine_addr))["scriptPubKey"]
 sh = script_hash(script_hex)
+el = Electrum(port)
+s, f = el.sock, el.f
+notifications = el.notes
 
-s = socket.create_connection(("127.0.0.1", port), timeout=20)
-f = s.makefile("rwb")
-notifications = []
 
-
-def call(i, method, params):
-    f.write(
-        (json.dumps({"jsonrpc": "2.0", "id": i, "method": method, "params": params}) + "\n").encode()
-    )
-    f.flush()
-    while True:
-        r = json.loads(f.readline())
-        if "method" in r and "id" not in r:
-            notifications.append(r)
-            continue
-        assert "error" not in r, (method, r)
-        return r["result"]
-
+def call(_id, method, params):
+    return el.call(method, params)
 
 def wait_for(fn, timeout=25, what="condition"):
     deadline = time.time() + timeout

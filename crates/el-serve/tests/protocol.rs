@@ -115,34 +115,34 @@ fn fixture() -> (Fixture, ScriptHash, Hash32) {
             Arc::clone(&store),
             &RawtxConfig {
                 enabled: true,
-                cache_mib: 0,
-                decoys: 0,
-                tor_socks: None,
-                allow_clearnet: true,
-                fallback_clearnet: false,
-                request_timeout_seconds: 15,
-                tor_request_timeout_seconds: 15,
-                tor_connect_timeout_seconds: 15,
-                tor_stall_timeout_seconds: 15,
-                provider_cooldown_seconds: 120,
-                max_parallel_fetches: 4,
-                cache_dir: None,
-                use_p2p: false,
-                use_esplora: false,
-                p2p_v2: false,
-                esplora_urls: Vec::new(),
-                p2p_peers: Vec::new(),
-                p2p_timeout: Duration::from_secs(1),
-                p2p_tor_timeout: Duration::from_secs(1),
-                chain,
-                privacy: el_rawtx::PrivacyParams::default(),
-                electrum_servers: Vec::new(),
+                ..RawtxConfig::local_only(chain)
             },
         )
         .unwrap(),
     );
 
-    let shared = Arc::new(Shared {
+    let shared = shared_for(store, core, resolver, identity, &dir);
+
+    (
+        Fixture {
+            dir,
+            shared: Arc::clone(&shared),
+        },
+        script,
+        txid,
+    )
+}
+
+/// The served state every fixture uses: READY, plain listener only, four
+/// client slots, no providers.
+fn shared_for(
+    store: Arc<Store>,
+    core: CoreClient,
+    resolver: Arc<Resolver>,
+    identity: NetworkIdentity,
+    dir: &std::path::Path,
+) -> Arc<Shared> {
+    Arc::new(Shared {
         store,
         core,
         resolver,
@@ -165,8 +165,8 @@ fn fixture() -> (Fixture, ScriptHash, Hash32) {
         headers: el_serve::HeaderCache::new(),
         db_bytes: el_model::sync::Mutex::new(el_serve::DbBytesCache::default()),
         dirty_scripts: el_serve::DirtyScripts::new(),
-        data_dir: dir.clone(),
-        core_datadir: dir.clone(),
+        data_dir: dir.to_path_buf(),
+        core_datadir: dir.to_path_buf(),
         log_file: dir.join("e-lite.log"),
         listen: "127.0.0.1:0".to_string(),
         tls_listen: None,
@@ -179,16 +179,7 @@ fn fixture() -> (Fixture, ScriptHash, Hash32) {
         shutdown: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         lock: Arc::new(RwLock::new(())),
         stats: Stats::default(),
-    });
-
-    (
-        Fixture {
-            dir,
-            shared: Arc::clone(&shared),
-        },
-        script,
-        txid,
-    )
+    })
 }
 
 fn call(shared: &Shared, id: u64, method: &str, params: Value) -> Value {
@@ -490,44 +481,7 @@ fn slow_fixture(delay: Duration) -> (Arc<Shared>, Hash32, std::path::PathBuf) {
             delay,
         })),
     );
-    let shared = Arc::new(Shared {
-        store,
-        core,
-        resolver,
-        public_servers: Vec::new(),
-        tx_sources: 0,
-        rawtx_path: "tor".to_string(),
-        provider_status: el_model::sync::Mutex::new(Vec::new()),
-        provider_ready: std::sync::atomic::AtomicBool::new(false),
-        tor_ready: std::sync::atomic::AtomicBool::new(false),
-        clearnet_fallback: std::sync::atomic::AtomicBool::new(false),
-        prefetch: el_serve::Prefetcher::disabled(),
-        mempool: Arc::new(RwLock::new(Mempool::new())),
-        relayfee: el_model::sync::Mutex::new(0.0),
-        fee_estimates: el_model::sync::Mutex::new(std::collections::HashMap::new()),
-        error_log: el_model::sync::Mutex::new(std::collections::HashMap::new()),
-        clients: Arc::new(ClientRegistry::new()),
-        readers: el_chain::ReaderTracker::new(),
-        silent_payments_enabled: false,
-        identity: RwLock::new(identity),
-        headers: el_serve::HeaderCache::new(),
-        db_bytes: el_model::sync::Mutex::new(el_serve::DbBytesCache::default()),
-        dirty_scripts: el_serve::DirtyScripts::new(),
-        data_dir: dir.clone(),
-        core_datadir: dir.clone(),
-        log_file: dir.join("e-lite.log"),
-        listen: "127.0.0.1:0".to_string(),
-        tls_listen: None,
-        onion: el_model::sync::Mutex::new(None),
-        onion_plain_port: 50001,
-        onion_tls_port: 50002,
-        banner_file: None,
-        max_clients: 4,
-        state: AtomicU8::new(state::READY),
-        shutdown: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-        lock: Arc::new(RwLock::new(())),
-        stats: Stats::default(),
-    });
+    let shared = shared_for(store, core, resolver, identity, &dir);
     (shared, txid, dir)
 }
 

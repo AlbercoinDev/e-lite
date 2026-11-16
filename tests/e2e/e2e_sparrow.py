@@ -3,48 +3,29 @@
 
 Usage: e2e_sparrow.py <electrum_port> <core_datadir> <rpc_port> <mine_address>
 """
+import hashlib
 import json
-import socket
-import subprocess
 import sys
 import time
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
+from e2e import Electrum, cli_for, script_hash  # noqa: E402
 
 port, core, rpc, addr = int(sys.argv[1]), sys.argv[2], sys.argv[3], sys.argv[4]
-
-
-def cli(*args):
-    out = subprocess.run(
-        ["bitcoin-cli", "-regtest", f"-datadir={core}", f"-rpcport={rpc}", *args],
-        capture_output=True,
-        text=True,
-    )
-    if out.returncode != 0:
-        raise SystemExit(f"bitcoin-cli {args} failed: {out.stderr.strip()}")
-    return out.stdout.strip()
+cli = cli_for(core, rpc)
 
 
 def sh_of(address):
-    import hashlib
-
-    script = bytes.fromhex(json.loads(cli("getaddressinfo", address))["scriptPubKey"])
-    return hashlib.sha256(script).digest()[::-1].hex()
+    return script_hash(json.loads(cli("getaddressinfo", address))["scriptPubKey"])
 
 
-s = socket.create_connection(("127.0.0.1", port), timeout=20)
-f = s.makefile("rwb")
+el = Electrum(port)
+s, f = el.sock, el.f
 
 
-def call(i, m, p):
-    f.write((json.dumps({"jsonrpc": "2.0", "id": i, "method": m, "params": p}) + "\n").encode())
-    f.flush()
-    while True:
-        r = json.loads(f.readline())
-        # Subscribed clients receive notifications interleaved with responses.
-        if "method" in r and "id" not in r:
-            continue
-        assert "error" not in r, (m, r)
-        return r["result"]
-
+def call(_id, method, params):
+    return el.call(method, params)
 
 # Connect sequence used by Sparrow.
 assert call(1, "server.version", ["Sparrow", "1.4"])[1] == "1.4"
@@ -167,7 +148,6 @@ assert vtx_confirmed["in_active_chain"] is True, vtx_confirmed
 print("verbose confirmed tx OK")
 
 # --- transaction merkle proof must reach the block's merkle root ---
-import hashlib
 
 
 def sha256d(data):

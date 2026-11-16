@@ -63,9 +63,25 @@ Code and documentation review; not tagged. Write-up:
     prints two pids**: use `pkill -o -f 'e-lite run'` (documented commands
     are updated).
   - `--no-supervise` / `E_LITE_NO_SUPERVISE=1` keeps the single process.
-  - New suite `tests/e2e/e2e_supervisor.sh`.
+  - Covered by `tests/e2e/e2e_launch_core.sh`.
 - The managed Tor ends with e-lite however e-lite ends, and a Tor left behind
   by an older run is stopped at start instead of blocking the new one.
+
+### Tests
+
+- **One way to run the end-to-end suites**: `tests/run-e2e.sh` builds once,
+  runs every regtest suite (or the ones named), keeps the logs under
+  `target/e2e-logs/` and fails a suite that leaves a process behind.
+- The suites share `tests/lib/e2e.sh` (setup, cleanup that waits for every
+  process, Core helpers, a config generator, status/wait helpers) and
+  `tests/lib/e2e.py` (Electrum client and bitcoin-cli); the copies of that
+  code in each script are gone. The old `query_history.py` helper is replaced by
+  `tests/lib/e2e.py history`.
+- `e2e_supervisor` is merged into `e2e_launch_core` (both started a managed
+  Core from scratch); ten regtest suites remain.
+- Rust: `RawtxConfig::local_only(chain)` replaces four copies of the full
+  config in the tests, and the Electrum protocol tests build their served
+  state in one place.
 
 ### Refactored (no behaviour change)
 

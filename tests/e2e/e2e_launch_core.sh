@@ -1,112 +1,88 @@
 #!/usr/bin/env bash
-# e-lite starts Core from scratch with manual pruning (prune=1) and indexes
-# the chain. Regtest keeps the run small; the same path is used on mainnet.
-set -euo pipefail
-
-cd "$(dirname "$0")/../.."
-BIN="${E_LITE_BIN:-$PWD/target/debug/e-lite}"
-[ -x "$BIN" ] || { echo "build first: cargo build -p e-lite" >&2; exit 1; }
-command -v bitcoind >/dev/null || { echo "bitcoind not found" >&2; exit 1; }
-
-RUN="$(mktemp -d "${TMPDIR:-/tmp}/e-lite-launch-XXXXXX")"
+# A Core started and owned by e-lite, and e-lite restarting itself:
+#   - e-lite starts Core from an empty datadir with manual pruning (-prune=1)
+#     and indexes the chain;
+#   - `run` is a watching parent plus the node; the node is killed twice
+#     (SIGABRT, what a fatal internal error ends with; then SIGKILL, as the
+#     out-of-memory killer does) and comes back by itself, with the same Core
+#     process and no orphaned Tor;
+#   - a clean stop stops Core too and is not followed by a restart; an error
+#     exit is final; --no-supervise runs a single process.
+. "$(dirname "$0")/../lib/e2e.sh"
+e2e_init launch
 CORE="$RUN/core"; DATA="$RUN/index"; CONF="$RUN/e-lite.toml"
 RPC=18485; ELECTRUM=15008; METRICS=19191
+e2e_conf "$CONF" core.manage='"managed"' core.prune_mib=1 \
+  'core.extra_args=["-listen=0", "-fallbackfee=0.0002"]' \
+  index.batch_blocks=32 pruning.max_core_lag_blocks=64
+core_track "$CORE" "$RPC"
 
-cleanup() {
-  set +e
-  [ -f "$RUN/serve.pid" ] && kill "$(cat "$RUN/serve.pid")" 2>/dev/null
-  [ -f "$CORE/regtest/bitcoind.pid" ] && kill "$(cat "$CORE/regtest/bitcoind.pid")" 2>/dev/null
-  pkill -f "bitcoind .*$CORE" 2>/dev/null
-  sleep 1
-  rm -rf "$RUN"
-}
-trap cleanup EXIT INT TERM
-
-mkdir -p "$CORE" "$DATA"
-cat >"$CONF" <<EOF
-[network]
-name = "regtest"
-data_dir = "$DATA"
-
-[core]
-manage = "managed"
-core_datadir = "$CORE"
-rpc_url = "http://127.0.0.1:$RPC"
-prune_mib = 1
-extra_args = ["-listen=0", "-fallbackfee=0.0002"]
-
-[index]
-batch_blocks = 32
-reorg_window = 8
-
-[pruning]
-min_free_gib = 1
-max_core_lag_blocks = 64
-poll_seconds = 1
-
-[server]
-listen = "127.0.0.1:$ELECTRUM"
-tls = false
-
-[metrics]
-listen = "127.0.0.1:$METRICS"
-
-[rawtx]
-enabled = false
-EOF
+# The node is the only e-lite child of the watching parent.
+node_of() { pgrep -P "$1" -x e-lite | head -1; }
+NODE=""
+node_changed() { local now; now="$(node_of "$ELITE" || true)"; [ -n "$now" ] && [ "$now" != "$NODE" ]; }
+our_tors() { pgrep -f "tor -f $DATA" | wc -l; }
 
 echo "== e-lite starts Core from an empty datadir =="
-"$BIN" run --config "$CONF" >"$RUN/serve.log" 2>&1 &
-echo $! >"$RUN/serve.pid"
+elite_start "$RUN/serve.log" run --config "$CONF"
+wait_for 40 cli "$CORE" "$RPC" getblockcount || fail "Core did not start" "$RUN/serve.log"
+PRUNED=$(cli "$CORE" "$RPC" getblockchaininfo | python3 -c 'import json,sys;print(json.load(sys.stdin)["pruned"])')
+[ "$PRUNED" = "True" ] || fail "managed Core is not pruned"
+ADDR=$(core_mine_new "$CORE" "$RPC" launch 101)
+SH=$(scripthash_of "$CORE" "$RPC" launch "$ADDR")
+wait_ready "$METRICS" "$RUN/serve.log" 101 120
+NODE="$(node_of "$ELITE")"
+[ -n "$NODE" ] || fail "no supervised node under pid $ELITE"
+CORE_PID="$(cat "$CORE/regtest/bitcoind.pid")"
+echo "parent $ELITE node $NODE core $CORE_PID"
 
-CLI="bitcoin-cli -regtest -datadir=$CORE -rpcport=$RPC"
-for _ in $(seq 1 200); do $CLI getblockcount >/dev/null 2>&1 && break; sleep 0.2; done
-$CLI getblockchaininfo | python3 -c 'import json,sys;d=json.load(sys.stdin);print("core pruned",d["pruned"],"blocks",d["blocks"])'
+echo "== the node aborts (what a fatal internal error ends with) =="
+kill -ABRT "$NODE"
+wait_for 60 node_changed || fail "the node was not restarted" "$RUN/serve.log"
+wait_ready "$METRICS" "$RUN/serve.log"
+grep -q "ended abnormally (signal 6" "$RUN/serve.log" || fail "no supervisor line" "$RUN/serve.log"
+grep -q "restarted automatically after the previous run ended abnormally" "$RUN/serve.log" \
+  || fail "the restarted node did not say why" "$RUN/serve.log"
+grep -q "adopted Core pid $CORE_PID" "$RUN/serve.log" || fail "Core was not adopted" "$RUN/serve.log"
+kill -0 "$CORE_PID" || fail "Core was lost"
+NODE="$(node_of "$ELITE")"
 
-$CLI createwallet launch >/dev/null
-ADDR=$($CLI -rpcwallet=launch getnewaddress)
-SH=$(python3 - "$ADDR" "$CORE" "$RPC" <<'PY'
-import hashlib, json, subprocess, sys
-addr, core, rpc = sys.argv[1], sys.argv[2], sys.argv[3]
-out = subprocess.check_output(["bitcoin-cli", "-regtest", f"-datadir={core}", f"-rpcport={rpc}", "getaddressinfo", addr])
-print(hashlib.sha256(bytes.fromhex(json.loads(out)["scriptPubKey"])).digest()[::-1].hex())
-PY
-)
-$CLI -rpcwallet=launch generatetoaddress 101 "$ADDR" >/dev/null
+echo "== the index keeps following the chain =="
+core_mine "$CORE" "$RPC" launch 50 "$ADDR"
+wait_ready "$METRICS" "$RUN/serve.log" 151
 
-state() {
-  curl -s "http://127.0.0.1:$METRICS/status" 2>/dev/null \
-    | python3 -c 'import json,sys
-try: print(json.load(sys.stdin)["state"])
-except Exception: print("DOWN")' 2>/dev/null || echo DOWN
-}
-for _ in $(seq 1 120); do [ "$(state)" = READY ] && break; sleep 0.5; done
-echo "state: $(state)"
-[ "$(state)" = READY ] || { tail -40 "$RUN/serve.log"; exit 1; }
-
-$CLI -rpcwallet=launch generatetoaddress 50 "$ADDR" >/dev/null
-for _ in $(seq 1 60); do
-  H=$(curl -s "http://127.0.0.1:$METRICS/status" | python3 -c 'import json,sys;print(json.load(sys.stdin)["indexed_height"])')
-  [ "$H" -ge 151 ] && break
-  sleep 0.5
-done
-echo "indexed height: $H"
-
-ENTRIES=$(python3 tests/lib/query_history.py "$ELECTRUM" "$SH")
+echo "== the node is killed outright (as the out-of-memory killer does) =="
+kill -KILL "$NODE"
+wait_for 60 node_changed || fail "the node was not restarted" "$RUN/serve.log"
+wait_ready "$METRICS" "$RUN/serve.log" 151
+kill -0 "$CORE_PID" || fail "Core died"
+ENTRIES=$(electrum history "$ELECTRUM" "$SH")
 echo "history: $ENTRIES entries"
-[ "$ENTRIES" -ge 151 ] || { echo "history incomplete" >&2; exit 1; }
+[ "$ENTRIES" -ge 151 ] || fail "history incomplete"
+if grep -q "Tor" "$RUN/serve.log"; then
+  one_tor() { [ "$(our_tors)" -le 1 ]; }
+  wait_for 30 one_tor || fail "$(our_tors) Tor processes for one instance"
+fi
 
-kill -TERM "$(cat "$RUN/serve.pid")"
+echo "== a clean stop stops Core and is final =="
+NODE="$(node_of "$ELITE")"
+elite_stop "$ELITE" "$RUN/serve.log"
+sleep 1
+kill -0 "$NODE" 2>/dev/null && fail "the node outlived the stop"
+core_down "$CORE" "$RPC" || fail "Core still running after e-lite shutdown"
+[ "$(our_tors)" -eq 0 ] || fail "Tor left behind after a clean stop"
+
+echo "== an error exit is final =="
 set +e
-wait "$(cat "$RUN/serve.pid")"
+"$BIN" run --config "$RUN/does-not-exist.toml" --network not-a-network >"$RUN/bad.log" 2>&1
 RC=$?
 set -e
-[ "$RC" -eq 0 ] || { tail -20 "$RUN/serve.log"; exit 1; }
+[ "$RC" -ne 0 ] || fail "expected an error exit"
+grep -q "restarting in" "$RUN/bad.log" && fail "an error exit was restarted" "$RUN/bad.log"
 
-# e-lite owns this Core, so it must have stopped it on shutdown.
-sleep 1
-if $CLI getblockcount >/dev/null 2>&1; then
-  echo "Core still running after e-lite shutdown" >&2
-  exit 1
-fi
+echo "== --no-supervise: one process =="
+elite_start "$RUN/single.log" run --config "$CONF" --no-supervise
+wait_ready "$METRICS" "$RUN/single.log"
+pgrep -P "$ELITE" -x e-lite >/dev/null && fail "--no-supervise still started a child node"
+elite_stop "$ELITE" "$RUN/single.log"
 echo "launch-core OK"

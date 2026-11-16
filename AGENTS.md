@@ -165,7 +165,7 @@ Never treat a version number in this file as authoritative over the code/tag.
   ends with e-lite (`PR_SET_PDEATHSIG` SIGTERM) and a Tor left by an older
   run is stopped at start (AUD-180). `--no-supervise`/`E_LITE_NO_SUPERVISE=1`
   keeps one process; benchmarks that sample the pid use it. Cover:
-  `tests/e2e/e2e_supervisor.sh`.
+  `tests/e2e/e2e_launch_core.sh`.
 - The supervisor runs at commit boundaries inside the catch-up pipeline; the
   only teardown left is the 512-block checkpoint. Do not reintroduce a time
   deadline that drops prepared blocks/readers. Disk and shutdown checks stay
@@ -691,7 +691,7 @@ cargo fmt --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 scripts/check-docs.sh   # links, versions and source references in the docs
-shellcheck install.sh scripts/*.sh tests/e2e/*.sh tests/bench/*.sh tests/manual/*.sh
+shellcheck install.sh scripts/*.sh tests/*.sh tests/lib/*.sh tests/e2e/*.sh tests/bench/*.sh tests/manual/*.sh
 ```
 
 Focused checks when touching a subsystem:
@@ -701,15 +701,22 @@ cargo test -p el-serve tls   # TLS config, watcher reload
 cargo test -p e-lite tls     # TLS config validation, Tor auto-cert
 ```
 
-Plus the relevant integration tests (`tests/e2e/*.sh`) and the install/update
-commands on a clean environment.
+Plus the integration tests: `tests/run-e2e.sh` runs every regtest suite with
+one build and fails a suite that leaves a process behind; `tests/run-e2e.sh
+<suite>...` runs a subset. And the install/update commands on a clean
+environment.
 
 Environment facts:
 
 - Build needs `build-essential clang libclang-dev pkg-config` (RocksDB bindgen),
   matching the `debian:12` CI container.
 - Each `tests/e2e/*.sh` needs `bitcoind` in `PATH` and a debug binary first
-  (`cargo build -p e-lite`); they create their own regtest datadir and ports.
+  (`cargo build -p e-lite`, or let `tests/run-e2e.sh` build it); they create
+  their own regtest datadir and ports. New suites source `tests/lib/e2e.sh`
+  (`e2e_init`, `core_start`, `e2e_conf`, `elite_start`, `wait_ready`, `fail`)
+  and use `tests/lib/e2e.py` for Electrum calls instead of copying them.
+- Rust tests build a no-network rawtx config with
+  `RawtxConfig::local_only(chain)` plus struct update syntax.
 
 ## Code review rule
 

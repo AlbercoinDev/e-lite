@@ -231,12 +231,7 @@ cargo fmt --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 scripts/check-docs.sh
-tests/e2e/e2e_launch_core.sh
-tests/e2e/e2e_pruned_ibd.sh
-tests/e2e/e2e_regtest.sh
-tests/e2e/e2e_defaults.sh
-tests/e2e/e2e_recovery.sh
-tests/e2e/e2e_multi_instance.sh
+tests/run-e2e.sh            # every regtest e2e suite, one build, summary
 ```
 
 Hot reload:

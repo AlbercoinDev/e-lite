@@ -255,8 +255,9 @@ tema (`git log main..review/analisis-2026-11`).
 | Guard para plazas de cliente, conexión muerta, análisis único de la línea, registro de errores acotado (AUD-170) | arreglo P2 | `crates/el-serve/src/server.rs`, `client.rs`, `rpc.rs` |
 | `:t` solo para `.onion` y servidores locales; origen en `privacy check` (AUD-171) | arreglo P2 | `crates/el-rawtx/src/electrum.rs`, `bin/e-lite/src/privacy.rs` |
 | Exportación fallida sin restos (AUD-172) | arreglo P3 | `bin/e-lite/src/snapshot.rs` |
-| Reinicio automático integrado, sin systemd; Tor gestionado sin huérfanos (AUD-180) | decisión del dueño | `bin/e-lite/src/supervisor.rs`, `bin/e-lite/src/tor.rs`, `tests/e2e/e2e_supervisor.sh` |
+| Reinicio automático integrado, sin systemd; Tor gestionado sin huérfanos (AUD-180) | decisión del dueño | `bin/e-lite/src/supervisor.rs`, `bin/e-lite/src/tor.rs`, `tests/e2e/e2e_launch_core.sh` |
 | `bind` de los puertos que espera si solo los ocupa una conexión saliente; los tests esperan a que e-lite termine (AUD-181) | arreglo P2 | `crates/el-serve/src/server.rs`, `bin/e-lite/src/setup.rs`, `tests/e2e/` |
+| Tests simplificados y reunificados: biblioteca común para los e2e (`tests/lib/e2e.sh`, `tests/lib/e2e.py`), lanzador único `tests/run-e2e.sh`, `e2e_supervisor` fusionado en `e2e_launch_core`, configuración de pruebas Rust en un solo sitio | mantenimiento | `tests/`, `crates/el-rawtx/src/lib.rs`, `crates/el-serve/tests/protocol.rs` |
 | Política de panic: *unwind*, *hook* que contiene los hilos de wallet y aborta el resto, *mutex* sin envenenamiento (AUD-173) | decisión del dueño | `Cargo.toml`, `bin/e-lite/src/main.rs`, `crates/el-model/src/sync.rs`, `crates/el-serve/src/server.rs` |
 | AUDIT solo con abiertos, ROADMAP con rutas reales, FEATURES/ELECTRUM_PROTOCOL/OPERATIONS corregidos, comprobación de referencias a código | documentación | `docs/`, `scripts/check-docs.sh` |
 
@@ -284,16 +285,17 @@ Cambios visibles para un usuario:
 
 ### Verificación
 
-Ejecutado en esta rama, última pasada completa el 2026-11-16, con el reinicio automático activo:
+Ejecutado en esta rama, última pasada completa el 2026-11-16, con el reinicio
+automático activo y los tests ya reunificados:
 
 | Comprobación | Resultado |
 |---|---|
 | `cargo fmt --check` | correcto |
 | `cargo clippy --workspace --all-targets -- -D warnings` | correcto |
 | `cargo test --workspace` | 372 tests correctos, 6 ignorados (350 antes de la revisión) |
-| `cargo build --release` (con `panic = "unwind"`) + `e2e_regtest.sh` y `e2e_supervisor.sh` sobre ese binario | correcto |
+| `tests/run-e2e.sh --release launch_core regtest` (binario release, con `panic = "unwind"`) | correcto |
 | `scripts/check-docs.sh` | correcto (38 documentos) |
-| Los once e2e de regtest: `e2e_supervisor`, `e2e_regtest`, `e2e_defaults`, `e2e_launch_core`, `e2e_wait_core`, `e2e_external_pruned`, `e2e_resilience`, `e2e_snapshot`, `e2e_multi_instance`, `e2e_pruned_ibd` (poda + SIGKILL + SIGTERM), `e2e_recovery` | correctos en la última pasada completa, sin procesos residuales al terminar |
+| `tests/run-e2e.sh`: las diez suites e2e de regtest (`defaults`, `external_pruned`, `launch_core`, `multi_instance`, `pruned_ibd`, `recovery`, `regtest`, `resilience`, `snapshot`, `wait_core`) | correctas en la última pasada (unos 8 minutos), sin procesos residuales |
 
 Dos e2e fallaron de forma esporádica a lo largo de las pasadas
 (`e2e_multi_instance.sh` dos veces con `cannot bind metrics 127.0.0.1:55484`,
@@ -401,7 +403,7 @@ reinicio va dentro del propio e-lite:
   instante, como antes: los e2e de recuperación dependen de eso.
 - `--no-supervise` o `E_LITE_NO_SUPERVISE=1` dejan un solo proceso.
 
-Probado con `tests/e2e/e2e_supervisor.sh`: mata el nodo con SIGABRT y luego con
+Probado con `tests/e2e/e2e_launch_core.sh`: mata el nodo con SIGABRT y luego con
 SIGKILL, y comprueba que vuelve solo, que Core conserva su pid, que el índice
 sigue avanzando, que queda un único Tor y que ni una parada limpia ni una
 salida con error se reinician.

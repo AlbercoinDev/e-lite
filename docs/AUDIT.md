@@ -16,7 +16,7 @@ Spanish, is [`ANALISIS.md`](ANALISIS.md).
 cargo fmt --check                                      OK
 cargo clippy --workspace --all-targets -- -D warnings  OK
 cargo test --workspace                                 372 tests OK (6 ignored)
-cargo build --release + e2e_regtest + e2e_supervisor   OK
+tests/run-e2e.sh --release launch_core regtest          OK
 scripts/check-docs.sh                                  OK
 tests/e2e/e2e_regtest.sh                               OK
 tests/e2e/e2e_defaults.sh                              OK
@@ -28,7 +28,6 @@ tests/e2e/e2e_snapshot.sh                              OK
 tests/e2e/e2e_multi_instance.sh                        OK
 tests/e2e/e2e_pruned_ibd.sh                            OK
 tests/e2e/e2e_recovery.sh                              OK
-tests/e2e/e2e_supervisor.sh                            OK
 ```
 
 Run on the review branch on 2026-11-16, with the automatic restart on;

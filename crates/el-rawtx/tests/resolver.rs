@@ -173,26 +173,7 @@ fn config(decoys: u32, cache_mib: u64) -> RawtxConfig {
         enabled: true,
         cache_mib,
         decoys,
-        tor_socks: None,
-        allow_clearnet: true,
-        fallback_clearnet: false,
-        request_timeout_seconds: 15,
-        tor_request_timeout_seconds: 15,
-        provider_cooldown_seconds: 120,
-        max_parallel_fetches: 4,
-        cache_dir: None,
-        use_p2p: false,
-        use_esplora: false,
-        p2p_v2: false,
-        esplora_urls: Vec::new(),
-        p2p_peers: Vec::new(),
-        tor_connect_timeout_seconds: 15,
-        tor_stall_timeout_seconds: 15,
-        p2p_timeout: Duration::from_secs(1),
-        p2p_tor_timeout: Duration::from_secs(1),
-        chain: el_model::Chain::Regtest,
-        privacy: el_rawtx::PrivacyParams::default(),
-        electrum_servers: Vec::new(),
+        ..RawtxConfig::local_only(el_model::Chain::Regtest)
     }
 }
 

@@ -1,217 +1,72 @@
 #!/usr/bin/env bash
-# Two instances running at once on different Core datadirs and ports:
-# listeners, TLS, metrics, heights and independent shutdown/restart.
-set -euo pipefail
-
-cd "$(dirname "$0")/../.."
-BIN="${E_LITE_BIN:-$PWD/target/debug/e-lite}"
-[ -x "$BIN" ] || { echo "build first: cargo build -p e-lite" >&2; exit 1; }
-command -v bitcoind >/dev/null || { echo "bitcoind not found" >&2; exit 1; }
-
-RUN="$(mktemp -d "${TMPDIR:-/tmp}/e-lite-multi-XXXXXX")"
+# Two instances side by side (default regtest ports for A, explicit ports for
+# B): independent listeners, data, certificates and heights; stopping one
+# leaves the other serving; the stopped one comes back.
+. "$(dirname "$0")/../lib/e2e.sh"
+e2e_init multi
 A="$RUN/a"; B="$RUN/b"
 RPC_A=18490; RPC_B=18491
 A_PLAIN=55311; A_TLS=55322; A_METRICS=55384
 B_PLAIN=55411; B_TLS=55422; B_METRICS=55484
 
-cleanup() {
-  set +e
-  local pids=""
-  for f in "$RUN/a.pid" "$RUN/b.pid"; do
-    [ -f "$f" ] && { kill -TERM "$(cat "$f")" 2>/dev/null; pids="$pids $(cat "$f")"; }
-  done
-  for d in "$A/core" "$B/core"; do
-    [ -f "$d/regtest/bitcoind.pid" ] && kill "$(cat "$d/regtest/bitcoind.pid")" 2>/dev/null
-  done
-  # Wait for the instances to really end: the next suite reuses the ports.
-  for _ in $(seq 1 60); do
-    alive=0
-    for p in $pids; do kill -0 "$p" 2>/dev/null && alive=1; done
-    [ "$alive" -eq 0 ] && break
-    sleep 0.5
-  done
-  rm -rf "$RUN"
+core_start "$A/core" "$RPC_A"; core_mine_new "$A/core" "$RPC_A" multi 40 >/dev/null
+core_start "$B/core" "$RPC_B"; core_mine_new "$B/core" "$RPC_B" multi 80 >/dev/null
+# A: no [server]/[metrics] sections, so the regtest defaults apply.
+DATA="$A/index" CORE="$A/core" RPC=$RPC_A e2e_conf "$A/e-lite.toml" \
+  index.batch_blocks=32 index.reorg_window= pruning.poll_seconds= \
+  server.listen= server.tls= metrics.listen= tor.mode='"off"'
+DATA="$B/index" CORE="$B/core" RPC=$RPC_B e2e_conf "$B/e-lite.toml" \
+  index.batch_blocks=32 index.reorg_window= pruning.poll_seconds= \
+  server.listen="\"127.0.0.1:$B_PLAIN\"" server.tls= \
+  server.tls_listen="\"127.0.0.1:$B_TLS\"" metrics.listen="\"127.0.0.1:$B_METRICS\"" \
+  tor.mode='"off"'
+
+elite_start "$RUN/a.log" run --config "$A/e-lite.toml"; PID_A=$ELITE
+elite_start "$RUN/b.log" run --config "$B/e-lite.toml"; PID_B=$ELITE
+wait_ready "$A_METRICS" "$RUN/a.log"
+wait_ready "$B_METRICS" "$RUN/b.log"
+
+expect_height() {
+  local got
+  got=$(electrum height "${@:3}" "$1")
+  [ "$got" = "$2" ] || fail "port $1 serves height $got, expected $2"
 }
-trap cleanup EXIT INT TERM
+expect_height "$A_PLAIN" 40; expect_height "$A_TLS" 40 --tls
+expect_height "$B_PLAIN" 80; expect_height "$B_TLS" 80 --tls
+[ "$(status "$A_METRICS" listen)" = "127.0.0.1:$A_PLAIN" ] || fail "A plain is not the loopback default"
+[ "$(status "$A_METRICS" tls_listen)" = "0.0.0.0:$A_TLS" ] || fail "A TLS is not the default"
+[ "$(status "$B_METRICS" listen)" = "127.0.0.1:$B_PLAIN" ] || fail "B plain listen"
+[ "$(status "$B_METRICS" tls_listen)" = "127.0.0.1:$B_TLS" ] || fail "B TLS listen"
+echo "A plain/tls 40, B plain/tls 80; listeners independent"
 
-start_core() {
-  local dir=$1 rpc=$2 blocks=$3
-  mkdir -p "$dir"
-  bitcoind -regtest -datadir="$dir" -daemon -server -listen=0 \
-    -rpcport="$rpc" -fallbackfee=0.0002 >/dev/null
-  local cli="bitcoin-cli -regtest -datadir=$dir -rpcport=$rpc"
-  for _ in $(seq 1 100); do $cli getblockcount >/dev/null 2>&1 && break; sleep 0.2; done
-  $cli createwallet multi >/dev/null
-  local addr
-  addr=$($cli -rpcwallet=multi getnewaddress)
-  $cli -rpcwallet=multi generatetoaddress "$blocks" "$addr" >/dev/null
-  $cli getblockcount
-}
-
-mkdir -p "$A/index" "$B/index"
-cat >"$A/e-lite.toml" <<EOF
-[network]
-name = "regtest"
-data_dir = "$A/index"
-
-[core]
-manage = "external"
-core_datadir = "$A/core"
-rpc_url = "http://127.0.0.1:$RPC_A"
-
-[index]
-batch_blocks = 32
-
-[pruning]
-min_free_gib = 1
-
-[tor]
-mode = "off"
-
-[rawtx]
-enabled = false
-EOF
-
-cat >"$B/e-lite.toml" <<EOF
-[network]
-name = "regtest"
-data_dir = "$B/index"
-
-[core]
-manage = "external"
-core_datadir = "$B/core"
-rpc_url = "http://127.0.0.1:$RPC_B"
-
-[index]
-batch_blocks = 32
-
-[pruning]
-min_free_gib = 1
-
-[server]
-listen = "127.0.0.1:$B_PLAIN"
-tls_listen = "127.0.0.1:$B_TLS"
-
-[metrics]
-listen = "127.0.0.1:$B_METRICS"
-
-[tor]
-mode = "off"
-
-[rawtx]
-enabled = false
-EOF
-
-HEIGHT_A=$(start_core "$A/core" "$RPC_A" 40)
-HEIGHT_B=$(start_core "$B/core" "$RPC_B" 80)
-echo "chains: A=$HEIGHT_A B=$HEIGHT_B"
-
-"$BIN" run --config "$A/e-lite.toml" >"$RUN/a.log" 2>&1 &
-echo $! >"$RUN/a.pid"
-"$BIN" run --config "$B/e-lite.toml" >"$RUN/b.log" 2>&1 &
-echo $! >"$RUN/b.pid"
-
-wait_ready() {
-  local metrics=$1
-  for _ in $(seq 1 120); do
-    [ "$(curl -s "http://127.0.0.1:$metrics/status" \
-      | python3 -c 'import json,sys;print(json.load(sys.stdin).get("state",""))' 2>/dev/null)" = "READY" ] && return 0
-    sleep 0.5
-  done
-  return 1
-}
-wait_ready "$A_METRICS" || { echo "A did not become READY" >&2; tail -30 "$RUN/a.log"; exit 1; }
-wait_ready "$B_METRICS" || { echo "B did not become READY" >&2; tail -30 "$RUN/b.log"; exit 1; }
-
-python3 - "$A_PLAIN" "$A_TLS" "$B_PLAIN" "$B_TLS" "$A_METRICS" "$B_METRICS" <<'PY'
-import json, socket, ssl, sys, urllib.request
-a_plain, a_tls, b_plain, b_tls, a_metrics, b_metrics = map(int, sys.argv[1:])
-
-def height(port, use_tls):
-    s = socket.create_connection(("127.0.0.1", port), timeout=10)
-    if use_tls:
-        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
-        ctx.check_hostname = False
-        ctx.verify_mode = ssl.CERT_NONE
-        s = ctx.wrap_socket(s, server_hostname="localhost")
-    f = s.makefile("rwb")
-    f.write(json.dumps({"id": 1, "method": "blockchain.headers.subscribe",
-                        "params": []}).encode() + b"\n")
-    f.flush()
-    h = json.loads(f.readline())["result"]["height"]
-    s.close()
-    return h
-
-assert height(a_plain, False) == 40
-assert height(a_tls, True) == 40
-assert height(b_plain, False) == 80
-assert height(b_tls, True) == 80
-sa = json.load(urllib.request.urlopen(f"http://127.0.0.1:{a_metrics}/status"))
-sb = json.load(urllib.request.urlopen(f"http://127.0.0.1:{b_metrics}/status"))
-assert sa["indexed_height"] == 40 and sb["indexed_height"] == 80
-assert sa["listen"] == "127.0.0.1:55311", sa["listen"]
-assert sb["listen"] == "127.0.0.1:55411", sb["listen"]
-assert sa["tls_listen"] == "0.0.0.0:55322", sa["tls_listen"]
-assert sb["tls_listen"] == "127.0.0.1:55422", sb["tls_listen"]
-print("A plain/tls 40, B plain/tls 80; listeners independent")
-PY
-
-# Distinct certificates: separate data dirs must not share identity.
+# Separate data dirs must not share a TLS identity.
 FP_A=$(openssl x509 -in "$A/index/tls/self-signed.crt" -noout -fingerprint -sha256)
 FP_B=$(openssl x509 -in "$B/index/tls/self-signed.crt" -noout -fingerprint -sha256)
-[ "$FP_A" != "$FP_B" ] || { echo "instances share a TLS certificate" >&2; exit 1; }
+[ "$FP_A" != "$FP_B" ] || fail "instances share a TLS certificate"
 echo "TLS certificates are distinct"
 
-# Combined memory must stay under the process budget.
-# The pid files hold the watching parents; the memory is in their nodes.
-node_of() {
+# Memory is in the nodes (children of the watching parents).
+rss_of() {
   local node
   node="$(pgrep -P "$1" -x e-lite | head -1 || true)"
-  echo "${node:-$1}"
+  awk '/VmRSS/ {print $2}' "/proc/${node:-$1}/status"
 }
-RSS_A=$(awk '/VmRSS/ {print $2}' "/proc/$(node_of "$(cat "$RUN/a.pid")")/status")
-RSS_B=$(awk '/VmRSS/ {print $2}' "/proc/$(node_of "$(cat "$RUN/b.pid")")/status")
-TOTAL_KB=$(awk '/MemTotal/ {print $2}' /proc/meminfo)
-python3 - "$RSS_A" "$RSS_B" "$TOTAL_KB" <<'PY'
+python3 - "$(rss_of "$PID_A")" "$(rss_of "$PID_B")" "$(awk '/MemTotal/ {print $2}' /proc/meminfo)" <<'PY'
 import sys
 a, b, total = map(int, sys.argv[1:])
-ceiling = total * 0.75
-assert a < ceiling and b < ceiling, (a, b, ceiling)
-assert a + b < total * 0.9, (a, b, total)
-print(f"RSS A={a//1024} MiB B={b//1024} MiB combined={((a+b)//1024)} MiB (total {total//1024} MiB)")
+assert a < total * 0.75 and b < total * 0.75 and a + b < total * 0.9, (a, b, total)
+print(f"RSS A={a//1024} MiB B={b//1024} MiB (total {total//1024} MiB)")
 PY
 
-echo "== stop A, B must keep serving =="
-kill -TERM "$(cat "$RUN/a.pid")"
-for _ in $(seq 1 60); do kill -0 "$(cat "$RUN/a.pid")" 2>/dev/null || break; sleep 0.5; done
-python3 - "$B_PLAIN" <<'PY'
-import json, socket, sys
-s = socket.create_connection(("127.0.0.1", int(sys.argv[1])), timeout=10)
-f = s.makefile("rwb")
-f.write(json.dumps({"id": 1, "method": "blockchain.headers.subscribe",
-                    "params": []}).encode() + b"\n")
-f.flush()
-assert json.loads(f.readline())["result"]["height"] == 80
-print("B still serves height 80 while A is stopped")
-PY
-curl -sf "http://127.0.0.1:$A_METRICS/status" >/dev/null 2>&1 && {
-  echo "A metrics still answering after shutdown" >&2; exit 1;
-}
+echo "== stop A, B keeps serving =="
+elite_stop "$PID_A" "$RUN/a.log"
+expect_height "$B_PLAIN" 80
+curl -sf "http://127.0.0.1:$A_METRICS/status" >/dev/null 2>&1 && fail "A metrics still answering after shutdown"
+echo "B still serves height 80 while A is stopped"
 
 echo "== restart A =="
-"$BIN" run --config "$A/e-lite.toml" >"$RUN/a2.log" 2>&1 &
-echo $! >"$RUN/a.pid"
-wait_ready "$A_METRICS" || { echo "A did not restart" >&2; tail -30 "$RUN/a2.log"; exit 1; }
-python3 - "$A_PLAIN" "$B_PLAIN" <<'PY'
-import json, socket, sys
-for port, expected in ((int(sys.argv[1]), 40), (int(sys.argv[2]), 80)):
-    s = socket.create_connection(("127.0.0.1", port), timeout=10)
-    f = s.makefile("rwb")
-    f.write(json.dumps({"id": 1, "method": "blockchain.headers.subscribe",
-                        "params": []}).encode() + b"\n")
-    f.flush()
-    assert json.loads(f.readline())["result"]["height"] == expected
-print("both instances serve after A restarted")
-PY
-
+elite_start "$RUN/a2.log" run --config "$A/e-lite.toml"
+wait_ready "$A_METRICS" "$RUN/a2.log"
+expect_height "$A_PLAIN" 40; expect_height "$B_PLAIN" 80
+echo "both instances serve after A restarted"
 echo "multi-instance OK"

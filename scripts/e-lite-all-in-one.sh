@@ -420,7 +420,7 @@ run_quick() {
   wait_ready || { tail -80 "$TMP/serve.log"; die "index did not reach READY"; }
   sh="$(scripthash_for_address "$addr")"
   local entries
-  entries="$(python3 "$ROOT/tests/lib/query_history.py" "$ELECTRUM_PORT" "$sh")"
+  entries="$(python3 "$ROOT/tests/lib/e2e.py" history "$ELECTRUM_PORT" "$sh")"
   info "history entries: $entries"
   printf 'quick regtest: OK (%s history entries)\n' "$entries" >"$TMP/results.txt"
   report_common
