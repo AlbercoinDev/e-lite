@@ -19,6 +19,7 @@ pub mod txcache;
 pub mod txsource;
 pub mod verify;
 
+use el_model::sync::Mutex;
 use el_model::{Chain, Hash32};
 use el_store::Store;
 use rand::seq::SliceRandom;
@@ -28,7 +29,7 @@ use std::fmt;
 use std::net::TcpStream;
 use std::panic::AssertUnwindSafe;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{mpsc, Arc, Condvar, Mutex};
+use std::sync::{mpsc, Arc, Condvar};
 use std::time::{Duration, Instant};
 
 /// Extra `debug:` lines (per-block failures of the background prefetch),
@@ -1791,7 +1792,7 @@ impl Resolver {
     ) {
         let stats = Arc::clone(&self.stats);
         let spawned = std::thread::Builder::new()
-            .name("el-fetch".to_string())
+            .name(el_model::sync::THREAD_FETCH.to_string())
             .spawn(move || {
                 let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
                     source.fetch_endpoint(&endpoint, &hash, deadline, FetchMode::Normal, &ctl)

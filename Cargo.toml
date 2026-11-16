@@ -43,7 +43,10 @@ rcgen = "0.13"
 opt-level = 3
 lto = "thin"
 codegen-units = 1
-panic = "abort"
+# Unwind, so a panic while serving one wallet connection ends that connection
+# only. The panic hook in bin/e-lite aborts the process for every other
+# thread (index, commit, prune, mempool, notifier): see el_model::sync.
+panic = "unwind"
 
 [profile.dev]
 opt-level = 1

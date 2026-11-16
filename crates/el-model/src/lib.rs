@@ -2,6 +2,7 @@
 
 pub mod codec;
 pub mod merkle;
+pub mod sync;
 pub mod types;
 
 pub use codec::{CodecError, SCHEMA_VERSION};

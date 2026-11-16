@@ -17,13 +17,13 @@
 //! 4 KiB filesystem blocks, so the budget matches real disk use.
 
 use crate::{RawtxError, Result};
+use el_model::sync::Mutex;
 use el_model::Hash32;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
 use std::time::SystemTime;
 
 const MAGIC: &[u8; 4] = b"ELT1";

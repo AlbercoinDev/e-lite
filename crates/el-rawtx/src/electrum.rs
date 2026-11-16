@@ -13,12 +13,13 @@ use crate::health::{Blame, HealthMap, TRANSIENT_BASE, TRANSIENT_CAP};
 use crate::p2p::{socks_connect, split_host_port};
 use crate::txsource::{TxBatch, TxSource, MAX_TX_BYTES};
 use crate::{AttemptCtl, RawtxError, Result};
+use el_model::sync::Mutex;
 use el_model::Hash32;
 use serde_json::{json, Value};
 use std::collections::HashSet;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 /// A generic client name: never "e-lite" (AUD-133).

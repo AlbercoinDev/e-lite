@@ -1,12 +1,12 @@
 //! Bounded on-disk cache of **validated** raw blocks (LRU by mtime).
 
 use crate::{RawtxError, Result};
+use el_model::sync::Mutex;
 use el_model::Hash32;
 use std::collections::HashMap;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
 use std::time::SystemTime;
 
 struct State {

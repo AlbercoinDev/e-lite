@@ -8,7 +8,7 @@ the signal that would move it to `FEATURES.md`. No dates are promised.
 ## Near-term fixes (verified in code)
 
 What is left of the 29.15.0 audit (AUD-167) after the 2026-11-15 review, which
-fixed items 4, 5, 12, 14 and 15 (AUD-169..172 in
+fixed items 4, 5, 12, 14 and 15 (AUD-169..173 in
 [`audit/FIXED.md`](audit/FIXED.md)) and documented item 16. Numbers are kept so
 older notes still match. New findings of that review are AUD-173..181 in
 [`AUDIT.md`](AUDIT.md).
@@ -77,7 +77,7 @@ older notes still match. New findings of that review are AUD-173..181 in
 | P2 | Container image (Docker/Podman) | reproducible runtime, mounts for Core/index; no secrets baked in. UmbrelOS notes are in `TUNING.md`. |
 | P2 | Electrum/Sparrow matrix | scripted versions for 1.4; document known limitations. |
 | P2 | Core version matrix | test the oldest supported and the latest official Core; fail clearly. |
-| P2 | Systemd unit and service hardening | `Restart=on-failure`, resource limits, no privileges. Raised from P3: the release binary aborts on any panic (AUD-173) and nothing restarts it today. |
+| P2 | Systemd unit and service hardening | `Restart=on-failure`, resource limits, no privileges. Raised from P3: a panic outside the wallet threads still aborts the process by design (AUD-173), and nothing restarts it today. |
 | P3 | Cross-container sync coordination | the per-user IBD lock does not cross mount namespaces; needs a shared lock medium or orchestrator policy. |
 | P3 | Plugin/extension surface | only after core stability; avoid freezing unstable APIs. |
 

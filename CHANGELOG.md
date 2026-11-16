@@ -27,7 +27,19 @@ Code and documentation review; not tagged. Write-up:
   `rawtx.decoys`, not always from `config.toml`.
 - A failed `export-snapshot` removes its partial `.tmp` archive (AUD-172).
 
-### Changed (no behaviour change)
+### Changed
+
+- **Panic policy (AUD-173).** Release builds unwind instead of aborting. A
+  panic in a thread that serves one wallet connection (connection, pipelined
+  line, batch worker, block-download attempt) now closes that connection and
+  logs `internal error in <thread> at <file:line>`; the node keeps running.
+  A panic in any other thread (indexing, commit, prune, mempool, notifier)
+  still stops the process, after a `FATAL` line, and the index recovers from
+  its log on the next start. Locks shared between connections no longer
+  poison, so one contained panic cannot disable a cache for the rest of the
+  run.
+
+### Refactored (no behaviour change)
 
 - `catch_up_limited` (620 lines) is split into `preflight`, `spawn_readers`,
   `next_prepared`, `live_lag_check`, `commit_reason`, `flush_group` and
@@ -44,7 +56,7 @@ Code and documentation review; not tagged. Write-up:
   (sync/IBD/indexing, wallet service, backup/restore), the written improvement
   plan and new proposals.
 - `docs/AUDIT.md` keeps only open findings and residual risks; AUD-016 and
-  AUD-091..125 moved to `docs/audit/FIXED.md`. New open findings AUD-173..181.
+  AUD-091..125 moved to `docs/audit/FIXED.md`. New open findings AUD-174..181.
 - `docs/ROADMAP.md` points at the modules that exist after the 29.17.0 split;
   item 10 is marked as conflicting with AUD-041; the systemd unit is P2.
 - `docs/FEATURES.md`, `docs/ELECTRUM_PROTOCOL.md`: raw-transaction source

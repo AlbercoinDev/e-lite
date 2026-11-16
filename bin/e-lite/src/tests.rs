@@ -400,3 +400,58 @@ fn help_flags_are_documented() {
         );
     }
 }
+
+/// AUD-173: the panic hook keeps the node up when a wallet-facing thread
+/// panics and aborts the process for any other thread. Abort cannot be
+/// observed in-process, so the test runs itself again as a child.
+#[test]
+fn panic_hook_contains_wallet_threads_and_aborts_the_rest() {
+    use std::os::unix::process::ExitStatusExt;
+    const CHILD: &str = "E_LITE_PANIC_HOOK_CHILD";
+    if let Ok(which) = std::env::var(CHILD) {
+        crate::install_panic_hook();
+        let name = if which == "contained" {
+            el_model::sync::THREAD_CLIENT
+        } else {
+            "el-prune"
+        };
+        let _ = std::thread::Builder::new()
+            .name(name.to_string())
+            .spawn(|| panic!("injected"))
+            .unwrap()
+            .join();
+        std::process::exit(0);
+    }
+    let exe = std::env::current_exe().unwrap();
+    for (which, survives) in [("contained", true), ("critical", false)] {
+        let out = std::process::Command::new(&exe)
+            .args([
+                "--exact",
+                "tests::panic_hook_contains_wallet_threads_and_aborts_the_rest",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(CHILD, which)
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        if survives {
+            assert!(out.status.success(), "{which}: {:?}\n{stderr}", out.status);
+            assert!(stderr.contains("the node keeps running"), "{stderr}");
+            assert!(
+                !stderr.contains("injected"),
+                "wallet panic message leaked: {stderr}"
+            );
+        } else {
+            assert_eq!(
+                out.status.signal(),
+                Some(libc::SIGABRT),
+                "{which}: {stderr}"
+            );
+            assert!(
+                stderr.contains("FATAL: internal error in el-prune"),
+                "{stderr}"
+            );
+        }
+    }
+}

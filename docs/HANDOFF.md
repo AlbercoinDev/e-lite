@@ -111,8 +111,11 @@ Not tagged, not pushed; version unchanged. Full write-up in Spanish:
   `audit/FIXED.md`), `ROADMAP.md` points at the files that exist after the
   29.17.0 split, and `scripts/check-docs.sh` now fails when a document names a
   source file or an identifier that is no longer there.
-- **New open findings**: AUD-173 (`panic = "abort"` vs code written for
-  unwinding), AUD-174 (threads per connection), AUD-175 (errors classified by
+- **Panic policy (AUD-173, owner decision 2026-11-16)**: release builds
+  unwind; a panic hook contains panics in the wallet-facing threads
+  (`el-client`, `el-line`, `el-batch`, `el-fetch`) and aborts for every other
+  thread. Shared locks no longer poison.
+- **New open findings**: AUD-174 (threads per connection), AUD-175 (errors classified by
   message text), AUD-176 (snapshot digest cost), AUD-177 (commit holds the
   global lock), AUD-178 (negotiation rule), AUD-179 (reader pool per call),
   AUD-180 (managed Tor orphaned after an unclean exit), AUD-181 (default
@@ -191,6 +194,8 @@ Full detail: `CHANGELOG.md`.
 - `prune_mib = 1` for from-zero pruned IBD; snapshots are manual only.
 - Public providers fail closed; the shipped Electrum list never stands in for
   a missing or invalid `public-servers.toml`.
+- Release builds unwind; only the threads in
+  `el_model::sync::CONTAINED_THREADS` may fail alone (AUD-173).
 - The TLS identity is one CA + leaf per instance (no SNI); a domain
   certificate and `.onion` access are mutually exclusive per instance.
 
@@ -204,8 +209,9 @@ P1 (before any public exposure or mainnet production claim):
 3. Close or document the residual audit risks (snapshot archive size limits,
    per-client threads, provider trust); see `AUDIT.md`.
 
-4. Decide the panic policy (AUD-173): the release binary aborts on any panic
-   and nothing restarts it.
+4. Ship a systemd unit with `Restart=on-failure`: a panic outside the wallet
+   threads still stops the node by design (AUD-173), and the managed Tor is
+   orphaned when that happens (AUD-180).
 
 P2/P3: the verified list (13 items left) is in `ROADMAP.md`; the short
 version: leader-verifies-before-notify, Tor retry by blame, no provider

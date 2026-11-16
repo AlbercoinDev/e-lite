@@ -50,9 +50,14 @@ pub fn start_listener_on(
                 shared: Arc::clone(&shared),
                 client,
             };
-            std::thread::spawn(move || {
-                let _ = handle_client(&slot.shared, Arc::clone(&slot.client));
-            });
+            // Named: the panic hook lets this thread fail alone (AUD-173).
+            // If the thread cannot start, the closure is dropped and the
+            // slot with it.
+            let _ = std::thread::Builder::new()
+                .name(el_model::sync::THREAD_CLIENT.to_string())
+                .spawn(move || {
+                    let _ = handle_client(&slot.shared, Arc::clone(&slot.client));
+                });
         }
     })
 }
@@ -60,7 +65,8 @@ pub fn start_listener_on(
 /// One accepted connection: its `max_clients` slot and its registry entry.
 /// Released on drop, so a connection thread that unwinds cannot leak the slot
 /// (the listener would otherwise refuse clients forever once enough had
-/// leaked). Release builds abort on panic; this covers every other exit.
+/// leaked). A panic in a connection thread is contained (AUD-173), so this
+/// guard is what gives the slot back.
 struct ClientSlot {
     shared: Arc<Shared>,
     client: Arc<ClientState>,
@@ -229,7 +235,7 @@ pub(crate) fn client_loop(shared: &Shared, client: &Arc<ClientState>) -> std::io
     // every later request of the connection, including the wallet's retry
     // of the same batch after its own read timeout. Responses carry their
     // ids, so their order on the wire does not matter.
-    let in_flight = (Mutex::new(0usize), Condvar::new());
+    let in_flight = (std::sync::Mutex::new(0usize), Condvar::new());
     let closing = AtomicBool::new(false);
     let wait_below = |limit: usize| {
         let (count, cv) = &in_flight;
@@ -278,22 +284,29 @@ pub(crate) fn client_loop(shared: &Shared, client: &Arc<ClientState>) -> std::io
                 *n += 1;
                 drop(n);
                 client.background.fetch_add(1, Ordering::Relaxed);
-                let in_flight = &in_flight;
-                let closing = &closing;
-                scope.spawn(move || {
-                    let outcome = process_parsed(shared, Some(client), request);
-                    let sent = outcome
-                        .response
-                        .as_ref()
-                        .is_none_or(|response| client.send(response));
-                    if !sent || outcome.close {
-                        closing.store(true, Ordering::Relaxed);
-                    }
-                    client.background.fetch_sub(1, Ordering::Relaxed);
-                    let (count, cv) = in_flight;
-                    *count.lock().unwrap_or_else(|p| p.into_inner()) -= 1;
-                    cv.notify_all();
-                });
+                // Gives the pipeline place back when the line ends, however
+                // it ends: a line that panics, or a thread that cannot
+                // start, must not leave the reader waiting for a free place.
+                let place = LinePlace {
+                    client,
+                    in_flight: &in_flight,
+                    closing: &closing,
+                };
+                let spawned = std::thread::Builder::new()
+                    .name(el_model::sync::THREAD_LINE.to_string())
+                    .spawn_scoped(scope, move || {
+                        let outcome = process_parsed(shared, Some(place.client), request);
+                        let sent = outcome
+                            .response
+                            .as_ref()
+                            .is_none_or(|response| place.client.send(response));
+                        if sent && !outcome.close {
+                            place.finished();
+                        }
+                    });
+                if spawned.is_err() {
+                    break;
+                }
                 continue;
             }
             // `server.version` fixes the protocol of everything after it:
@@ -313,6 +326,39 @@ pub(crate) fn client_loop(shared: &Shared, client: &Arc<ClientState>) -> std::io
         }
     });
     Ok(())
+}
+
+/// One background line of a connection. Dropping it frees its place; unless
+/// `finished` ran first, it also closes the connection (the line could not
+/// answer: its write failed, it asked to close, or it panicked).
+pub(crate) struct LinePlace<'a> {
+    pub(crate) client: &'a Arc<ClientState>,
+    pub(crate) in_flight: &'a (std::sync::Mutex<usize>, Condvar),
+    pub(crate) closing: &'a AtomicBool,
+}
+
+impl LinePlace<'_> {
+    /// The line answered and the connection goes on.
+    pub(crate) fn finished(self) {
+        let mut done = std::mem::ManuallyDrop::new(self);
+        done.release();
+    }
+
+    fn release(&mut self) {
+        self.client.background.fetch_sub(1, Ordering::Relaxed);
+        let (count, cv) = self.in_flight;
+        let mut n = count.lock().unwrap_or_else(|p| p.into_inner());
+        *n = n.saturating_sub(1);
+        drop(n);
+        cv.notify_all();
+    }
+}
+
+impl Drop for LinePlace<'_> {
+    fn drop(&mut self) {
+        self.closing.store(true, Ordering::Relaxed);
+        self.release();
+    }
 }
 
 /// Lines of one connection that may run at the same time while they wait on
@@ -498,16 +544,20 @@ pub(crate) fn process_batch(
             items.iter().map(|_| Mutex::new(None)).collect();
         std::thread::scope(|scope| {
             for _ in 0..workers {
-                scope.spawn(|| loop {
-                    let idx = next.fetch_add(1, Ordering::Relaxed);
-                    let Some(item) = items.get(idx) else {
-                        return;
-                    };
-                    let outcome = process_request(shared, client, item);
-                    if let Ok(mut slot) = slots[idx].lock() {
-                        *slot = Some(outcome);
-                    }
-                });
+                // A worker that cannot start is not an error: the others
+                // take its items, and an item nobody took answers -32603.
+                let _ = std::thread::Builder::new()
+                    .name(el_model::sync::THREAD_BATCH.to_string())
+                    .spawn_scoped(scope, || loop {
+                        let idx = next.fetch_add(1, Ordering::Relaxed);
+                        let Some(item) = items.get(idx) else {
+                            return;
+                        };
+                        let outcome = process_request(shared, client, item);
+                        if let Ok(mut slot) = slots[idx].lock() {
+                            *slot = Some(outcome);
+                        }
+                    });
             }
         });
         slots

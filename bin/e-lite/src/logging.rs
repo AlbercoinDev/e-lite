@@ -123,30 +123,34 @@ pub fn init(path: &Path, max_mib: u64) -> Result<(), String> {
 
     let path = path.to_path_buf();
     let max_bytes = max_mib.saturating_mul(1024 * 1024);
-    let handle = std::thread::spawn(move || {
-        let mut file = file;
-        let mut out = unsafe { File::from_raw_fd(out_fd) };
-        let mut reader = unsafe { File::from_raw_fd(pipe[0]) };
-        let mut buf = [0u8; 8192];
-        let mut pending = Vec::new();
-        loop {
-            match reader.read(&mut buf) {
-                Ok(0) => break,
-                Ok(n) => {
-                    pending.extend_from_slice(&buf[..n]);
-                    while let Some(pos) = pending.iter().position(|b| *b == b'\n') {
-                        let chunk: Vec<u8> = pending.drain(..=pos).collect();
-                        write_chunk(&mut out, &mut file, &path, max_bytes, &chunk);
+    // Named so the panic hook does not try to join this thread from itself.
+    let spawned = std::thread::Builder::new()
+        .name(TEE_THREAD.to_string())
+        .spawn(move || {
+            let mut file = file;
+            let mut out = unsafe { File::from_raw_fd(out_fd) };
+            let mut reader = unsafe { File::from_raw_fd(pipe[0]) };
+            let mut buf = [0u8; 8192];
+            let mut pending = Vec::new();
+            loop {
+                match reader.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        pending.extend_from_slice(&buf[..n]);
+                        while let Some(pos) = pending.iter().position(|b| *b == b'\n') {
+                            let chunk: Vec<u8> = pending.drain(..=pos).collect();
+                            write_chunk(&mut out, &mut file, &path, max_bytes, &chunk);
+                        }
                     }
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(_) => break,
                 }
-                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-                Err(_) => break,
             }
-        }
-        if !pending.is_empty() {
-            write_chunk(&mut out, &mut file, &path, max_bytes, &pending);
-        }
-    });
+            if !pending.is_empty() {
+                write_chunk(&mut out, &mut file, &path, max_bytes, &pending);
+            }
+        });
+    let handle = spawned.map_err(|e| format!("cannot start the log tee thread: {e}"))?;
 
     let slot = HANDLE.get_or_init(|| Mutex::new(None));
     if let Ok(mut guard) = slot.lock() {
@@ -190,8 +194,15 @@ fn restrict_permissions(path: &Path) {
     let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o640));
 }
 
+/// Name of the thread that copies the console to the log file.
+pub const TEE_THREAD: &str = "el-log";
+
 /// Drain the tee and restore the process exit path. Safe to call more than once.
 pub fn shutdown() {
+    // The tee thread cannot join itself (the panic hook calls this).
+    if std::thread::current().name() == Some(TEE_THREAD) {
+        return;
+    }
     let Some(slot) = HANDLE.get() else {
         return;
     };

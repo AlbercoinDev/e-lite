@@ -9,6 +9,7 @@ use crate::health::{Blame, HealthMap};
 use crate::{AttemptCtl, BlockSource, Endpoint, FetchMode, RawtxError, RawtxStats, Result};
 use bip324::io::{Payload, Protocol};
 use bip324::{PacketType, Role};
+use el_model::sync::Mutex;
 use el_model::{Chain, Hash32};
 use rand::seq::SliceRandom;
 use rand::thread_rng;
@@ -18,7 +19,7 @@ use std::fmt;
 use std::io::{self, BufReader, Read, Write};
 use std::net::{IpAddr, TcpStream, ToSocketAddrs};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
 const PROTOCOL_VERSION: i32 = 70016;

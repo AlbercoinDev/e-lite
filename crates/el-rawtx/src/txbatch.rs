@@ -19,13 +19,14 @@ use crate::privacy::PrivacyParams;
 use crate::txcache::{CachedTx, TxCache};
 use crate::txsource::TxSource;
 use crate::{AttemptCtl, RawtxError, RawtxStats, Result, Semaphore};
+use el_model::sync::Mutex;
 use el_model::{Hash32, ScriptHash};
 use el_store::Store;
 use rand::seq::SliceRandom;
 use rand::thread_rng;
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar};
 use std::time::{Duration, Instant};
 
 /// Servers a real transaction is tried on before the block fallback.

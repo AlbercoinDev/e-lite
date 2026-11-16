@@ -373,3 +373,49 @@ fn a_dead_connection_stops_reading_at_once() {
         "must not wait for the idle timeout"
     );
 }
+
+/// AUD-173: a background line that panics gives its pipeline place back and
+/// closes the connection; one that answers keeps the connection open.
+#[test]
+fn a_panicking_line_releases_its_place_and_closes_the_connection() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let _peer = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+    let (server_side, _) = listener.accept().unwrap();
+    let registry = ClientRegistry::new();
+    let client = registry.register(Wire::plain(server_side).unwrap());
+    let in_flight = (std::sync::Mutex::new(0usize), Condvar::new());
+    let closing = AtomicBool::new(false);
+
+    let take = || {
+        *in_flight.0.lock().unwrap() += 1;
+        client.background.fetch_add(1, Ordering::Relaxed);
+        LinePlace {
+            client: &client,
+            in_flight: &in_flight,
+            closing: &closing,
+        }
+    };
+
+    // Answered normally: place released, connection stays open.
+    take().finished();
+    assert_eq!(*in_flight.0.lock().unwrap(), 0);
+    assert_eq!(client.background.load(Ordering::Relaxed), 0);
+    assert!(!closing.load(Ordering::Relaxed));
+
+    // Panics while holding the place.
+    std::thread::scope(|scope| {
+        let place = take();
+        let joined = std::thread::Builder::new()
+            .name(el_model::sync::THREAD_LINE.to_string())
+            .spawn_scoped(scope, move || {
+                let _place = place;
+                panic!("bug in a request handler");
+            })
+            .unwrap()
+            .join();
+        assert!(joined.is_err());
+    });
+    assert_eq!(*in_flight.0.lock().unwrap(), 0, "place not released");
+    assert_eq!(client.background.load(Ordering::Relaxed), 0);
+    assert!(closing.load(Ordering::Relaxed), "connection not closed");
+}

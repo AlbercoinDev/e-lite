@@ -7,7 +7,7 @@
 
 This audit is not a claim of formal verification. It records static checks,
 manual review areas, concrete findings and residual risks. Fixed findings
-(AUD-001..172) are in [`audit/FIXED.md`](audit/FIXED.md). The review itself, in
+(AUD-001..173) are in [`audit/FIXED.md`](audit/FIXED.md). The review itself, in
 Spanish, is [`ANALISIS.md`](ANALISIS.md).
 
 ## Baseline
@@ -15,7 +15,8 @@ Spanish, is [`ANALISIS.md`](ANALISIS.md).
 ```text
 cargo fmt --check                                      OK
 cargo clippy --workspace --all-targets -- -D warnings  OK
-cargo test --workspace                                 361 tests OK (6 ignored)
+cargo test --workspace                                 366 tests OK (6 ignored)
+cargo build --release (panic = "unwind") + e2e_regtest  OK
 scripts/check-docs.sh                                  OK
 tests/e2e/e2e_pruned_ibd.sh                            OK
 tests/e2e/e2e_regtest.sh                               OK
@@ -53,7 +54,6 @@ Additional checks performed:
 | AUD-140 | P2 | Snapshot export | `bin/e-lite/src/snapshot.rs`, `bin/e-lite/src/diagnostics.rs` | Export still requires the DB lock (cannot run while `run` holds it); an online RocksDB checkpoint is not implemented. | Open: online export via a control endpoint. Digest/dedup/gzip work landed in 29.12.0. |
 | AUD-143 | P3 | Snapshot details | `bin/e-lite/src/snapshot.rs` | Core file hashes are on by default, but there is no incremental backup and no option to carry the TLS/onion identity, so a restore changes the onion address and needs a new trust import. | Open: incremental backups and an identity-carrying option. |
 | AUD-166 | P3 | Merkle proof cost | `crates/el-serve/src/protocol.rs` (`transaction_merkle`, `block_txids_cached`) | `get_merkle` reuses the 64-block txid ring, but a script-status cache (`subscribe` + `get_history` scan twice) is not implemented. | Open: measured 189-257 µs per history, not worth the invalidation risk yet. |
-| AUD-173 | P2 | Panic policy | `Cargo.toml` (`[profile.release] panic = "abort"`), `crates/el-rawtx/src/lib.rs` (`fetch_external_block`, `spawn_attempt`), lock handling everywhere (`unwrap_or_else(\|p\| p.into_inner())`) | The release binary aborts on any panic, in any thread. The code is written as if it unwound: `catch_unwind` around the block download and every race attempt, poison recovery on every mutex, and ROADMAP proposed another `catch_unwind` for client threads. None of that runs in a release build: a panic reachable from one client request, one provider response or one P2P message stops the whole node (Electrum, indexing, the managed Tor), and nothing restarts it (no systemd unit ships). Tests run with unwinding, so they exercise a different failure model than production. | Open - owner decision. Either (a) keep `abort` as the crash-only model (RocksDB/WAL recovery is tested by `e2e_recovery.sh`), ship a unit with `Restart=on-failure` and delete the dead `catch_unwind`; or (b) `panic = "unwind"` plus a panic hook that aborts when the panicking thread is the apply/commit/prune thread, so wallet-facing threads fail alone. Do not mix. Until then every new parser of untrusted bytes must be panic-free by construction. |
 | AUD-174 | P2 | Server threads | `crates/el-serve/src/server.rs` (`client_loop`, `process_batch`, `PIPELINE_DEPTH`, `BATCH_IO_WORKERS`) | One OS thread per connection, plus up to 4 background lines per connection, each of which may be a batch that spawns up to 32 scoped threads: ~130 threads for one busy wallet, created and destroyed per batch line. `max_clients` therefore bounds connections, not threads; the real ceiling under load is memory and the scheduler. Extends AUD-015. | Open: one bounded worker pool shared by all connections (requests queued per connection to keep fairness), sized from `MachinePlan`. Needs a wallet-load benchmark before and after; do not change the per-connection limits without it. |
 | AUD-175 | P3 | Error handling | `bin/e-lite/src/main.rs` (`classify_error`), `bin/e-lite/src/pipeline.rs` (`index_loop`) | Whether an indexing error is fatal or retried forever is decided by searching the message for 13 substrings ("schema", "txids.dat", "needs_recovery", ...), and "Core is loading" by three more. Rewording a message, or an unrelated error that happens to contain "schema", silently changes the class: a fatal integrity error becomes an endless retry, or a transient RPC error stops the node. | Open: a typed error (`IndexFailure { Permanent, Transient, CoreLoading }`) built where the error is created (`el-index`, `el-store`, `el-rpc` already have their own enums); `classify_error` then matches a variant. A test per variant. |
 | AUD-176 | P3 | Snapshot cost | `crates/el-store/src/lib.rs` (`canonical_digest`), `bin/e-lite/src/snapshot.rs` (`export`, `import_into`) | The digest that protects a snapshot iterates and hashes every row of every column family, single-threaded, once at export and again at import: on mainnet that is the whole index (~260 GiB logical) read and decompressed twice, on top of the tar pass. The cost grows with the chain. | Open: record a SHA-256 per stored file (the index section is already stored uncompressed, so it is one sequential pass that the tar walk can share) and keep the canonical digest for `--verify=full`. No format break: a new optional manifest table. |

@@ -7,6 +7,7 @@
 
 use el_chain::ReaderTracker;
 use el_mempool::Mempool;
+use el_model::sync::Mutex;
 use el_model::{merkle_branch, BlockRecord, Hash32, NetworkIdentity, Outpoint, ScriptHash};
 use el_rawtx::Resolver;
 use el_rpc::CoreClient;
@@ -21,7 +22,7 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
-use std::sync::{mpsc, Arc, Condvar, Mutex, RwLock, RwLockReadGuard};
+use std::sync::{mpsc, Arc, Condvar, RwLock, RwLockReadGuard};
 use std::time::{Duration, Instant, SystemTime};
 
 mod version;

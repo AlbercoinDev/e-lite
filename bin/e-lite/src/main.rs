@@ -189,7 +189,52 @@ pub(crate) use pipeline::*;
 pub(crate) use serve::*;
 pub(crate) use setup::*;
 
+/// Panic policy (AUD-173). The binary unwinds, and this hook decides what a
+/// panic costs:
+///
+/// * in a thread that serves one wallet connection
+///   (`el_model::sync::CONTAINED_THREADS`), that thread ends and the node
+///   keeps running; its `max_clients` slot and pipeline place are released by
+///   drop guards and the shared locks do not poison;
+/// * anywhere else (index, commit, prune gate, tuning, mempool, notifier,
+///   startup) the process aborts, as it always did: a half-applied state must
+///   never be served, and RocksDB/WAL recovery on restart is the tested path.
+///
+/// The line carries the thread and the source location, never the panic
+/// message of a wallet thread: it could quote request data.
+fn install_panic_hook() {
+    std::panic::set_hook(Box::new(|info| {
+        let thread = std::thread::current();
+        let name = thread.name().unwrap_or("unnamed");
+        let at = info
+            .location()
+            .map(|l| format!("{}:{}", l.file(), l.line()))
+            .unwrap_or_else(|| "unknown location".to_string());
+        if el_model::sync::panic_is_contained(thread.name()) {
+            eprintln!(
+                "[e-lite] ERROR: internal error in {name} at {at}; that connection \
+                 is closed, the node keeps running. Please report it."
+            );
+            return;
+        }
+        let message = info
+            .payload()
+            .downcast_ref::<&str>()
+            .map(|s| s.to_string())
+            .or_else(|| info.payload().downcast_ref::<String>().cloned())
+            .unwrap_or_default();
+        eprintln!(
+            "[e-lite] FATAL: internal error in {name} at {at}: {}; stopping. \
+             The index recovers from its log on the next start.",
+            el_rawtx::redact_hashes(&message)
+        );
+        logging::shutdown();
+        std::process::abort();
+    }));
+}
+
 fn main() {
+    install_panic_hook();
     let result = run();
     if let Err(e) = &result {
         eprintln!("e-lite: error: {e}");

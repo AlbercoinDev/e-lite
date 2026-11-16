@@ -139,9 +139,17 @@ Never treat a version number in this file as authoritative over the code/tag.
   the permit channel never disconnects on its own: stop them only through the
   pool (`finish`/drop), which hands out wake-up permits and drains the results.
   A bare stop flag + join hangs when the prepared window is full (AUD-169).
-- The release profile is `panic = "abort"`: `catch_unwind` and lock-poison
-  recovery do nothing in the published binary. Do not add `catch_unwind` as a
-  fix, and keep parsers of untrusted bytes panic-free (AUD-173).
+- Panic policy (AUD-173, owner decision 2026-11-16): the release profile is
+  `panic = "unwind"` and `install_panic_hook` (`main.rs`) runs first. A panic
+  is contained only in the threads named in
+  `el_model::sync::CONTAINED_THREADS` (`el-client`, `el-line`, `el-batch`,
+  `el-fetch`); every other thread aborts the process (index, commit, prune
+  and notifier keep the crash-and-recover model). A new wallet-facing thread
+  must be spawned with one of those names, and whatever it holds (slots,
+  counters, places) must be released by a drop guard. Shared locks in
+  `el-serve`/`el-rawtx` use `el_model::sync::Mutex` (no poisoning); do not
+  go back to `std::sync::Mutex` there. A contained panic logs thread and
+  location only, never the panic message.
 - The supervisor runs at commit boundaries inside the catch-up pipeline; the
   only teardown left is the 512-block checkpoint. Do not reintroduce a time
   deadline that drops prepared blocks/readers. Disk and shutdown checks stay

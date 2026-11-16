@@ -6,8 +6,8 @@
 //! hard failure (wrong data, wrong services) gets the full cooldown. A success
 //! forgets the endpoint's history (AUD-155).
 
+use el_model::sync::Mutex;
 use std::collections::HashMap;
-use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 /// How a failed attempt reflects on the endpoint that served it.

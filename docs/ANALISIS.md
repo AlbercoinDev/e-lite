@@ -25,9 +25,11 @@ Los identificadores `AUD-nnn` remiten a [`AUDIT.md`](AUDIT.md) (abiertos) y a
   central del indexador (de 620 a 178 líneas) sin cambiar su comportamiento.
 - La documentación tenía deriva tras la última reorganización de módulos. Está
   corregida y `scripts/check-docs.sh` ahora detecta ese tipo de deriva.
-- Quedan nueve hallazgos abiertos nuevos (AUD-173..181). El más importante es de
-  criterio, no de código: el binario publicado **aborta ante cualquier panic** y
-  parte del código está escrito como si no lo hiciera.
+- La política de panic era incoherente (AUD-173): el binario publicado abortaba
+  ante cualquier panic con código escrito para no hacerlo. Por decisión del
+  dueño ahora hace *unwind*: un fallo en un hilo de wallet cierra esa conexión y
+  el nodo sigue; en cualquier otro hilo el proceso se detiene como antes.
+- Quedan ocho hallazgos abiertos nuevos (AUD-174..181).
 
 ### Alcance real de la lectura
 
@@ -165,7 +167,7 @@ ocupa ~260 GiB en mainnet (AUD-130), que es el coste principal en disco.
 |---|---|---|---|
 | AUD-170 | P2 | La plaza de `max_clients` se liberaba con código posterior a la conexión, no con un guard; una conexión marcada como muerta seguía viva hasta 600 s; el bucle decidía buscando texto en la línea cruda y volvía a analizar el JSON; el registro de errores crecía con cualquier nombre de método inventado por el cliente y escribía ese texto en el log. | **Corregido** |
 | AUD-171 | P2 | La lista de servidores Electrum aceptaba texto plano (`:t`) hacia clearnet: los txids cruzarían el nodo de salida de Tor sin cifrar. Esplora ya exigía HTTPS. | **Corregido** |
-| AUD-173 | P2 | **Política de panic incoherente.** El binario publicado usa `panic = "abort"`, pero el código tiene `catch_unwind` y recuperación de *locks* envenenados que solo funcionan con *unwind*. Un panic en cualquier hilo detiene todo el nodo, y nada lo reinicia. | Abierto (decisión) |
+| AUD-173 | P2 | **Política de panic incoherente.** El binario publicado usaba `panic = "abort"`, pero el código tenía `catch_unwind` y recuperación de *locks* envenenados que solo funcionan con *unwind*: un panic en cualquier hilo detenía todo el nodo. | **Corregido** (decisión del dueño: *unwind*) |
 | AUD-174 | P2 | Hasta ~130 hilos por una sola wallet activa (1 + 4 líneas × 32 hilos de lote), creados y destruidos por línea. `max_clients` limita conexiones, no hilos. | Abierto |
 | AUD-180 | P3 | El Tor gestionado queda huérfano si e-lite muere sin cerrar (SIGKILL, OOM, panic) y el siguiente arranque no lo adopta ni lo para. Observado en los e2e. | Abierto |
 | AUD-181 | P3 | Todos los puertos por defecto caen en el rango efímero de Linux: un `bind` puede fallar de forma esporádica. Observado una vez. | Abierto |
@@ -235,7 +237,7 @@ una copia obliga a parar el servicio. Ver las propuestas 4 y 5.
 
 ## 5. Cambios hechos en esta revisión
 
-Cuatro commits de código y uno de documentación, en la rama
+Cinco commits de código y uno de documentación, en la rama
 `review/analisis-2026-11`.
 
 | Cambio | Tipo | Ficheros |
@@ -246,11 +248,13 @@ Cuatro commits de código y uno de documentación, en la rama
 | Guard para plazas de cliente, conexión muerta, análisis único de la línea, registro de errores acotado (AUD-170) | arreglo P2 | `crates/el-serve/src/server.rs`, `client.rs`, `rpc.rs` |
 | `:t` solo para `.onion` y servidores locales; origen en `privacy check` (AUD-171) | arreglo P2 | `crates/el-rawtx/src/electrum.rs`, `bin/e-lite/src/privacy.rs` |
 | Exportación fallida sin restos (AUD-172) | arreglo P3 | `bin/e-lite/src/snapshot.rs` |
+| Política de panic: *unwind*, *hook* que contiene los hilos de wallet y aborta el resto, *mutex* sin envenenamiento (AUD-173) | decisión del dueño | `Cargo.toml`, `bin/e-lite/src/main.rs`, `crates/el-model/src/sync.rs`, `crates/el-serve/src/server.rs` |
 | AUDIT solo con abiertos, ROADMAP con rutas reales, FEATURES/ELECTRUM_PROTOCOL/OPERATIONS corregidos, comprobación de referencias a código | documentación | `docs/`, `scripts/check-docs.sh` |
 
-Único cambio visible para un usuario: una entrada `:t` hacia un servidor
-clearnet en `public-servers.toml` ahora se ignora con un aviso. La plantilla
-distribuida no tiene ninguna.
+Cambios visibles para un usuario: una entrada `:t` hacia un servidor clearnet
+en `public-servers.toml` ahora se ignora con un aviso (la plantilla distribuida
+no tiene ninguna), y un fallo interno al atender a una wallet cierra esa
+conexión en vez de detener el nodo.
 
 **Lo que decidí no cambiar**, y por qué:
 
@@ -262,7 +266,8 @@ distribuida no tiene ninguna.
   fuente falsa de los tests ignora `penalize`, así que no podía probarlo.
 - ROADMAP #7 (límite de suscripciones): el valor del límite afecta a wallets
   grandes y necesita un dato, no una suposición.
-- `catch_unwind` del ROADMAP #4: no hace nada con `panic = "abort"`.
+- `catch_unwind` del ROADMAP #4: sustituido por la política de panic de la
+  propuesta 1, ya aplicada.
 
 ### Verificación
 
@@ -272,7 +277,8 @@ Ejecutado en esta rama el 2026-11-15:
 |---|---|
 | `cargo fmt --check` | correcto |
 | `cargo clippy --workspace --all-targets -- -D warnings` | correcto |
-| `cargo test --workspace` | 361 tests correctos, 6 ignorados (350 antes de la revisión) |
+| `cargo test --workspace` | 366 tests correctos, 6 ignorados (350 antes de la revisión) |
+| `cargo build --release` con `panic = "unwind"` + `e2e_regtest.sh` sobre ese binario | correcto |
 | `scripts/check-docs.sh` | correcto (38 documentos) |
 | `tests/e2e/e2e_regtest.sh` | correcto |
 | `tests/e2e/e2e_defaults.sh` | correcto |
@@ -289,6 +295,9 @@ al arrancar. Es una causa probable, no demostrada; queda como AUD-181.
 
 Los e2e dejaron además dos procesos `tor` huérfanos: el Tor gestionado sobrevive
 cuando e-lite muere sin cerrar (la fase SIGKILL del test). Queda como AUD-180.
+
+No medido: el efecto de *unwind* sobre el tamaño del binario y la velocidad de
+IBD (se espera pequeño, pero no hay medida de antes y después).
 
 No ejecutado en esta revisión: `e2e_launch_core.sh`, `e2e_wait_core.sh`,
 `e2e_external_pruned.sh`, `e2e_resilience.sh`, el test con Tor real y el
@@ -323,24 +332,32 @@ HDD/SATA; gestor de ARC en ZFS.
 
 En orden de prioridad. Cada una indica qué cambia respecto al plan escrito.
 
-### 1. Decidir la política de panic (AUD-173) — antes que nada
+### 1. Política de panic (AUD-173) — aplicada
 
-Hay dos salidas coherentes y hoy el código está a medias entre ambas:
+Había dos salidas coherentes y el código estaba a medias entre ambas: mantener
+`abort` con reinicio externo, o pasar a *unwind* conteniendo solo los hilos de
+cara a la wallet. Yo recomendaba la primera por ser menos código; **el dueño
+eligió la segunda** (2026-11-16) y está hecha así:
 
-- **Mantener `abort`** (modelo "caer y recuperar"): la recuperación por WAL ya
-  está probada. Entonces hay que entregar una unidad systemd con
-  `Restart=on-failure` y borrar los `catch_unwind` y la recuperación de *locks*
-  envenenados, que son código muerto y dan una falsa sensación de protección.
-- **Pasar a `unwind`** con un *hook* que aborte solo si el hilo que falla es el
-  de aplicación, commit o poda: los hilos de cara a la wallet fallan solos y el
-  índice conserva la garantía actual.
+- `panic = "unwind"` en el perfil release.
+- Un *hook* instalado lo primero en `main` decide por el nombre del hilo. Los
+  hilos `el-client`, `el-line`, `el-batch` y `el-fetch` fallan solos: se cierra
+  esa conexión y el log registra hilo y línea de código, nunca el mensaje (podría
+  citar datos de la petición). Cualquier otro hilo (índice, commit, poda,
+  mempool, notificador) escribe un `FATAL` y aborta, igual que antes: un estado
+  a medio aplicar nunca se sirve y la recuperación por WAL es el camino probado.
+- Lo que tenía un hilo contenido lo devuelven *guards*: la plaza de cliente
+  (`ClientSlot`) y el sitio en el *pipeline* de la conexión (`LinePlace`).
+- Los *mutex* compartidos de `el-serve` y `el-rawtx` ya no se envenenan
+  (`el_model::sync::Mutex`): con el `Mutex` estándar, un panic contenido habría
+  desactivado en silencio una caché o un registro hasta reiniciar.
 
-Con cualquiera de las dos hay que resolver AUD-180: hoy una caída deja el Tor
-gestionado huérfano.
+Probado con un test que se relanza como proceso hijo: sobrevive a un panic en
+`el-client` y termina con SIGABRT ante uno en `el-prune`.
 
-Recomiendo la primera: es menos código y no cambia el binario. **Cambia el plan
-escrito**: ROADMAP #4 proponía `catch_unwind`, que no sirve, y la unidad systemd
-pasa de "P3 opcional" a P2 (ya reflejado en ROADMAP).
+Sigue haciendo falta la unidad systemd (P2): un fallo fuera de los hilos de
+wallet detiene el nodo a propósito y nada lo reinicia, y además deja el Tor
+gestionado huérfano (AUD-180).
 
 ### 2. Lectores persistentes (AUD-179)
 
