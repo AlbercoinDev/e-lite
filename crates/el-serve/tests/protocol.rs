@@ -1236,3 +1236,63 @@ fn unknown_methods_do_not_grow_the_error_log() {
         seen.keys().collect::<Vec<_>>()
     );
 }
+
+/// `/metrics` is `/status` in Prometheus form: top-level, nested and boolean
+/// values all come from the same document, and every sample is announced.
+#[test]
+fn metrics_follow_the_status_document() {
+    use std::io::{Read, Write};
+    use std::sync::atomic::Ordering;
+    let (fx, _script, _txid) = fixture();
+    fx.shared.stats.tuning_readers.store(7, Ordering::Relaxed);
+    fx.shared.stats.disk_low.store(true, Ordering::Relaxed);
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    el_serve::start_metrics_on(Arc::clone(&fx.shared), listener);
+    let get = |path: &str| {
+        let mut s = std::net::TcpStream::connect(addr).unwrap();
+        // One write: the endpoint answers what its first read returns.
+        s.write_all(format!("GET {path} HTTP/1.0\r\n\r\n").as_bytes())
+            .unwrap();
+        let mut reply = String::new();
+        s.read_to_string(&mut reply).unwrap();
+        reply.split_once("\r\n\r\n").unwrap().1.to_string()
+    };
+    let status: Value = serde_json::from_str(&get("/status")).unwrap();
+    let metrics = get("/metrics");
+    let sample = |name: &str| {
+        metrics
+            .lines()
+            .find_map(|l| l.strip_prefix(&format!("{name} ")))
+            .unwrap_or_else(|| panic!("no sample for {name}"))
+            .to_string()
+    };
+    assert_eq!(
+        sample("e_lite_indexed_height"),
+        status["indexed_height"].to_string()
+    );
+    assert_eq!(sample("e_lite_tuning_readers"), "7");
+    assert_eq!(sample("e_lite_disk_low"), "1");
+    assert_eq!(
+        sample("e_lite_ready"),
+        u8::from(status["ready"].as_bool().unwrap()).to_string()
+    );
+    assert!(
+        metrics.contains("e_lite_state{state=\"READY\"}"),
+        "{metrics}"
+    );
+    // 39 numeric metrics plus the state: each with HELP, TYPE and a number.
+    let samples: Vec<&str> = metrics.lines().filter(|l| !l.starts_with('#')).collect();
+    assert_eq!(samples.len(), 40, "{metrics}");
+    for line in &samples {
+        let (name, value) = line.rsplit_once(' ').unwrap();
+        value.parse::<u64>().unwrap_or_else(|_| panic!("{line}"));
+        let name = name.split('{').next().unwrap();
+        assert!(metrics.contains(&format!("# HELP {name} ")), "{name}");
+        assert!(
+            metrics.contains(&format!("# TYPE {name} gauge"))
+                || metrics.contains(&format!("# TYPE {name} counter")),
+            "{name}"
+        );
+    }
+}

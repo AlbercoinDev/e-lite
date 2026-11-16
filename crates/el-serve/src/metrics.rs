@@ -46,261 +46,81 @@ pub fn start_metrics_on(shared: Arc<Shared>, listener: TcpListener) -> std::thre
     })
 }
 
+/// Every numeric metric, one per line: name, type, the dotted path of its
+/// value in `/status`, and the help text. A boolean is exported as 0/1.
+const METRICS: &str = "\
+e_lite_indexed_height gauge indexed_height Indexed tip height
+e_lite_core_height gauge core_height Bitcoin Core tip height
+e_lite_lag_blocks gauge lag_blocks Blocks behind Core
+e_lite_core_pruneheight gauge core.pruneheight Lowest block still available in Core
+e_lite_core_retention_blocks gauge retention_blocks Blocks Core can still serve before pruning
+e_lite_blocks_applied counter blocks_applied Blocks applied to the index
+e_lite_tuning_readers gauge tuning.readers Effective parallel fetch readers
+e_lite_tuning_commit_interval_ms gauge tuning.commit_interval_ms Effective commit interval
+e_lite_tuning_decode_ms gauge tuning.decode_ms_ewma Block decode/hash latency (EWMA)
+e_lite_tuning_wait_ms gauge tuning.wait_ms_ewma Pipeline wait latency (EWMA)
+e_lite_tuning_cache_mib gauge tuning.cache_mib Effective RocksDB block cache
+e_lite_rawtx_cache_hits counter rawtx.cache_hits Raw transactions served from the validated block cache
+e_lite_rawtx_fetches counter rawtx.fetches Whole blocks fetched from external sources
+e_lite_rawtx_unavailable counter rawtx.unavailable Raw transactions that could not be resolved
+e_lite_rawtx_decoys_pending gauge rawtx.decoys_pending Decoy block downloads owed for real external downloads
+e_lite_rawtx_p2p_failures counter rawtx.p2p_failures P2P peer fetch failures
+e_lite_rawtx_p2p_skipped counter rawtx.p2p_skipped P2P fetches skipped because every peer was cooling down
+e_lite_prefetch_queued counter prefetch.queued History blocks queued for background prefetch
+e_lite_prefetch_done counter prefetch.done History blocks processed by the prefetcher
+e_lite_memory_available_mib gauge memory.available_mib Memory available to e-lite (cgroup aware)
+e_lite_memory_total_mib gauge memory.total_mib Memory visible to e-lite (cgroup aware)
+e_lite_tx_per_sec gauge tuning.tx_per_sec Indexed transactions per second (EWMA)
+e_lite_blocks_per_sec gauge tuning.blocks_per_sec Indexed blocks per second (EWMA)
+e_lite_ready gauge ready 1 when the index has caught up to Core's validated blocks
+e_lite_fully_synced gauge fully_synced 1 when Core is out of IBD and the index is at the network tip
+e_lite_commit_ms gauge tuning.commit_ms_ewma Commit latency (EWMA)
+e_lite_disk_low gauge disk_low 1 when the disk guard has paused indexing
+e_lite_txnum counter txnum Indexed transaction occurrences
+e_lite_db_bytes gauge db_bytes Index size on disk
+e_lite_disk_free_bytes gauge disk_free_bytes Free disk on the data directory
+e_lite_server_clients gauge clients Connected Electrum clients
+e_lite_server_requests_total counter requests_total Electrum requests served
+e_lite_tls_handshakes_total counter tls_handshakes Completed Electrum TLS handshakes
+e_lite_tls_handshake_failures_total counter tls_handshake_failures Failed Electrum TLS handshakes
+e_lite_errors_total counter errors_total Protocol and internal errors
+e_lite_rate_limited_total counter rate_limited Requests delayed by the per-client rate limiter
+e_lite_providers_healthy gauge providers_healthy Public providers that answered the startup probe
+e_lite_last_block_ms gauge last_block_ms Duration of the last applied block
+e_lite_uptime_seconds gauge uptime_seconds Process uptime
+";
+
+/// The table above as `(name, kind, path, help)`.
+fn metrics_table() -> impl Iterator<Item = (&'static str, &'static str, &'static str, &'static str)>
+{
+    METRICS.lines().filter_map(|row| {
+        let mut fields = row.splitn(4, ' ');
+        Some((
+            fields.next()?,
+            fields.next()?,
+            fields.next()?,
+            fields.next()?,
+        ))
+    })
+}
+
+/// The number at a dotted path of the status document (0 when absent).
+fn status_number(status: &Value, path: &str) -> u64 {
+    let value = path.split('.').fold(status, |v, key| &v[key]);
+    value
+        .as_u64()
+        .unwrap_or_else(|| u64::from(value.as_bool().unwrap_or(false)))
+}
+
 pub(crate) fn metrics_text(shared: &Shared) -> String {
     let st = shared.status_json();
-    let g = |k: &str| st[k].as_u64().unwrap_or(0);
     let mut out = String::new();
-    let mut line = |name: &str, help: &str, kind: &str, value: u64| {
+    for (name, kind, path, help) in metrics_table() {
+        let value = status_number(&st, path);
         out.push_str(&format!(
             "# HELP {name} {help}\n# TYPE {name} {kind}\n{name} {value}\n"
         ));
-    };
-    line(
-        "e_lite_indexed_height",
-        "Indexed tip height",
-        "gauge",
-        g("indexed_height"),
-    );
-    line(
-        "e_lite_core_height",
-        "Bitcoin Core tip height",
-        "gauge",
-        g("core_height"),
-    );
-    line(
-        "e_lite_lag_blocks",
-        "Blocks behind Core",
-        "gauge",
-        g("lag_blocks"),
-    );
-    line(
-        "e_lite_core_pruneheight",
-        "Lowest block still available in Core",
-        "gauge",
-        st["core"]["pruneheight"].as_u64().unwrap_or(0),
-    );
-    line(
-        "e_lite_core_retention_blocks",
-        "Blocks Core can still serve before pruning",
-        "gauge",
-        g("retention_blocks"),
-    );
-    line(
-        "e_lite_blocks_applied",
-        "Blocks applied to the index",
-        "counter",
-        g("blocks_applied"),
-    );
-    line(
-        "e_lite_tuning_readers",
-        "Effective parallel fetch readers",
-        "gauge",
-        st["tuning"]["readers"].as_u64().unwrap_or(0),
-    );
-    line(
-        "e_lite_tuning_commit_interval_ms",
-        "Effective commit interval",
-        "gauge",
-        st["tuning"]["commit_interval_ms"].as_u64().unwrap_or(0),
-    );
-    line(
-        "e_lite_tuning_decode_ms",
-        "Block decode/hash latency (EWMA)",
-        "gauge",
-        st["tuning"]["decode_ms_ewma"].as_u64().unwrap_or(0),
-    );
-    line(
-        "e_lite_tuning_wait_ms",
-        "Pipeline wait latency (EWMA)",
-        "gauge",
-        st["tuning"]["wait_ms_ewma"].as_u64().unwrap_or(0),
-    );
-    line(
-        "e_lite_tuning_cache_mib",
-        "Effective RocksDB block cache",
-        "gauge",
-        st["tuning"]["cache_mib"].as_u64().unwrap_or(0),
-    );
-    line(
-        "e_lite_rawtx_cache_hits",
-        "Raw transactions served from the validated block cache",
-        "counter",
-        st["rawtx"]["cache_hits"].as_u64().unwrap_or(0),
-    );
-    line(
-        "e_lite_rawtx_fetches",
-        "Whole blocks fetched from external sources",
-        "counter",
-        st["rawtx"]["fetches"].as_u64().unwrap_or(0),
-    );
-    line(
-        "e_lite_rawtx_unavailable",
-        "Raw transactions that could not be resolved",
-        "counter",
-        st["rawtx"]["unavailable"].as_u64().unwrap_or(0),
-    );
-    line(
-        "e_lite_rawtx_decoys_pending",
-        "Decoy block downloads owed for real external downloads",
-        "gauge",
-        st["rawtx"]["decoys_pending"].as_u64().unwrap_or(0),
-    );
-    line(
-        "e_lite_rawtx_p2p_failures",
-        "P2P peer fetch failures",
-        "counter",
-        st["rawtx"]["p2p_failures"].as_u64().unwrap_or(0),
-    );
-    line(
-        "e_lite_rawtx_p2p_skipped",
-        "P2P fetches skipped because every peer was cooling down",
-        "counter",
-        st["rawtx"]["p2p_skipped"].as_u64().unwrap_or(0),
-    );
-    line(
-        "e_lite_prefetch_queued",
-        "History blocks queued for background prefetch",
-        "counter",
-        st["prefetch"]["queued"].as_u64().unwrap_or(0),
-    );
-    line(
-        "e_lite_prefetch_done",
-        "History blocks processed by the prefetcher",
-        "counter",
-        st["prefetch"]["done"].as_u64().unwrap_or(0),
-    );
-    line(
-        "e_lite_memory_available_mib",
-        "Memory available to e-lite (cgroup aware)",
-        "gauge",
-        st["memory"]["available_mib"].as_u64().unwrap_or(0),
-    );
-    line(
-        "e_lite_memory_total_mib",
-        "Memory visible to e-lite (cgroup aware)",
-        "gauge",
-        st["memory"]["total_mib"].as_u64().unwrap_or(0),
-    );
-    line(
-        "e_lite_tx_per_sec",
-        "Indexed transactions per second (EWMA)",
-        "gauge",
-        st["tuning"]["tx_per_sec"].as_u64().unwrap_or(0),
-    );
-    line(
-        "e_lite_blocks_per_sec",
-        "Indexed blocks per second (EWMA)",
-        "gauge",
-        st["tuning"]["blocks_per_sec"].as_u64().unwrap_or(0),
-    );
-    line(
-        "e_lite_ready",
-        "1 when the index has caught up to Core's validated blocks",
-        "gauge",
-        if st["ready"].as_bool().unwrap_or(false) {
-            1
-        } else {
-            0
-        },
-    );
-    line(
-        "e_lite_fully_synced",
-        "1 when Core is out of IBD and the index is at the network tip",
-        "gauge",
-        if st["fully_synced"].as_bool().unwrap_or(false) {
-            1
-        } else {
-            0
-        },
-    );
-    line(
-        "e_lite_commit_ms",
-        "Commit latency (EWMA)",
-        "gauge",
-        st["tuning"]["commit_ms_ewma"].as_u64().unwrap_or(0),
-    );
-    line(
-        "e_lite_disk_low",
-        "1 when the disk guard has paused indexing",
-        "gauge",
-        if st["disk_low"].as_bool().unwrap_or(false) {
-            1
-        } else {
-            0
-        },
-    );
-    line(
-        "e_lite_txnum",
-        "Indexed transaction occurrences",
-        "counter",
-        g("txnum"),
-    );
-    line(
-        "e_lite_db_bytes",
-        "Index size on disk",
-        "gauge",
-        g("db_bytes"),
-    );
-    line(
-        "e_lite_disk_free_bytes",
-        "Free disk on the data directory",
-        "gauge",
-        g("disk_free_bytes"),
-    );
-    line(
-        "e_lite_server_clients",
-        "Connected Electrum clients",
-        "gauge",
-        g("clients"),
-    );
-    line(
-        "e_lite_server_requests_total",
-        "Electrum requests served",
-        "counter",
-        g("requests_total"),
-    );
-    line(
-        "e_lite_tls_handshakes_total",
-        "Completed Electrum TLS handshakes",
-        "counter",
-        g("tls_handshakes"),
-    );
-    line(
-        "e_lite_tls_handshake_failures_total",
-        "Failed Electrum TLS handshakes",
-        "counter",
-        g("tls_handshake_failures"),
-    );
-    line(
-        "e_lite_errors_total",
-        "Protocol and internal errors",
-        "counter",
-        g("errors_total"),
-    );
-    line(
-        "e_lite_rate_limited_total",
-        "Requests delayed by the per-client rate limiter",
-        "counter",
-        g("rate_limited"),
-    );
-    line(
-        "e_lite_providers_healthy",
-        "Public providers that answered the startup probe",
-        "gauge",
-        g("providers_healthy"),
-    );
-    line(
-        "e_lite_last_block_ms",
-        "Duration of the last applied block",
-        "gauge",
-        g("last_block_ms"),
-    );
-    line(
-        "e_lite_uptime_seconds",
-        "Process uptime",
-        "gauge",
-        g("uptime_seconds"),
-    );
+    }
     let state = shared.get_state();
     out.push_str("# HELP e_lite_state Server state (0 blocking values)\n");
     out.push_str("# TYPE e_lite_state gauge\n");
