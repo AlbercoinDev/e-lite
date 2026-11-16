@@ -44,7 +44,7 @@ su casilla aquí y haz commit; cuando no quede ninguna, borra este fichero.
 | Copia en caliente (AUD-140) | **No se quiere.** Eliminar la opción de la documentación (tarea B0). |
 | Línea de comandos | Reducirla (bloque C). |
 | Mediciones | No se tratan en este encargo. |
-| Variantes opcionales | Pendiente: el dueño decide una a una (bloque D). |
+| Variantes opcionales | **Borrar las seis apagadas** (bloque D). El ARC dinámico de ZFS se mantiene. |
 | AUD-178 | **Se deja como está** (tolerante). Solo documentación (tarea B0b). |
 
 ---
@@ -353,31 +353,68 @@ Hoy hay 115 opciones; la mayoría duplica lo que ya hace
 
 ---
 
-## Bloque D — Pendiente de decisión del dueño: variantes opcionales
+## Bloque D — Borrar las variantes opcionales apagadas
 
-**No toques nada de este bloque sin su respuesta.** Pregúntale con las
-opciones de abajo.
+Decisión del dueño (2026-11-16): se borran las seis variantes que están
+apagadas por defecto. **El ARC dinámico de ZFS (`zfs_arc_dynamic`,
+`arc-setup`) se mantiene**: está encendido por defecto y quitarlo cambiaría la
+memoria en máquinas con ZFS.
 
-### D1. Variantes opcionales
+Va después de los bloques B y C, un commit por variante, en este orden (de
+menos a más código):
 
-Cada una es código, documentación y pruebas de un camino alternativo. El
-dueño no va a medir aquí, así que la decisión es mantener o borrar.
+- [ ] **D1. `prefetch_deadline_ms`** (`[index]`, `--prefetch-deadline-ms`).
+- [ ] **D2. `[core] cgroup_io_weight`** (`--core-cgroup-io-weight`). El
+  `io_priority` por `ionice` se queda.
+- [ ] **D3. `adaptive_memtables`** (`--adaptive-memtables`,
+  `--no-adaptive-memtables`; `memtable_step` en
+  `bin/e-lite/src/tuning/controller.rs`). **Se queda** la reducción de
+  emergencia de memtables cuando `MemAvailable < 256 MiB`: es protección
+  contra OOM, no la variante opcional. Sepáralas antes de borrar.
+- [ ] **D4. `E_LITE_LAG_POLICY=drain`** y `E_LITE_LAG_TARGET_SECONDS`
+  (`lag_guard`, `bin/e-lite/src/pipeline.rs`).
+- [ ] **D5. Ventana de retraso en bloques**: `max_bulk_lag_blocks` y
+  `core_resume_ahead_blocks` (`--max-bulk-lag-blocks`,
+  `--core-resume-ahead-blocks`). Queda solo la ventana en GiB
+  (`max_bulk_lag_gib`, `core_resume_ahead_gib`). Hoy un valor de GiB igual a 0
+  activa la ventana en bloques: decide qué significa 0 a partir de ahora
+  (recomendado: error de validación que nombre la clave) y pruébalo.
+- [ ] **D6. `scheduler = "alternate"`** (`--scheduler`,
+  `--pause-core-during-bulk` solo si deja de tener otro uso: compruébalo).
+  Es la que más código toca en `pipeline.rs`, `setup.rs`,
+  `core_supervisor.rs` y `/status.scheduler`. `/status.scheduler` puede
+  conservar los campos de la ventana de bytes (`backlog_bytes`, `high_bytes`,
+  `low_bytes`, `avg_block_bytes`), pero sin `mode`, `phase*` ni
+  `index_paused` si ya nada los alimenta.
 
-| Variante | Qué es | Por defecto | Recomendación |
-|---|---|---|---|
-| `E_LITE_LAG_POLICY=drain` | Política alternativa de pausa de Core basada en la tasa del último ciclo de commit; solo por variable de entorno | apagada | **Borrar.** Sin documentar para usuarios y sin medición. |
-| `max_bulk_lag_blocks` / `core_resume_ahead_blocks` | Ventana de retraso contada en bloques; solo actúa si el valor en GiB es 0 | sin uso (manda GiB) | **Borrar**, con aviso: si alguien las tiene en su `config.toml`, mensaje claro en vez de error críptico. |
-| `scheduler = "alternate"` | Core descarga con e-lite parado y luego al revés | `overlap` | **Borrar** si no se va a medir nunca; es la variante con más código en `pipeline.rs`. Mantener solo si el dueño quiere probarla. |
-| `adaptive_memtables` | Cambia el tamaño de las memtables en caliente | apagado | **Borrar.** Puede forzar *flushes* y nadie lo usa por defecto. |
-| `prefetch_deadline_ms` | Corta la precarga de un bloque tras n ms | 0 (apagado) | **Borrar.** |
-| `[core] cgroup_io_weight` | Prioridad de E/S de Core por cgroup v2 | apagado | **Borrar**; `io_priority` (ionice) se queda. |
-| ARC dinámico de ZFS (`zfs_arc_dynamic`, `arc-setup`) | Sube y baja el tope del ARC de ZFS según el estado | **encendido** | **Mantener.** Es comportamiento por defecto en hosts ZFS; quitarlo les cambia la memoria. Es además la única pieza que toca systemd, y es opcional. |
+Para **cada** variante:
 
-Por cada variante que el dueño mande borrar: quitar clave, opción, rama de
-código, tests, líneas de `config.example.toml`, `docs/TUNING.md`,
-`docs/CLI.md`, `AGENTS.md` y campos de `/status`; una clave retirada presente
-en un `config.toml` existente debe dar un aviso que nombre la clave, no
-impedir el arranque. `tests/run-e2e.sh` completo después.
+1. Localiza todo con `grep -rn` de la clave, la opción y la variable de
+   entorno en `bin/`, `crates/`, `tests/`, `scripts/`, `docs/`,
+   `config.example.toml` y `AGENTS.md`.
+2. Borra la clave de `Config`, su validación, la opción de línea de comandos,
+   la rama de código, sus tests y sus campos en `/status`.
+3. **Una clave retirada en un `config.toml` existente no impide arrancar**:
+   una lista `RETIRED_KEYS` en `bin/e-lite/src/config.rs` produce un aviso
+   que nombra la clave (`[index] adaptive_memtables is no longer used; remove
+   it`). Mira primero cómo trata hoy `Config` las claves desconocidas y no
+   rompas ese comportamiento para las demás. Test: un fichero con las claves
+   retiradas carga y avisa. Lo mismo para las opciones de línea de comandos
+   retiradas: aviso, no error (encaja con la tabla `DEPRECATED_FLAGS` del
+   bloque C).
+4. Documentación: `config.example.toml`, `docs/TUNING.md`, `docs/CLI.md`,
+   `docs/FEATURES.md`, `docs/ROADMAP.md` (fila "Core/e-lite scheduler A/B" y
+   las menciones a memtables en caliente), `docs/AB_TESTS.md`, `AGENTS.md`
+   (las reglas que nombran `alternate` y `drain`), `CHANGELOG.md` con nota de
+   actualización.
+5. Puertas de calidad; tras D4, D5 y D6, además `tests/run-e2e.sh` completo
+   (`e2e_pruned_ibd`, `e2e_recovery` y `e2e_resilience` ejercitan la pausa y
+   reanudación de Core).
+
+Lo que **no** cambia: la ventana de bytes por defecto (pausa a 30 GiB,
+reanuda a 7 GiB), que la marca debe mantenerse 10 s, que una reanudación por
+retraso nunca anula una pausa por disco, y `pause_core_during_bulk` en modo
+`overlap`.
 
 ---
 
