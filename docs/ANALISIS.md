@@ -76,7 +76,8 @@ Qué sale del índice local y qué necesita una fuente externa:
 | Transacción cruda de un bloque podado | caché | no | sí (txid entre señuelos, o bloque entero) |
 
 No disponible hoy: autenticación de clientes, pagos silenciosos (BIP352),
-unidad systemd, imagen de contenedor, ARM64, exportación de copias en caliente.
+reinicio automático tras un fallo fatal, imagen de contenedor, ARM64,
+exportación de copias en caliente.
 
 ## 2. Parte inicial: sincronización, IBD e indexación
 
@@ -237,8 +238,8 @@ una copia obliga a parar el servicio. Ver las propuestas 4 y 5.
 
 ## 5. Cambios hechos en esta revisión
 
-Cinco commits de código y uno de documentación, en la rama
-`review/analisis-2026-11`.
+Todo está en la rama `review/analisis-2026-11`, en commits separados por
+tema (`git log main..review/analisis-2026-11`).
 
 | Cambio | Tipo | Ficheros |
 |---|---|---|
@@ -271,7 +272,7 @@ conexión en vez de detener el nodo.
 
 ### Verificación
 
-Ejecutado en esta rama el 2026-11-15:
+Ejecutado en esta rama, última pasada completa el 2026-11-16:
 
 | Comprobación | Resultado |
 |---|---|
@@ -280,27 +281,25 @@ Ejecutado en esta rama el 2026-11-15:
 | `cargo test --workspace` | 366 tests correctos, 6 ignorados (350 antes de la revisión) |
 | `cargo build --release` con `panic = "unwind"` + `e2e_regtest.sh` sobre ese binario | correcto |
 | `scripts/check-docs.sh` | correcto (38 documentos) |
-| `tests/e2e/e2e_regtest.sh` | correcto |
-| `tests/e2e/e2e_defaults.sh` | correcto |
-| `tests/e2e/e2e_pruned_ibd.sh` (poda + SIGKILL + SIGTERM) | correcto |
-| `tests/e2e/e2e_recovery.sh` | correcto |
-| `tests/e2e/e2e_snapshot.sh` | correcto |
-| `tests/e2e/e2e_multi_instance.sh` | **falló una vez** (`cannot bind metrics 127.0.0.1:55484`), correcto al repetir |
+| Los diez e2e de regtest: `e2e_regtest`, `e2e_defaults`, `e2e_launch_core`, `e2e_wait_core`, `e2e_external_pruned`, `e2e_resilience`, `e2e_snapshot`, `e2e_multi_instance`, `e2e_pruned_ibd` (poda + SIGKILL + SIGTERM), `e2e_recovery` | correctos en la segunda revisión completa (2026-11-16) |
 
-El fallo de `e2e_multi_instance.sh` no viene de los cambios: el puerto no tenía
-ningún proceso escuchando después. Todos los puertos por defecto de e-lite
-están dentro del rango efímero de Linux (32768–60999), así que una conexión
-saliente de cualquier proceso puede estar usando ese puerto como origen justo
-al arrancar. Es una causa probable, no demostrada; queda como AUD-181.
+En la primera pasada `e2e_multi_instance.sh` falló una vez
+(`cannot bind metrics 127.0.0.1:55484`) y pasó al repetir; en la segunda pasó a
+la primera. El fallo no viene de los cambios: el puerto no tenía ningún proceso
+escuchando después. Todos los puertos por defecto de e-lite están dentro del
+rango efímero de Linux (32768–60999), así que una conexión saliente de cualquier
+proceso puede estar usando ese puerto como origen justo al arrancar. Es una
+causa probable, no demostrada; queda como AUD-181.
 
-Los e2e dejaron además dos procesos `tor` huérfanos: el Tor gestionado sobrevive
-cuando e-lite muere sin cerrar (la fase SIGKILL del test). Queda como AUD-180.
+Cada pasada de los e2e dejó procesos `tor` huérfanos: el Tor gestionado
+sobrevive cuando e-lite muere sin cerrar (la fase SIGKILL de
+`e2e_pruned_ibd.sh`). Queda como AUD-180.
 
 No medido: el efecto de *unwind* sobre el tamaño del binario y la velocidad de
 IBD (se espera pequeño, pero no hay medida de antes y después).
 
-No ejecutado en esta revisión: `e2e_launch_core.sh`, `e2e_wait_core.sh`,
-`e2e_external_pruned.sh`, `e2e_resilience.sh`, el test con Tor real y el
+No ejecutado: `e2e_networks.sh` (sincroniza signet y testnet4 reales y se niega
+a arrancar sin el espacio en disco que exige), el test con Tor real y el
 instalador.
 
 No verificado aquí: `shellcheck` (no está instalado en esta máquina; no se
@@ -355,9 +354,30 @@ eligió la segunda** (2026-11-16) y está hecha así:
 Probado con un test que se relanza como proceso hijo: sobrevive a un panic en
 `el-client` y termina con SIGABRT ante uno en `el-prune`.
 
-Sigue haciendo falta la unidad systemd (P2): un fallo fuera de los hilos de
-wallet detiene el nodo a propósito y nada lo reinicia, y además deja el Tor
-gestionado huérfano (AUD-180).
+Queda un hueco: un fallo fuera de los hilos de wallet detiene el nodo a
+propósito, nada lo reinicia, y además deja el Tor gestionado huérfano
+(AUD-180).
+
+**Sin systemd** (decisión del dueño, 2026-11-16). Mi primera propuesta era una
+unidad systemd con reinicio; se puede evitar y queda descartada. El reinicio
+irá dentro del propio `run`:
+
+- `run` deja un proceso padre mínimo que arranca el nodo real como hijo (el
+  mismo binario), le reenvía SIGTERM/SIGINT/SIGUSR1 y lo vuelve a arrancar si
+  termina de forma anómala.
+- Espera creciente entre reinicios (1 s hasta 60 s) y una regla de abandono
+  (por ejemplo, 5 fallos en 10 minutos) para no entrar en un bucle de caídas.
+  Una salida limpia o un error de configuración nunca se reinician.
+- Core no se toca: sigue corriendo y el hijo nuevo lo adopta por su fichero de
+  pid, que es lo que ya hace hoy `CoreSupervisor`. Falta hacer lo mismo con Tor
+  (AUD-180), que es requisito previo.
+- Opción para desactivarlo si alguien ya usa su propio supervisor.
+
+Lo que e-lite no puede hacer por sí mismo es **arrancar al encender la
+máquina**: eso siempre lo lanza algo del sistema. Pero no tiene que ser
+systemd: sirve `cron @reboot`, la política de reinicio de un contenedor, runit o
+lo que tenga el equipo. No está implementado todavía; es la primera tarea
+pendiente de P2.
 
 ### 2. Lectores persistentes (AUD-179)
 

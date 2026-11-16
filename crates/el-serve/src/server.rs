@@ -646,7 +646,7 @@ pub(crate) fn process_request(
         },
         Err(e) => {
             shared.stats.errors_total.fetch_add(1, Ordering::Relaxed);
-            log_rpc_error(shared, method, e.code);
+            log_rpc_error(shared, method, &e);
             LineOutcome {
                 response: if is_notification {
                     None

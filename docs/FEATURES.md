@@ -126,7 +126,8 @@ available**.
 | Optional Tor expert bundle | stable | `--with-tor` default; `--without-tor` |
 | `.deb`, tarball, release checksums | stable | GitHub Releases |
 | All-in-one test harness | experimental | `scripts/e-lite-all-in-one.sh` |
-| Systemd unit / container image | **not available** | roadmap |
+| Automatic restart after a fatal error | **not available** | roadmap: built into `run`, no init system (systemd) required |
+| Container image | **not available** | roadmap |
 
 ## Compatibility
 

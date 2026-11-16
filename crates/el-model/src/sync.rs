@@ -49,16 +49,24 @@ impl<T> Mutex<T> {
 }
 
 impl<T: ?Sized> Mutex<T> {
-    /// Always `Ok`: a lock whose holder panicked is handed out as it is.
+    /// Always `Ok`: a lock whose holder panicked is handed out as it is. The
+    /// poison mark is cleared, so a `Condvar` waiting on this lock does not
+    /// report it either.
     pub fn lock(&self) -> LockResult<MutexGuard<'_, T>> {
-        Ok(self.0.lock().unwrap_or_else(|p| p.into_inner()))
+        Ok(self.0.lock().unwrap_or_else(|p| {
+            self.0.clear_poison();
+            p.into_inner()
+        }))
     }
 
     /// `Err` only when the lock is held right now.
     pub fn try_lock(&self) -> TryLockResult<MutexGuard<'_, T>> {
         match self.0.try_lock() {
             Ok(guard) => Ok(guard),
-            Err(TryLockError::Poisoned(p)) => Ok(p.into_inner()),
+            Err(TryLockError::Poisoned(p)) => {
+                self.0.clear_poison();
+                Ok(p.into_inner())
+            }
             Err(TryLockError::WouldBlock) => Err(TryLockError::WouldBlock),
         }
     }
@@ -90,6 +98,12 @@ mod tests {
         shared.lock().unwrap().push(2);
         assert_eq!(*shared.lock().unwrap(), vec![1, 2]);
         assert!(shared.try_lock().is_ok());
+        // The mark is gone: a condition variable on this lock sees a clean one.
+        let guard = shared.lock().unwrap();
+        let cv = std::sync::Condvar::new();
+        assert!(cv
+            .wait_timeout(guard, std::time::Duration::from_millis(1))
+            .is_ok());
     }
 
     #[test]

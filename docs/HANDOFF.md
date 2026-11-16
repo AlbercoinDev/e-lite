@@ -194,6 +194,8 @@ Full detail: `CHANGELOG.md`.
 - `prune_mib = 1` for from-zero pruned IBD; snapshots are manual only.
 - Public providers fail closed; the shipped Electrum list never stands in for
   a missing or invalid `public-servers.toml`.
+- e-lite must not depend on systemd (or any init system): restart after a
+  fatal error is to be built into `run`; boot-time start is left to the host.
 - Release builds unwind; only the threads in
   `el_model::sync::CONTAINED_THREADS` may fail alone (AUD-173).
 - The TLS identity is one CA + leaf per instance (no SNI); a domain
@@ -209,9 +211,10 @@ P1 (before any public exposure or mainnet production claim):
 3. Close or document the residual audit risks (snapshot archive size limits,
    per-client threads, provider trust); see `AUDIT.md`.
 
-4. Ship a systemd unit with `Restart=on-failure`: a panic outside the wallet
+4. Built-in restart after a fatal error, with no dependency on systemd (owner
+   decision 2026-11-16; design in `ROADMAP.md`): a panic outside the wallet
    threads still stops the node by design (AUD-173), and the managed Tor is
-   orphaned when that happens (AUD-180).
+   orphaned when that happens (AUD-180, a prerequisite).
 
 P2/P3: the verified list (13 items left) is in `ROADMAP.md`; the short
 version: leader-verifies-before-notify, Tor retry by blame, no provider

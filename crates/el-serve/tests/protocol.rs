@@ -1261,7 +1261,24 @@ fn unknown_methods_do_not_grow_the_error_log() {
         );
         assert_eq!(r["error"]["code"], -32601, "{r}");
     }
+    {
+        let seen = fx.shared.error_log.lock().unwrap();
+        assert_eq!(seen.len(), 1, "{:?}", seen.keys().collect::<Vec<_>>());
+        assert!(seen.keys().all(|k| !k.contains("made.up")));
+    }
+    // A known method keeps its name even when it answers "method not found"
+    // (a 1.6 method on a 1.4 connection): only invented names are hidden.
+    let r = call(
+        &fx.shared,
+        1,
+        "blockchain.transaction.broadcast_package",
+        json!([[], false]),
+    );
+    assert_eq!(r["error"]["code"], -32601, "{r}");
     let seen = fx.shared.error_log.lock().unwrap();
-    assert_eq!(seen.len(), 1, "{:?}", seen.keys().collect::<Vec<_>>());
-    assert!(seen.keys().all(|k| !k.contains("made.up")));
+    assert!(
+        seen.contains_key("blockchain.transaction.broadcast_package:-32601"),
+        "{:?}",
+        seen.keys().collect::<Vec<_>>()
+    );
 }

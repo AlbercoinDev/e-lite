@@ -17,7 +17,8 @@ Code and documentation review; not tagged. Write-up:
   entry are released by a drop guard; a connection marked dead stops at the
   next poll instead of idling up to 600 s, and a failed write closes the
   socket; the once-a-minute `rpc error` log is bounded and no longer prints
-  the method name of an unknown method (client text).
+  the name of a method the server does not know (client text). Known methods
+  keep their name.
 - **Plain-text Electrum upstreams (AUD-171).** `host:port:t` in
   `public-servers.toml` is accepted only for `.onion` and local servers; a
   clearnet `:t` entry is ignored with a warning (it would show the txids to
@@ -58,7 +59,8 @@ Code and documentation review; not tagged. Write-up:
 - `docs/AUDIT.md` keeps only open findings and residual risks; AUD-016 and
   AUD-091..125 moved to `docs/audit/FIXED.md`. New open findings AUD-174..181.
 - `docs/ROADMAP.md` points at the modules that exist after the 29.17.0 split;
-  item 10 is marked as conflicting with AUD-041; the systemd unit is P2.
+  item 10 is marked as conflicting with AUD-041; restart after a fatal error
+  is planned inside `run`, with no dependency on systemd (P2).
 - `docs/FEATURES.md`, `docs/ELECTRUM_PROTOCOL.md`: raw-transaction source
   order, download budgets and `server.features.pruning` match the code.
 - `scripts/check-docs.sh` fails when a document names a source file that does

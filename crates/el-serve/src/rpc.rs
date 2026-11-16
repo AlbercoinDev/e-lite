@@ -8,6 +8,9 @@ pub struct RpcError {
     pub message: String,
     /// Set when the connection must be closed after sending the error.
     pub close: bool,
+    /// The method name is not one this server knows. Its name is client
+    /// text and never reaches the log.
+    pub unknown_method: bool,
 }
 
 impl RpcError {
@@ -16,6 +19,7 @@ impl RpcError {
             code,
             message: message.into(),
             close: false,
+            unknown_method: false,
         }
     }
     pub(crate) fn invalid(msg: impl Into<String>) -> Self {
@@ -23,6 +27,12 @@ impl RpcError {
     }
     pub(crate) fn method(msg: impl Into<String>) -> Self {
         Self::new(-32601, msg)
+    }
+    /// A method name this server does not implement at all.
+    pub(crate) fn unknown_method(name: &str) -> Self {
+        let mut e = Self::method(format!("unknown method: {name}"));
+        e.unknown_method = true;
+        e
     }
     pub(crate) fn server(msg: impl Into<String>) -> Self {
         Self::new(-32000, msg)
@@ -45,9 +55,12 @@ pub(crate) const ERROR_LOG_MAX: usize = 256;
 
 /// One INFO line per method and error code, at most once a minute. An unknown
 /// method is logged without its name: the name is client text (unbounded
-/// distinct values, and it may carry control characters into the log).
-pub(crate) fn log_rpc_error(shared: &Shared, method: &str, code: i64) {
-    let method = if code == METHOD_NOT_FOUND {
+/// distinct values, and it may carry control characters into the log). A
+/// known method keeps its name whatever the code (a 1.6 method called on a
+/// 1.4 connection also answers -32601).
+pub(crate) fn log_rpc_error(shared: &Shared, method: &str, error: &RpcError) {
+    let code = error.code;
+    let method = if error.unknown_method {
         "<unknown>"
     } else {
         method
@@ -218,7 +231,7 @@ pub fn dispatch_for(
                     let _g = read_guard(shared)?;
                     transaction_id_from_pos(shared, params)
                 }
-                _ => Err(RpcError::method(format!("unknown method: {method}"))),
+                _ => Err(RpcError::unknown_method(method)),
             }
         }
     }

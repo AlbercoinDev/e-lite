@@ -212,8 +212,8 @@ fn install_panic_hook() {
             .unwrap_or_else(|| "unknown location".to_string());
         if el_model::sync::panic_is_contained(thread.name()) {
             eprintln!(
-                "[e-lite] ERROR: internal error in {name} at {at}; that connection \
-                 is closed, the node keeps running. Please report it."
+                "[e-lite] ERROR: internal error in {name} at {at}; that request \
+                 fails (its connection may close), the node keeps running. Please report it."
             );
             return;
         }

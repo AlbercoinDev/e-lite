@@ -150,6 +150,10 @@ Never treat a version number in this file as authoritative over the code/tag.
   `el-serve`/`el-rawtx` use `el_model::sync::Mutex` (no poisoning); do not
   go back to `std::sync::Mutex` there. A contained panic logs thread and
   location only, never the panic message.
+- No dependency on systemd or any init system (owner decision 2026-11-16):
+  do not ship a unit file as the answer to "who restarts e-lite". Restart
+  after a fatal error belongs inside `run` (ROADMAP); the only systemd piece
+  is the optional ZFS `e-lite-arc-cap.service` oneshot.
 - The supervisor runs at commit boundaries inside the catch-up pipeline; the
   only teardown left is the 512-block checkpoint. Do not reintroduce a time
   deadline that drops prepared blocks/readers. Disk and shutdown checks stay
