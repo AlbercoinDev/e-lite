@@ -44,7 +44,7 @@ su casilla aquí y haz commit; cuando no quede ninguna, borra este fichero.
 | Copia en caliente (AUD-140) | **No se quiere.** Eliminar la opción de la documentación (tarea B0). |
 | Línea de comandos | Reducirla (bloque C). |
 | Mediciones | No se tratan en este encargo. |
-| Variantes opcionales | **Borrar las seis apagadas** (bloque D). El ARC dinámico de ZFS se mantiene. |
+| Variantes opcionales | **Borrar las seis apagadas y también el ARC dinámico de ZFS** (bloque D). |
 | AUD-178 | **Se deja como está** (tolerante). Solo documentación (tarea B0b). |
 
 ---
@@ -320,7 +320,8 @@ Hoy hay 115 opciones; la mayoría duplica lo que ya hace
     `--allow-low-memory`, `--allow-auto-prune`, `--yes`, `--dry-run`;
   - argumentos de subcomando: `--output`, `--input`, `--with-core`,
     `--verify`, `--expect-digest`, `--compress-level`, `--hash-files`,
-    `--no-hash-files`, `--apply`, `--purge`, `--public-servers`.
+    `--no-hash-files`, `--purge`, `--public-servers` (`--apply` desaparece
+    con `arc-setup`, tarea D7).
 
 - [ ] **C3. Las demás pasan a `--set`, con periodo de aviso.**
   - Una tabla `DEPRECATED_FLAGS: &[(opción, clave, tipo)]` en `cli.rs`.
@@ -353,12 +354,12 @@ Hoy hay 115 opciones; la mayoría duplica lo que ya hace
 
 ---
 
-## Bloque D — Borrar las variantes opcionales apagadas
+## Bloque D — Borrar las variantes opcionales
 
 Decisión del dueño (2026-11-16): se borran las seis variantes que están
-apagadas por defecto. **El ARC dinámico de ZFS (`zfs_arc_dynamic`,
-`arc-setup`) se mantiene**: está encendido por defecto y quitarlo cambiaría la
-memoria en máquinas con ZFS.
+apagadas por defecto **y también el ARC dinámico de ZFS** (D7), que está
+encendido por defecto: esa tarea sí cambia el comportamiento en máquinas con
+ZFS y lleva nota de actualización.
 
 Va después de los bloques B y C, un commit por variante, en este orden (de
 menos a más código):
@@ -386,6 +387,49 @@ menos a más código):
   conservar los campos de la ventana de bytes (`backlog_bytes`, `high_bytes`,
   `low_bytes`, `avg_block_bytes`), pero sin `mode`, `phase*` ni
   `index_paused` si ya nada los alimenta.
+
+- [ ] **D7. ARC dinámico de ZFS.** Con esto e-lite deja de tocar systemd por
+  completo.
+  - Qué se borra:
+    - claves `[index] zfs_arc_dynamic`, `zfs_arc_max_mib`, `zfs_arc_min_mib`;
+    - `Tunables::arc_tick`, `ArcManagerState`, `ARC_PARAM_PATH`,
+      `ARC_CAP_PATH` y su llamada desde `bin/e-lite/src/pipeline.rs`
+      (`bin/e-lite/src/tuning/controller.rs`, `tuning/memory.rs`,
+      `tuning/mod.rs`);
+    - el subcomando `arc-setup` (`cmd_arc_setup` en
+      `bin/e-lite/src/diagnostics.rs`, `Command::ArcSetup` en `cli.rs`,
+      `main.rs`) y la opción `--apply`, que solo usa él: quítala también de
+      la lista de opciones que se quedan en C2;
+    - `configure_arc` en `install.sh` (crea `e-lite-arc-cap.service`).
+  - Qué **se queda**: la lectura del tamaño del ARC (`arc_mib`,
+    `zfs_arc_counters`) en `memory_info`, `doctor` y `/status`, y el aviso de
+    ARC sin tope (`warn_uncapped_arc`). Su texto deja de recomendar
+    `e-lite arc-setup` y pasa a recomendar un tope fijo puesto por el
+    administrador (`zfs_arc_max`), con el valor que hoy sugiere la
+    documentación para una máquina dedicada. e-lite solo lee, nunca escribe.
+  - Instalaciones existentes (importante):
+    - e-lite pudo dejar escrito un tope de 1024 MiB en `zfs_arc_max`, que
+      dura hasta el reinicio de la máquina. El `CHANGELOG.md` debe decirlo y
+      dar el comando para volver al valor por defecto (`echo 0 | sudo tee
+      /sys/module/zfs/parameters/zfs_arc_max`).
+    - `install.sh`, al actualizar, **desactiva y borra**
+      `/etc/systemd/system/e-lite-arc-cap.service` si existe (solo con root
+      o `sudo` disponible, sin fallar si no puede) y lo dice en una línea.
+      Ese servicio dejaba el parámetro escribible por el grupo del usuario:
+      borrarlo lo devuelve a solo root en el siguiente arranque.
+    - Las tres claves entran en `RETIRED_KEYS` (aviso, no error).
+  - Documentación: `config.example.toml`, `docs/TUNING.md`, `docs/CLI.md`,
+    `docs/FEATURES.md`, `docs/INSTALL.md`, `docs/OPERATIONS.md`,
+    `docs/ROADMAP.md` (fila "Compaction/job tuning" nombra el ARC dinámico) y
+    `AGENTS.md`: en "Owner decisions", la línea de systemd pasa a "No
+    dependency on systemd or any init system; nothing in e-lite or its
+    installer creates a unit".
+  - `install.sh` es un script de shell y aquí no hay `shellcheck`: espera a
+    CI en verde, y prueba la actualización sobre una instalación que tenga el
+    servicio (o di claramente que no se pudo probar).
+  - Tests: los de `tuning/` que cubren el ARC se borran con él; los de
+    lectura (`zfs_arc_size_reads_the_value_column`,
+    `parse_arc_counters_and_psi`) se quedan.
 
 Para **cada** variante:
 
