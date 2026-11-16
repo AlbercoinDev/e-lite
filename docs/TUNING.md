@@ -274,7 +274,10 @@ index and starts automatically when the slot is released. Acquiring happens
 before a from-zero managed Core starts downloading, and the slot is released as
 soon as the instance is within 1000 blocks of Core. The kernel drops the lock on
 crash, so a dead process cannot block the queue. `E_LITE_NO_SYNC_LOCK=1`
-disables it (not recommended).
+disables it (not recommended). If the lock file cannot be created in the
+runtime directory (read-only, or left over from another user after `su`), the
+`/tmp` location is used; if neither can be, the sync runs without the lock
+after one warning instead of waiting for a lock nobody holds.
 
 This is a per-user lock. Separate containers do not see each other's locks.
 
