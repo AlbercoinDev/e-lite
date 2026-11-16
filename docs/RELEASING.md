@@ -25,7 +25,7 @@ cargo fmt --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 scripts/check-docs.sh
-shellcheck install.sh scripts/*.sh tests/e2e/*.sh tests/bench/*.sh tests/manual/*.sh
+shellcheck install.sh scripts/*.sh tests/*.sh tests/lib/*.sh tests/e2e/*.sh tests/bench/*.sh tests/manual/*.sh
 ```
 
 Plus the e2e suites relevant to the change; before a release at least

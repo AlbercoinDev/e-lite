@@ -9,7 +9,7 @@ CORE="$RUN/core"; DATA="$RUN/index"; DATA2="$RUN/index-limit"; CONF="$RUN/e-lite
 RPC=18488
 BLOCKS="${E_LITE_RECOVERY_BLOCKS:-20000}"
 core_start "$CORE" "$RPC"
-ADDR=$(core_mine_new "$CORE" "$RPC" rec "$BLOCKS")
+core_mine_new "$CORE" "$RPC" rec "$BLOCKS" >/dev/null
 TIP=$(cli "$CORE" "$RPC" getblockcount)
 echo "chain: $TIP blocks"
 e2e_conf "$CONF" index.batch_blocks=32 index.reorg_window=32 \

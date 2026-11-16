@@ -52,9 +52,9 @@ e2e_cleanup() {
   done
   for pid in "${E2E_PIDS[@]+"${E2E_PIDS[@]}"}"; do kill -KILL "$pid" 2>/dev/null; done
   for core in "${E2E_CORES[@]+"${E2E_CORES[@]}"}"; do
-    set -- $core
-    for _ in $(seq 1 40); do pgrep -f "bitcoind .*-datadir=$1( |$)" >/dev/null || break; sleep 0.5; done
-    pkill -KILL -f "bitcoind .*-datadir=$1( |$)" 2>/dev/null
+    local dir="${core%% *}"
+    for _ in $(seq 1 40); do pgrep -f "bitcoind .*-datadir=$dir( |$)" >/dev/null || break; sleep 0.5; done
+    pkill -KILL -f "bitcoind .*-datadir=$dir( |$)" 2>/dev/null
   done
   pkill -f "tor -f $RUN/" 2>/dev/null
   rm -rf "$RUN"
@@ -63,8 +63,7 @@ e2e_cleanup() {
 # Poll `cmd...` every 0.5 s until it succeeds or `seconds` pass.
 wait_for() {
   local seconds=$1; shift
-  local i
-  for i in $(seq 1 $((seconds * 2))); do
+  for _ in $(seq 1 $((seconds * 2))); do
     "$@" >/dev/null 2>&1 && return 0
     sleep 0.5
   done
