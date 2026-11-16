@@ -1358,3 +1358,67 @@ fn a_disconnect_frees_the_slot_while_downloads_are_in_flight() {
     assert!(answer["result"].as_str().unwrap().len() > 100, "{line}");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// AUD-186: a verbose `transaction.get` announces the transaction with the
+/// block its bytes were fetched for. A reorg during the download repeats the
+/// resolution; it never returns the old bytes with the new block.
+#[test]
+fn a_reorg_during_the_download_is_resolved_again() {
+    use std::cell::Cell;
+    let (fx, _script, txid) = fixture();
+    let old = Hash32::from_hex(&"aa".repeat(32)).unwrap();
+    let new = Hash32::from_hex(&"cc".repeat(32)).unwrap();
+
+    // No reorg: one fetch, the indexed block.
+    let calls = Cell::new(0);
+    let (raw, block, tip) = el_serve::confirmed_tx_with_block(&fx.shared, txid, |height| {
+        calls.set(calls.get() + 1);
+        Ok(format!("raw@{height}"))
+    })
+    .unwrap();
+    assert_eq!(
+        (raw.as_str(), block.hash, tip, calls.get()),
+        ("raw@0", old, 0, 1)
+    );
+
+    // The block at that height is replaced while the first fetch runs.
+    let calls = Cell::new(0);
+    let (raw, block, _tip) = el_serve::confirmed_tx_with_block(&fx.shared, txid, |_height| {
+        calls.set(calls.get() + 1);
+        if calls.get() == 1 {
+            let mut batch = Store::batch();
+            fx.shared
+                .store
+                .put_block(
+                    &mut batch,
+                    &BlockRecord {
+                        height: 0,
+                        hash: new,
+                        header: [0x43; 80],
+                        tx_count: 1,
+                        txnum_base: 0,
+                    },
+                )
+                .unwrap();
+            fx.shared
+                .store
+                .commit(
+                    batch,
+                    &IndexedTip {
+                        height: 0,
+                        block_hash: new,
+                        schema_version: el_model::codec::SCHEMA_VERSION,
+                        txnum: 1,
+                    },
+                    &[],
+                )
+                .unwrap();
+            return Ok("bytes of the old chain".to_string());
+        }
+        Ok("bytes of the new chain".to_string())
+    })
+    .unwrap();
+    assert_eq!(calls.get(), 2, "the resolution was not repeated");
+    assert_eq!(block.hash, new);
+    assert_eq!(raw, "bytes of the new chain");
+}

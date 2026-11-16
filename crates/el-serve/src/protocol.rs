@@ -1163,6 +1163,58 @@ pub(crate) fn decorate_verbose_tx(
     Ok(())
 }
 
+/// Where the index places a confirmed transaction right now: its block and
+/// the tip, read under one guard so they describe the same chain.
+fn locate_confirmed(shared: &Shared, txid: Hash32) -> RpcResult<Option<(BlockRecord, u32)>> {
+    let _g = read_guard(shared)?;
+    let occ = shared
+        .store
+        .occurrences(txid)
+        .map_err(|e| RpcError::server(e.to_string()))?;
+    let Some((height, _)) = occ.first().copied() else {
+        return Ok(None);
+    };
+    let block = shared
+        .store
+        .get_block(height)
+        .map_err(|e| RpcError::server(e.to_string()))?
+        .ok_or_else(|| RpcError::server(format!("block {height} missing")))?;
+    let tip = shared
+        .store
+        .committed_tip()
+        .map_err(|e| RpcError::server(e.to_string()))?
+        .map(|t| t.height)
+        .unwrap_or(height);
+    Ok(Some((block, tip)))
+}
+
+/// The raw transaction together with the block and tip it is announced
+/// with (AUD-186). The download runs without the index lock, so a reorg may
+/// move the transaction meanwhile: the location is read before and after, and
+/// the bytes are only returned with the block they were fetched for. A reorg
+/// in between repeats the resolution instead of mixing two chains.
+#[doc(hidden)]
+pub fn confirmed_tx_with_block(
+    shared: &Shared,
+    txid: Hash32,
+    fetch: impl Fn(u32) -> RpcResult<String>,
+) -> RpcResult<(String, BlockRecord, u32)> {
+    const ATTEMPTS: usize = 3;
+    for _ in 0..ATTEMPTS {
+        let Some((before, _)) = locate_confirmed(shared, txid)? else {
+            break;
+        };
+        let raw = fetch(before.height)?;
+        match locate_confirmed(shared, txid)? {
+            Some((after, tip)) if after.hash == before.hash => return Ok((raw, after, tip)),
+            _ => continue,
+        }
+    }
+    Err(RpcError::server(
+        "the transaction moved during a reorganisation; ask again",
+    ))
+}
+
 pub(crate) fn transaction_get(shared: &Shared, params: &Value) -> RpcResult<Value> {
     let txid = params
         .as_array()
@@ -1197,33 +1249,18 @@ pub(crate) fn transaction_get(shared: &Shared, params: &Value) -> RpcResult<Valu
         // For a confirmed transaction use the verified resolver and decode the
         // raw bytes locally through Core. This works on a pruned node, where
         // getrawtransaction(txid, true, blockhash) would fail.
-        if let Some((height, _)) = occ.first().copied() {
-            let raw = {
+        if !occ.is_empty() {
+            let (raw, block, tip) = confirmed_tx_with_block(shared, txid_hash, |height| {
                 let _guard = rawtx_reader_guard(shared, height);
                 shared
                     .resolver
                     .raw_tx_for(current_client(), txid_hash, height)
-                    .map_err(|e| rawtx_failure(shared, height, e))?
-            };
+                    .map_err(|e| rawtx_failure(shared, height, e))
+            })?;
             let mut decoded = shared.core.decode_raw_transaction(&raw).map_err(|e| {
-                note_tx_get_failure(shared, TxGetFailure::Internal, Some(height));
+                note_tx_get_failure(shared, TxGetFailure::Internal, Some(block.height));
                 RpcError::server(format!("rawtx decode: {e}"))
             })?;
-            let (block, tip) = {
-                let _g = read_guard(shared)?;
-                let block = shared
-                    .store
-                    .get_block(height)
-                    .map_err(|e| RpcError::server(e.to_string()))?
-                    .ok_or_else(|| RpcError::server(format!("block {height} missing")))?;
-                let tip = shared
-                    .store
-                    .committed_tip()
-                    .map_err(|e| RpcError::server(e.to_string()))?
-                    .map(|t| t.height)
-                    .unwrap_or(height);
-                (block, tip)
-            };
             decorate_verbose_tx(&mut decoded, &raw, &block, tip)?;
             return Ok(decoded);
         }
