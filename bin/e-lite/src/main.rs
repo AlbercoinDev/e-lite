@@ -8,6 +8,7 @@ mod privacy;
 mod public_servers;
 mod reader_pool;
 mod snapshot;
+mod supervisor;
 mod tls;
 mod tor;
 mod tuning;
@@ -235,6 +236,19 @@ fn install_panic_hook() {
 
 fn main() {
     install_panic_hook();
+    // A daemon command becomes a watching parent plus the node as its child,
+    // so a fatal error is followed by a restart without any init system.
+    if let Ok(args) = parse_args() {
+        let daemon = matches!(
+            args.command,
+            Some(Command::Run | Command::Serve | Command::Index)
+        );
+        if supervisor::wanted(daemon, args.no_supervise, args.no_follow) {
+            if let Some(code) = supervisor::run() {
+                std::process::exit(code);
+            }
+        }
+    }
     let result = run();
     if let Err(e) = &result {
         eprintln!("e-lite: error: {e}");
@@ -281,6 +295,9 @@ fn run() -> R<()> {
         if let Err(e) = logging::init(&path, cfg.logging.max_mib) {
             eprintln!("[e-lite] WARNING: {e}; continuing without a log file");
         }
+    }
+    if let Some(note) = supervisor::restart_note() {
+        eprintln!("{note}");
     }
     eprintln!(
         "[e-lite] log level: {} ([logging] level or --log-level; hot-reloadable)",

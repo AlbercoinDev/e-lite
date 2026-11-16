@@ -419,3 +419,67 @@ fn a_panicking_line_releases_its_place_and_closes_the_connection() {
     assert_eq!(client.background.load(Ordering::Relaxed), 0);
     assert!(closing.load(Ordering::Relaxed), "connection not closed");
 }
+
+/// AUD-181: a port used as the *source* of an outgoing connection cannot be
+/// bound, although nothing listens on it. `bind_listener` waits for it; a
+/// port with a real listener fails at once.
+#[test]
+fn bind_waits_for_a_port_held_by_an_outgoing_connection() {
+    let peer = TcpListener::bind("127.0.0.1:0").unwrap();
+    let outgoing = std::net::TcpStream::connect(peer.local_addr().unwrap()).unwrap();
+    let (accepted, _) = peer.accept().unwrap();
+    let addr = outgoing.local_addr().unwrap().to_string();
+    // The situation itself: the kernel refuses the port.
+    let refused = TcpListener::bind(&addr).unwrap_err();
+    assert_eq!(refused.kind(), std::io::ErrorKind::AddrInUse);
+
+    let closer = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(700));
+        // The far side closes first, so this side leaves no TIME_WAIT and
+        // the port is free as soon as both are closed.
+        drop(accepted);
+        std::thread::sleep(Duration::from_millis(100));
+        drop(outgoing);
+    });
+    let started = Instant::now();
+    let listener = bind_listener(&addr, "test", None).expect("bound after the connection ended");
+    assert!(
+        started.elapsed() >= Duration::from_millis(500),
+        "it had to wait"
+    );
+    assert!(started.elapsed() < Duration::from_secs(20));
+    closer.join().unwrap();
+
+    // Someone really listens there: no waiting.
+    let started = Instant::now();
+    let err = bind_listener(&addr, "test", None).unwrap_err();
+    assert_eq!(err.kind(), std::io::ErrorKind::AddrInUse);
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "must fail at once"
+    );
+    drop(listener);
+
+    // A stop request ends the wait.
+    let peer = TcpListener::bind("127.0.0.1:0").unwrap();
+    let outgoing = std::net::TcpStream::connect(peer.local_addr().unwrap()).unwrap();
+    let addr = outgoing.local_addr().unwrap().to_string();
+    let stop = AtomicBool::new(true);
+    let started = Instant::now();
+    assert!(bind_listener(&addr, "test", Some(&stop)).is_err());
+    assert!(started.elapsed() < Duration::from_secs(5));
+}
+
+#[test]
+fn the_socket_table_tells_a_listener_from_a_connection() {
+    // Port 0xD8AC = 55468 listening; 0xD8BC = 55484 only as the source of an
+    // established connection (state 01) and of one in TIME_WAIT (06).
+    let table = "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n\
+   0: 0100007F:D8AC 00000000:0000 0A 00000000:00000000 00:00000000 00000000  1000        0 1 1 0\n\
+   1: 0100007F:D8BC 0100007F:483B 01 00000000:00000000 00:00000000 00000000  1000        0 2 1 0\n\
+   2: 0100007F:D8BC 0100007F:483C 06 00000000:00000000 03:00000A00 00000000     0        0 0 3 0\n";
+    assert!(proc_table_listens(table, 55468));
+    assert!(!proc_table_listens(table, 55484));
+    assert!(!proc_table_listens(table, 1));
+    assert!(!proc_table_listens("", 55468));
+}

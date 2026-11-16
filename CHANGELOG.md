@@ -27,6 +27,14 @@ Code and documentation review; not tagged. Write-up:
 - `e-lite privacy check` reports the default of `blocks.decoys` as coming from
   `rawtx.decoys`, not always from `config.toml`.
 - A failed `export-snapshot` removes its partial `.tmp` archive (AUD-172).
+- **`cannot bind ... Address already in use` with nothing listening
+  (AUD-181).** The default ports are inside the kernel's ephemeral range, so
+  a local connection (e-lite's own RPC calls to Core included) can be using
+  one as its source port, open or for 60 s after closing, and the kernel then
+  refuses the listener. The plain, TLS and metrics binds now wait for that
+  (up to 75 s, one log line); a port another program really listens on still
+  fails at once, and the error says which case it was. Sporadic e2e failures
+  led here; that they had this cause is not proven.
 
 ### Changed
 
@@ -39,6 +47,25 @@ Code and documentation review; not tagged. Write-up:
   its log on the next start. Locks shared between connections no longer
   poison, so one contained panic cannot disable a cache for the rest of the
   run.
+
+### Added
+
+- **Automatic restart after a fatal error, without systemd or any other init
+  system (AUD-180).** `run`, `serve` and `index` now run as two processes of
+  the same binary: a small parent that only watches and the node as its
+  child. When the node ends abnormally (the abort after a fatal internal
+  error, a crash, the out-of-memory killer) the parent starts it again after
+  1 s, doubling up to 60 s; after 5 abnormal ends in 10 minutes it stops with
+  one line saying so. A clean stop and any exit with an error code are final.
+  A managed Core keeps running and is adopted by the new node.
+  - Signals go to the parent (the pid your shell or script started), which
+    passes `SIGTERM`/`SIGINT`/`SIGUSR1` on. **`pgrep -f 'e-lite run'` now
+    prints two pids**: use `pkill -o -f 'e-lite run'` (documented commands
+    are updated).
+  - `--no-supervise` / `E_LITE_NO_SUPERVISE=1` keeps the single process.
+  - New suite `tests/e2e/e2e_supervisor.sh`.
+- The managed Tor ends with e-lite however e-lite ends, and a Tor left behind
+  by an older run is stopped at start instead of blocking the new one.
 
 ### Refactored (no behaviour change)
 
@@ -57,10 +84,9 @@ Code and documentation review; not tagged. Write-up:
   (sync/IBD/indexing, wallet service, backup/restore), the written improvement
   plan and new proposals.
 - `docs/AUDIT.md` keeps only open findings and residual risks; AUD-016 and
-  AUD-091..125 moved to `docs/audit/FIXED.md`. New open findings AUD-174..181.
+  AUD-091..125 moved to `docs/audit/FIXED.md`. New open findings AUD-174..179.
 - `docs/ROADMAP.md` points at the modules that exist after the 29.17.0 split;
-  item 10 is marked as conflicting with AUD-041; restart after a fatal error
-  is planned inside `run`, with no dependency on systemd (P2).
+  item 10 is marked as conflicting with AUD-041.
 - `docs/FEATURES.md`, `docs/ELECTRUM_PROTOCOL.md`: raw-transaction source
   order, download budgets and `server.features.pruning` match the code.
 - `scripts/check-docs.sh` fails when a document names a source file that does

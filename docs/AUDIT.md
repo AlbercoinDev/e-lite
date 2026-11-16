@@ -7,7 +7,7 @@
 
 This audit is not a claim of formal verification. It records static checks,
 manual review areas, concrete findings and residual risks. Fixed findings
-(AUD-001..173) are in [`audit/FIXED.md`](audit/FIXED.md). The review itself, in
+(AUD-001..173, 180, 181) are in [`audit/FIXED.md`](audit/FIXED.md). The review itself, in
 Spanish, is [`ANALISIS.md`](ANALISIS.md).
 
 ## Baseline
@@ -15,8 +15,8 @@ Spanish, is [`ANALISIS.md`](ANALISIS.md).
 ```text
 cargo fmt --check                                      OK
 cargo clippy --workspace --all-targets -- -D warnings  OK
-cargo test --workspace                                 366 tests OK (6 ignored)
-cargo build --release (panic = "unwind") + e2e_regtest  OK
+cargo test --workspace                                 372 tests OK (6 ignored)
+cargo build --release + e2e_regtest + e2e_supervisor   OK
 scripts/check-docs.sh                                  OK
 tests/e2e/e2e_regtest.sh                               OK
 tests/e2e/e2e_defaults.sh                              OK
@@ -25,12 +25,14 @@ tests/e2e/e2e_wait_core.sh                             OK
 tests/e2e/e2e_external_pruned.sh                       OK
 tests/e2e/e2e_resilience.sh                            OK
 tests/e2e/e2e_snapshot.sh                              OK
-tests/e2e/e2e_multi_instance.sh                        OK (one flaky bind earlier, AUD-181)
+tests/e2e/e2e_multi_instance.sh                        OK
 tests/e2e/e2e_pruned_ibd.sh                            OK
 tests/e2e/e2e_recovery.sh                              OK
+tests/e2e/e2e_supervisor.sh                            OK
 ```
 
-Run on the review branch on 2026-11-16. Not run: `shellcheck` (not installed
+Run on the review branch on 2026-11-16, with the automatic restart on;
+no process was left behind. Not run: `shellcheck` (not installed
 on the review machine), `e2e_networks.sh` (real signet/testnet4 sync; it
 refuses to start without the free disk space it requires), the real-Tor test
 and the installer.
@@ -64,8 +66,6 @@ Additional checks performed:
 | AUD-177 | P2 | Wallet latency during IBD | `bin/e-lite/src/pipeline.rs` (`commit_group`), `crates/el-serve/src/protocol.rs` (readers of `Shared::lock`) | The commit holds the global write lock for the whole `txids.dat` append + fsync and the RocksDB write. Wallet requests take the read side, so every request waits for the commit: milliseconds in live mode, seconds for a 512-block bulk group and tens of seconds in the spikes the log already warns about ("commit spike"). | Open: serve reads from a RocksDB snapshot taken at the committed tip (the batch is atomic and `txids.dat` is only read below the committed `txnum`), keeping the exclusive lock for rewinds only. Needs a reorg test under concurrent readers. |
 | AUD-178 | P3 | Protocol negotiation | `crates/el-serve/src/protocol.rs` (`negotiate_protocol`), `docs/ROADMAP.md` | ROADMAP asked to honour `client_min` (a client asking `[1.4.3, 1.4.3]` gets 1.4.2), while AUD-041 records the same downgrade as deliberate leniency and the tests assert it. The two documents contradicted each other. | Not changed. Recommended rule: keep the leniency for a single version string (what wallets send) and honour `client_min` only for an explicit `[min, max]` range with `min < max`; decide before touching the tests. |
 | AUD-179 | P3 | Pipeline waste | `bin/e-lite/src/pipeline.rs` (`catch_up_limited`, `spawn_readers`), `bin/e-lite/src/reader_pool.rs` | The reader pool lives for one call: every 512 blocks (and every 500 ms at the tip) the threads are created and joined and the prepared window (4-32 blocks already fetched, decoded and prefetched) is thrown away. With 8 readers that is up to 16 of every 528 prepared blocks. | Open: keep one `ReaderPool` across calls and feed it heights; the pool is already isolated for this. Measure with `tests/bench/bench_ibd.sh` and `/status.pipeline.discarded`. |
-| AUD-180 | P3 | Managed Tor lifetime | `bin/e-lite/src/tor.rs` (`supervise`, `terminate`) | The managed Tor is a plain child process. When e-lite ends without running its shutdown (SIGKILL, OOM kill, the deliberate abort after a panic outside the wallet threads, AUD-173), Tor stays alive as an orphan holding the SOCKS port and the onion data directory. The next start does not look at `tor.pid` before spawning, so its own Tor cannot bind and the supervisor keeps retrying while the node works through the orphan by accident; a later clean shutdown does not stop the orphan either. Observed: two `tor` processes left behind by two runs of `tests/e2e/e2e_pruned_ibd.sh` (its SIGKILL phase). | Open: on start, adopt or terminate a live `tor.pid` that belongs to this data directory; on Linux also set `PR_SET_PDEATHSIG` on the child. The e2e should assert that no `tor` survives it. |
-| AUD-181 | P3 | Default ports | `bin/e-lite/src/config.rs` (`apply_network_defaults`), `tests/e2e/e2e_multi_instance.sh` | Every default listener (55011..55384) is inside Linux's default ephemeral range (32768-60999). An outbound connection of any local process may be using that port as its source port when e-lite binds, and the bind then fails with "Address already in use". Seen once in this review: `e2e_multi_instance.sh` failed with `cannot bind metrics 127.0.0.1:55484` while nothing was listening there, and passed on the next run. The cause is inferred, not proven. | Open: retry a failed bind for a few seconds before giving up, and document `net.ipv4.ip_local_reserved_ports` for hosts that run several instances. Changing the ports would break existing wallets' settings. |
 
 ## Residual risks and intentional limits
 

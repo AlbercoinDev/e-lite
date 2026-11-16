@@ -121,7 +121,8 @@ enabled = false
 EOF
 
 echo "== e-lite run =="
-"$BIN" run --config "$CONF" >"$RUN/run.log" 2>&1 &
+# One process: the sampler reads CPU and memory of this pid.
+E_LITE_NO_SUPERVISE=1 "$BIN" run --config "$CONF" >"$RUN/run.log" 2>&1 &
 echo $! >"$RUN/elite.pid"
 
 set +e

@@ -16,13 +16,20 @@ B_PLAIN=55411; B_TLS=55422; B_METRICS=55484
 
 cleanup() {
   set +e
+  local pids=""
   for f in "$RUN/a.pid" "$RUN/b.pid"; do
-    [ -f "$f" ] && kill -TERM "$(cat "$f")" 2>/dev/null
+    [ -f "$f" ] && { kill -TERM "$(cat "$f")" 2>/dev/null; pids="$pids $(cat "$f")"; }
   done
   for d in "$A/core" "$B/core"; do
     [ -f "$d/regtest/bitcoind.pid" ] && kill "$(cat "$d/regtest/bitcoind.pid")" 2>/dev/null
   done
-  sleep 2
+  # Wait for the instances to really end: the next suite reuses the ports.
+  for _ in $(seq 1 60); do
+    alive=0
+    for p in $pids; do kill -0 "$p" 2>/dev/null && alive=1; done
+    [ "$alive" -eq 0 ] && break
+    sleep 0.5
+  done
   rm -rf "$RUN"
 }
 trap cleanup EXIT INT TERM
@@ -156,8 +163,14 @@ FP_B=$(openssl x509 -in "$B/index/tls/self-signed.crt" -noout -fingerprint -sha2
 echo "TLS certificates are distinct"
 
 # Combined memory must stay under the process budget.
-RSS_A=$(awk '/VmRSS/ {print $2}' "/proc/$(cat "$RUN/a.pid")/status")
-RSS_B=$(awk '/VmRSS/ {print $2}' "/proc/$(cat "$RUN/b.pid")/status")
+# The pid files hold the watching parents; the memory is in their nodes.
+node_of() {
+  local node
+  node="$(pgrep -P "$1" -x e-lite | head -1 || true)"
+  echo "${node:-$1}"
+}
+RSS_A=$(awk '/VmRSS/ {print $2}' "/proc/$(node_of "$(cat "$RUN/a.pid")")/status")
+RSS_B=$(awk '/VmRSS/ {print $2}' "/proc/$(node_of "$(cat "$RUN/b.pid")")/status")
 TOTAL_KB=$(awk '/MemTotal/ {print $2}' /proc/meminfo)
 python3 - "$RSS_A" "$RSS_B" "$TOTAL_KB" <<'PY'
 import sys

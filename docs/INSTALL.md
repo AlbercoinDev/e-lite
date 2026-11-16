@@ -175,7 +175,7 @@ The installer keeps a reference copy of both templates in
 
 ```bash
 # stop the old process (Ctrl+C is preferred)
-kill -TERM "$(pgrep -f 'e-lite run')"
+pkill -TERM -o -f 'e-lite run'   # -o: the watching parent, which stops the node
 
 curl -fsSL https://github.com/AlbercoinDev/e-lite/releases/latest/download/install.sh | sh
 

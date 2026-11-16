@@ -3,8 +3,117 @@
 use super::*;
 
 pub fn start_server(shared: Arc<Shared>) -> std::io::Result<std::thread::JoinHandle<()>> {
-    let listener = TcpListener::bind(&shared.listen)?;
+    let listener = bind_listener(&shared.listen, "Electrum", None)?;
     Ok(start_listener_on(listener, shared, None))
+}
+
+/// How long `bind_listener` waits for a port held by an outgoing connection.
+/// A closed connection keeps its source port for 60 s (TIME_WAIT).
+pub const BIND_RETRY: Duration = Duration::from_secs(75);
+
+/// Bind a listener, waiting when the port is only held by an outgoing
+/// connection (AUD-181).
+///
+/// The default ports are inside the kernel's ephemeral range, so any local
+/// connection, including e-lite's own RPC calls to Core, may be using one of
+/// them as its *source* port, live or for 60 s after it closed. The kernel
+/// then refuses the bind with "address in use" although nothing listens
+/// there. That clears by itself, so it is retried; a port another program is
+/// really listening on fails at once, and the error says which case it was.
+/// `stop` ends the wait early.
+pub fn bind_listener(
+    addr: &str,
+    what: &str,
+    stop: Option<&AtomicBool>,
+) -> std::io::Result<TcpListener> {
+    let deadline = Instant::now() + BIND_RETRY;
+    let mut announced = false;
+    loop {
+        let error = match TcpListener::bind(addr) {
+            Ok(listener) => return Ok(listener),
+            Err(e) => e,
+        };
+        if error.kind() != std::io::ErrorKind::AddrInUse {
+            return Err(error);
+        }
+        let explain = |why: &str| std::io::Error::new(error.kind(), format!("{error} ({why})"));
+        if someone_listens(addr) {
+            return Err(explain("another program is listening on this port"));
+        }
+        if stop.is_some_and(|flag| flag.load(Ordering::SeqCst)) {
+            return Err(explain("stopped while waiting for the port"));
+        }
+        if Instant::now() >= deadline {
+            return Err(explain(
+                "nothing listens on it, but outgoing connections kept the port busy",
+            ));
+        }
+        if !announced {
+            eprintln!(
+                "[e-lite] {what} port {addr} is held for a moment by an outgoing connection \
+                 of this host (nothing is listening on it); retrying for up to {} s",
+                BIND_RETRY.as_secs()
+            );
+            announced = true;
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
+}
+
+/// Whether a program is listening on the port of `addr` right now. The
+/// kernel's socket table answers exactly; a connection attempt is the
+/// fallback where `/proc/net` cannot be read.
+fn someone_listens(addr: &str) -> bool {
+    use std::net::ToSocketAddrs;
+    let Ok(resolved) = addr.to_socket_addrs() else {
+        return false;
+    };
+    let targets: Vec<std::net::SocketAddr> = resolved.collect();
+    let Some(port) = targets.first().map(|t| t.port()) else {
+        return false;
+    };
+    if let Some(listening) = listening_in_proc(port) {
+        return listening;
+    }
+    targets.into_iter().any(|mut target| {
+        if target.ip().is_unspecified() {
+            target.set_ip(match target {
+                std::net::SocketAddr::V4(_) => std::net::Ipv4Addr::LOCALHOST.into(),
+                std::net::SocketAddr::V6(_) => std::net::Ipv6Addr::LOCALHOST.into(),
+            });
+        }
+        TcpStream::connect_timeout(&target, Duration::from_millis(300)).is_ok()
+    })
+}
+
+/// `Some(true)` when `/proc/net/tcp` or `tcp6` has a socket in LISTEN state
+/// on `port`; `None` when neither file can be read.
+fn listening_in_proc(port: u16) -> Option<bool> {
+    let mut readable = false;
+    for table in ["/proc/net/tcp", "/proc/net/tcp6"] {
+        let Ok(text) = std::fs::read_to_string(table) else {
+            continue;
+        };
+        readable = true;
+        if proc_table_listens(&text, port) {
+            return Some(true);
+        }
+    }
+    readable.then_some(false)
+}
+
+/// One `/proc/net/tcp*` table: `sl local_address rem_address st ...`, the
+/// local address as `HEXIP:HEXPORT` and `0A` for the LISTEN state.
+pub(crate) fn proc_table_listens(table: &str, port: u16) -> bool {
+    table.lines().skip(1).any(|line| {
+        let mut fields = line.split_whitespace();
+        let local = fields.nth(1);
+        let state = fields.nth(1);
+        let local_port = local
+            .and_then(|l| l.rsplit(':').next())
+            .and_then(|hex| u16::from_str_radix(hex, 16).ok());
+        local_port == Some(port) && state == Some("0A")
+    })
 }
 
 /// Serve an already-bound listener. When `tls` is set, every accepted

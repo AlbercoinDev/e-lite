@@ -17,7 +17,11 @@ cleanup() {
   [ -f "$RUN/serve.pid" ] && kill "$(cat "$RUN/serve.pid")" 2>/dev/null
   [ -f "$CORE/regtest/bitcoind.pid" ] && kill "$(cat "$CORE/regtest/bitcoind.pid")" 2>/dev/null
   pkill -f "bitcoind .*$CORE" 2>/dev/null
-  sleep 1
+  # Wait for e-lite to really end: the next suite reuses the default ports.
+  for _ in $(seq 1 60); do
+    [ -f "$RUN/serve.pid" ] && kill -0 "$(cat "$RUN/serve.pid")" 2>/dev/null || break
+    sleep 0.5
+  done
   rm -rf "$RUN"
 }
 trap cleanup EXIT INT TERM

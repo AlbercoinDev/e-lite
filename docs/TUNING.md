@@ -444,7 +444,7 @@ blocks/s index-only), the break-even is ~6.7 blocks/s. Measure Core alone with a
 5-minute `SIGSTOP` of e-lite before changing the default:
 
 ```bash
-PID=$(pgrep -f 'e-lite run' | head -1)
+PID=$(pgrep -n -f 'e-lite run')   # the node (newest); the oldest is its watching parent
 bitcoin-cli -datadir=<core-datadir> getblockcount
 kill -STOP "$PID"; sleep 300
 bitcoin-cli -datadir=<core-datadir> getblockcount

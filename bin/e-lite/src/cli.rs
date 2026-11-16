@@ -126,6 +126,7 @@ pub(crate) struct Args {
     pub(crate) log_max_mib: Option<u64>,
     pub(crate) log_level: Option<String>,
     pub(crate) no_log_file: bool,
+    pub(crate) no_supervise: bool,
 }
 
 pub(crate) fn parse_args() -> R<Args> {
@@ -301,6 +302,7 @@ pub(crate) fn parse_args() -> R<Args> {
             "--log-file" => args.log_file = Some(value("--log-file")?),
             "--log-max-mib" => args.log_max_mib = Some(value("--log-max-mib")?.parse()?),
             "--no-log-file" => args.no_log_file = true,
+            "--no-supervise" => args.no_supervise = true,
             "--log-level" => args.log_level = Some(value("--log-level")?),
             "--stop-on-exit" => args.stop_on_exit = Some(true),
             "--no-stop-on-exit" => args.stop_on_exit = Some(false),
@@ -507,6 +509,8 @@ LOGGING:
     --log-level <level>     info | debug | trace (alpha default: debug;
                             extra diagnostic lines are gated by this level)
     --no-log-file           disable the application log
+    --no-supervise          run/serve/index as one process, without the
+                            automatic restart of e-lite after a fatal error
 "#
     )
 }

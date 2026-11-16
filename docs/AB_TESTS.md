@@ -78,7 +78,7 @@ actual bytes.
 With Core downloading and e-lite running:
 
 ```bash
-PID=$(pgrep -f 'e-lite run' | head -1)
+PID=$(pgrep -n -f 'e-lite run')   # the node (newest); the oldest is its watching parent
 bitcoin-cli -datadir=<core-datadir> getblockcount
 kill -STOP "$PID"; sleep 300
 bitcoin-cli -datadir=<core-datadir> getblockcount

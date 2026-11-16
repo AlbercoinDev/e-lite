@@ -7,8 +7,13 @@ pub fn start_metrics(
     shared: Arc<Shared>,
     addr: String,
 ) -> std::io::Result<std::thread::JoinHandle<()>> {
-    let listener = TcpListener::bind(&addr)?;
-    let handle = std::thread::spawn(move || {
+    let listener = bind_listener(&addr, "metrics", None)?;
+    Ok(start_metrics_on(shared, listener))
+}
+
+/// Serve `/status`, `/metrics` and `/healthz` on an already-bound listener.
+pub fn start_metrics_on(shared: Arc<Shared>, listener: TcpListener) -> std::thread::JoinHandle<()> {
+    std::thread::spawn(move || {
         for incoming in listener.incoming() {
             let mut stream = match incoming {
                 Ok(s) => s,
@@ -38,8 +43,7 @@ pub fn start_metrics(
             );
             let _ = stream.write_all(resp.as_bytes());
         }
-    });
-    Ok(handle)
+    })
 }
 
 pub(crate) fn metrics_text(shared: &Shared) -> String {

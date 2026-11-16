@@ -29,7 +29,13 @@ Los identificadores `AUD-nnn` remiten a [`AUDIT.md`](AUDIT.md) (abiertos) y a
   ante cualquier panic con código escrito para no hacerlo. Por decisión del
   dueño ahora hace *unwind*: un fallo en un hilo de wallet cierra esa conexión y
   el nodo sigue; en cualquier otro hilo el proceso se detiene como antes.
-- Quedan ocho hallazgos abiertos nuevos (AUD-174..181).
+- e-lite se reinicia solo tras un fallo fatal, **sin systemd ni ningún otro
+  gestor de servicios** (decisión del dueño): `run` es un proceso padre que
+  vigila y el nodo como hijo. El Tor gestionado ya no queda huérfano (AUD-180).
+- Un fallo esporádico de arranque (`cannot bind ... Address already in use`
+  sin nada escuchando) tiene un mecanismo real que ya está cubierto (AUD-181);
+  que fuera la causa de los fallos vistos en los tests no está demostrado.
+- Quedan seis hallazgos abiertos nuevos (AUD-174..179).
 
 ### Alcance real de la lectura
 
@@ -63,6 +69,7 @@ historial, UTXO y txids, y responde a las wallets desde ese índice.
 | Transacciones crudas | caché local → Core → por txid a servidores públicos con wallets señuelo (por defecto) → bloque entero. Siempre verificadas contra el índice. |
 | Privacidad | Tor por defecto y cerrado ante fallo; nunca salen scripts, direcciones ni xpubs; `privacy.toml` con tres perfiles. |
 | Copias | `export-snapshot` / `import-snapshot` por red, con o sin los datos de cadena de Core. |
+| Reinicio automático | integrado en `run`/`serve`/`index`, sin gestor de servicios: tras un final anómalo (aborto por error interno, caída, falta de memoria) el nodo vuelve solo. |
 | Operación | instalación y actualización en una línea, `/status` y `/metrics` en loopback, `doctor`, registro con tres niveles, recarga en caliente. |
 
 Qué sale del índice local y qué necesita una fuente externa:
@@ -76,8 +83,7 @@ Qué sale del índice local y qué necesita una fuente externa:
 | Transacción cruda de un bloque podado | caché | no | sí (txid entre señuelos, o bloque entero) |
 
 No disponible hoy: autenticación de clientes, pagos silenciosos (BIP352),
-reinicio automático tras un fallo fatal, imagen de contenedor, ARM64,
-exportación de copias en caliente.
+imagen de contenedor, ARM64, exportación de copias en caliente.
 
 ## 2. Parte inicial: sincronización, IBD e indexación
 
@@ -170,8 +176,8 @@ ocupa ~260 GiB en mainnet (AUD-130), que es el coste principal en disco.
 | AUD-171 | P2 | La lista de servidores Electrum aceptaba texto plano (`:t`) hacia clearnet: los txids cruzarían el nodo de salida de Tor sin cifrar. Esplora ya exigía HTTPS. | **Corregido** |
 | AUD-173 | P2 | **Política de panic incoherente.** El binario publicado usaba `panic = "abort"`, pero el código tenía `catch_unwind` y recuperación de *locks* envenenados que solo funcionan con *unwind*: un panic en cualquier hilo detenía todo el nodo. | **Corregido** (decisión del dueño: *unwind*) |
 | AUD-174 | P2 | Hasta ~130 hilos por una sola wallet activa (1 + 4 líneas × 32 hilos de lote), creados y destruidos por línea. `max_clients` limita conexiones, no hilos. | Abierto |
-| AUD-180 | P3 | El Tor gestionado queda huérfano si e-lite muere sin cerrar (SIGKILL, OOM, panic) y el siguiente arranque no lo adopta ni lo para. Observado en los e2e. | Abierto |
-| AUD-181 | P3 | Todos los puertos por defecto caen en el rango efímero de Linux: un `bind` puede fallar de forma esporádica. Observado una vez. | Abierto |
+| AUD-180 | P3 | El Tor gestionado quedaba huérfano si e-lite moría sin cerrar (SIGKILL, falta de memoria, aborto) y nada reiniciaba e-lite. Observado en los e2e. | **Corregido** (reinicio integrado, sin systemd) |
+| AUD-181 | P2 | Los puertos por defecto caen en el rango efímero de Linux: una conexión saliente que use uno como puerto de origen (las propias llamadas RPC de e-lite a Core, por ejemplo), viva o cerrada hace menos de 60 s, hacía fallar el arranque con "Address already in use". | **Corregido** (el `bind` espera hasta 75 s) |
 | AUD-178 | P3 | ROADMAP pedía respetar `client_min` en la negociación de versión; AUD-041 documenta esa misma rebaja como intencionada. Dos documentos se contradecían. | Abierto (decisión) |
 
 Siguen abiertos, ya verificados en ROADMAP: los seguidores de una descarga
@@ -249,13 +255,19 @@ tema (`git log main..review/analisis-2026-11`).
 | Guard para plazas de cliente, conexión muerta, análisis único de la línea, registro de errores acotado (AUD-170) | arreglo P2 | `crates/el-serve/src/server.rs`, `client.rs`, `rpc.rs` |
 | `:t` solo para `.onion` y servidores locales; origen en `privacy check` (AUD-171) | arreglo P2 | `crates/el-rawtx/src/electrum.rs`, `bin/e-lite/src/privacy.rs` |
 | Exportación fallida sin restos (AUD-172) | arreglo P3 | `bin/e-lite/src/snapshot.rs` |
+| Reinicio automático integrado, sin systemd; Tor gestionado sin huérfanos (AUD-180) | decisión del dueño | `bin/e-lite/src/supervisor.rs`, `bin/e-lite/src/tor.rs`, `tests/e2e/e2e_supervisor.sh` |
+| `bind` de los puertos que espera si solo los ocupa una conexión saliente; los tests esperan a que e-lite termine (AUD-181) | arreglo P2 | `crates/el-serve/src/server.rs`, `bin/e-lite/src/setup.rs`, `tests/e2e/` |
 | Política de panic: *unwind*, *hook* que contiene los hilos de wallet y aborta el resto, *mutex* sin envenenamiento (AUD-173) | decisión del dueño | `Cargo.toml`, `bin/e-lite/src/main.rs`, `crates/el-model/src/sync.rs`, `crates/el-serve/src/server.rs` |
 | AUDIT solo con abiertos, ROADMAP con rutas reales, FEATURES/ELECTRUM_PROTOCOL/OPERATIONS corregidos, comprobación de referencias a código | documentación | `docs/`, `scripts/check-docs.sh` |
 
-Cambios visibles para un usuario: una entrada `:t` hacia un servidor clearnet
-en `public-servers.toml` ahora se ignora con un aviso (la plantilla distribuida
-no tiene ninguna), y un fallo interno al atender a una wallet cierra esa
-conexión en vez de detener el nodo.
+Cambios visibles para un usuario:
+
+- una entrada `:t` hacia un servidor clearnet en `public-servers.toml` ahora se
+  ignora con un aviso (la plantilla distribuida no tiene ninguna);
+- un fallo interno al atender a una wallet cierra esa conexión en vez de
+  detener el nodo;
+- `run`, `serve` e `index` son ahora dos procesos (padre que vigila y nodo) y
+  el nodo se reinicia solo tras un final anómalo; `--no-supervise` lo desactiva.
 
 **Lo que decidí no cambiar**, y por qué:
 
@@ -272,28 +284,40 @@ conexión en vez de detener el nodo.
 
 ### Verificación
 
-Ejecutado en esta rama, última pasada completa el 2026-11-16:
+Ejecutado en esta rama, última pasada completa el 2026-11-16, con el reinicio automático activo:
 
 | Comprobación | Resultado |
 |---|---|
 | `cargo fmt --check` | correcto |
 | `cargo clippy --workspace --all-targets -- -D warnings` | correcto |
-| `cargo test --workspace` | 366 tests correctos, 6 ignorados (350 antes de la revisión) |
-| `cargo build --release` con `panic = "unwind"` + `e2e_regtest.sh` sobre ese binario | correcto |
+| `cargo test --workspace` | 372 tests correctos, 6 ignorados (350 antes de la revisión) |
+| `cargo build --release` (con `panic = "unwind"`) + `e2e_regtest.sh` y `e2e_supervisor.sh` sobre ese binario | correcto |
 | `scripts/check-docs.sh` | correcto (38 documentos) |
-| Los diez e2e de regtest: `e2e_regtest`, `e2e_defaults`, `e2e_launch_core`, `e2e_wait_core`, `e2e_external_pruned`, `e2e_resilience`, `e2e_snapshot`, `e2e_multi_instance`, `e2e_pruned_ibd` (poda + SIGKILL + SIGTERM), `e2e_recovery` | correctos en la segunda revisión completa (2026-11-16) |
+| Los once e2e de regtest: `e2e_supervisor`, `e2e_regtest`, `e2e_defaults`, `e2e_launch_core`, `e2e_wait_core`, `e2e_external_pruned`, `e2e_resilience`, `e2e_snapshot`, `e2e_multi_instance`, `e2e_pruned_ibd` (poda + SIGKILL + SIGTERM), `e2e_recovery` | correctos en la última pasada completa, sin procesos residuales al terminar |
 
-En la primera pasada `e2e_multi_instance.sh` falló una vez
-(`cannot bind metrics 127.0.0.1:55484`) y pasó al repetir; en la segunda pasó a
-la primera. El fallo no viene de los cambios: el puerto no tenía ningún proceso
-escuchando después. Todos los puertos por defecto de e-lite están dentro del
-rango efímero de Linux (32768–60999), así que una conexión saliente de cualquier
-proceso puede estar usando ese puerto como origen justo al arrancar. Es una
-causa probable, no demostrada; queda como AUD-181.
+Dos e2e fallaron de forma esporádica a lo largo de las pasadas
+(`e2e_multi_instance.sh` dos veces con `cannot bind metrics 127.0.0.1:55484`,
+`e2e_defaults.sh` una vez con conexión rechazada), más o menos una vez de cada
+diez, y pasaban al repetir. Son los dos tests que usan los puertos por defecto.
 
-Cada pasada de los e2e dejó procesos `tor` huérfanos: el Tor gestionado
-sobrevive cuando e-lite muere sin cerrar (la fase SIGKILL de
-`e2e_pruned_ibd.sh`). Queda como AUD-180.
+- **Mecanismo real, reproducido aislado**: los puertos por defecto caen en el
+  rango efímero de Linux (32768–60999). Una conexión saliente que use uno como
+  puerto de origen, viva o cerrada hace menos de 60 s, impide abrir ahí un
+  puerto de escucha, y las llamadas RPC de e-lite a Core crean conexiones así
+  justo antes. Corregido: el `bind` espera hasta 75 s si la tabla de sockets del
+  kernel no muestra a nadie escuchando, y el error dice cuál de los dos casos
+  fue (AUD-181).
+- **Causa de esos fallos concretos: no demostrada.** El primer arreglo no
+  bastó (`multi_instance` volvió a fallar una vez) y ninguna ejecución capturó
+  el momento. Además, los dos tests borraban su directorio 2 s después de
+  pedir la parada, cuando las instancias aún tardan 1–2 s en terminar; ahora
+  esperan a que terminen.
+- **Tras los dos cambios**: 20 ejecuciones alternas de los dos tests, todas
+  correctas, y en ninguna hizo falta reintentar el `bind`.
+
+Las primeras pasadas de los e2e dejaron procesos `tor` huérfanos: el Tor
+gestionado sobrevivía cuando e-lite moría sin cerrar (la fase SIGKILL de
+`e2e_pruned_ibd.sh`). Era AUD-180, ya corregido.
 
 No medido: el efecto de *unwind* sobre el tamaño del binario y la velocidad de
 IBD (se espera pequeño, pero no hay medida de antes y después).
@@ -354,30 +378,39 @@ eligió la segunda** (2026-11-16) y está hecha así:
 Probado con un test que se relanza como proceso hijo: sobrevive a un panic en
 `el-client` y termina con SIGABRT ante uno en `el-prune`.
 
-Queda un hueco: un fallo fuera de los hilos de wallet detiene el nodo a
-propósito, nada lo reinicia, y además deja el Tor gestionado huérfano
-(AUD-180).
+**Reinicio automático sin systemd — aplicado** (decisión del dueño,
+2026-11-16). Un fallo fuera de los hilos de wallet detiene el nodo a propósito,
+así que algo tiene que volver a arrancarlo. Mi primera propuesta era una unidad
+systemd; se descartó para no depender de ningún gestor de servicios, y el
+reinicio va dentro del propio e-lite:
 
-**Sin systemd** (decisión del dueño, 2026-11-16). Mi primera propuesta era una
-unidad systemd con reinicio; se puede evitar y queda descartada. El reinicio
-irá dentro del propio `run`:
+- `run`, `serve` e `index` son dos procesos del mismo binario: un padre mínimo
+  que solo vigila y el nodo como hijo. El padre reenvía SIGTERM, SIGINT y
+  SIGUSR1.
+- **Solo se reinicia un final anómalo**: el nodo murió por una señal que nadie
+  envió para pararlo (el aborto tras un error interno, una caída, el *OOM
+  killer*). Una salida con código, limpia o de error, es definitiva: un error
+  de configuración o de integridad fallaría igual otra vez.
+- Espera de 1 s que se duplica hasta 60 s; tras 5 finales anómalos en 10
+  minutos el padre se detiene con una línea que lo explica.
+- Core no se reinicia: sigue corriendo y el nodo nuevo lo adopta por su fichero
+  de pid.
+- El Tor gestionado muere con e-lite, termine como termine, y un Tor que
+  hubiera dejado una ejecución anterior se para al arrancar (AUD-180).
+- `kill -9` sobre el proceso que lanzó el usuario sigue matando el nodo al
+  instante, como antes: los e2e de recuperación dependen de eso.
+- `--no-supervise` o `E_LITE_NO_SUPERVISE=1` dejan un solo proceso.
 
-- `run` deja un proceso padre mínimo que arranca el nodo real como hijo (el
-  mismo binario), le reenvía SIGTERM/SIGINT/SIGUSR1 y lo vuelve a arrancar si
-  termina de forma anómala.
-- Espera creciente entre reinicios (1 s hasta 60 s) y una regla de abandono
-  (por ejemplo, 5 fallos en 10 minutos) para no entrar en un bucle de caídas.
-  Una salida limpia o un error de configuración nunca se reinician.
-- Core no se toca: sigue corriendo y el hijo nuevo lo adopta por su fichero de
-  pid, que es lo que ya hace hoy `CoreSupervisor`. Falta hacer lo mismo con Tor
-  (AUD-180), que es requisito previo.
-- Opción para desactivarlo si alguien ya usa su propio supervisor.
+Probado con `tests/e2e/e2e_supervisor.sh`: mata el nodo con SIGABRT y luego con
+SIGKILL, y comprueba que vuelve solo, que Core conserva su pid, que el índice
+sigue avanzando, que queda un único Tor y que ni una parada limpia ni una
+salida con error se reinician.
 
 Lo que e-lite no puede hacer por sí mismo es **arrancar al encender la
-máquina**: eso siempre lo lanza algo del sistema. Pero no tiene que ser
-systemd: sirve `cron @reboot`, la política de reinicio de un contenedor, runit o
-lo que tenga el equipo. No está implementado todavía; es la primera tarea
-pendiente de P2.
+máquina**: eso lo lanza algo del sistema, pero sirve cualquier cosa (`cron
+@reboot`, la política de reinicio de un contenedor, runit). Efecto a tener en
+cuenta: `pgrep -f 'e-lite run'` devuelve ahora dos procesos; las órdenes de la
+documentación usan `pkill -o`, que apunta al padre.
 
 ### 2. Lectores persistentes (AUD-179)
 

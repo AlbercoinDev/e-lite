@@ -107,6 +107,40 @@ starts or stops Core.
 then stops a Core owned by e-lite. The log ends with a local-time
 `stopped at … (uptime …)` line.
 
+### Automatic restart (no init system needed)
+
+`run`, `serve` and `index` run as two processes of the same binary: a small
+parent that only watches, and the node as its child. If the node ends
+abnormally, the parent starts it again; nothing else (systemd, a container
+policy, a wrapper script) is required for that.
+
+- **Restarted**: the node was killed by a signal nobody sent to stop it: the
+  deliberate abort after a fatal internal error (`FATAL: internal error ...`,
+  SIGABRT), a crash, or SIGKILL from the kernel's out-of-memory killer. The
+  index recovers from its log, a managed Core is left running and adopted
+  again, and the managed Tor is started again.
+- **Never restarted**: a clean stop, and any exit with an error code
+  (configuration error, port in use, `NEEDS_RECOVERY`, integrity error): it
+  would fail the same way again.
+- Restarts wait 1 s, doubling up to 60 s. After 5 abnormal ends within 10
+  minutes the parent stops with one line saying so; a node that ran 10 minutes
+  starts over at 1 s. A managed Core is never restarted by this: it keeps
+  running when the parent gives up, and the next `e-lite run` adopts it.
+- A restart starts the binary that is installed at that moment, so after an
+  in-place update the restarted node is the new version.
+- Send signals to the **parent** (the older of the two processes, the pid your
+  shell or script started): it passes `SIGTERM`/`SIGINT`/`SIGUSR1` on and a
+  stop is final. `kill -9` on the parent stops the node at once too.
+- The console shows `supervisor: the node ended abnormally (...); restarting
+  in N s`; the new node's first line, also in `e-lite.log`, is `restarted
+  automatically after the previous run ended abnormally (<cause>); restart N`.
+- `--no-supervise` or `E_LITE_NO_SUPERVISE=1` runs a single process, as
+  before, for operators who already have their own supervisor.
+  `index --no-follow` (a one-shot run) is never supervised.
+
+Starting e-lite when the machine boots is not part of this: use whatever the
+host has (`cron @reboot`, a container restart policy, runit, a unit file).
+
 Progress is printed after each commit: indexed height and percentage of Core's
 `headers`, Core blocks/headers and percentage, lag, throughput and tuning
 metrics. Every `[index] milestone_blocks` (default 10,000) or
@@ -381,7 +415,7 @@ commit_interval_ms = 0
 Hot reload:
 
 ```bash
-kill -USR1 "$(pgrep -f 'e-lite run')"
+pkill -USR1 -o -f 'e-lite run'   # -o: the watching parent, which passes it on
 ```
 
 Cold fields (`prune_mib`, `block_source`, `reorg_window`, data dir/network)

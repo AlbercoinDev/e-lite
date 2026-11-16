@@ -81,7 +81,7 @@ available**.
 | Local-first rawtx | experimental | Core/cache before external |
 | External fetch mode | experimental | default `balanced`: loose transactions by txid (Electrum/Esplora) with decoy wallets, verified against the index; `preset = "max"`: whole blocks by hash only, never txid |
 | Tor SOCKS5h, fail-closed | experimental | Tor only by default (`rawtx.use_tor`); opt-in `tor_fallback_clearnet` uses clearnet if Tor fails; `allow_clearnet` forces it; `use_tor = false` (`--no-rawtx-tor`) is the explicit direct opt-out and is independent of the onion listener (`/status.rawtx.path`) |
-| Managed Tor + onion service | experimental | network plain/TLS ports; `e-lite onion show/reset` |
+| Managed Tor + onion service | experimental | network plain/TLS ports; `e-lite onion show/reset`; Tor ends with e-lite however e-lite ends, and a Tor left by an older run is stopped at start |
 | Auto self-signed TLS cert | experimental | generated without Tor; SAN includes localhost, hostname and onion; reloaded on change |
 | Decoys and random source order | experimental | `decoys=1` per real external download (wallet or prefetch), served one at a time by a background thread outside the wallet's download slots, paused while a provider rate-limits; a decoy failure never cools a provider/peer; at most 32 owed (`/status.rawtx.decoys_pending`) |
 | Rawtx cache | experimental | 256 MiB default; verified transactions with merkle branch (whole blocks only for prune repair, max 64 MiB); last 8 external blocks in memory; `cache_dir` can point at tmpfs to avoid disk |
@@ -126,7 +126,7 @@ available**.
 | Optional Tor expert bundle | stable | `--with-tor` default; `--without-tor` |
 | `.deb`, tarball, release checksums | stable | GitHub Releases |
 | All-in-one test harness | experimental | `scripts/e-lite-all-in-one.sh` |
-| Automatic restart after a fatal error | **not available** | roadmap: built into `run`, no init system (systemd) required |
+| Automatic restart after a fatal error | experimental | built into `run`/`serve`/`index`, no init system (systemd) required: a watching parent restarts the node after an abnormal end (abort after a fatal internal error, crash, OOM kill) with backoff 1..60 s, and gives up after 5 in 10 minutes; a clean stop or an error exit is final; Core keeps running and is adopted; `--no-supervise`/`E_LITE_NO_SUPERVISE=1` disables it. Boot-time start is left to the host |
 | Container image | **not available** | roadmap |
 
 ## Compatibility

@@ -151,9 +151,21 @@ Never treat a version number in this file as authoritative over the code/tag.
   go back to `std::sync::Mutex` there. A contained panic logs thread and
   location only, never the panic message.
 - No dependency on systemd or any init system (owner decision 2026-11-16):
-  do not ship a unit file as the answer to "who restarts e-lite". Restart
-  after a fatal error belongs inside `run` (ROADMAP); the only systemd piece
-  is the optional ZFS `e-lite-arc-cap.service` oneshot.
+  do not ship a unit file as the answer to "who restarts e-lite"; the only
+  systemd piece is the optional ZFS `e-lite-arc-cap.service` oneshot.
+  `run`/`serve`/`index` are a watching parent plus the node as its child
+  (`bin/e-lite/src/supervisor.rs`). Only an abnormal end (a signal nobody
+  sent to stop it: SIGABRT after a fatal error, a crash, the OOM killer) is
+  restarted, with backoff 1..60 s and a stop after 5 in 10 minutes; **an exit
+  code is final** (never restart a configuration or integrity error) and so
+  is a stop request. The node dies with its parent (`PR_SET_PDEATHSIG`
+  SIGKILL), so `kill -9` on the pid a script started still crashes the node,
+  which is what `e2e_recovery.sh`/`e2e_pruned_ibd.sh` rely on. A managed Core
+  is not restarted: the new node adopts it from its pid file. The managed Tor
+  ends with e-lite (`PR_SET_PDEATHSIG` SIGTERM) and a Tor left by an older
+  run is stopped at start (AUD-180). `--no-supervise`/`E_LITE_NO_SUPERVISE=1`
+  keeps one process; benchmarks that sample the pid use it. Cover:
+  `tests/e2e/e2e_supervisor.sh`.
 - The supervisor runs at commit boundaries inside the catch-up pipeline; the
   only teardown left is the 512-block checkpoint. Do not reintroduce a time
   deadline that drops prepared blocks/readers. Disk and shutdown checks stay
@@ -206,6 +218,12 @@ Never treat a version number in this file as authoritative over the code/tag.
 - RocksDB memtables are weighted per CF (`utxo` 6, `history`/`utxo_by_script`
   4) under the shared `WriteBufferManager`; `/status.rocksdb.cf` exposes the
   per-family pressure used to tune them.
+- Bind listeners with `el_serve::bind_listener`, never a bare
+  `TcpListener::bind`: the default ports are inside the kernel's ephemeral
+  range and a local outgoing connection (e-lite's own RPC to Core) holding
+  one as its source port, live or in TIME_WAIT, makes a bare bind fail with
+  "address in use" (AUD-181). The helper waits up to 75 s unless something
+  really listens there.
 - Electrum binds per-network defaults: plain/TLS/metrics are
   `55011/55022/55084` (mainnet), `55111/55122/55184` (testnet4),
   `55211/55222/55284` (signet) and `55311/55322/55384` (regtest). TLS binds

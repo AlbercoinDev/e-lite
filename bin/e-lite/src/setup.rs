@@ -1468,7 +1468,7 @@ pub(crate) fn start_tls_transport(shared: &Arc<Shared>, cfg: &Config) -> R<()> {
             cfg.server.tls_listen
         );
     }
-    let listener = std::net::TcpListener::bind(&cfg.server.tls_listen)
+    let listener = el_serve::bind_listener(&cfg.server.tls_listen, "TLS", Some(&shutdown_flag()))
         .map_err(|e| format!("cannot bind TLS {}: {e}", cfg.server.tls_listen))?;
     el_serve::start_listener_on(listener, Arc::clone(shared), Some(Arc::new(watcher)));
     eprintln!(
@@ -1487,15 +1487,17 @@ pub(crate) struct Transports {
 pub(crate) fn start_transports(shared: &Arc<Shared>, cfg: &Config) -> R<Transports> {
     warn_public_listen("Electrum", &cfg.server.listen);
     warn_public_listen("metrics", &cfg.metrics.listen);
-    let server = Arc::clone(shared);
-    el_serve::start_server(server).map_err(|e| format!("cannot bind {}: {e}", shared.listen))?;
+    let stop = shutdown_flag();
+    let listener = el_serve::bind_listener(&shared.listen, "Electrum", Some(&stop))
+        .map_err(|e| format!("cannot bind {}: {e}", shared.listen))?;
+    el_serve::start_listener_on(listener, Arc::clone(shared), None);
     if cfg.server.tls_enabled() {
         start_tls_transport(shared, cfg)?;
     }
     if cfg.metrics.enabled {
-        let m = Arc::clone(shared);
-        el_serve::start_metrics(m, cfg.metrics.listen.clone())
+        let listener = el_serve::bind_listener(&cfg.metrics.listen, "metrics", Some(&stop))
             .map_err(|e| format!("cannot bind metrics {}: {e}", cfg.metrics.listen))?;
+        el_serve::start_metrics_on(Arc::clone(shared), listener);
     }
     let mempool = el_serve::start_mempool(Arc::clone(shared));
     let notifications = el_serve::start_notifications(Arc::clone(shared));

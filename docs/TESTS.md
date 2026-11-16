@@ -11,7 +11,7 @@ explicitly an operator-driven network test.
 ```bash
 cargo fmt --check
 cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace          # 350 tests: unit, resolver, txmode, protocol
+cargo test --workspace          # 372 tests: unit, resolver, txmode, protocol
 scripts/check-docs.sh           # links, anchors, version, test paths, source references
 shellcheck install.sh scripts/*.sh tests/e2e/*.sh tests/bench/*.sh tests/manual/*.sh
 ```
@@ -31,6 +31,7 @@ smoke-tests the published artifacts.
 | `e2e_pruned_ibd.sh` | Manual pruning, prune gate, SIGKILL + restart, pruning keeps serving, discarded work bound. |
 | `e2e_recovery.sh` | Repeated SIGKILL while indexing, a reorg at the tip (undo), write failure, `NEEDS_RECOVERY` rules. |
 | `e2e_resilience.sh` | Core outage, cookie rotation, cached serving, clean shutdown. |
+| `e2e_supervisor.sh` | Automatic restart without an init system: the node is killed with SIGABRT and SIGKILL and comes back, same Core pid, index keeps following, one Tor; a clean stop, an error exit and `--no-supervise` are not restarted. |
 | `e2e_regtest.sh` | Full wallet path: plain + TLS, 1.6/1.7 negotiation, Sparrow sequence, subscriptions, broadcast, rate limit, log file. |
 | `e2e_multi_instance.sh` | Two instances at once: distinct ports, certificates, heights, independent shutdown. |
 | `e2e_snapshot.sh` | Export/import per network, index + optional Core section, digest, second import rejected, `--verify=full`. |

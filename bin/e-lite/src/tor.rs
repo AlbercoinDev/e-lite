@@ -298,6 +298,13 @@ pub fn resolve_binary(cfg: &Config) -> Option<PathBuf> {
     find_in_path("tor")
 }
 
+/// Whether the Tor recorded in this instance's `tor.pid` is still running.
+fn own_tor_is_still_up(cfg: &Config, chain: Chain) -> bool {
+    let tor_dir = cfg.tor_dir(chain);
+    read_pid(&tor_dir.join("tor.pid"))
+        .is_some_and(|pid| pid_alive(pid) && is_our_tor(pid, &tor_dir.join("torrc")))
+}
+
 fn port_free(port: u16) -> bool {
     TcpListener::bind(("127.0.0.1", port)).is_ok()
 }
@@ -309,7 +316,11 @@ fn choose_socks_port(cfg: &Config, chain: Chain) -> Result<u16, String> {
     // Per-network defaults avoid a race when several managed instances start
     // together. Mainnet keeps 9050 for compatibility with existing setups.
     let preferred = chain.default_socks_port();
-    if port_free(preferred) {
+    if port_free(preferred) || own_tor_is_still_up(cfg, chain) {
+        // A Tor of this instance left by a run that ended abnormally still
+        // holds the port; it is stopped before ours starts (`stop_orphan`).
+        // Keep the port: a managed Core that kept running was started with
+        // `-onion=` pointing at it.
         return Ok(preferred);
     }
     if preferred != 9050 && port_free(9050) {
@@ -377,6 +388,46 @@ fn pid_alive(pid: u32) -> bool {
     // kill(pid, 0) reports EPERM for processes owned by other users; either way
     // the PID exists and we must not touch its onion keys.
     unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
+}
+
+/// Whether `pid` is a Tor started with this instance's `torrc`. A recycled
+/// pid, or another instance's Tor, is never touched.
+fn is_our_tor(pid: u32, torrc: &Path) -> bool {
+    let Ok(raw) = fs::read(Path::new("/proc").join(pid.to_string()).join("cmdline")) else {
+        return false;
+    };
+    let wanted = torrc.as_os_str().as_encoded_bytes();
+    let mut args = raw.split(|b| *b == 0);
+    let is_tor = args
+        .next()
+        .and_then(|exe| exe.rsplit(|b| *b == b'/').next())
+        .is_some_and(|name| name == b"tor");
+    is_tor && args.any(|arg| arg == wanted)
+}
+
+/// Stop the Tor recorded in `tor.pid` if it is still this instance's Tor,
+/// then forget the pid file. SIGTERM first; SIGKILL after 10 s.
+fn stop_orphan(pid_path: &Path, torrc: &Path) {
+    let Some(pid) = read_pid(pid_path) else {
+        return;
+    };
+    if pid_alive(pid) && is_our_tor(pid, torrc) {
+        eprintln!("[e-lite] Tor: stopping the Tor left by a previous run (pid {pid})");
+        unsafe {
+            libc::kill(pid as libc::pid_t, libc::SIGTERM);
+        }
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline && pid_alive(pid) && is_our_tor(pid, torrc) {
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        if pid_alive(pid) && is_our_tor(pid, torrc) {
+            unsafe {
+                libc::kill(pid as libc::pid_t, libc::SIGKILL);
+            }
+            std::thread::sleep(Duration::from_millis(200));
+        }
+    }
+    let _ = fs::remove_file(pid_path);
 }
 
 fn read_pid(path: &Path) -> Option<u32> {
@@ -495,6 +546,9 @@ fn supervise(
     let timeout = Duration::from_secs(cfg.tor.start_timeout_seconds.clamp(5, 600));
     let mut attempts = 0u32;
     while !stop.load(Ordering::SeqCst) {
+        // A Tor left by a run that ended without its shutdown still holds
+        // the SOCKS port and the onion keys: ours could not start (AUD-180).
+        stop_orphan(&pid_path, &torrc);
         let log = match OpenOptions::new().create(true).append(true).open(&log_path) {
             Ok(f) => f,
             Err(e) => {
@@ -504,6 +558,17 @@ fn supervise(
         };
         let mut command = Command::new(&binary);
         apply_tor_env(&mut command, &binary);
+        // Tor ends with e-lite, however e-lite ends (SIGKILL, the abort after
+        // a fatal error): it is useless without the listeners it points at.
+        unsafe {
+            use std::os::unix::process::CommandExt;
+            command.pre_exec(|| {
+                if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
         let spawned = command
             .arg("-f")
             .arg(&torrc)

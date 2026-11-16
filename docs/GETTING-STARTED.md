@@ -93,7 +93,7 @@ The script refuses to start below 15/20 GiB free unless
 ## 6. Hot reload
 
 ```bash
-kill -USR1 "$(pgrep -f 'e-lite run')"
+pkill -USR1 -o -f 'e-lite run'   # -o: the watching parent, which passes it on
 curl -s http://127.0.0.1:55084/status | python3 -m json.tool | grep -A20 '"tuning"'
 ```
 

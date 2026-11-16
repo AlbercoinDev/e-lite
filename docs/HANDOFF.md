@@ -115,11 +115,16 @@ Not tagged, not pushed; version unchanged. Full write-up in Spanish:
   unwind; a panic hook contains panics in the wallet-facing threads
   (`el-client`, `el-line`, `el-batch`, `el-fetch`) and aborts for every other
   thread. Shared locks no longer poison.
+- **Automatic restart without systemd (AUD-180)**: `run`/`serve`/`index` are
+  a watching parent plus the node; an abnormal end is restarted (backoff,
+  give-up rule), an exit code or a stop is final, Core is adopted, Tor never
+  stays orphaned. `--no-supervise` keeps one process.
 - **New open findings**: AUD-174 (threads per connection), AUD-175 (errors classified by
   message text), AUD-176 (snapshot digest cost), AUD-177 (commit holds the
-  global lock), AUD-178 (negotiation rule), AUD-179 (reader pool per call),
-  AUD-180 (managed Tor orphaned after an unclean exit), AUD-181 (default
-  ports inside the ephemeral range; one flaky bind in `e2e_multi_instance`).
+  global lock), AUD-178 (negotiation rule), AUD-179 (reader pool per call).
+- **Listener bind (AUD-181)**: a default port held as the source port of an
+  outgoing connection (e-lite's own RPC calls included) no longer fails the
+  start; the bind is retried for up to 75 s.
 
 ## Last change (alpha.29.17.0)
 
@@ -195,7 +200,8 @@ Full detail: `CHANGELOG.md`.
 - Public providers fail closed; the shipped Electrum list never stands in for
   a missing or invalid `public-servers.toml`.
 - e-lite must not depend on systemd (or any init system): restart after a
-  fatal error is to be built into `run`; boot-time start is left to the host.
+  fatal error is built into `run`/`serve`/`index`; boot-time start is left to
+  the host.
 - Release builds unwind; only the threads in
   `el_model::sync::CONTAINED_THREADS` may fail alone (AUD-173).
 - The TLS identity is one CA + leaf per instance (no SNI); a domain
@@ -211,16 +217,12 @@ P1 (before any public exposure or mainnet production claim):
 3. Close or document the residual audit risks (snapshot archive size limits,
    per-client threads, provider trust); see `AUDIT.md`.
 
-4. Built-in restart after a fatal error, with no dependency on systemd (owner
-   decision 2026-11-16; design in `ROADMAP.md`): a panic outside the wallet
-   threads still stops the node by design (AUD-173), and the managed Tor is
-   orphaned when that happens (AUD-180, a prerequisite).
 
 P2/P3: the verified list (13 items left) is in `ROADMAP.md`; the short
 version: leader-verifies-before-notify, Tor retry by blame, no provider
 penalty on a reorg, interruptible pipeline wait, subscription caps,
 `get_merkle` tree cache, one snapshot for verbose `transaction.get`,
-`privacy.toml` per network, per-network e2e. New in `AUDIT.md`: AUD-174..181.
+`privacy.toml` per network, per-network e2e. New in `AUDIT.md`: AUD-174..179.
 
 ## Commands
 
@@ -240,7 +242,7 @@ tests/e2e/e2e_multi_instance.sh
 Hot reload:
 
 ```bash
-kill -USR1 "$(pgrep -f 'e-lite run')"
+pkill -USR1 -o -f 'e-lite run'   # -o: the watching parent, which passes it on
 ```
 
 ## Do not do without explicit approval
