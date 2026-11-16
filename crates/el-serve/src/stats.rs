@@ -156,6 +156,9 @@ pub struct Stats {
     pub batch_items: AtomicU64,
     pub batch_max_items: AtomicU64,
     pub clients: AtomicUsize,
+    /// Connections whose client left while lines were still running: they
+    /// no longer hold a `max_clients` slot. Bounded by `max_clients`.
+    pub detached_clients: AtomicUsize,
     pub last_block_ms: AtomicU64,
     pub notifier_runs: AtomicU64,
     pub notifications_sent: AtomicU64,
@@ -292,6 +295,7 @@ impl Default for Stats {
             batch_items: AtomicU64::new(0),
             batch_max_items: AtomicU64::new(0),
             clients: AtomicUsize::new(0),
+            detached_clients: AtomicUsize::new(0),
             last_block_ms: AtomicU64::new(0),
             notifier_runs: AtomicU64::new(0),
             notifications_sent: AtomicU64::new(0),

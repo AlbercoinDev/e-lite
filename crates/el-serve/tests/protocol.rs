@@ -1296,3 +1296,65 @@ fn metrics_follow_the_status_document() {
         );
     }
 }
+
+/// AUD-184: a wallet that disconnects while its `transaction.get` lines wait
+/// on a slow download gives its `max_clients` slot back at once, not when
+/// the downloads end. A client that only half-closes still gets its answer.
+#[test]
+fn a_disconnect_frees_the_slot_while_downloads_are_in_flight() {
+    use std::io::{BufRead, BufReader, Write};
+    use std::net::{TcpListener, TcpStream};
+    use std::sync::atomic::Ordering;
+
+    let delay = Duration::from_secs(4);
+    let (shared, txid, dir) = slow_fixture(delay);
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    el_serve::start_listener_on(listener, Arc::clone(&shared), None);
+    let get = |id: u64| {
+        json!({"jsonrpc":"2.0","id":id,"method":"blockchain.transaction.get",
+            "params":[txid.to_hex()]})
+        .to_string()
+            + "\n"
+    };
+    let freed_within = |limit: Duration| {
+        let deadline = std::time::Instant::now() + limit;
+        while std::time::Instant::now() < deadline {
+            if shared.stats.clients.load(Ordering::SeqCst) == 0 && shared.clients.is_empty() {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        false
+    };
+
+    // Six lines: four run, the fifth waits for a place (the reader is then
+    // not reading), the sixth is still in the socket.
+    for lines in [4u64, 6] {
+        let mut sock = TcpStream::connect(addr).unwrap();
+        for id in 0..lines {
+            sock.write_all(get(id).as_bytes()).unwrap();
+        }
+        sock.flush().unwrap();
+        std::thread::sleep(Duration::from_millis(300));
+        assert_eq!(shared.stats.clients.load(Ordering::SeqCst), 1);
+        drop(sock);
+        assert!(
+            freed_within(Duration::from_secs(2)),
+            "{lines} lines: the slot waited for the downloads"
+        );
+    }
+
+    // Half-close: the request is answered after the client's EOF.
+    let mut sock = TcpStream::connect(addr).unwrap();
+    sock.set_read_timeout(Some(Duration::from_secs(20)))
+        .unwrap();
+    sock.write_all(get(7).as_bytes()).unwrap();
+    sock.shutdown(std::net::Shutdown::Write).unwrap();
+    let mut line = String::new();
+    BufReader::new(sock).read_line(&mut line).unwrap();
+    let answer: Value = serde_json::from_str(&line).unwrap();
+    assert_eq!(answer["id"], 7, "{line}");
+    assert!(answer["result"].as_str().unwrap().len() > 100, "{line}");
+    let _ = std::fs::remove_dir_all(&dir);
+}

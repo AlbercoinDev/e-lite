@@ -71,6 +71,9 @@ pub struct ClientState {
     pub background: AtomicUsize,
     pub last_height: AtomicU64,
     pub alive: AtomicBool,
+    /// The client is gone but lines of this connection are still finishing:
+    /// its `max_clients` slot and registry entry were given back early.
+    pub detached: AtomicBool,
     pub tls: bool,
     /// Protocol version negotiated by the first `server.version` call.
     pub protocol: Mutex<Option<ProtocolVersion>>,
@@ -443,6 +446,7 @@ impl ClientRegistry {
             background: AtomicUsize::new(0),
             last_height: AtomicU64::new(0),
             alive: AtomicBool::new(true),
+            detached: AtomicBool::new(false),
             tls,
             protocol: Mutex::new(None),
             saw_message: AtomicBool::new(false),
@@ -454,6 +458,14 @@ impl ClientRegistry {
             c.insert(id, Arc::clone(&state));
         }
         state
+    }
+
+    /// Drop the registry entry without marking the connection dead: lines
+    /// still running may answer a client that only half-closed.
+    pub fn detach(&self, id: u64) {
+        if let Ok(mut c) = self.clients.lock() {
+            c.remove(&id);
+        }
     }
 
     pub fn unregister(&self, id: u64) {

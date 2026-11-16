@@ -283,6 +283,7 @@ impl Shared {
                 "max_open_files_effective": self.stats.max_open_files_effective.load(Ordering::Relaxed),
             },
             "clients": self.stats.clients.load(Ordering::Relaxed) as u64,
+            "detached_clients": self.stats.detached_clients.load(Ordering::Relaxed) as u64,
             "max_clients": self.max_clients as u64,
             "requests_total": self.stats.requests_total.load(Ordering::Relaxed),
             "errors_total": self.stats.errors_total.load(Ordering::Relaxed),

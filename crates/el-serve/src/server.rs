@@ -186,8 +186,43 @@ impl Drop for ClientSlot {
         self.client.alive.store(false, Ordering::SeqCst);
         self.shared.clients.unregister(self.client.id);
         self.shared.resolver.forget_client(self.client.id);
-        self.shared.stats.clients.fetch_sub(1, Ordering::SeqCst);
+        let counter = if self.client.detached.load(Ordering::SeqCst) {
+            &self.shared.stats.detached_clients
+        } else {
+            &self.shared.stats.clients
+        };
+        counter.fetch_sub(1, Ordering::SeqCst);
     }
+}
+
+/// The client closed its side while lines of this connection still wait on a
+/// download: give the `max_clients` slot and the registry entry back now
+/// instead of when the downloads end (up to the download budget later). The
+/// lines go on and still answer a client that only half-closed. At most
+/// `max_clients` connections may be in this state, so cycling connections
+/// cannot pile up threads without limit; past that the slot stays held, as
+/// before.
+fn release_slot_early(shared: &Shared, client: &ClientState) {
+    if client.background.load(Ordering::Relaxed) == 0 || client.detached.load(Ordering::SeqCst) {
+        return;
+    }
+    let detached = &shared.stats.detached_clients;
+    if detached.fetch_add(1, Ordering::SeqCst) >= shared.max_clients {
+        detached.fetch_sub(1, Ordering::SeqCst);
+        return;
+    }
+    client.detached.store(true, Ordering::SeqCst);
+    shared.clients.detach(client.id);
+    shared.stats.clients.fetch_sub(1, Ordering::SeqCst);
+}
+
+/// Whether the client closed its side: a zero-length peek on the socket. Does
+/// not consume request bytes that are still unread.
+fn peer_closed(client: &ClientState) -> bool {
+    let Ok(wire) = client.writer.lock() else {
+        return true;
+    };
+    matches!(wire.socket().peek(&mut [0u8; 1]), Ok(0))
 }
 
 /// Reads from the client while releasing the connection lock between attempts,
@@ -346,11 +381,23 @@ pub(crate) fn client_loop(shared: &Shared, client: &Arc<ClientState>) -> std::io
     // ids, so their order on the wire does not matter.
     let in_flight = (std::sync::Mutex::new(0usize), Condvar::new());
     let closing = AtomicBool::new(false);
+    // While the reader waits for a free place it is not reading, so it
+    // would not see the client leave: look at the socket between waits.
     let wait_below = |limit: usize| {
         let (count, cv) = &in_flight;
         let mut n = count.lock().unwrap_or_else(|p| p.into_inner());
         while *n > limit.saturating_sub(1) {
-            n = cv.wait(n).unwrap_or_else(|p| p.into_inner());
+            let (guard, timeout) = cv
+                .wait_timeout(n, PLACE_WAIT_POLL)
+                .unwrap_or_else(|p| p.into_inner());
+            n = guard;
+            if timeout.timed_out() && !client.detached.load(Ordering::Relaxed) {
+                drop(n);
+                if peer_closed(client) {
+                    release_slot_early(shared, client);
+                }
+                n = count.lock().unwrap_or_else(|p| p.into_inner());
+            }
         }
         n
     };
@@ -362,7 +409,10 @@ pub(crate) fn client_loop(shared: &Shared, client: &Arc<ClientState>) -> std::io
             buf.clear();
             match read_line_limited(&mut reader, &mut buf, MAX_REQUEST_BYTES) {
                 Ok(true) => {}
-                Ok(false) => break,
+                Ok(false) => {
+                    release_slot_early(shared, client);
+                    break;
+                }
                 Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
                     let _ = client.send(&json!({
                         "jsonrpc": "2.0",
@@ -371,7 +421,10 @@ pub(crate) fn client_loop(shared: &Shared, client: &Arc<ClientState>) -> std::io
                     }));
                     break;
                 }
-                Err(_) => break,
+                Err(_) => {
+                    release_slot_early(shared, client);
+                    break;
+                }
             }
             let line = String::from_utf8_lossy(&buf);
             if line.trim().is_empty() {
@@ -473,6 +526,10 @@ impl Drop for LinePlace<'_> {
 /// Lines of one connection that may run at the same time while they wait on
 /// an external block download.
 pub const PIPELINE_DEPTH: usize = 4;
+
+/// How often a reader waiting for a pipeline place checks that the client is
+/// still there.
+const PLACE_WAIT_POLL: Duration = Duration::from_millis(250);
 
 /// Whether a request (or any item of a batch) calls `method`. Decided from
 /// the parsed request, never from the raw text: a parameter that happens to
