@@ -83,7 +83,8 @@ Qué sale del índice local y qué necesita una fuente externa:
 | Transacción cruda de un bloque podado | caché | no | sí (txid entre señuelos, o bloque entero) |
 
 No disponible hoy: autenticación de clientes, pagos silenciosos (BIP352),
-imagen de contenedor, ARM64, exportación de copias en caliente.
+imagen de contenedor, ARM64. La exportación de copias exige parar el servicio
+(decisión del dueño: no habrá exportación en caliente).
 
 ## 2. Parte inicial: sincronización, IBD e indexación
 
@@ -178,7 +179,7 @@ ocupa ~260 GiB en mainnet (AUD-130), que es el coste principal en disco.
 | AUD-174 | P2 | Hasta ~130 hilos por una sola wallet activa (1 + 4 líneas × 32 hilos de lote), creados y destruidos por línea. `max_clients` limita conexiones, no hilos. | Abierto |
 | AUD-180 | P3 | El Tor gestionado quedaba huérfano si e-lite moría sin cerrar (SIGKILL, falta de memoria, aborto) y nada reiniciaba e-lite. Observado en los e2e. | **Corregido** (reinicio integrado, sin systemd) |
 | AUD-181 | P2 | Los puertos por defecto caen en el rango efímero de Linux: una conexión saliente que use uno como puerto de origen (las propias llamadas RPC de e-lite a Core, por ejemplo), viva o cerrada hace menos de 60 s, hacía fallar el arranque con "Address already in use". | **Corregido** (el `bind` espera hasta 75 s) |
-| AUD-178 | P3 | ROADMAP pedía respetar `client_min` en la negociación de versión; AUD-041 documenta esa misma rebaja como intencionada. Dos documentos se contradecían. | Abierto (decisión) |
+| AUD-178 | P3 | ROADMAP pedía respetar `client_min` en la negociación de versión; AUD-041 documenta esa misma rebaja como intencionada. Dos documentos se contradecían. | Cerrado: se mantiene la tolerancia (decisión del dueño, 2026-11-16) |
 
 Siguen abiertos, ya verificados en ROADMAP: los seguidores de una descarga
 compartida vuelven a verificar el bloque (#1), el reintento por circuito nuevo
@@ -230,7 +231,7 @@ el bloqueo global durante los commits (AUD-177).
 | ID | Gravedad | Hallazgo | Estado |
 |---|---|---|---|
 | AUD-172 | P3 | Una exportación fallida dejaba el archivo parcial `.tmp` (cientos de GiB con `--with-core`). | **Corregido** |
-| AUD-140 | P2 | La exportación exige parar el servicio: necesita el bloqueo de la base de datos. | Abierto |
+| AUD-140 | P2 | La exportación exige parar el servicio: necesita el bloqueo de la base de datos. | Aceptado: no habrá exportación en caliente (decisión del dueño) |
 | AUD-143 | P3 | La copia no lleva la identidad (TLS, onion): tras restaurar cambia la dirección onion y las wallets deben importar una CA nueva. | Abierto |
 | AUD-176 | P3 | El digest recorre y resume **todas** las filas del índice, en un solo hilo, al exportar y otra vez al importar: el índice entero leído dos veces. | Abierto |
 | — | doc | `OPERATIONS.md` decía que al restaurar no había "cambio de TLS"; en realidad se genera una CA nueva. | **Corregido** |
@@ -273,7 +274,8 @@ Cambios visibles para un usuario:
 
 **Lo que decidí no cambiar**, y por qué:
 
-- ROADMAP #10 (`client_min`): contradice una decisión documentada (AUD-041).
+- ROADMAP #10 (`client_min`): contradice una decisión documentada (AUD-041). El
+  dueño confirmó después la tolerancia actual y la fila se retiró.
 - ROADMAP #17, "una línea sin terminar al final de la conexión se ejecuta": no
   es un defecto. Solo se ejecuta si es un JSON completo, y hay clientes que
   cierran tras su última petición.
@@ -346,7 +348,6 @@ Resumen de [`ROADMAP.md`](ROADMAP.md) y [`AUDIT.md`](AUDIT.md) tal como quedan.
 | P1 | RPC de Core sin TLS (AUD-011) | túnel SSH/VPN obligatorio fuera de loopback |
 | P2 | Los 13 arreglos verificados que quedan en ROADMAP | abiertos |
 | P2 | Rendimiento: modo secuencial para HDD, A/B del planificador alterno, controlador adaptativo v2, control por compactación | parcial |
-| P2 | Exportación de copias en caliente (AUD-140) | abierto |
 | P2 | BIP352, índice derivado de gastos, empaquetado onion | abierto |
 | P2 | Imagen de contenedor, matriz de versiones de Core y de wallets | abierto |
 | P3 | ARM64, coordinación entre contenedores, copias incrementales | abierto |
@@ -442,12 +443,11 @@ aparte y cifrado (`tls/`, `tor/`, `decoy.key` y los tres ficheros de
 configuración) con su propio comando. Es lo único de una instancia que no se
 puede reconstruir, y hoy no tiene copia.
 
-### 5. Exportación en caliente antes que copias incrementales (AUD-140)
+### 5. Exportación en caliente (AUD-140) — descartada por el dueño
 
-Un *checkpoint* de RocksDB (enlaces duros) más `txids.dat` copiado hasta el
-`txnum` confirmado da una copia consistente sin parar el servicio. **Cambia el
-orden** del plan: una copia que obliga a parar el nodo no se hace con
-regularidad, y eso importa más que hacerla incremental.
+Propuse un *checkpoint* de RocksDB para copiar sin parar el servicio. El dueño
+la descartó el 2026-11-16: una copia se hace con el servicio parado. AUD-140
+queda como riesgo aceptado en `AUDIT.md` y la fila sale de `ROADMAP.md`.
 
 ### 6. Digest por fichero (AUD-176)
 
@@ -503,7 +503,8 @@ Dos cosas que propuse y, al leer el código, **no** hice:
   se lee de arriba abajo, sin estado enredado. Trocearla movería líneas sin
   hacerla más fácil de entender.
 
-Pendiente, por orden de valor:
+Pendiente, por orden de valor (el dueño decidió mantener las tres fuentes
+externas, así que esa propuesta ya no figura):
 
 | # | Propuesta | Qué quita | Qué necesita |
 |---|---|---|---|
@@ -511,7 +512,6 @@ Pendiente, por orden de valor:
 | 2 | Línea de comandos: unas 15 opciones de uso diario; el resto solo por fichero o `--set sección.clave=valor`, que ya existe | `parse_args` (225 líneas), buena parte de `effective_config_with` (360) y de `CLI.md` | decisión del dueño: rompe compatibilidad, requiere periodo de aviso |
 | 3 | Lectores persistentes entre llamadas (AUD-179) | crear y destruir hilos cada 512 bloques y cada 500 ms al día | benchmark de IBD |
 | 4 | Grupo de hilos acotado en el servidor (AUD-174) | hasta ~128 hilos por conexión | medición de carga de wallet |
-| 5 | Fuentes externas: comprobar en `/status.rawtx.race` cuál gana las carreras antes de mantener las tres (`p2p.rs` son 1.805 líneas y la dependencia `bip324`) | una fuente entera, si los datos lo apoyan | datos reales sobre Tor; es una decisión de privacidad |
 | 6 | **Hecho (2026-11-16)**: `AGENTS.md` pasa de 727 a 247 líneas: reglas agrupadas con su `AUD` y el documento donde está el detalle; los valores por defecto quedan solo en `docs/` | duplicación que había que mantener a mano | — |
 
 Sobre eficiencia: según la medición de mainnet anotada en `AGENTS.md`, el

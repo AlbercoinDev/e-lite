@@ -40,6 +40,10 @@ the handoff is stale, update it in the change that makes it stale.
 - **No dependency on systemd or any init system.** e-lite restarts itself
   (`bin/e-lite/src/supervisor.rs`). The only systemd piece is the optional
   ZFS `e-lite-arc-cap.service` oneshot.
+- **No online snapshot export**: a backup is taken with the service stopped.
+- **Version negotiation stays lenient (AUD-041)**: `client_min` is not
+  enforced. Do not make it strict.
+- **The three external sources stay** (Electrum by txid, Esplora, P2P).
 - **Panic policy (AUD-173)**: release builds unwind; a panic is contained
   only in a wallet-facing thread, everything else aborts and recovers.
 - **External transactions go by txid with decoy wallets by default

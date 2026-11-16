@@ -129,7 +129,8 @@ Full write-up in Spanish: [`ANALISIS.md`](ANALISIS.md).
   stays orphaned. `--no-supervise` keeps one process.
 - **New open findings**: AUD-174 (threads per connection), AUD-175 (errors classified by
   message text), AUD-176 (snapshot digest cost), AUD-177 (commit holds the
-  global lock), AUD-178 (negotiation rule), AUD-179 (reader pool per call).
+  global lock), AUD-179 (reader pool per call). AUD-178 is closed: the
+  owner keeps the lenient negotiation; AUD-140 (online export) is not planned.
 - **Listener bind (AUD-181)**: a default port held as the source port of an
   outgoing connection (e-lite's own RPC calls included) no longer fails the
   start; the bind is retried for up to 75 s.

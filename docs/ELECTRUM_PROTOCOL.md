@@ -98,7 +98,9 @@ opt-in error until a BIP352 indexer is wired; it is not advertised as available.
 ## Deliberate deviations
 
 - **Lenient version negotiation**: future/skipped versions fall back instead of
-  closing the connection. The negotiated version is returned.
+  closing the connection, and the client's minimum is not enforced (a client
+  asking only for `1.4.3` gets `1.4.2`). The negotiated version is returned,
+  so a strict client can close. Owner decision, AUD-041.
 - **`blockchain.estimatefee` never returns `-1`**: Core's relay/mempool fee is
   used as a fallback because some wallets treat `-1` as a send failure.
 - **JSON-RPC batches** are answered in order with one array (max
