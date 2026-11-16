@@ -1,8 +1,7 @@
 # Análisis de e-lite
 
-**Fecha:** 2026-11-15 · **Base:** `v0.1.0-alpha.29.17.0` · **Rama de la
-revisión:** `review/analisis-2026-11` (sin publicar, sin etiqueta, versión sin
-cambiar).
+**Fecha:** 2026-11-15 · **Base:** `v0.1.0-alpha.29.17.0` · **Publicado
+como:** `v0.1.0-alpha.29.18.0` (rama de la revisión: `review/analisis-2026-11`).
 
 Este documento recoge la revisión completa del proyecto: qué hace la
 aplicación, el análisis en tres partes (sincronización e indexación, servicio a

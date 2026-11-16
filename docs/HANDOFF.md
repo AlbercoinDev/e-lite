@@ -1,9 +1,9 @@
 # Session handoff
 
-**Updated:** 2026-11-15 (after the code and documentation review)
-**Latest published release:** `0.1.0-alpha.29.17.0`
-**Release:** https://github.com/AlbercoinDev/e-lite/releases/tag/v0.1.0-alpha.29.17.0
-**Main commit at handoff:** tag `v0.1.0-alpha.29.17.0`
+**Updated:** 2026-11-16 (release of the code and documentation review)
+**Latest published release:** `0.1.0-alpha.29.18.0`
+**Release:** https://github.com/AlbercoinDev/e-lite/releases/tag/v0.1.0-alpha.29.18.0
+**Main commit at handoff:** tag `v0.1.0-alpha.29.18.0`
 
 This is the short “where we are”. The invariants live in
 [`AGENTS.md`](../AGENTS.md) and [`PROJECT_MEMORY.md`](PROJECT_MEMORY.md); the
@@ -91,10 +91,9 @@ no repitas contexto ni rehagas decisiones ya documentadas.
   `docs/ROADMAP.md` is future work only, and `docs/AUDIT.md` holds the open
   findings (`docs/audit/FIXED.md` is the fixed history).
 
-## Unreleased: 2026-11-15 review (branch `review/analisis-2026-11`)
+## Last change (alpha.29.18.0): the 2026-11-15 review
 
-Not tagged, not pushed; version unchanged. Full write-up in Spanish:
-[`ANALISIS.md`](ANALISIS.md).
+Full write-up in Spanish: [`ANALISIS.md`](ANALISIS.md).
 
 - **Fixed (AUD-169, P1)**: the reader teardown of a catch-up call could hang
   forever when the call ended early with the prepared window full (shutdown,
@@ -135,7 +134,7 @@ Not tagged, not pushed; version unchanged. Full write-up in Spanish:
   outgoing connection (e-lite's own RPC calls included) no longer fails the
   start; the bind is retried for up to 75 s.
 
-## Last change (alpha.29.17.0)
+## Previous change (alpha.29.17.0)
 
 Module reorganization and drift guards; no behaviour change. `main.rs` went
 from 7,843 to 298 lines (`cli`, `setup`, `pipeline`, `serve`, `diagnostics`,
@@ -263,11 +262,11 @@ pkill -USR1 -o -f 'e-lite run'   # -o: the watching parent, which passes it on
 
 ## Known working baseline at handoff
 
-The review branch was checked with the same gates (see `ANALISIS.md` for the
-exact list and what could not be run locally).
+See `ANALISIS.md` for what could not be run locally (real networks, real Tor,
+the installer on a clean host).
 
-On the `v0.1.0-alpha.29.17.0` tree: `cargo fmt --check`, `clippy -D warnings`,
-`cargo test --workspace` (350 tests), `scripts/check-docs.sh`, `shellcheck`
+On the `v0.1.0-alpha.29.18.0` tree: `cargo fmt --check`, `clippy -D warnings`,
+`cargo test --workspace` (373 tests), `scripts/check-docs.sh`, `shellcheck`
 over the shell scripts, and the full local regtest set: `e2e_defaults` (TLS
 trust/hostname, loopback plain, `/status.rawtx.path`), `e2e_launch_core`,
 `e2e_wait_core`, `e2e_external_pruned`, `e2e_pruned_ibd` (prune + SIGKILL),

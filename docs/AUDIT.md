@@ -3,7 +3,7 @@
 **Base:** `0.1.0-alpha.29.4.5` → current release · **Scope:** `bin/e-lite`,
 `crates/*`, snapshots, the Electrum server and the external path.
 **Status:** open findings and residual risks as of the 2026-11-15 review of
-`0.1.0-alpha.29.17.0` (branch `review/analisis-2026-11`).
+`0.1.0-alpha.29.17.0`, released as `0.1.0-alpha.29.18.0`.
 
 This audit is not a claim of formal verification. It records static checks,
 manual review areas, concrete findings and residual risks. Fixed findings

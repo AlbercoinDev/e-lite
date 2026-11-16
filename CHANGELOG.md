@@ -1,9 +1,18 @@
 # Changelog
 
-## Unreleased — 2026-11-15 review
+## 0.1.0-alpha.29.18.0 — 2026-11-16
 
-Code and documentation review; not tagged. Write-up:
+Code and documentation review. Write-up (Spanish):
 [`docs/ANALISIS.md`](docs/ANALISIS.md).
+
+### Upgrade notes
+
+- **`run`, `serve` and `index` are now two processes** (a watching parent and
+  the node). `pgrep -f 'e-lite run'` prints two pids: signal the parent, or
+  use `pkill -o -f 'e-lite run'`. `--no-supervise` keeps one process.
+- **A `host:port:t` (plain-text) Electrum entry in `public-servers.toml` is
+  ignored unless it is `.onion` or local.** Change it to `:s`.
+- No index schema, configuration format or Electrum protocol change.
 
 ### Fixed
 

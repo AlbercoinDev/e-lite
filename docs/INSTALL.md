@@ -64,7 +64,7 @@ export PATH="$HOME/.local/bin:$PATH"
 Pick any published tag (the leading `v` is not part of `--version`):
 
 ```bash
-VERSION=0.1.0-alpha.29.17.0          # replace with the tag you want
+VERSION=0.1.0-alpha.29.18.0          # replace with the tag you want
 curl -fsSL "https://github.com/AlbercoinDev/e-lite/releases/download/v$VERSION/install.sh" \
   | sh -s -- --version "$VERSION" --yes
 ```
@@ -72,7 +72,7 @@ curl -fsSL "https://github.com/AlbercoinDev/e-lite/releases/download/v$VERSION/i
 With Core:
 
 ```bash
-VERSION=0.1.0-alpha.29.17.0          # replace with the tag you want
+VERSION=0.1.0-alpha.29.18.0          # replace with the tag you want
 curl -fsSL "https://github.com/AlbercoinDev/e-lite/releases/download/v$VERSION/install.sh" \
   | sh -s -- --version "$VERSION" --with-core --yes
 ```
