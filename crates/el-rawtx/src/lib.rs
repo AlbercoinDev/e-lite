@@ -287,6 +287,7 @@ struct CtlInner {
     aborted: AtomicBool,
     bytes: AtomicU64,
     sockets: Mutex<Vec<TcpStream>>,
+    retry: AtomicBool,
 }
 
 /// Shared by one attempt and the race that started it: progress (bytes
@@ -312,6 +313,17 @@ impl AttemptCtl {
                 let _ = s.shutdown(std::net::Shutdown::Both);
             }
         }
+    }
+
+    /// The attempt failed in a way a new Tor circuit may fix (timeout, stall,
+    /// truncated body, 5xx): the race may try this endpoint once more. A
+    /// wrong answer or an endpoint that cannot be reached never asks for it.
+    pub fn retry_on_new_circuit(&self) {
+        self.0.retry.store(true, Ordering::Relaxed);
+    }
+
+    pub fn wants_retry(&self) -> bool {
+        self.0.retry.load(Ordering::Relaxed)
     }
 
     pub fn add_bytes(&self, n: usize) {
@@ -1803,19 +1815,19 @@ impl Resolver {
                     return Ok(bytes);
                 }
                 Ok((idx, Err(e))) => {
-                    if running.remove(&idx).is_some() {
+                    if let Some(ended) = running.remove(&idx) {
                         let (source, endpoint) = plan[idx].clone();
                         errors.push(format!("{}: {e}", source.name()));
                         // Over Tor the next attempt is a new circuit (new exit):
-                        // a provider that is not cooling down gets one more
-                        // try in this race, at the end of the queue.
+                        // after a failure a new circuit may fix, the endpoint
+                        // gets one more try in this race, at the end of the
+                        // queue. The attempt says so itself: by now the
+                        // endpoint is cooling down and no longer listed, so
+                        // asking the source would always say no.
                         let tries = retried.entry(endpoint.key.clone()).or_insert(0);
                         if endpoint.via_tor
                             && *tries < TOR_RETRIES_PER_ENDPOINT
-                            && source
-                                .endpoints(FetchMode::Quiet)
-                                .iter()
-                                .any(|e| e.key == endpoint.key)
+                            && ended.ctl.wants_retry()
                         {
                             *tries += 1;
                             // Before the fallback tier, which waits for it.

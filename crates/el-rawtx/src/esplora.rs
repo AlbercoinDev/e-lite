@@ -455,6 +455,9 @@ impl BlockSource for EsploraSource {
                 }
                 Err((e, blame)) => {
                     // A decoy or a losing hedge never cools a provider down.
+                    if !ctl.aborted() && matches!(blame, Blame::Transient) {
+                        ctl.retry_on_new_circuit();
+                    }
                     if !quiet && !ctl.aborted() {
                         self.fail_tor(base, blame);
                     }

@@ -1252,3 +1252,90 @@ fn a_shared_download_owes_one_decoy() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// One Tor endpoint that fails once and is then cooling down (no longer
+/// listed), as a real provider is after any failure.
+struct FlakyTorSource {
+    blocks: Vec<u8>,
+    calls: AtomicU64,
+    /// Whether the first failure is one a new circuit may fix.
+    transient: bool,
+}
+
+impl BlockSource for FlakyTorSource {
+    fn name(&self) -> &str {
+        "flaky"
+    }
+    fn fetch_block(&self, _hash: &Hash32) -> Result<Vec<u8>> {
+        Err(RawtxError::Unavailable("use endpoints".into()))
+    }
+    fn endpoints(&self, _mode: FetchMode) -> Vec<Endpoint> {
+        if self.calls.load(Ordering::SeqCst) > 0 {
+            return Vec::new();
+        }
+        vec![Endpoint {
+            key: "tor provider".into(),
+            tier: 0,
+            via_tor: true,
+        }]
+    }
+    fn fetch_endpoint(
+        &self,
+        _endpoint: &Endpoint,
+        _hash: &Hash32,
+        _deadline: Instant,
+        _mode: FetchMode,
+        ctl: &AttemptCtl,
+    ) -> Result<Vec<u8>> {
+        if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+            if self.transient {
+                ctl.retry_on_new_circuit();
+            }
+            return Err(RawtxError::Unavailable("first circuit failed".into()));
+        }
+        Ok(self.blocks.clone())
+    }
+}
+
+/// AUD-183: after a failure a new circuit may fix, a Tor endpoint is tried
+/// once more in the same race although it is cooling down by then.
+#[test]
+fn a_transient_tor_failure_is_retried_once_on_a_new_circuit() {
+    let dir = tmp("tor-retry");
+    let (store, _hash, txid, bytes) = setup(&dir, 0);
+    let src = Arc::new(FlakyTorSource {
+        blocks: bytes,
+        calls: AtomicU64::new(0),
+        transient: true,
+    });
+    let resolver = Resolver::new(Arc::clone(&store), &config(0, 0))
+        .unwrap()
+        .with_external(src.clone());
+    let started = Instant::now();
+    resolver.raw_tx(txid, 0).expect("the retry wins");
+    assert_eq!(src.calls.load(Ordering::SeqCst), 2);
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "{:?}",
+        started.elapsed()
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A wrong answer or an unreachable endpoint is not asked again.
+#[test]
+fn a_hard_tor_failure_is_not_retried() {
+    let dir = tmp("tor-no-retry");
+    let (store, _hash, txid, bytes) = setup(&dir, 0);
+    let src = Arc::new(FlakyTorSource {
+        blocks: bytes,
+        calls: AtomicU64::new(0),
+        transient: false,
+    });
+    let resolver = Resolver::new(Arc::clone(&store), &config(0, 0))
+        .unwrap()
+        .with_external(src.clone());
+    assert!(resolver.raw_tx(txid, 0).is_err());
+    assert_eq!(src.calls.load(Ordering::SeqCst), 1);
+    let _ = std::fs::remove_dir_all(&dir);
+}

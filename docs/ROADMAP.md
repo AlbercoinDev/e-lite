@@ -15,7 +15,6 @@ older notes still match. New findings of that review are AUD-173..181 in
 
 | # | Pri | Item | Where |
 |---|---|---|---|
-| 2 | P2 | The documented "one retry on a new circuit" never happens after a transient/unreachable failure: the retry is decided from `endpoints()`, which already excludes the cooled endpoint. Decide from the blame. | `crates/el-rawtx/src/lib.rs` (`race`), `crates/el-rawtx/src/esplora.rs`, `crates/el-rawtx/src/p2p.rs` |
 | 3 | P2 | An index-side error after a verified transaction (reorg moved its position, block not indexed) calls `penalize()` and cools up to three healthy providers for 300 s. Once the txid matches, everything else in `verify` is local: go straight to the block path. Needs a fake source that records `penalize` (the current one ignores it). | `crates/el-rawtx/src/txbatch.rs` (`verify`, `run_session`) |
 | 6 | P2 | `wait_below(PIPELINE_DEPTH)` blocks the reader without a timeout, and a disconnect waits for in-flight downloads (up to 60 s) before the connection thread ends. Make the wait interruptible and cancel on disconnect. | `crates/el-serve/src/server.rs` (`client_loop`) |
 | 7 | P2 | `scripthash`/`scriptpubkey` subscriptions are unbounded (only outpoints have a cap) and the notifier clones every subscription each pass. Cap them (a generous limit: a large wallet subscribes tens of thousands of scripts) and iterate under the lock. | `crates/el-serve/src/protocol.rs`, `crates/el-serve/src/notify.rs` |
