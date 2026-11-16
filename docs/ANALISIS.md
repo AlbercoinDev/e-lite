@@ -513,7 +513,7 @@ Pendiente, por orden de valor:
 | 3 | Lectores persistentes entre llamadas (AUD-179) | crear y destruir hilos cada 512 bloques y cada 500 ms al día | benchmark de IBD |
 | 4 | Grupo de hilos acotado en el servidor (AUD-174) | hasta ~128 hilos por conexión | medición de carga de wallet |
 | 5 | Fuentes externas: comprobar en `/status.rawtx.race` cuál gana las carreras antes de mantener las tres (`p2p.rs` son 1.805 líneas y la dependencia `bip324`) | una fuente entera, si los datos lo apoyan | datos reales sobre Tor; es una decisión de privacidad |
-| 6 | `AGENTS.md` (727 líneas): dejar invariantes y enlaces; los valores por defecto ya están en `TUNING.md` y `OPERATIONS.md` | duplicación que hay que mantener a mano | nada; conviene hacerlo junto con la ampliación de `check-docs.sh` |
+| 6 | **Hecho (2026-11-16)**: `AGENTS.md` pasa de 727 a 247 líneas: reglas agrupadas con su `AUD` y el documento donde está el detalle; los valores por defecto quedan solo en `docs/` | duplicación que había que mantener a mano | — |
 
 Sobre eficiencia: según la medición de mainnet anotada en `AGENTS.md`, el
 coste por bloque en la sincronización inicial lo domina la precarga de salidas

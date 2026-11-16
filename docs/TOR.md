@@ -151,6 +151,12 @@ single-cert installation is migrated on the next start. Files are written
 `0600` atomically. Operator-provided certificates are never overwritten; if
 `tls_auto_cert = false`, an existing valid pair is still served.
 
+One process serves **one certificate** to every client on both the TLS
+listener and the onion TLS port; there is no per-hostname selection (no SNI).
+A certificate for a public domain therefore fails for a wallet that connects
+to the `.onion` address, and the generated one fails for a public hostname:
+pick one identity per instance.
+
 Verify the chain yourself:
 
 ```bash

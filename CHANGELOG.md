@@ -114,6 +114,11 @@ Code and documentation review; not tagged. Write-up:
   order, download budgets and `server.features.pruning` match the code.
 - `scripts/check-docs.sh` fails when a document names a source file that does
   not exist or an identifier that is no longer in the file it is listed under.
+- `AGENTS.md` is rules and pointers only (727 → 247 lines): owner decisions,
+  the rules that must not regress grouped by area with their `AUD` number,
+  and where the detail lives. Defaults and ranges are no longer repeated
+  there. What only `AGENTS.md` said moved to `docs/ARCHITECTURE.md`
+  ("Processes and threads") and `docs/TOR.md` (one certificate, no SNI).
 
 ## 0.1.0-alpha.29.17.0 — 2026-11-15
 

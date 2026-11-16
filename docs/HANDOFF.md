@@ -109,6 +109,9 @@ Not tagged, not pushed; version unchanged. Full write-up in Spanish:
   list of further simplifications (optional variants to decide or delete,
   CLI flags that duplicate `--set`, persistent readers, bounded server
   threads) is section 7.10 of `ANALISIS.md`.
+- **`AGENTS.md` rewritten (2026-11-16)**: rules and pointers only; defaults
+  and ranges live in `docs/`. Keep it that way: a new rule is one or two
+  lines plus the document that explains it.
 - **Fixed (AUD-170..172)**: client slots released by a drop guard, dead
   connections stop at once, request lines parsed once, bounded error log;
   `:t` Electrum entries only for `.onion`/local servers; `privacy check`

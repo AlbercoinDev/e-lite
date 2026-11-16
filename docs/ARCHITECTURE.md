@@ -137,6 +137,28 @@ provider details are in [`PRIVACY.md`](PRIVACY.md).
   (network, genesis, tip, schema, txnum, canonical digest). They are never
   required for the from-zero flow.
 
+## Processes and threads
+
+- `run`, `serve` and `index` are two processes of the same binary: a parent
+  that only watches (`bin/e-lite/src/supervisor.rs`) and the node as its
+  child. The node dies with its parent (`PR_SET_PDEATHSIG`), and so does a
+  managed Tor. A managed Core is a separate process that a restarted node
+  adopts from its pid file. See
+  [`OPERATIONS.md`](OPERATIONS.md#automatic-restart-no-init-system-needed).
+- Release builds unwind. A panic is contained only in the threads that serve
+  one wallet connection, named in `el_model::sync::CONTAINED_THREADS`
+  (`el-client`, `el-line`, `el-batch`, `el-fetch`): that connection closes and
+  the node goes on. A panic anywhere else (index, commit, prune, mempool,
+  notifier) aborts the process and the index recovers from its log.
+- Locks shared between connections use `el_model::sync::Mutex`, which does not
+  poison, so a contained panic cannot disable a cache for the rest of the run.
+- Listeners are bound with `el_serve::bind_listener`. The default ports are in
+  the kernel's ephemeral range, where a local outgoing connection can hold one
+  as its source port; the helper waits for that instead of failing.
+- Background threads have a name (`el-tune`, `el-prune`, `el-decoys`,
+  `el-providers`, `el-p2p-peers`, `el-log`...), which is what the logs and the
+  panic hook print.
+
 ## Adaptive tuning
 
 `[index] profile = auto|hdd|ssd|nvme|manual` selects starting readers, commit
