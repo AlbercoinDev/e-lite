@@ -1,9 +1,9 @@
 # Session handoff
 
-**Updated:** 2026-11-16 (release of the code and documentation review)
+**Updated:** 2026-11-17 (fixes, identity backup, shorter CLI, optional variants removed)
 **Latest published release:** `0.1.0-alpha.29.17.0`
 **Release:** https://github.com/AlbercoinDev/e-lite/releases/tag/v0.1.0-alpha.29.17.0
-**In `main`, not tagged yet:** `0.1.0-alpha.29.18.0` (the owner decides when to tag; see `RELEASING.md`)
+**In `main`, not tagged yet:** `0.1.0-alpha.29.18.0` plus the `Unreleased` section of `CHANGELOG.md` (the owner decides the version and the tag; see `RELEASING.md`)
 
 This is the short “where we are”. The invariants live in
 [`AGENTS.md`](../AGENTS.md) and [`PROJECT_MEMORY.md`](PROJECT_MEMORY.md); the
@@ -89,6 +89,26 @@ no repitas contexto ni rehagas decisiones ya documentadas.
 - `docs/FEATURES.md` is the current-feature source of truth;
   `docs/ROADMAP.md` is future work only, and `docs/AUDIT.md` holds the open
   findings (`docs/audit/FIXED.md` is the fixed history).
+
+## Unreleased (2026-11-17): fixes, identity backup, shorter CLI
+
+Not tagged. Full list in `CHANGELOG.md` ("Unreleased"); Spanish summary in
+`ANALISIS.md` section 5.
+
+- **Fixed**: AUD-182..188 (shared block verified once, Tor retry on a new
+  circuit, slot freed on disconnect, merkle tree per block, verbose
+  `transaction.get` across a reorg, one deadline per request, unusable sync
+  lock).
+- **Added**: `export-identity`/`import-identity` (AUD-189); restart count and
+  cause in `/status.supervisor` and `/metrics`, `[safety] supervise`
+  (AUD-190); `tests/e2e/e2e_privacy.sh`.
+- **Changed**: indexing errors classified by a `Fatal` type (AUD-175); the
+  command line keeps the daily options and the rest become `--set`
+  (`DEPRECATED_FLAGS`, removed two releases later).
+- **Removed** (owner decision): `prefetch_deadline_ms`, `cgroup_io_weight`,
+  `adaptive_memtables`, `E_LITE_LAG_POLICY=drain`, the block-count lag window,
+  `scheduler = "alternate"`, the dynamic ZFS ARC manager and `arc-setup`.
+  Their keys are accepted with a warning (`RETIRED_KEYS`).
 
 ## Last change (alpha.29.18.0): the 2026-11-15 review
 

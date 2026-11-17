@@ -272,6 +272,26 @@ Cambios visibles para un usuario:
 - `run`, `serve` e `index` son ahora dos procesos (padre que vigila y nodo) y
   el nodo se reinicia solo tras un final anómalo; `--no-supervise` lo desactiva.
 
+Segunda tanda (2026-11-17), en la rama `fixes/2026-11`, sobre la lista de
+tareas que aprobó el dueño:
+
+| Cambio | Tipo | Ficheros |
+|---|---|---|
+| Un bloque compartido se verifica una vez por descarga (AUD-182) | arreglo P2 | `crates/el-rawtx/src/lib.rs` |
+| El reintento por un circuito Tor nuevo ocurre de verdad (AUD-183) | arreglo P2 | `crates/el-rawtx/src/lib.rs`, `esplora.rs` |
+| Una desconexión libera la plaza aunque haya descargas en curso (AUD-184) | arreglo P2 | `crates/el-serve/src/server.rs` |
+| Un árbol merkle por bloque en caché, no uno por prueba (AUD-185) | rendimiento P2 | `crates/el-model/src/merkle.rs`, `crates/el-serve/src/protocol.rs` |
+| `transaction.get` detallado coherente si hay un reorg durante la descarga (AUD-186) | arreglo P2 | `crates/el-serve/src/protocol.rs` |
+| Un único plazo por petición `transaction.get` (AUD-187) | arreglo P3 | `crates/el-rawtx/src/lib.rs` |
+| El cerrojo de sincronización inutilizable ya no bloquea para siempre (AUD-188, encontrado al ejecutar los e2e en un sandbox) | arreglo P2 | `bin/e-lite/src/ibd_lock.rs` |
+| Copia de la identidad aparte del snapshot (AUD-189) | funcionalidad | `bin/e-lite/src/identity.rs` |
+| Errores de indexación clasificados por tipo (AUD-175) | reordenación | `bin/e-lite/src/main.rs`, `setup.rs`, `pipeline.rs` |
+| Reinicios en `/status` y `/metrics`; `[safety] supervise` (AUD-190) | funcionalidad | `bin/e-lite/src/supervisor.rs`, `crates/el-serve/` |
+| Suite `e2e_privacy` | pruebas | `tests/e2e/e2e_privacy.sh` |
+| Línea de comandos reducida, opciones antiguas traducidas a `--set` | cambio visible | `bin/e-lite/src/cli.rs`, `setup.rs`, `docs/CLI.md` |
+| Siete variantes opcionales borradas; claves retiradas aceptadas con aviso | simplificación | `bin/e-lite/src/config.rs`, `pipeline.rs`, `tuning/`, `install.sh` |
+| CI: `shellcheck` sigue la biblioteca e2e y revisa `tests/*.sh` y `tests/lib` | CI | `.shellcheckrc`, `.github/workflows/ci.yml` |
+
 **Lo que decidí no cambiar**, y por qué:
 
 - ROADMAP #10 (`client_min`): contradice una decisión documentada (AUD-041). El
@@ -295,10 +315,11 @@ automático activo y los tests ya reunificados:
 |---|---|
 | `cargo fmt --check` | correcto |
 | `cargo clippy --workspace --all-targets -- -D warnings` | correcto |
-| `cargo test --workspace` | 373 tests correctos, 6 ignorados (350 antes de la revisión) |
+| `cargo test --workspace` | 389 tests correctos, 6 ignorados (350 antes de la revisión; 373 tras la primera tanda) |
 | `tests/run-e2e.sh --release launch_core regtest` (binario release, con `panic = "unwind"`) | correcto |
 | `scripts/check-docs.sh` | correcto (38 documentos) |
-| `tests/run-e2e.sh`: las diez suites e2e de regtest (`defaults`, `external_pruned`, `launch_core`, `multi_instance`, `pruned_ibd`, `recovery`, `regtest`, `resilience`, `snapshot`, `wait_core`) | correctas en la última pasada (unos 8 minutos), sin procesos residuales |
+| `tests/run-e2e.sh`: las once suites e2e de regtest (`defaults`, `external_pruned`, `launch_core`, `multi_instance`, `privacy`, `pruned_ibd`, `recovery`, `regtest`, `resilience`, `snapshot`, `wait_core`) | correctas en la última pasada (2026-11-17, unos 6 minutos), sin procesos residuales |
+| `shellcheck` (misma versión que CI, en un contenedor Debian 12) | correcto |
 
 Dos e2e fallaron de forma esporádica a lo largo de las pasadas
 (`e2e_multi_instance.sh` dos veces con `cannot bind metrics 127.0.0.1:55484`,
@@ -510,8 +531,8 @@ externas, así que esa propuesta ya no figura):
 
 | # | Propuesta | Qué quita | Qué necesita |
 |---|---|---|---|
-| 1 | Decidir o borrar las variantes opcionales: política de retraso por bloques (heredada) y `drain`, planificador `alternate`, `adaptive_memtables`, `prefetch_deadline_ms`, `cgroup_io_weight`, ARC dinámico de ZFS | código, documentación y pruebas de caminos que nadie usa por defecto | una prueba A/B en mainnet por variante |
-| 2 | Línea de comandos: unas 15 opciones de uso diario; el resto solo por fichero o `--set sección.clave=valor`, que ya existe | `parse_args` (225 líneas), buena parte de `effective_config_with` (360) y de `CLI.md` | decisión del dueño: rompe compatibilidad, requiere periodo de aviso |
+| 1 | **Hecho (2026-11-17)**: borradas las siete variantes por decisión del dueño (política de retraso por bloques y `drain`, planificador `alternate`, `adaptive_memtables`, `prefetch_deadline_ms`, `cgroup_io_weight`, ARC dinámico de ZFS). Las claves antiguas se aceptan con un aviso | código, documentación y pruebas de caminos que nadie usaba por defecto | — |
+| 2 | **Hecho (2026-11-17)**: unas 45 opciones (incluidos argumentos de subcomando y permisos explícitos); las ~70 restantes siguen funcionando como su `--set` con un aviso, y se borrarán dos versiones después | 61 bloques de `effective_config_with` y 61 campos de `Args` | — |
 | 3 | Lectores persistentes entre llamadas (AUD-179) | crear y destruir hilos cada 512 bloques y cada 500 ms al día | benchmark de IBD |
 | 4 | Grupo de hilos acotado en el servidor (AUD-174) | hasta ~128 hilos por conexión | medición de carga de wallet |
 | 6 | **Hecho (2026-11-16)**: `AGENTS.md` pasa de 727 a 247 líneas: reglas agrupadas con su `AUD` y el documento donde está el detalle; los valores por defecto quedan solo en `docs/` | duplicación que había que mantener a mano | — |

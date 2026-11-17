@@ -448,7 +448,6 @@ COMMANDS:
                      configuration files to --output (private keys, not
                      encrypted; stop e-lite first)
     import-identity  restore them from --input (--yes replaces files that differ)
-                     (prints the chgrp/chmod + systemd unit; --apply as root)
     version          print version
 
 OPTIONS:

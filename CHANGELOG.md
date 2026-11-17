@@ -2,13 +2,47 @@
 
 ## Unreleased
 
+Not tagged. Work list of 2026-11-16/17: fixes verified in the code, an
+identity backup, a shorter command line and the removal of the optional
+variants nobody used by default.
+
+### Upgrade notes
+
+- About 70 command-line flags are retired in favour of `--set`; they still
+  work for now and print their replacement (`docs/CLI.md`, "Retired flags").
+- Removed configuration keys are accepted with a warning and ignored; only
+  `max_bulk_lag_gib = 0` is now an error.
+- On ZFS hosts, e-lite no longer manages the ARC cap: see "Removed".
+
 ### Fixed
+
+- A block shared by several concurrent `transaction.get` is verified once, by the request that downloaded it, instead of once per waiting request (AUD-182). `/status.rawtx.verifications` counts full verifications.
+- The retry of a Tor provider on a new circuit after a timeout or a stalled download now happens, as documented; it never did, because the provider was already marked as cooling down when the retry was decided (AUD-183).
+- A wallet that disconnects while its transactions are still being downloaded gives its client slot back at once, instead of holding it until the downloads end (AUD-184). `/status.detached_clients` shows connections in that state.
+- Merkle proofs of the same block reuse one tree instead of rebuilding it per proof (AUD-185).
+- A verbose `transaction.get` that crosses a reorganisation no longer mixes the old chain's bytes with the new block's hash and confirmations; it resolves the transaction again (AUD-186).
+- A `transaction.get` that falls back from the per-txid path to a whole block no longer starts a second full wait; the request has one deadline (AUD-187).
+- e-lite no longer waits for ever for the intensive-sync lock when its lock file cannot be created (read-only or foreign `XDG_RUNTIME_DIR`): it uses `/tmp/e-lite-<uid>`, or runs without the lock after a warning (AUD-188).
 
 ### Changed
 
+- Whether an indexing error stops the node or is retried no longer depends on the words in its message (AUD-175).
+- **The command line keeps only the options of daily use** (`e-lite --help`: about 45, including subcommand arguments and explicit permissions). Every other setting is a config key, in `config.toml` or with `--set section.key=value`. The ~70 retired flags (`--readers`, `--profile`, `--cache-mib`, `--tor-mode`, `--decoys`, ...) still work for now: each acts like its `--set` in the same position and prints the replacement; the full table is in `docs/CLI.md` ("Retired flags"). **Upgrade note:** a retired flag no longer beats a `--set` of the same key given after it; the later one wins.
+
 ### Added
 
+- `e-lite export-identity` / `import-identity`: back up and restore the TLS identity, the onion keys, the decoy secret and the configuration files, apart from the snapshot, so a restored node keeps its onion address and the CA wallets trust (AUD-189).
+- `/status.supervisor` and the metrics `e_lite_restarts_total` / `e_lite_supervised` show automatic restarts and the cause of the last one; `[safety] supervise = false` turns the supervisor off from the configuration (AUD-190).
+
 ### Removed
+
+- `[index] prefetch_deadline_ms` (opt-in, off by default): prevout prefetch always completes. The key in an existing `config.toml` and `--prefetch-deadline-ms` are accepted with a warning and ignored.
+- `[core] cgroup_io_weight` (opt-in, off by default): `[core] io_priority` (ionice) remains. The key and `--core-cgroup-io-weight` are accepted with a warning and ignored.
+- `[index] adaptive_memtables` (opt-in, off by default): memtables are fixed at startup and still halve, as a safety valve, when memory is critical. The key and `--adaptive-memtables` are accepted with a warning and ignored.
+- `E_LITE_LAG_POLICY=drain` and `E_LITE_LAG_TARGET_SECONDS` (an environment-only experiment): the variables are ignored.
+- `[pruning] max_bulk_lag_blocks` and `core_resume_ahead_blocks`, the block-count lag window that applied only with `max_bulk_lag_gib = 0`. The GiB window is the only one; **`max_bulk_lag_gib = 0` is now a startup error naming the key**. The old keys and flags are accepted with a warning and ignored.
+- `[pruning] scheduler = "alternate"` (opt-in; Core and e-lite taking turns): e-lite always indexes while Core downloads. `/status.scheduler` loses `mode` and `index_paused`; `phase` is `indexing` or `draining`. The key (including `scheduler = "overlap"` copied from an old example config) and `--scheduler` are accepted with a warning and ignored.
+- **The dynamic ZFS ARC manager** (`[index] zfs_arc_dynamic`, on by default, with `zfs_arc_max_mib`/`zfs_arc_min_mib`) and the `e-lite arc-setup` command. e-lite no longer writes `zfs_arc_max`; it still reads the ARC size (`doctor`, `/status`, debug lines) and warns when the ARC is uncapped, suggesting a fixed cap. With this, nothing in e-lite or its installer touches systemd. **Upgrade notes:** on a ZFS host where an older release lowered the cap, it stays at that value (often 1024 MiB) until reboot; restore the ZFS default with `echo 0 | sudo tee /sys/module/zfs/parameters/zfs_arc_max`. The installer removes the old `e-lite-arc-cap.service` when it can (root or passwordless sudo) and otherwise prints the two commands. The three keys are accepted with a warning and ignored.
 
 ## 0.1.0-alpha.29.18.0 — 2026-11-16
 
