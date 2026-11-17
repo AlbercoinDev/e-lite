@@ -18,8 +18,8 @@ use config::{Config, CoreManage};
 use core_supervisor::{CoreStartOutcome, CoreSupervisor};
 use el_chain::ReaderTracker;
 use el_index::{
-    apply_prepared_deferred_undo, prefetch_prevouts, prefetch_prevouts_with_deadline,
-    prepare_block_bytes, prune_undo, rewind_to, write_window_undo, GroupOverlay,
+    apply_prepared_deferred_undo, prefetch_prevouts, prepare_block_bytes, prune_undo, rewind_to,
+    write_window_undo, GroupOverlay,
 };
 use el_mempool::Mempool;
 use el_model::{Chain, Hash32, IndexedTip, NetworkIdentity, ScriptHash};

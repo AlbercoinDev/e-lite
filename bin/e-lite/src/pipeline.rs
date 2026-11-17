@@ -1440,7 +1440,6 @@ impl Indexer {
         let resolver = self.resolver.clone();
         let store = Arc::clone(&self.store);
         let tunables = Arc::clone(&self.tunables);
-        let prefetch_deadline_ms = self.cfg.index.prefetch_deadline_ms;
         ReaderPool::spawn(workers, window, items, move |i| {
             let read_started = Instant::now();
             let fetched = fetch_block(
@@ -1461,15 +1460,7 @@ impl Indexer {
             // random UTXO reads do not serialise the whole pipeline. Missing
             // entries fall back to the overlay/point lookup during apply.
             let prefetch_started = Instant::now();
-            let prevouts = if prefetch_deadline_ms > 0 {
-                prefetch_prevouts_with_deadline(
-                    &store,
-                    &prepared,
-                    Duration::from_millis(prefetch_deadline_ms),
-                )
-            } else {
-                prefetch_prevouts(&store, &prepared)
-            };
+            let prevouts = prefetch_prevouts(&store, &prepared);
             tunables.record_prefetch(prefetch_started.elapsed());
             prevouts
                 .map(|m| (height, prepared, m))

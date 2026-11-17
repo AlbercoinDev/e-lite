@@ -140,10 +140,6 @@ pub struct CoreCfg {
     /// to a Core launched/adopted by e-lite. None leaves the priority alone.
     #[serde(default)]
     pub io_priority: Option<u8>,
-    /// Best-effort cgroup v2 `io.weight` (1-10000) for Core. Requires a
-    /// delegated cgroup with the io controller; failure is a warning.
-    #[serde(default)]
-    pub cgroup_io_weight: Option<u64>,
     /// Restart a Core process launched by e-lite if it exits unexpectedly.
     #[serde(default = "d_true")]
     pub restart: bool,
@@ -196,7 +192,6 @@ impl Default for CoreCfg {
             prune_mib: d_prune_mib(),
             extra_args: Vec::new(),
             io_priority: None,
-            cgroup_io_weight: None,
             restart: true,
             stop_on_exit: true,
             log_file: None,
@@ -248,10 +243,6 @@ pub struct IndexCfg {
     /// default: shrinking can force a flush and stall commits.
     #[serde(default)]
     pub adaptive_memtables: bool,
-    /// Optional per-block prefetch deadline in ms. 0 = no deadline; the apply
-    /// path falls back to point lookups for prevouts not prefetched in time.
-    #[serde(default)]
-    pub prefetch_deadline_ms: u64,
     /// RocksDB `max_open_files` (fds kept for table/index/filter readers).
     /// 0 = 8192; lowering to 2048/4096 shrinks `table_readers` memory on
     /// 8-16 GiB hosts, at the cost of reopened table readers.
@@ -310,7 +301,6 @@ impl Default for IndexCfg {
             prefetch_blocks: 0,
             write_buffer_mib: 0,
             adaptive_memtables: false,
-            prefetch_deadline_ms: 0,
             max_open_files: 0,
             memory_reserve_mib: 0,
             memory_fraction: 0.0,
@@ -986,41 +976,32 @@ impl Config {
     /// configuration field without requiring a config file.
     pub fn load_with_overrides(path: Option<&str>, overrides: &[String]) -> Result<Config, String> {
         let resolved = Self::resolve_path(path);
+        let where_ = || {
+            resolved
+                .as_ref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| "<defaults>".to_string())
+        };
         let text = match &resolved {
             Some(p) => std::fs::read_to_string(p)
                 .map_err(|e| format!("cannot read config {}: {e}", p.display()))?,
             None => String::new(),
         };
-        if overrides.is_empty() {
-            return if text.trim().is_empty() {
-                Ok(Config::default())
-            } else {
-                toml::from_str(&text).map_err(|e| {
-                    let where_ = resolved
-                        .as_ref()
-                        .map(|p| p.display().to_string())
-                        .unwrap_or_else(|| "<defaults>".to_string());
-                    format!("invalid config {where_}: {e}")
-                })
-            };
-        }
         let mut value: toml::Value = if text.trim().is_empty() {
             toml::Value::Table(Default::default())
         } else {
-            toml::from_str(&text).map_err(|e| {
-                let where_ = resolved
-                    .as_ref()
-                    .map(|p| p.display().to_string())
-                    .unwrap_or_else(|| "<defaults>".to_string());
-                format!("invalid config {where_}: {e}")
-            })?
+            toml::from_str(&text).map_err(|e| format!("invalid config {}: {e}", where_()))?
         };
         for item in overrides {
             apply_override(&mut value, item)?;
         }
-        value
-            .try_into()
-            .map_err(|e| format!("invalid config after --set: {e}"))
+        drop_retired_keys(&mut value);
+        let context = if overrides.is_empty() {
+            format!("invalid config {}", where_())
+        } else {
+            "invalid config after --set".to_string()
+        };
+        value.try_into().map_err(|e| format!("{context}: {e}"))
     }
 
     pub fn chain(&self) -> Result<Chain, String> {
@@ -1240,11 +1221,6 @@ impl Config {
         {
             return Err("[index] zfs_arc_max_mib must be >= zfs_arc_min_mib when set".to_string());
         }
-        if self.index.prefetch_deadline_ms != 0
-            && !(50..=60_000).contains(&self.index.prefetch_deadline_ms)
-        {
-            return Err("[index] prefetch_deadline_ms must be 0 or 50..60000".to_string());
-        }
         if let Some(prio) = self.core.io_priority {
             if prio > 7 {
                 return Err("[core] io_priority must be 0..7".to_string());
@@ -1252,11 +1228,6 @@ impl Config {
         }
         if self.index.max_open_files > 0 && self.index.max_open_files < 256 {
             return Err("[index] max_open_files must be 0 (auto) or >= 256".to_string());
-        }
-        if let Some(weight) = self.core.cgroup_io_weight {
-            if !(1..=10_000).contains(&weight) {
-                return Err("[core] cgroup_io_weight must be 1..10000".to_string());
-            }
         }
         if !matches!(self.pruning.scheduler.as_str(), "overlap" | "alternate") {
             return Err("[pruning] scheduler must be overlap or alternate".to_string());
@@ -1396,6 +1367,45 @@ impl Config {
             }
         }
         Ok(())
+    }
+}
+
+/// Keys that existed and were removed. A configuration that still has one
+/// starts, with one warning naming it, instead of failing on an unknown
+/// field: every other unknown key is still an error.
+pub const RETIRED_KEYS: &[(&str, &str)] = &[
+    (
+        "index.prefetch_deadline_ms",
+        "removed in 0.1.0-alpha.29.19.0; prefetch always completes",
+    ),
+    (
+        "core.cgroup_io_weight",
+        "removed in 0.1.0-alpha.29.19.0; [core] io_priority (ionice) remains",
+    ),
+];
+
+/// Remove retired keys from a parsed configuration, warning once per key and
+/// process.
+fn drop_retired_keys(root: &mut toml::Value) {
+    static WARNED: std::sync::Mutex<Vec<&'static str>> = std::sync::Mutex::new(Vec::new());
+    for (key, note) in RETIRED_KEYS {
+        let Some((section, field)) = key.split_once('.') else {
+            continue;
+        };
+        let removed = root
+            .get_mut(section)
+            .and_then(toml::Value::as_table_mut)
+            .and_then(|table| table.remove(field))
+            .is_some();
+        if removed {
+            let mut warned = WARNED.lock().unwrap_or_else(|p| p.into_inner());
+            if !warned.contains(key) {
+                warned.push(key);
+                eprintln!(
+                    "[e-lite] WARNING: [{section}] {field} is no longer used ({note}); remove it"
+                );
+            }
+        }
     }
 }
 
@@ -1689,15 +1699,9 @@ mod tests {
     }
 
     #[test]
-    fn adaptive_memtables_and_prefetch_deadline_are_opt_in() {
+    fn opt_in_knobs_are_validated() {
         let cfg = Config::default();
         assert!(!cfg.index.adaptive_memtables);
-        assert_eq!(cfg.index.prefetch_deadline_ms, 0);
-        let mut bad = Config::default();
-        bad.index.prefetch_deadline_ms = 10;
-        assert!(bad.validate().is_err());
-        bad.index.prefetch_deadline_ms = 500;
-        assert!(bad.validate().is_ok());
         let mut fds = Config::default();
         fds.index.max_open_files = 128;
         assert!(fds.validate().is_err());
@@ -1710,11 +1714,6 @@ mod tests {
         assert!(prio.validate().is_err());
         prio.core.io_priority = Some(7);
         assert!(prio.validate().is_ok());
-        let mut cg = Config::default();
-        cg.core.cgroup_io_weight = Some(0);
-        assert!(cg.validate().is_err());
-        cg.core.cgroup_io_weight = Some(100);
-        assert!(cg.validate().is_ok());
     }
 
     #[test]

@@ -327,14 +327,9 @@ inflate the `WriteBatch`.
   CF's `write_buffer_size` to `effective/16` (512 MiB..2 GiB) after a
   10-minute persistent target and a 10-minute cooldown; cache changes have
   priority and an explicit `write_buffer_mib` disables the feature.
-- `[index] prefetch_deadline_ms` (50..60000, 0 = off) splits prevout prefetch
-  into 512-key chunks and stops after the deadline; apply falls back to point
-  lookups. It trades a tail reader for more apply work.
 - `[core] io_priority = 0..7` applies best-effort `ionice` to a Core launched
-  or adopted by e-lite. `[core] cgroup_io_weight = 1..10000` additionally tries
-  to place Core in `e-lite-core` under the current cgroup v2 and set
-  `io.weight`; it requires a delegated `io` controller. Both are warnings, not
-  fatal, when the kernel/filesystem does not support them (NVMe `none`).
+  or adopted by e-lite. It is a warning, not fatal, when the kernel does not
+  support it (NVMe `none`).
 - Prevout lookup uses `batched_multi_get_cf` over deduplicated, sorted keys.
 - **Commits in bulk are deliberately infrequent**: transactions (250k), blocks
   (512), raw bytes (`clamp(RAM/128, 64-256 MiB)`) or time (20 s NVMe, 30 s

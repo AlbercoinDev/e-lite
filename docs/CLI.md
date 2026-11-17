@@ -102,7 +102,6 @@ version          print version
 | `--set index.commit_interval_ms=<n>` | `index.commit_interval_ms` | `0` (profile; 500..30000) |
 | `--set index.commit_sync=<mode>` | `index.commit_sync` | `auto` (`txids` in bulk, `always` live) |
 | `--set index.prefetch_blocks=<n>` | `index.prefetch_blocks` | `0` (auto; >0 caps the window) |
-| `--set index.prefetch_deadline_ms=<n>` | `index.prefetch_deadline_ms` | `0` (off; 50..60000) |
 | `--set index.max_open_files=<n>` | `index.max_open_files` | `0` (8192; 2048/4096 for 8-16 GB) |
 | `--set index.adaptive_memtables=true` / `--set index.adaptive_memtables=false` | `index.adaptive_memtables` | `false` |
 | `--set index.batch_blocks=<n>` | `index.batch_blocks` | `256`/profile, capped at 512 |
@@ -192,7 +191,6 @@ e-lite import-snapshot --network mainnet --allow-mainnet \
 | `--allow-auto-prune` | `pruning.allow_auto_prune` | `false` |
 | `--core-arg <arg>` | `core.extra_args` (appended) | none |
 | `--set core.io_priority=<0-7>` | `core.io_priority` | unset (opt-in ionice) |
-| `--set core.cgroup_io_weight=<n>` | `core.cgroup_io_weight` | unset (opt-in cgroup v2 io.weight) |
 | `--set core.stop_on_exit=true` / `--set core.stop_on_exit=false` | `core.stop_on_exit` | `true` |
 | `--set core.restart=true` / `--set core.restart=false` | `core.restart` | `true` |
 
@@ -507,7 +505,7 @@ replacement. They will be removed two releases later.
 | `--commit-interval-ms <v>` | `--set index.commit_interval_ms=<v>` |
 | `--prefetch-blocks <v>` | `--set index.prefetch_blocks=<v>` |
 | `--write-buffer-mib <v>` | `--set index.write_buffer_mib=<v>` |
-| `--prefetch-deadline-ms <v>` | `--set index.prefetch_deadline_ms=<v>` |
+| `--prefetch-deadline-ms <v>` | accepted and ignored: the setting was removed |
 | `--max-open-files <v>` | `--set index.max_open_files=<v>` |
 | `--memory-reserve-mib <v>` | `--set index.memory_reserve_mib=<v>` |
 | `--memory-fraction <v>` | `--set index.memory_fraction=<v>` |
@@ -527,7 +525,7 @@ replacement. They will be removed two releases later.
 | `--critical-free-gib <v>` | `--set pruning.critical_free_gib=<v>` |
 | `--max-clients <v>` | `--set server.max_clients=<v>` |
 | `--core-io-priority <v>` | `--set core.io_priority=<v>` |
-| `--core-cgroup-io-weight <v>` | `--set core.cgroup_io_weight=<v>` |
+| `--core-cgroup-io-weight <v>` | accepted and ignored: the setting was removed |
 | `--decoys <v>` | `--set rawtx.decoys=<v>` |
 | `--rawtx-cache-mib <v>` | `--set rawtx.cache_mib=<v>` |
 | `--tor-onion-port <v>` | `--set tor.onion_port=<v>` |
