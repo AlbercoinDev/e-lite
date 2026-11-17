@@ -23,7 +23,6 @@ available**.
 | Per-network defaults | experimental | plain/TLS/metrics ports and `<data-dir>/bitcoin` per chain; multiple instances |
 | Prune cadence and deferral | experimental | every 5k safe blocks; 20 GiB free-space deferral while Core downloads or the index drains; once caught up, one prune to the safe maximum then every `min_gain_live_blocks` (144, ~1 day) |
 | Core bulk pause + peer warm-up | experimental | pause above 30 GiB backlog; resume at 7 GiB; legacy 5k-block fallback |
-| Overlap/alternate scheduler | experimental | `overlap` default; `alternate` opt-in (Core and e-lite take turns) |
 | Disk guard with download/index split | experimental | cgroup/LXC aware |
 | Adaptive profiles and hot reload | experimental | `auto/hdd/ssd/nvme/manual`, `SIGUSR1` |
 | Machine plan | experimental | physical cores + cgroup quota + disk class: readers and RocksDB jobs = physical cores clamped to 2..cap per disk (jobs: SSD/NVMe 8, ZFS/virtual 4, HDD 2) |

@@ -71,11 +71,10 @@ no repitas contexto ni rehagas decisiones ya documentadas.
   decoys. The cache is a 256 MiB verified-transaction cache under
   `<data-dir>/rawtx-cache`; `e-lite cache status|clear` is the only code that
   deletes it and never touches the index, Core, TLS or Tor.
-- **Defaults stay conservative**: `scheduler = "overlap"`, Tor-only external
-  fetches (`tor_fallback_clearnet = false`), fail-closed public providers,
-  plain listener on loopback, manual pruning. `alternate`,
-  `adaptive_memtables`, `prefetch_deadline_ms`, `io_priority`,
-  `cgroup_io_weight` and `private_broadcast` remain opt-in.
+- **Defaults stay conservative**: Tor-only external fetches
+  (`tor_fallback_clearnet = false`), fail-closed public providers, plain
+  listener on loopback, manual pruning. `io_priority` and `private_broadcast`
+  remain opt-in.
 - **Machine plan**: physical cores, cgroup CPU quota and disk class choose
   readers/jobs and Core `-par`/`-rpcthreads`/`-dbcache`; the memory budget is
   fitted to `MemAvailable`, not installed RAM. `doctor` and `/status.machine`
@@ -203,8 +202,6 @@ Full detail: `CHANGELOG.md`.
 - Per-txid external fetch (`balanced`) is the default; `max` never sends a
   txid. Decoys are wallets, stable per node, spread over servers.
 - `use_tor = false` is opt-in and never the default.
-- `scheduler = "overlap"` stays default until a measured Core-solo rate beats
-  the ~6.7 blocks/s break-even for `alternate`.
 - `prune_mib = 1` for from-zero pruned IBD; snapshots are manual only.
 - Public providers fail closed; the shipped Electrum list never stands in for
   a missing or invalid `public-servers.toml`.

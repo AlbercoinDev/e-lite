@@ -1123,12 +1123,7 @@ pub(crate) fn build_shared(
             Ordering::Relaxed,
         );
     }
-    // Publish the scheduler configuration even in `serve`, where no Indexer
-    // exists. `index_paused` stays false because nothing is indexing.
-    stats.scheduler_alternate.store(
-        cfg.pruning.scheduler.eq_ignore_ascii_case("alternate"),
-        Ordering::Relaxed,
-    );
+    // Publish the lag window even in `serve`, where no Indexer exists.
     stats.scheduler_high_bytes.store(
         cfg.pruning.max_bulk_lag_gib.saturating_mul(GIB),
         Ordering::Relaxed,

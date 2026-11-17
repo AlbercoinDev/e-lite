@@ -13,11 +13,8 @@ name.
 [index]
 readers = 4          # or 0/auto
 cache_mib = 0
-adaptive_memtables = false
-prefetch_deadline_ms = 0
 
 [pruning]
-scheduler = "overlap"
 max_bulk_lag_gib = 30
 core_resume_ahead_gib = 7
 ```
@@ -40,7 +37,8 @@ readers = 6
 ```
 
 Restart, run `tests/manual/ab_umbrel.sh readers6 1800`, compare:
-`phase=core` (Core downloading) and `phase=draining` (Core paused).
+`phase=indexing` (Core downloading while e-lite indexes) and `phase=draining`
+(Core paused).
 Keep 6 only if the active-phase rate improves and the drain rate does not fall.
 
 For an 8 GiB box, skip readers=6 unless `wait_p95` was high; 4 is the safer
@@ -73,47 +71,7 @@ Run `tests/manual/ab_umbrel.sh bulk20g 1800`. Keep it only if the phase switch c
 does not outweigh the shorter queues; the CSV's `backlog_bytes` shows the
 actual bytes.
 
-## 4. Core solo (`alternate` decision)
-
-With Core downloading and e-lite running:
-
-```bash
-PID=$(pgrep -n -f 'e-lite run')   # the node (newest); the oldest is its watching parent
-bitcoin-cli -datadir=<core-datadir> getblockcount
-kill -STOP "$PID"; sleep 300
-bitcoin-cli -datadir=<core-datadir> getblockcount
-kill -CONT "$PID"
-```
-
-If Core solo is **> 6 blocks/s**, test:
-
-```toml
-[pruning]
-scheduler = "alternate"
-prune_mib = 1
-pause_core_during_bulk = true
-max_bulk_lag_gib = 20
-core_resume_ahead_gib = 5
-```
-
-Run `tests/manual/ab_umbrel.sh alternate 1800`. `alternate` is only a candidate when
-Core solo is clearly above the break-even; otherwise keep `overlap`.
-
-## 5. Optional prefetch/memtable experiments
-
-```toml
-[index]
-adaptive_memtables = true
-prefetch_deadline_ms = 2000
-```
-
-These are **not** defaults. Run `tests/manual/ab_umbrel.sh memtables-adaptive 1800`
-and watch:
-- `memtables_mib` should move only after a 10-minute persistent target;
-- `prefetch_p95` should fall;
-- `wait_p95` and apply/commit should not regress.
-
-## 6. Compaction (`background_jobs`)
+## 4. Compaction (`background_jobs`)
 
 Baseline evidence (mainnet, end of IBD, ~5 blocks/s): `pending_compaction`
 grew 49 → 185 GiB in one hour with `running 1` the whole time, commit/blk went
@@ -149,7 +107,7 @@ cumulative `blocks/s` in the log. Compare the same phase at the same height:
 
 | Signal | Keep the variant if… |
 |---|---|
-| `phase=core` | rate improves ≥ 0.2 b/s and Core still downloads |
+| `phase=indexing` | rate improves ≥ 0.2 b/s and Core still downloads |
 | `phase=draining` | rate does not fall and backlog reaches the low mark |
 | `memory.available_mib` | stays above ~1 GiB; no OOM |
 | `prefetch_p95_ms` | falls without `wait_p95` rising |

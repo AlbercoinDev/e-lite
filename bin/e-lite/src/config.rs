@@ -565,11 +565,6 @@ pub struct PruningCfg {
     /// this, so its peers reconnect while e-lite finishes the catch-up.
     #[serde(default = "d_core_resume_ahead_gib")]
     pub core_resume_ahead_gib: u64,
-    /// `overlap`: e-lite keeps indexing while Core downloads. `alternate`:
-    /// Core and e-lite take turns (Core downloads, then e-lite indexes) to
-    /// avoid I/O contention. `alternate` is opt-in for testing.
-    #[serde(default = "d_scheduler")]
-    pub scheduler: String,
     /// Skip normal pruning while free space is at or above this many GiB.
     #[serde(default = "d_prune_defer_free")]
     pub prune_defer_free_gib: u64,
@@ -604,7 +599,6 @@ impl Default for PruningCfg {
             max_bulk_lag_gib: d_max_bulk_lag_gib(),
             pause_core_during_bulk: true,
             core_resume_ahead_gib: d_core_resume_ahead_gib(),
-            scheduler: d_scheduler(),
             prune_defer_free_gib: d_prune_defer_free(),
             min_gain_blocks: d_min_gain(),
             min_gain_live_blocks: d_min_gain_live(),
@@ -879,9 +873,6 @@ fn d_max_bulk_lag_gib() -> u64 {
 }
 fn d_core_resume_ahead_gib() -> u64 {
     7
-}
-fn d_scheduler() -> String {
-    "overlap".to_string()
 }
 
 /// Host part of a `host:port` listener, used to pair the TLS listener with the
@@ -1206,21 +1197,6 @@ impl Config {
         if self.index.max_open_files > 0 && self.index.max_open_files < 256 {
             return Err("[index] max_open_files must be 0 (auto) or >= 256".to_string());
         }
-        if !matches!(self.pruning.scheduler.as_str(), "overlap" | "alternate") {
-            return Err("[pruning] scheduler must be overlap or alternate".to_string());
-        }
-        if self.pruning.scheduler == "alternate" && !self.pruning.pause_core_during_bulk {
-            return Err(
-                "[pruning] scheduler = \"alternate\" requires pause_core_during_bulk = true"
-                    .to_string(),
-            );
-        }
-        if self.pruning.scheduler == "alternate" && self.core.prune_mib != 1 {
-            return Err(
-                "[pruning] scheduler = \"alternate\" requires prune_mib = 1 (manual prune)"
-                    .to_string(),
-            );
-        }
         if self.pruning.max_bulk_lag_gib == 0 {
             return Err(
                 "[pruning] max_bulk_lag_gib must be at least 1 (the block-count window that 0 \
@@ -1371,6 +1347,10 @@ pub const RETIRED_KEYS: &[(&str, &str)] = &[
     (
         "pruning.core_resume_ahead_blocks",
         "removed in 0.1.0-alpha.29.19.0; core_resume_ahead_gib is the only window",
+    ),
+    (
+        "pruning.scheduler",
+        "removed in 0.1.0-alpha.29.19.0; e-lite always indexes while Core downloads",
     ),
     (
         "core.cgroup_io_weight",
@@ -1668,22 +1648,9 @@ mod tests {
         let cfg = Config::default();
         assert_eq!(cfg.pruning.max_bulk_lag_gib, 30);
         assert_eq!(cfg.pruning.core_resume_ahead_gib, 7);
-        assert_eq!(cfg.pruning.scheduler, "overlap");
-
-        let mut alt = Config::default();
-        alt.pruning.scheduler = "alternate".to_string();
-        assert!(alt.validate().is_ok());
-        alt.pruning.pause_core_during_bulk = false;
-        assert!(alt.validate().is_err());
-
-        let mut full = Config::default();
-        full.pruning.scheduler = "alternate".to_string();
-        full.core.prune_mib = 0;
-        assert!(full.validate().is_err());
-
-        let mut bad = Config::default();
-        bad.pruning.scheduler = "round-robin".to_string();
-        assert!(bad.validate().is_err());
+        let mut no_pause = Config::default();
+        no_pause.pruning.pause_core_during_bulk = false;
+        assert!(no_pause.validate().is_ok());
 
         let mut inverted = Config::default();
         inverted.pruning.max_bulk_lag_gib = 10;

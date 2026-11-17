@@ -262,8 +262,6 @@ pub struct Stats {
     pub pipeline_applied: AtomicU64,
     pub pipeline_discarded: AtomicU64,
     /// Core/e-lite scheduler: backlog bytes and high/low watermarks.
-    pub scheduler_alternate: AtomicBool,
-    pub scheduler_index_paused: AtomicBool,
     pub scheduler_backlog_bytes: AtomicU64,
     pub scheduler_high_bytes: AtomicU64,
     pub scheduler_low_bytes: AtomicU64,
@@ -387,8 +385,6 @@ impl Default for Stats {
             pipeline_prepared: AtomicU64::new(0),
             pipeline_applied: AtomicU64::new(0),
             pipeline_discarded: AtomicU64::new(0),
-            scheduler_alternate: AtomicBool::new(false),
-            scheduler_index_paused: AtomicBool::new(false),
             scheduler_backlog_bytes: AtomicU64::new(0),
             scheduler_high_bytes: AtomicU64::new(0),
             scheduler_low_bytes: AtomicU64::new(0),

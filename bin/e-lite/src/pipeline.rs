@@ -50,16 +50,10 @@ pub(crate) struct Indexer {
     pub(crate) milestone_sizes_running: Arc<AtomicBool>,
     pub(crate) bulk_started: AtomicBool,
     pub(crate) bulk_full_pause: AtomicBool,
-    /// `true` when `[pruning] scheduler = "alternate"`: Core downloads and
-    /// e-lite indexes in alternating phases. `false` keeps the overlap.
-    pub(crate) scheduler_alternate: bool,
     /// Byte watermark confirmation: a pause/resume must persist before acting.
     pub(crate) high_since: Mutex<Option<Instant>>,
     pub(crate) low_since: Mutex<Option<Instant>>,
-    /// The alternate scheduler has paused indexing (Core is downloading).
-    /// Serving (Electrum, Tor, status) continues.
-    pub(crate) index_paused: AtomicBool,
-    /// 0 = overlap/indexing, 1 = Core paused/e-lite draining, 2 = Core phase.
+    /// 0 = indexing while Core downloads, 1 = Core paused/e-lite draining.
     pub(crate) phase: AtomicU64,
     pub(crate) phase_state: Mutex<Option<(Instant, u64)>>,
     pub(crate) last_rocksdb_log: Mutex<Instant>,
@@ -116,18 +110,7 @@ impl Indexer {
         let start_height = tip.as_ref().map(|t| t.height as u64).unwrap_or(0);
         let start_txnum = tip.as_ref().map(|t| t.txnum).unwrap_or(0);
         let now = Instant::now();
-        let requested_alternate = cfg.pruning.scheduler.eq_ignore_ascii_case("alternate");
-        let scheduler_alternate = requested_alternate && can_control_core;
-        if requested_alternate && !can_control_core {
-            eprintln!(
-                "[e-lite] WARNING: scheduler = \"alternate\" needs a Core that e-lite can pause; \
-                 this Core is external/already running. Keeping overlap."
-            );
-        }
         if let Some(sh) = &shared {
-            sh.stats
-                .scheduler_alternate
-                .store(scheduler_alternate, Ordering::Relaxed);
             sh.stats.scheduler_high_bytes.store(
                 cfg.pruning
                     .max_bulk_lag_gib
@@ -177,10 +160,8 @@ impl Indexer {
             milestone_sizes_running: Arc::new(AtomicBool::new(false)),
             bulk_started: AtomicBool::new(false),
             bulk_full_pause: AtomicBool::new(false),
-            scheduler_alternate,
             high_since: Mutex::new(None),
             low_since: Mutex::new(None),
-            index_paused: AtomicBool::new(false),
             phase: AtomicU64::new(0),
             phase_state: Mutex::new(None),
             last_rocksdb_log: Mutex::new(Instant::now()),
@@ -773,7 +754,6 @@ impl Indexer {
             let backlog_gib = lag.saturating_mul(avg) / GIB;
             let name = match phase {
                 1 => "draining",
-                2 => "core",
                 _ => "indexing",
             };
             crate::debug_log!(
@@ -813,38 +793,6 @@ impl Indexer {
         }
     }
 
-    /// Pause/resume e-lite indexing for the `alternate` scheduler. Serving
-    /// (Electrum, Tor, metrics) continues; only block application stops.
-    fn set_index_paused(&self, paused: bool) {
-        if !self.scheduler_alternate {
-            if self.index_paused.swap(false, Ordering::SeqCst) {
-                if let Some(sh) = &self.shared {
-                    sh.stats
-                        .scheduler_index_paused
-                        .store(false, Ordering::Relaxed);
-                }
-            }
-            return;
-        }
-        let previous = self.index_paused.swap(paused, Ordering::SeqCst);
-        if previous == paused {
-            return;
-        }
-        if let Some(sh) = &self.shared {
-            sh.stats
-                .scheduler_index_paused
-                .store(paused, Ordering::Relaxed);
-        }
-        if paused {
-            eprintln!(
-                "[e-lite] scheduler alternate: e-lite indexing paused; Core downloading \
-                 (serving continues)"
-            );
-        } else {
-            eprintln!("[e-lite] scheduler alternate: Core paused; e-lite indexing");
-        }
-    }
-
     /// The lag guard no longer applies (no pruning to protect, IBD finished):
     /// hand the network back to Core if this guard was the one holding it.
     /// A disk pause keeps it; a failed RPC is retried on the next call.
@@ -866,9 +814,7 @@ impl Indexer {
     ///
     /// For manual pruning the guard uses absolute byte watermarks
     /// (`max_bulk_lag_gib`/`core_resume_ahead_gib`) over the estimated
-    /// unindexed backlog. The legacy block window is used only when the GiB
-    /// value is 0. In `alternate` mode, e-lite also stops indexing while Core
-    /// downloads and resumes when Core is paused.
+    /// unindexed backlog.
     fn lag_guard(&self, info: &BlockchainInfo, committed: u64) {
         if !self.can_control_core {
             return;
@@ -903,7 +849,6 @@ impl Indexer {
             .unwrap_or(false);
 
         if !bulk && !auto_enabled {
-            self.set_index_paused(false);
             self.release_lag_pause(paused, "resumed Core downloads");
             return;
         }
@@ -920,7 +865,6 @@ impl Indexer {
             if !info.initialblockdownload {
                 self.bulk_started.store(false, Ordering::Relaxed);
                 self.bulk_full_pause.store(false, Ordering::Relaxed);
-                self.set_index_paused(false);
                 self.release_lag_pause(paused, "resumed Core downloads after IBD");
                 return;
             }
@@ -952,12 +896,10 @@ impl Indexer {
             }
         } else {
             if !info.pruned {
-                self.set_index_paused(false);
                 self.release_lag_pause(paused, "Core is no longer pruned: resumed downloads");
                 return;
             }
             if info.pruneheight == 0 {
-                self.set_index_paused(false);
                 self.release_lag_pause(paused, "Core has no pruned blocks: resumed downloads");
                 return;
             }
@@ -976,7 +918,6 @@ impl Indexer {
                 Ok(_) => {
                     self.lag_paused.store(true, Ordering::Relaxed);
                     self.mark_paused(true);
-                    self.set_index_paused(false);
                     if let Some(sh) = &self.shared {
                         sh.stats.core_network_active.store(false, Ordering::Relaxed);
                         sh.set_state(state::PAUSE_DOWNLOAD);
@@ -1010,7 +951,6 @@ impl Indexer {
         } else if paused && resume_due {
             if self.downloads_paused() {
                 self.lag_paused.store(false, Ordering::Relaxed);
-                self.set_index_paused(false);
                 return;
             }
             self.tunables.shrink_for_core_resume(&self.store);
@@ -1019,7 +959,6 @@ impl Indexer {
                     self.lag_paused.store(false, Ordering::Relaxed);
                     self.mark_paused(false);
                     let prewarm = is_bulk && self.bulk_full_pause.swap(false, Ordering::SeqCst);
-                    self.set_index_paused(is_bulk && self.scheduler_alternate);
                     if let Some(sh) = &self.shared {
                         sh.stats.core_network_active.store(true, Ordering::Relaxed);
                         refresh_ready_state(sh);
@@ -1043,9 +982,6 @@ impl Indexer {
         } else if paused {
             let _ = self.core.set_network_active(false);
             self.mark_paused(true);
-            self.set_index_paused(false);
-        } else {
-            self.set_index_paused(is_bulk && self.scheduler_alternate);
         }
     }
 
@@ -1242,18 +1178,8 @@ impl Indexer {
         if self.disk_guard() {
             return Ok(Preflight::Idle(height_at_start));
         }
-        // The alternate scheduler is the only phase that polls while e-lite is
-        // not indexing. Use the 1 Hz observation there to avoid an RPC every
-        // 500 ms; in the indexing phase always ask Core so a new block/reorg is
-        // seen immediately.
-        let info = if self.index_paused.load(Ordering::SeqCst) {
-            match self.observed_core(Duration::from_secs(2)) {
-                Some(info) => info,
-                None => self.core.blockchain_info()?,
-            }
-        } else {
-            self.core.blockchain_info()?
-        };
+        // Always ask Core: a new block or a reorg must be seen at once.
+        let info = self.core.blockchain_info()?;
         let core_tip = info.blocks;
         self.tunables
             .set_core_state(core_tip, info.initialblockdownload);
@@ -1311,19 +1237,8 @@ impl Indexer {
         // Automatic pruning (`-prune=NNN`) is decided by Core's own tip. If we
         // fall too far behind, stop new downloads while the backlog is drained.
         self.lag_guard(&info, committed);
-        let phase = if self.lag_paused.load(Ordering::Relaxed) {
-            1
-        } else if self.index_paused.load(Ordering::SeqCst) {
-            2
-        } else {
-            0
-        };
+        let phase = u64::from(self.lag_paused.load(Ordering::Relaxed));
         self.update_phase(phase, committed);
-        if self.index_paused.load(Ordering::SeqCst) {
-            // Alternate scheduler: Core is downloading. Keep serving the
-            // current index; the next call re-checks the backlog.
-            return Ok(Preflight::Idle(committed));
-        }
         Ok(Preflight::Ready { info, tip })
     }
 
@@ -1663,11 +1578,6 @@ impl Indexer {
             }
             if self.is_paused() || self.disk_guard() {
                 paused_by_disk = true;
-                break;
-            }
-            if self.index_paused.load(Ordering::SeqCst) {
-                // Alternate scheduler switched to Core downloading. Commit the
-                // applied prefix below, then return.
                 break;
             }
             let (height, prepared, prevouts) = match item {
@@ -2793,12 +2703,11 @@ pub(crate) fn reload_hot(
                 || new.pruning.max_bulk_lag_gib != old.pruning.max_bulk_lag_gib
                 || new.pruning.core_resume_ahead_gib != old.pruning.core_resume_ahead_gib
                 || new.pruning.pause_core_during_bulk != old.pruning.pause_core_during_bulk
-                || new.pruning.scheduler != old.pruning.scheduler
             {
                 eprintln!(
                     "[e-lite] reload: cold fields changed (prune_mib, block_source, \
                      reorg_window, data_dir, server listeners/TLS, write buffers, \
-                     milestones, lag limits/scheduler); restart required"
+                     milestones, lag limits); restart required"
                 );
             }
             eprintln!(

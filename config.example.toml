@@ -91,10 +91,6 @@ allow_auto_prune = false            # required for prune_mib >= 550; not for fro
 max_bulk_lag_gib = 30               # preferred: pause Core above this unindexed backlog
 pause_core_during_bulk = true       # pause Core during a long catch-up
 core_resume_ahead_gib = 7           # resume Core when the backlog falls to this
-scheduler = "overlap"               # overlap (e-lite indexes while Core downloads)
-                                    # | alternate (take turns; opt-in, needs
-                                    # prune_mib = 1 and
-                                    # pause_core_during_bulk = true)
 prune_defer_free_gib = 20           # keep 20 GiB free before normal pruning (low disk bypasses; once the index is caught up with a Core out of IBD, the deferral is bypassed so indexed blocks are released)
 min_gain_blocks = 5000              # evaluate/execute prune every ~5k safe blocks (IBD/drain batching)
 min_gain_live_blocks = 144          # once fully synced: ~1 day of tail (~220 MiB); 0 = min_gain_blocks

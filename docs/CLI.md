@@ -176,7 +176,6 @@ e-lite import-snapshot --network mainnet --allow-mainnet \
 | `--set pruning.pause_core_during_bulk=true` | `pruning.pause_core_during_bulk` | `true` |
 | `--set pruning.pause_core_during_bulk=false` | same | disable the full bulk pause |
 | `--set pruning.core_resume_ahead_gib=<n>` | `pruning.core_resume_ahead_gib` | `7` |
-| `--set pruning.scheduler=<mode>` | `pruning.scheduler` | `overlap` |
 | `--set pruning.prune_defer_free_gib=<n>` | `pruning.prune_defer_free_gib` | `20` |
 | `--set pruning.min_gain_blocks=<n>` | `pruning.min_gain_blocks` | `5000` |
 | `--set pruning.min_gain_live_blocks=<n>` | once fully synced, prune every N safe blocks (0 = `min_gain_blocks`) | `144` |
@@ -197,14 +196,6 @@ resumes it at `core_resume_ahead_gib` (7 GiB). The backlog is
 `lag_blocks × avg_block_bytes`, so the threshold means the same disk footprint
 at 100k and at 800k; blocks are not comparable across heights.
 `max_bulk_lag_gib` must be at least 1.
-
-`scheduler = "overlap"` (default) keeps e-lite indexing while Core downloads.
-`scheduler = "alternate"` pauses e-lite indexing during the Core phase and
-pauses Core during the e-lite phase, so only one of them writes at a time. It
-requires `prune_mib = 1` (manual prune) and `pause_core_during_bulk = true`;
-serving (Electrum, Tor, metrics) continues while indexing is paused. Use it to
-test whether removing I/O contention beats the lost overlap; it is not the
-default.
 
 `commit_sync = auto` relaxes the RocksDB fsync during bulk/IBD (`txids.dat` is
 still fsynced, so a crash only reindexes the last interval) and returns to
@@ -422,13 +413,10 @@ These are escape hatches for measurements, not normal configuration:
   (1 blocks, 2 txs, 3 bytes, 4 time, 5 boundary, 6 shutdown).
 - `commit_breakdown_us.txids_append_fsync` and `rocksdb_write`: separate the
   flat-file fsync from the RocksDB write.
-- `scheduler`: `mode` (`overlap`/`alternate`), `index_paused`,
-  `backlog_bytes` (`lag × average raw block size`), `avg_block_bytes`,
-  `high_bytes`, `low_bytes`, `phase` (`indexing`/`draining`/`core`),
-  `phase_blocks` and `phase_elapsed_ms`. In `alternate`, `index_paused = true`
-  means Core is downloading and e-lite is serving but not indexing. If the
-  configured mode is `alternate` but Core cannot be paused, the effective mode
-  is `overlap` and a warning is logged.
+- `scheduler`: `backlog_bytes` (`lag × average raw block size`),
+  `avg_block_bytes`, `high_bytes`, `low_bytes`, `phase` (`indexing` while Core
+  downloads, `draining` while Core is paused), `phase_blocks` and
+  `phase_elapsed_ms`.
 - `tuning.prefetch_p50_ms`, `prefetch_p95_ms`, `prefetch_max_ms`,
   `wait_p50_ms` and `wait_p95_ms`: the cache controller uses p95, not the
   tail-dominated EWMA.
@@ -482,7 +470,7 @@ replacement. They will be removed two releases later.
 | `--tls-key <v>` | `--set server.tls_key=<v>` |
 | `--profile <v>` | `--set index.profile=<v>` |
 | `--commit-sync <v>` | `--set index.commit_sync=<v>` |
-| `--scheduler <v>` | `--set pruning.scheduler=<v>` |
+| `--scheduler <v>` | accepted and ignored: the setting was removed |
 | `--banner-file <v>` | `--set server.banner_file=<v>` |
 | `--tor-socks <v>` | `--set rawtx.tor_socks=<v>` |
 | `--tor-mode <v>` | `--set tor.mode=<v>` |
@@ -560,7 +548,7 @@ e-lite run --set 'rawtx.p2p_peers=["203.0.113.10:8333","[2001:db8::1]:8333"]'
 e-lite run --set 'core.extra_args=["-dbcache=256","-maxmempool=128"]'
 
 # Pruning and server fields
-e-lite run --set pruning.max_bulk_lag_gib=40 --set pruning.scheduler=alternate
+e-lite run --set pruning.max_bulk_lag_gib=40 --set pruning.core_resume_ahead_gib=10
 e-lite serve --set server.max_clients=64
 ```
 

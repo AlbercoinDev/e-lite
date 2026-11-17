@@ -326,19 +326,12 @@ impl Shared {
                 "discarded": self.stats.pipeline_discarded.load(Ordering::Relaxed),
             },
             "scheduler": {
-                "mode": if self.stats.scheduler_alternate.load(Ordering::Relaxed) {
-                    "alternate"
-                } else {
-                    "overlap"
-                },
-                "index_paused": self.stats.scheduler_index_paused.load(Ordering::Relaxed),
                 "backlog_bytes": self.stats.scheduler_backlog_bytes.load(Ordering::Relaxed),
                 "high_bytes": self.stats.scheduler_high_bytes.load(Ordering::Relaxed),
                 "low_bytes": self.stats.scheduler_low_bytes.load(Ordering::Relaxed),
                 "avg_block_bytes": self.stats.scheduler_avg_block_bytes.load(Ordering::Relaxed),
                 "phase": match self.stats.scheduler_phase.load(Ordering::Relaxed) {
                     1 => "draining",
-                    2 => "core",
                     _ => "indexing",
                 },
                 "phase_blocks": self.stats.scheduler_phase_blocks.load(Ordering::Relaxed),

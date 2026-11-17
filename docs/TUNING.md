@@ -411,39 +411,12 @@ watermark is `lag_blocks × avg_block_bytes`. The average is an EWMA of the raw
 serialized blocks applied (`/status.scheduler.backlog_bytes`). The old
 block-count window was removed: `max_bulk_lag_gib` must be at least 1.
 
-### `scheduler = "overlap" | "alternate"`
+### Indexing while Core downloads
 
-- `overlap` (default): Core downloads while e-lite keeps indexing. This is the
-  historical behaviour and usually wins because the index still advances during
-  the Core phase.
-- `alternate` (opt-in): while Core downloads, e-lite stops indexing (serving
-  continues); when the backlog reaches `max_bulk_lag_gib`, Core stops and
-  e-lite drains it to `core_resume_ahead_gib`, then the cycle repeats. This
-  removes I/O contention at the cost of the overlap. It requires
-  `prune_mib = 1` and `pause_core_during_bulk = true`.
-
-Strict alternation only wins if Core alone is faster than roughly
-
-```text
-v_core_solo > v_overlap / (1 - v_overlap / v_index_solo)
-```
-
-With the measured 29.7.1 mainnet rates (1.36 blocks/s overlapping, 5.6–6
-blocks/s index-only), the break-even is ~6.7 blocks/s. Measure Core alone with a
-5-minute `SIGSTOP` of e-lite before changing the default:
-
-```bash
-PID=$(pgrep -n -f 'e-lite run')   # the node (newest); the oldest is its watching parent
-bitcoin-cli -datadir=<core-datadir> getblockcount
-kill -STOP "$PID"; sleep 300
-bitcoin-cli -datadir=<core-datadir> getblockcount
-kill -CONT "$PID"
-```
-
-The blocking `setnetworkactive` switch and peer reconnect make short phases
-expensive; use 40–60 GiB phases if you test `alternate`, not 7–30 GiB. The
-`SIGSTOP` test also pauses Electrum/Tor for those 5 minutes; that is acceptable
-for a one-off measurement but not during wallet use.
+e-lite keeps indexing while Core downloads (the overlap). An opt-in mode that
+made them take turns (`scheduler = "alternate"`) was removed in
+0.1.0-alpha.29.19.0 without having been measured as faster: by the 29.7.1
+mainnet rates, Core alone would have needed more than ~6.7 blocks/s to win.
 
 ### Commit controller
 
