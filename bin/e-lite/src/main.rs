@@ -144,39 +144,48 @@ fn config_path() -> Option<std::path::PathBuf> {
     CONFIG_PATH.get().cloned().flatten()
 }
 
+/// An indexing failure that retrying cannot fix: wrong network or genesis, a
+/// rollback deeper than the undo window, a prune gap, a pruned Core with an
+/// empty index, a block that no source can provide. The indexing loop stops
+/// on it (`FATAL`) instead of retrying for ever. Every other error is
+/// retried with backoff.
+///
+/// The class is carried by the type, built where the error is detected
+/// (AUD-175): it used to be guessed from the message text, so rewording a
+/// message, or an unrelated error that happened to contain "schema", changed
+/// a fatal error into an endless retry or the other way round.
+#[derive(Debug)]
+pub(crate) struct Fatal(pub(crate) String);
+
+impl std::fmt::Display for Fatal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for Fatal {}
+
+/// `Err(Fatal)`, as `fail` builds a retried error.
+pub(crate) fn fatal<T>(msg: impl Into<String>) -> R<T> {
+    Err(Box::new(Fatal(msg.into())))
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ErrorClass {
     Permanent,
     Transient,
 }
 
-/// Errors that retrying cannot fix: wrong network, prune gap, corrupt schema...
-/// A transient "Block not available (pruned data)" is *not* permanent: the lag
-/// guard can pause Core and retry.
-fn classify_error(msg: &str) -> ErrorClass {
-    let m = msg.to_ascii_lowercase();
-    let permanent = [
-        "genesis mismatch",
-        "needs_recovery",
-        "schema",
-        "txids.dat",
-        "database is not initialized",
-        "network mismatch",
-        "signet challenge mismatch",
-        "index behind pruneheight",
-        "core is pruned and the index is empty",
-        "core is pruned from height",
-        "repair failed",
-        "no repair source",
-        "database belongs to",
-    ]
-    .iter()
-    .any(|p| m.contains(p));
-    if permanent {
-        ErrorClass::Permanent
-    } else {
-        ErrorClass::Transient
+/// Permanent when the error, or any error it wraps, is a `Fatal`.
+fn classify_error(e: &(dyn std::error::Error + 'static)) -> ErrorClass {
+    let mut current = Some(e);
+    while let Some(err) = current {
+        if err.downcast_ref::<Fatal>().is_some() {
+            return ErrorClass::Permanent;
+        }
+        current = err.source();
     }
+    ErrorClass::Transient
 }
 
 mod cli;

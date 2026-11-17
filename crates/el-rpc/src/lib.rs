@@ -30,6 +30,15 @@ fn is_transient_rpc_error(e: &CoreError) -> bool {
         || m.contains("truncated")
 }
 
+/// Whether an error message is Core's "still starting" answer (RPC code -28
+/// while it loads the block index or verifies blocks). Kept here, next to the
+/// client that produces these messages: a transient state, never fatal.
+pub fn is_core_loading(message: &str) -> bool {
+    message.contains("Loading block index")
+        || message.contains("Verifying blocks")
+        || message.contains("(code -28)")
+}
+
 impl fmt::Display for CoreError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "core error: {}", self.0)

@@ -8,7 +8,7 @@ pub(crate) const CATCH_UP_BLOCKS: u64 = 512;
 pub(crate) const GIB: u64 = 1024 * 1024 * 1024;
 
 pub(crate) type FetchResult =
-    std::result::Result<(u64, el_index::PreparedBlock, el_index::PrefetchedPrevouts), String>;
+    std::result::Result<(u64, el_index::PreparedBlock, el_index::PrefetchedPrevouts), E>;
 pub(crate) type PendingMap = std::collections::BTreeMap<usize, FetchResult>;
 
 pub(crate) struct MilestoneState {
@@ -484,7 +484,7 @@ impl Indexer {
             if (tip.height as u64) > core_tip {
                 let window = self.cfg.index.reorg_window as u64;
                 if (tip.height as u64).saturating_sub(core_tip) > window {
-                    return fail(format!(
+                    return fatal(format!(
                         "Core tip {core_tip} is {} blocks below the index ({}), beyond the \
                          {window}-block undo window: NEEDS_RECOVERY (restore a snapshot or reindex)",
                         (tip.height as u64).saturating_sub(core_tip),
@@ -517,7 +517,7 @@ impl Indexer {
         let mut h = check_height;
         loop {
             if h == 0 {
-                return fail(format!(
+                return fatal(format!(
                     "genesis mismatch: db {}, core {} — wrong network or wiped node",
                     tip.block_hash,
                     self.core.block_hash(0)?
@@ -533,7 +533,7 @@ impl Indexer {
             }
             h -= 1;
             if (tip.height as u64).saturating_sub(h) > window {
-                return fail(format!(
+                return fatal(format!(
                     "reorg deeper than the {window}-block undo window: NEEDS_RECOVERY (restore a snapshot or reindex)"
                 ));
             }
@@ -1371,13 +1371,13 @@ impl Indexer {
         // e-lite, so the lag guard can pause it before it prunes.
         if info.pruned && tip_at_start.is_none() {
             if self.bulk.is_none() {
-                return fail(
+                return fatal(
                     "Core is pruned and the index is empty: pruned IBD requires a local Core \
                      blocks directory (run e-lite on the Core host) and [core] prune_mib = 1",
                 );
             }
             if !self.can_control_core {
-                return fail(
+                return fatal(
                     "Core is pruned and the index is empty, but e-lite did not start Core; \
                      stop Core and use [core] manage = \"managed\" with prune_mib = 1, or use a full node",
                 );
@@ -1473,7 +1473,7 @@ impl Indexer {
             tunables.record_prefetch(prefetch_started.elapsed());
             prevouts
                 .map(|m| (height, prepared, m))
-                .map_err(|e| e.to_string())
+                .map_err(|e| E::from(e.to_string()))
         })
     }
 
@@ -1764,7 +1764,7 @@ impl Indexer {
             let (height, prepared, prevouts) = match item {
                 Ok(v) => v,
                 Err(e) => {
-                    result = Err(e.into());
+                    result = Err(e);
                     break;
                 }
             };
@@ -1961,7 +1961,7 @@ pub(crate) fn fetch_block(
     pruneheight: u64,
     height: u64,
     hash: &str,
-) -> std::result::Result<(u64, String, Vec<u8>), String> {
+) -> std::result::Result<(u64, String, Vec<u8>), E> {
     let expected = Hash32::from_hex(hash).map_err(|e| e.to_string())?;
 
     // A prune gap cannot be served by Core or the local block files. Fetch the
@@ -2005,12 +2005,13 @@ pub(crate) fn fetch_block(
             Ok((height, hash.to_string(), bytes))
         }
         Err(e) => {
-            let mut msg = e.to_string();
-            if let Some(repair) = repair_error {
-                msg.push_str("; repair failed: ");
-                msg.push_str(&repair);
+            let msg = e.to_string();
+            match repair_error {
+                // Core pruned it and no verified source has it: retrying
+                // cannot bring the block back.
+                Some(repair) => fatal(format!("{msg}; repair failed: {repair}")),
+                None => Err(msg.into()),
             }
-            Err(msg)
         }
     }
 }
@@ -3222,7 +3223,7 @@ pub(crate) fn index_loop(
             }
             Err(e) => {
                 let msg = e.to_string();
-                match classify_error(&msg) {
+                match classify_error(e.as_ref()) {
                     ErrorClass::Permanent => {
                         if let Some(sh) = &shared {
                             sh.set_state(state::FATAL);
@@ -3234,9 +3235,7 @@ pub(crate) fn index_loop(
                             sh.set_state(state::CORE_UNAVAILABLE);
                         }
                         let _ = core_sup.ensure_started(&idx.core);
-                        let loading = msg.contains("Loading block index")
-                            || msg.contains("Verifying blocks")
-                            || msg.contains("(code -28)");
+                        let loading = el_rpc::is_core_loading(&msg);
                         if loading {
                             if !loading_logged {
                                 eprintln!(
@@ -3296,7 +3295,7 @@ pub(crate) fn check_pruned(
             if info.pruneheight == 0 {
                 return Ok(());
             }
-            return fail(
+            return fatal(
                 "Core is pruned and the index is empty: use a full node, or let e-lite own Core \
                  with [core] prune_mib = 1 (manual pruning) so it can index before pruning",
             );
@@ -3315,7 +3314,7 @@ pub(crate) fn check_pruned(
                 return Ok(());
             }
         }
-        return fail(format!(
+        return fatal(format!(
             "Core is pruned from height {} but the index stops at {}; blocks {}..{} are unavailable \
              (gap {}). Use a full node, enable a verified P2P/Esplora repair source, or use \
              [core] prune_mib = 1 so Core cannot create this gap.",

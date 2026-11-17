@@ -125,7 +125,7 @@ imagen de contenedor, ARM64. La exportación de copias exige parar el servicio
 | AUD-169 | P1 | **Bloqueo al parar el indexador.** Los lectores esperaban un permiso en un canal que ellos mismos mantenían abierto. Si la llamada terminaba antes de tiempo (apagado, pausa por disco, planificador alterno, error) con la ventana de bloques preparados llena, nadie los despertaba y el `join` no volvía nunca: Ctrl-C no hacía nada y una pausa por disco podía congelar la indexación. La ventana se llena siempre que aplicar es más lento que leer, por ejemplo durante un commit de varios segundos. | **Corregido** |
 | AUD-179 | P3 | Los lectores se crean y destruyen en cada llamada (cada 512 bloques, y cada 500 ms en la punta) y la ventana preparada (4–32 bloques) se descarta. | Abierto |
 | AUD-177 | P2 | El commit retiene el bloqueo global de escritura durante el fsync de `txids.dat` y la escritura de RocksDB; toda petición de wallet espera. Milisegundos en vivo, segundos en IBD. | Abierto |
-| AUD-175 | P3 | Que un error de indexación sea fatal o se reintente para siempre se decide buscando 13 subcadenas en el mensaje (`classify_error`). | Abierto |
+| AUD-175 | P3 | Que un error de indexación sea fatal o se reintente para siempre se decide buscando 13 subcadenas en el mensaje (`classify_error`). | Corregido: tipo `Fatal` (2026-11-17) |
 
 ### Valoración
 

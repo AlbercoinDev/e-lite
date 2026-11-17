@@ -455,3 +455,79 @@ fn panic_hook_contains_wallet_threads_and_aborts_the_rest() {
         }
     }
 }
+
+/// AUD-175: the class of an indexing error comes from its type, built where
+/// it is detected, never from the words in the message.
+#[test]
+fn indexing_errors_are_classified_by_type_not_by_text() {
+    let class = |r: R<()>| classify_error(r.unwrap_err().as_ref());
+    // Producers of the failures that used to be matched by text.
+    assert_eq!(
+        class(check_pruned(&info(true, 100), None, None)),
+        ErrorClass::Permanent
+    );
+    assert_eq!(
+        class(check_pruned(&info(true, 100), Some(&tip(50)), None)),
+        ErrorClass::Permanent
+    );
+    let regtest = NetworkIdentity::new(Chain::Regtest, Chain::Regtest.known_genesis().unwrap());
+    let other = NetworkIdentity::new(Chain::Regtest, Hash32([7; 32]));
+    assert_eq!(
+        class(verify_identity(&regtest, &other)),
+        ErrorClass::Permanent
+    );
+    let mut signet = regtest.clone();
+    signet.signet_challenge = Some(Hash32([1; 32]));
+    assert_eq!(
+        class(verify_identity(&regtest, &signet)),
+        ErrorClass::Permanent
+    );
+    // A database of another network.
+    let dir = std::env::temp_dir().join(format!("e-lite-classify-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    {
+        let store = Store::open(&dir).unwrap();
+        store.init_identity(&regtest).unwrap();
+        let wrong = stored_identity(&store, Chain::Signet).map(|_| ());
+        assert_eq!(class(wrong), ErrorClass::Permanent);
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+
+    // The words alone decide nothing any more: an RPC hiccup that mentions
+    // "schema" or "txids.dat" is retried, and a fatal error reworded stays
+    // fatal.
+    assert_eq!(
+        class(fail("rpc timed out reading the schema")),
+        ErrorClass::Transient
+    );
+    assert_eq!(
+        class(fail("txids.dat: Resource temporarily unavailable")),
+        ErrorClass::Transient
+    );
+    assert_eq!(
+        class(fatal("something new and unrecoverable")),
+        ErrorClass::Permanent
+    );
+
+    // A wrapped Fatal is still fatal.
+    #[derive(Debug)]
+    struct Wrapper(Fatal);
+    impl std::fmt::Display for Wrapper {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "context: {}", self.0)
+        }
+    }
+    impl std::error::Error for Wrapper {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            Some(&self.0)
+        }
+    }
+    let wrapped: E = Box::new(Wrapper(Fatal("deep".into())));
+    assert_eq!(classify_error(wrapped.as_ref()), ErrorClass::Permanent);
+
+    // Core still starting is transient, and recognised for the log line.
+    assert!(el_rpc::is_core_loading(
+        "getblockchaininfo failed: \"Loading block index…\" (code -28)"
+    ));
+    assert!(!el_rpc::is_core_loading("connection refused"));
+}

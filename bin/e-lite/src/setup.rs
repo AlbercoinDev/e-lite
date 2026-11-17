@@ -514,7 +514,7 @@ pub(crate) fn core_identity(core: &CoreClient, chain: Chain) -> R<NetworkIdentit
     let core_chain = chain_from_core(&info.chain)
         .ok_or_else(|| format!("Core reports unsupported chain: {}", info.chain))?;
     if core_chain != chain {
-        return fail(format!(
+        return fatal(format!(
             "network mismatch: config says {}, Core says {}",
             chain.name(),
             core_chain.name()
@@ -533,7 +533,7 @@ pub(crate) fn core_identity(core: &CoreClient, chain: Chain) -> R<NetworkIdentit
         genesis,
         signet_challenge,
     };
-    identity.check_known_genesis()?;
+    identity.check_known_genesis().map_err(Fatal)?;
     Ok(identity)
 }
 
@@ -730,26 +730,26 @@ pub(crate) fn stored_identity(store: &Store, chain: Chain) -> R<Option<NetworkId
     let stored = store.network_identity()?;
     if let Some(id) = &stored {
         if id.chain != chain {
-            return fail(format!(
+            return fatal(format!(
                 "database belongs to {}, config says {}",
                 id.chain.name(),
                 chain.name()
             ));
         }
-        id.check_known_genesis()?;
+        id.check_known_genesis().map_err(Fatal)?;
     }
     Ok(stored)
 }
 
 pub(crate) fn verify_identity(stored: &NetworkIdentity, live: &NetworkIdentity) -> R<()> {
     if stored.genesis != live.genesis {
-        return fail(format!(
+        return fatal(format!(
             "genesis mismatch: db {} vs core {}",
             stored.genesis, live.genesis
         ));
     }
     if stored.signet_challenge != live.signet_challenge {
-        return fail("signet challenge mismatch");
+        return fatal("signet challenge mismatch");
     }
     Ok(())
 }
