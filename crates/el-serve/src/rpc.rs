@@ -84,6 +84,15 @@ pub(crate) fn log_rpc_error(shared: &Shared, method: &str, error: &RpcError) {
         seen.insert(key, Instant::now());
     }
     eprintln!("[e-lite] rpc error: method={method} code={code}");
+    if debug_logs() {
+        // The INFO line stays code-only (AUD-132); the debug line carries the
+        // cause with any 64-hex value redacted, so a persistent subscribe or
+        // tx.get error can be diagnosed without guessing.
+        eprintln!(
+            "[e-lite] debug: rpc error: method={method} code={code} message={}",
+            el_rawtx::redact_hashes(&error.message)
+        );
+    }
 }
 
 /// Count a failed `blockchain.transaction.get` by cause and say so in a
@@ -238,10 +247,17 @@ pub fn dispatch_for(
 }
 
 pub(crate) fn read_guard(shared: &Shared) -> RpcResult<RwLockReadGuard<'_, ()>> {
-    shared
-        .lock
-        .read()
-        .map_err(|_| RpcError::server("lock poisoned"))
+    match shared.lock.read() {
+        Ok(guard) => Ok(guard),
+        Err(poisoned) => {
+            // A panic in a writer must not turn every later read into -32000:
+            // the commit barrier is a unit lock, and the index recovers from
+            // its own WAL; refusing all wallets for the rest of the run is
+            // worse than continuing with the recovered guard.
+            eprintln!("[e-lite] WARNING: index read lock was poisoned; recovering");
+            Ok(poisoned.into_inner())
+        }
+    }
 }
 
 pub(crate) fn check_ready(shared: &Shared) -> RpcResult<()> {

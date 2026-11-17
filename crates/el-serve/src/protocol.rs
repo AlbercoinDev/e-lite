@@ -633,7 +633,7 @@ pub(crate) fn history_value(
     let mem = shared
         .mempool
         .read()
-        .map_err(|_| RpcError::server("mempool lock poisoned"))?;
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let mem_entries = mem.history(script);
     let mut arr = Vec::with_capacity(entries.len() + mem_entries.len());
     for (height, _, txid, _, _) in entries {
@@ -658,7 +658,7 @@ pub(crate) fn balance_value(shared: &Shared, script: ScriptHash) -> RpcResult<Va
     let mem = shared
         .mempool
         .read()
-        .map_err(|_| RpcError::server("mempool lock poisoned"))?;
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     // Confirmed balance ignores mempool events; the unconfirmed field carries
     // the mempool delta (which already subtracts spent confirmed UTXOs).
     let confirmed: u64 = utxos.iter().map(|(_, v, _, _)| *v).sum();
@@ -676,7 +676,7 @@ pub(crate) fn listunspent_value(shared: &Shared, script: ScriptHash) -> RpcResul
     let mem = shared
         .mempool
         .read()
-        .map_err(|_| RpcError::server("mempool lock poisoned"))?;
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     // Electrum expects confirmed UTXOs in blockchain order: height, then the
     // transaction's position in its block (AUD-146; it used to be txid
     // order), then vout. The store is keyed by (script, outpoint), so the
@@ -740,7 +740,7 @@ pub(crate) fn status_value(
     let mem = shared
         .mempool
         .read()
-        .map_err(|_| RpcError::server("mempool lock poisoned"))?;
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let mem_entries = mem.history(script);
     if entries.is_empty() && mem_entries.is_empty() {
         return Ok(None);
@@ -763,7 +763,7 @@ pub(crate) fn mempool_value(shared: &Shared, script: ScriptHash) -> RpcResult<Va
     let mem = shared
         .mempool
         .read()
-        .map_err(|_| RpcError::server("mempool lock poisoned"))?;
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let arr: Vec<Value> = mem
         .history(script)
         .into_iter()
@@ -807,7 +807,15 @@ pub(crate) fn scripthash_subscribe(
     let script = param_scripthash(params)?;
     // A subscribe is the wallet's first look at an address: start fetching
     // its transactions now (AUD-163), one round trip before get_history.
-    let status = status_value(shared, script, -32000, true)?;
+    // A single retry covers a transient store/lock error; a deterministic
+    // one (history too large, missing block) is reported with its message.
+    let status = match status_value(shared, script, -32000, true) {
+        Ok(status) => status,
+        Err(first) => {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            status_value(shared, script, -32000, true).map_err(|_| first)?
+        }
+    };
     if let Some(c) = client {
         if let Ok(mut subs) = c.subs.lock() {
             subs.insert(script, status.clone());
@@ -944,7 +952,7 @@ pub(crate) fn outpoint_status(
         let mem = shared
             .mempool
             .read()
-            .map_err(|_| RpcError::server("mempool lock poisoned"))?;
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         if let Some(tx) = mem.tx(&txid) {
             let Some((_, out_script, _)) = tx.outputs.iter().find(|(op, _, _)| op.vout == vout)
             else {
@@ -979,7 +987,7 @@ pub(crate) fn outpoint_status(
     if let Some((spender, height)) = shared
         .mempool
         .read()
-        .map_err(|_| RpcError::server("mempool lock poisoned"))?
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
         .spender(&op)
     {
         return Ok(json!({
@@ -1322,7 +1330,7 @@ pub(crate) fn mempool_recent(shared: &Shared) -> RpcResult<Value> {
     let mem = shared
         .mempool
         .read()
-        .map_err(|_| RpcError::server("mempool lock poisoned"))?;
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     Ok(Value::Array(
         mem.recent(10)
             .into_iter()
@@ -1341,7 +1349,7 @@ pub(crate) fn fee_histogram(shared: &Shared) -> RpcResult<Value> {
     let mem = shared
         .mempool
         .read()
-        .map_err(|_| RpcError::server("mempool lock poisoned"))?;
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     Ok(Value::Array(
         mem.fee_histogram()
             .into_iter()

@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.1.0-alpha.29.24.1 — 2026-11-17
+
+### Fixed
+
+- A subscribed script that hit a transient store/lock error returned `-32000`
+  to the wallet; Sparrow stores the address as failed and crashes with a
+  NullPointerException on the next load. `blockchain.scripthash.subscribe` now
+  retries once after 50 ms.
+- A poisoned mempool read lock or index read lock no longer fails every
+  request for the rest of the run: the lock is recovered with a warning (the
+  index recovers from its own WAL; the commit barrier is a unit lock).
+- The INFO `rpc error` line stays code-only (AUD-132); a `debug:` line now
+  adds the error message with 64-hex values redacted, so a persistent
+  subscribe/tx.get error can be diagnosed.
+
 ## 0.1.0-alpha.29.24.0 — 2026-11-17
 
 ### Fixed
