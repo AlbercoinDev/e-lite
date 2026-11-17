@@ -76,7 +76,7 @@ Each rule names where the detail is. Read it before touching that area.
 - After touching commit, undo or rewind: `tests/e2e/e2e_recovery.sh` and
   `tests/e2e/e2e_pruned_ibd.sh`.
 
-### Indexing pipeline — `bin/e-lite/src/pipeline.rs`, `docs/TUNING.md`
+### Indexing pipeline — `bin/e-lite/src/pipeline.rs` and `pipeline/`, `docs/TUNING.md`
 
 - Readers are stopped only through `ReaderPool` (`finish`/drop). A bare stop
   flag plus join hangs when the prepared window is full (AUD-169).
@@ -167,9 +167,9 @@ Each rule names where the detail is. Read it before touching that area.
   `public-servers.toml` means local data only: no hidden fallback list.
   Clearnet entries must be HTTPS; a plain Electrum entry only for `.onion` or
   a local server (AUD-171).
-- Every download is a race over shuffled endpoints (`Resolver::race`, `crates/el-rawtx/src/race.rs`). Never
-  go back to serial sources or to preferring the provider that answered last
-  (AUD-135, AUD-160).
+- Every download is a race over shuffled endpoints (`Resolver::race` in
+  `crates/el-rawtx/src/race.rs`). Never go back to serial sources or to
+  preferring the provider that answered last (AUD-135, AUD-160).
 - Provider health depends on the failure (`crates/el-rawtx/src/health.rs`,
   AUD-155). Do not cool a provider for minutes after a slow circuit, and never
   cool one that was not contacted.

@@ -26,6 +26,34 @@ The plain and TLS Electrum listeners share the same JSON-RPC dispatcher. TLS
 wraps each accepted socket with rustls; the certificate/key PEM files are
 reloaded when they change on disk. There is no client authentication.
 
+## Source layout
+
+| Crate | Job |
+|---|---|
+| `el-model` | Shared types, key/value codec, merkle and double SHA-256, the lock that never poisons. |
+| `el-store` | RocksDB column families, commit, digests and statistics. |
+| `el-blocks` | Reading Core's `blk*.dat` directly (scanner, locator, sidecar). |
+| `el-index` | Applying and undoing blocks; reorg rewind. |
+| `el-chain` | The supervisor that decides prune, pause and resume. |
+| `el-rpc` | Core JSON-RPC client. |
+| `el-mempool` | Mempool view for wallets. |
+| `el-rawtx` | Raw transactions from the cache, Core or external sources: per-txid mode with decoys, block race (`race.rs`), Esplora, Electrum, P2P, SOCKS. |
+| `el-serve` | The Electrum server, `/status` and `/metrics`. |
+| `bin/e-lite` | Commands, configuration, startup, the indexing pipeline, Tor, TLS, snapshots and the restart supervisor. |
+
+Inside the binary, the indexing pipeline is
+`bin/e-lite/src/pipeline.rs` (the indexer: state, reorgs, commit, catch-up)
+plus `bin/e-lite/src/pipeline/`:
+
+- `core_pace.rs`: disk guard and pausing Core's downloads;
+- `supervise.rs`: prune gate and supervisor actions;
+- `progress.rs`: progress lines and milestones;
+- `run.rs`: the `index` command and its loop.
+
+Startup lives in `bin/e-lite/src/setup.rs`, the `run`/`serve` commands in
+`bin/e-lite/src/serve.rs`, and machine/memory tuning in
+`bin/e-lite/src/tuning/`.
+
 ## Execution modes
 
 | Mode | Command | Core | Block source | Use case |
