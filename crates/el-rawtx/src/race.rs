@@ -11,7 +11,9 @@ use super::*;
 fn block_path_deadline(now: Instant, request_deadline: Option<Instant>) -> Instant {
     let full = now + EXTERNAL_QUEUE_MAX + EXTERNAL_BUDGET;
     match request_deadline {
-        Some(limit) => limit.clamp(now + EXTERNAL_BUDGET, full),
+        // A wallet request has a total budget; keep at least the network
+        // part for the download itself and give the rest to the queue.
+        Some(limit) => limit.min(full).max(now + WALLET_BLOCK_NET),
         None => full,
     }
 }
@@ -194,9 +196,18 @@ impl Resolver {
         // A wallet request may take the last free slot; the prefetch leaves
         // it free and steps aside while any wallet request waits for a slot.
         // A prefetch that a wallet joined becomes a wallet download (AUD-165).
+        let wallet = priority == Priority::Wallet || entry.wallet_waiting.load(Ordering::Relaxed);
+        // The queue gets whatever the request budget leaves after the network
+        // part (12 s of queue and 8 s of network for a wallet request, 20 s
+        // total); the full 120 s for a background prefetch.
+        let budget = if wallet {
+            WALLET_BLOCK_NET
+        } else {
+            EXTERNAL_BUDGET
+        };
         let queue_deadline = entry
             .deadline()
-            .checked_sub(EXTERNAL_BUDGET)
+            .checked_sub(budget)
             .unwrap_or_else(Instant::now);
         let mut permit = None;
         while Instant::now() < queue_deadline {
@@ -222,7 +233,7 @@ impl Resolver {
             ));
         };
         // The network budget starts now, not when the request queued.
-        let deadline = Instant::now() + EXTERNAL_BUDGET;
+        let deadline = Instant::now() + budget;
         entry.set_deadline(deadline);
         let mut plan: Vec<(Arc<dyn BlockSource>, Endpoint)> = Vec::new();
         for source in self.sources() {
@@ -557,13 +568,14 @@ mod tests {
         assert_eq!(block_path_deadline(now, None), full);
         // Fresh request: the whole wait.
         assert_eq!(block_path_deadline(now, Some(full)), full);
-        // A minute went to the per-txid path: a minute less, not a new 180 s.
-        let left = full - Duration::from_secs(60);
+        // Five seconds of the request went elsewhere: the block path gets the
+        // rest of its one deadline, not a new full wait.
+        let left = now + EXTERNAL_BUDGET + Duration::from_secs(1);
         assert_eq!(block_path_deadline(now, Some(left)), left);
-        // Never below the network budget, never above the full wait.
+        // Never below the network part, never above the full wait.
         assert_eq!(
             block_path_deadline(now, Some(now + Duration::from_secs(1))),
-            now + EXTERNAL_BUDGET
+            now + WALLET_BLOCK_NET
         );
         assert_eq!(
             block_path_deadline(now, Some(full + Duration::from_secs(600))),

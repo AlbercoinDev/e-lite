@@ -210,16 +210,27 @@ pub fn redact_hashes(text: &str) -> String {
     out
 }
 
-/// Total time one external block download may take, from the moment its
-/// leader registers it (queue wait included) to the last source. Callers that
-/// share the download wait `EXTERNAL_BUDGET + FOLLOWER_GRACE`, so a follower
-/// never gives up before its leader (AUD-156).
+/// Time one external block download may spend on the network once it has a
+/// slot. Background (prefetch) downloads may take this long; a wallet request
+/// uses `WALLET_BLOCK_NET` instead.
 pub const EXTERNAL_BUDGET: Duration = Duration::from_secs(60);
-/// Longest a download waits for a free download slot before its network
-/// budget starts (AUD-160). A burst of distinct blocks queues behind the
-/// slots; that local wait must not eat the network budget, or the last
-/// blocks of a wallet load fail although every source works.
+/// Longest a background download waits for a free download slot before its
+/// network budget starts (AUD-160).
 pub const EXTERNAL_QUEUE_MAX: Duration = Duration::from_secs(120);
+/// Budget of the per-txid path for one wallet request. Measured over Tor, a
+/// 50-tx batch takes 0.3-1.2 s; 8 s leaves room for two 3 s attempts and one
+/// switch. The old 60 s made a single slow provider hold the wallet.
+pub const WALLET_TX_BUDGET: Duration = Duration::from_secs(8);
+/// Total budget of a wallet block request (queue + network). A 1.9 MB block
+/// takes ~3.2 s over Tor (581 KiB/s measured) and a first load queues ~55 of
+/// them behind 16 slots, so the queue needs room; 20 s still beats the old
+/// 60 s network + 120 s queue and never returns a transient error for a
+/// confirmed transaction (AUD-045).
+pub const WALLET_BLOCK_BUDGET: Duration = Duration::from_secs(20);
+/// Network part of a wallet block request, once it holds a download slot.
+/// Eight seconds covers a 1.9 MB block on a slow circuit and leaves the race
+/// engine room to retry a recovering endpoint (MIN_ATTEMPT * 3).
+pub const WALLET_BLOCK_NET: Duration = Duration::from_secs(8);
 /// Extra time a follower waits beyond the leader's deadline.
 pub const FOLLOWER_GRACE: Duration = Duration::from_secs(5);
 /// A block whose download just failed is answered from that failure for this
@@ -1176,34 +1187,50 @@ impl Resolver {
         priority: Priority,
     ) -> Result<String> {
         let rec = self.block_record(height)?;
-        // One deadline for the whole request (AUD-187): the per-txid path and
-        // the whole-block path share it instead of each starting its own.
-        let request_deadline = Instant::now() + EXTERNAL_QUEUE_MAX + EXTERNAL_BUDGET;
         // 1) Transaction cache: one small file per transaction (AUD-139).
         if let Some(hex) = self.cached_tx(&rec, txid) {
             self.stats.cache_hits.fetch_add(1, Ordering::Relaxed);
             return Ok(hex);
         }
         // 2) The block without asking outside: memory, block cache, Core.
-        let block = match self.local_block(&rec) {
-            Some((block, _)) => block,
-            None => {
-                // 3) Per-txid mode (AUD-163): the loose transaction, verified
-                //    against the index; whole blocks only if it fails.
-                let pruned_below = self.prune_height.load(Ordering::Relaxed);
-                if let Some(tm) = &self.tx_mode {
-                    if pruned_below > 0 && height < pruned_below {
+        let block = if let Some((block, _)) = self.local_block(&rec) {
+            block
+        } else {
+            let pruned_below = self.prune_height.load(Ordering::Relaxed);
+            let mut block = None;
+            if pruned_below > 0 && height < pruned_below {
+                // A prefetch or another tx.get already started this block:
+                // join it instead of spending the txid budget (AUD-160).
+                if self.block_inflight(&rec.hash) {
+                    if let Ok((joined, _)) = self.fetch_external_block(
+                        &rec,
+                        priority,
+                        Some(Instant::now() + WALLET_BLOCK_BUDGET),
+                    ) {
+                        block = Some(joined);
+                    }
+                }
+                if block.is_none() {
+                    // 3) Per-txid mode (AUD-163): the loose transaction,
+                    //    verified against the index. It gets a short budget
+                    //    (8 s, two 3 s session attempts) and then the block.
+                    if let Some(tm) = &self.tx_mode {
                         if let Some(pos) = self.position_of(txid, height) {
                             let t = TxRef { txid, height, pos };
-                            if let Ok(hex) = tm.fetch(ctx, t, Instant::now() + EXTERNAL_BUDGET) {
+                            if let Ok(hex) = tm.fetch(ctx, t, Instant::now() + WALLET_TX_BUDGET) {
                                 return Ok(hex);
                             }
                         }
                     }
                 }
-                // 4) Whole block from external sources, with what is left.
-                self.external_block(&rec, priority, Some(request_deadline))?
-                    .0
+            }
+            // 4) Whole block from external sources.
+            match block {
+                Some(block) => block,
+                None => {
+                    self.external_block(&rec, priority, Some(Instant::now() + WALLET_BLOCK_BUDGET))?
+                        .0
+                }
             }
         };
         let hex = self
@@ -1211,6 +1238,14 @@ impl Resolver {
             .pop()
             .ok_or_else(|| RawtxError::Verify("transaction is not in the block".into()))?;
         Ok(hex)
+    }
+
+    /// True when another caller is already downloading this block.
+    fn block_inflight(&self, hash: &Hash32) -> bool {
+        self.inflight
+            .lock()
+            .map(|map| map.contains_key(hash))
+            .unwrap_or(false)
     }
 
     /// A cached transaction authenticated against the indexed header: txid,

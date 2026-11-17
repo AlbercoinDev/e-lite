@@ -11,7 +11,7 @@ use bitcoin::{
 use el_model::codec::SCHEMA_VERSION;
 use el_model::{BlockRecord, Hash32, HistoryEffect, IndexedTip, ScriptHash};
 use el_rawtx::{
-    AttemptCtl, PrivacyParams, RawtxConfig, Resolver, Result, TxBatch, TxRef, TxSource,
+    AttemptCtl, PrivacyParams, RawtxConfig, RawtxError, Resolver, Result, TxBatch, TxRef, TxSource,
 };
 use el_store::Store;
 use std::collections::{HashMap, HashSet};
@@ -186,6 +186,9 @@ struct FakeSource {
     raw: HashMap<Hash32, Vec<u8>>,
     servers: Vec<String>,
     liar: Option<String>,
+    /// Largest batch this server accepts; above it, the session fails like
+    /// a provider that closes the connection (measured with blockstream).
+    limit: Option<usize>,
     calls: Mutex<Vec<(String, Vec<Hash32>)>>,
 }
 
@@ -195,6 +198,17 @@ impl FakeSource {
             raw: raw.clone(),
             servers: (0..n).map(|i| format!("s{i}")).collect(),
             liar: liar.map(str::to_string),
+            limit: None,
+            calls: Mutex::new(Vec::new()),
+        })
+    }
+
+    fn with_limit(self: Arc<Self>, limit: usize) -> Arc<Self> {
+        Arc::new(FakeSource {
+            raw: self.raw.clone(),
+            servers: self.servers.clone(),
+            liar: self.liar.clone(),
+            limit: Some(limit),
             calls: Mutex::new(Vec::new()),
         })
     }
@@ -232,6 +246,14 @@ impl TxSource for FakeSource {
             .lock()
             .unwrap()
             .push((server.to_string(), txids.to_vec()));
+        if let Some(limit) = self.limit {
+            if txids.len() > limit {
+                return Err(RawtxError::Unavailable(format!(
+                    "{server}: batch of {} rejected (limit {limit})",
+                    txids.len()
+                )));
+            }
+        }
         let other = self.raw.values().next().unwrap().clone();
         Ok(txids
             .iter()
@@ -293,6 +315,32 @@ fn load(r: &Resolver, c: &Chain, ctx: u64) -> Vec<String> {
         .iter()
         .map(|t| r.raw_tx_for(ctx, t.txid, t.height).unwrap())
         .collect()
+}
+
+#[test]
+fn a_provider_that_rejects_a_batch_is_retried_with_a_smaller_one() {
+    let c = chain("batchcap");
+    let src = FakeSource::new(&c.raw, 1, None).with_limit(2);
+    // Four txids per session against a server that closes above two: the
+    // first session fails, the cap halves and the retry succeeds.
+    let privacy = PrivacyParams {
+        session_size: 4,
+        ..PrivacyParams::balanced()
+    };
+    let r = resolver(&c, privacy, Arc::clone(&src), [3; 32]);
+    let got = load(&r, &c, 1);
+    for (t, hex) in c.real.1.iter().zip(&got) {
+        assert_eq!(hex, &hex::encode(&c.raw[&t.txid]));
+    }
+    let calls = src.calls();
+    assert!(
+        calls.iter().any(|(_, txids)| txids.len() > 2),
+        "a large batch must be attempted first: {calls:?}"
+    );
+    assert!(
+        calls.iter().any(|(_, txids)| txids.len() <= 2),
+        "the retry must use a smaller batch: {calls:?}"
+    );
 }
 
 #[test]

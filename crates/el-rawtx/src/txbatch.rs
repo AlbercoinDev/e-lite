@@ -31,8 +31,15 @@ use std::time::{Duration, Instant};
 
 /// Servers a real transaction is tried on before the block fallback.
 const MAX_TX_ATTEMPTS: u32 = 3;
-/// Budget of one session (connection, version, batch, answer).
-const SESSION_BUDGET: Duration = Duration::from_secs(40);
+/// Budget of one session (connection, version, batch, answer). Measured over
+/// Tor: a 50-tx batch takes 0.3-1.2 s and a full session 1-2 s, so 3 s is a
+/// firm switch threshold: a provider that misses it is replaced instead of
+/// holding the wallet's transactions.
+const SESSION_BUDGET: Duration = Duration::from_secs(3);
+/// Smallest batch tried after a provider rejects larger ones. Measured:
+/// `electrum.blockstream.info` accepts 20 txids and closes the connection
+/// above that. The cap halves per failure down to this value.
+const MIN_BATCH: usize = 2;
 /// Connections whose decoy book is kept (oldest dropped first).
 const MAX_BOOKS: usize = 64;
 /// Sessions open at once to one server. Measured over Tor on 2026-11-14:
@@ -85,8 +92,15 @@ struct Shared {
     queue_cv: Condvar,
     waiters: Mutex<HashMap<Hash32, Arc<Wait>>>,
     sessions: Arc<Semaphore>,
-    /// Sessions open per server (at most `MAX_SESSIONS_PER_SERVER`).
+    /// Sessions open to a server (at most `MAX_SESSIONS_PER_SERVER`).
     per_server: Mutex<HashMap<String, Arc<Semaphore>>>,
+    /// Decoy sessions get their own small pool so three decoy wallets never
+    /// take the slots the real wallet is waiting for.
+    decoy_sessions: Arc<Semaphore>,
+    /// Longest batch a server accepted, learned after a session failure: a
+    /// provider that closes connections above 20 items (measured) is not asked
+    /// for 50 again in the same process.
+    batch_caps: Mutex<HashMap<String, usize>>,
     /// Average session time per server, ms (failures count as slow).
     latency: Mutex<HashMap<String, f64>>,
     /// Items of each group sent to each server during a connection's load,
@@ -136,6 +150,8 @@ impl TxMode {
             txcache,
             sources,
             sessions: Semaphore::new(params.parallel_sessions.max(1)),
+            decoy_sessions: Semaphore::new((params.parallel_sessions / 4).max(1)),
+            batch_caps: Mutex::new(HashMap::new()),
             params,
             books: Mutex::new((HashMap::new(), VecDeque::new())),
             queue: Mutex::new(Vec::new()),
@@ -329,6 +345,31 @@ impl Shared {
         *e = *e * (1.0 - LATENCY_ALPHA) + ms * LATENCY_ALPHA;
     }
 
+    /// Longest batch to ask this server for. Starts at `default`; a failed
+    /// session halves it down to `MIN_BATCH` and the value is kept for the
+    /// rest of the process (a provider that closes above 20 items is not
+    /// retried with 50 on the next load).
+    fn batch_cap(&self, key: &str, default: usize) -> usize {
+        self.batch_caps
+            .lock()
+            .map(|m| m.get(key).copied().unwrap_or(default))
+            .unwrap_or(default)
+    }
+
+    /// A session with `items` transactions failed: remember a smaller batch.
+    fn note_batch_failure(&self, key: &str, items: usize) {
+        if items <= MIN_BATCH {
+            return;
+        }
+        let smaller = (items / 2).max(MIN_BATCH);
+        if let Ok(mut m) = self.batch_caps.lock() {
+            let entry = m.entry(key.to_string()).or_insert(items);
+            if smaller < *entry {
+                *entry = smaller;
+            }
+        }
+    }
+
     /// Expected session time of a server; unknown servers rank as average.
     fn expected_ms(&self, key: &str) -> f64 {
         self.latency
@@ -520,13 +561,19 @@ fn dispatch(shared: &Arc<Shared>, reqs: Vec<Req>) {
     }
     drop(spread_counts);
 
-    for (idx, mut items) in per_server {
+    let mut pending: Vec<(usize, Vec<Item>)> = per_server.into_iter().collect();
+    // Real items first: their sessions must not queue behind decoy sessions
+    // for the global session slots (three decoy wallets, one real).
+    pending.sort_by_key(|(_, items)| !items.iter().any(|i| matches!(i, Item::Real(_))));
+    for (idx, mut items) in pending {
         items.shuffle(&mut rng);
-        for chunk in items.chunks(p.session_size.max(1)) {
-            let (src_idx, key, _) = servers[idx].clone();
+        let (src_idx, key, _) = servers[idx].clone();
+        let cap = shared.batch_cap(&key, p.session_size.max(1));
+        for chunk in items.chunks(cap) {
             let src = Arc::clone(&shared.sources[src_idx]);
             let chunk = chunk.to_vec();
             let shared = Arc::clone(shared);
+            let key = key.clone();
             let spawned = std::thread::Builder::new()
                 .name("el-txsession".into())
                 .spawn(move || run_session(&shared, src, &key, chunk));
@@ -549,6 +596,21 @@ impl Drop for SessionGuard<'_> {
 fn run_session(shared: &Arc<Shared>, src: Arc<dyn TxSource>, key: &str, items: Vec<Item>) {
     shared.sessions_active.fetch_add(1, Ordering::SeqCst);
     let _guard = SessionGuard(&shared.sessions_active);
+    let has_real = items.iter().any(|item| matches!(item, Item::Real(_)));
+    // Decoy sessions use a small separate pool so three decoy wallets never
+    // take the session slots a real transaction is waiting for. Dropping a
+    // decoy when the pool is full is harmless: it is background noise.
+    let _decoy_permit = if has_real {
+        None
+    } else {
+        match shared
+            .decoy_sessions
+            .acquire_until(Instant::now() + crate::EXTERNAL_QUEUE_MAX, 0)
+        {
+            Some(permit) => Some(permit),
+            None => return,
+        }
+    };
     // The server's slot first: a session waiting for a busy server must not
     // hold one of the global slots.
     let slot = shared.server_slot(key);
@@ -583,12 +645,14 @@ fn run_session(shared: &Arc<Shared>, src: Arc<dyn TxSource>, key: &str, items: V
     let ctl = AttemptCtl::new();
     let started = Instant::now();
     let result = src.fetch_from(key, &txids, started + SESSION_BUDGET, &ctl);
-    // A failed session counts as a slow one, so the server drops in rank.
-    let ms = if result.is_ok() {
-        started.elapsed().as_millis() as f64
-    } else {
-        SESSION_BUDGET.as_millis() as f64
-    };
+    // Real time, success or failure: a fast rejection must not look like a
+    // 40 s stall (the old code used the whole session budget on failure).
+    let ms = started.elapsed().as_millis() as f64;
+    if result.is_err() {
+        // A provider that closes above its batch limit is remembered with a
+        // smaller batch, so the next session succeeds instead of failing.
+        shared.note_batch_failure(key, items.len());
+    }
     shared.note_latency(key, ms);
     let batch = result.unwrap_or_default();
     let mut bad = false;

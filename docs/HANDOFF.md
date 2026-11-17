@@ -1,8 +1,8 @@
 # Session handoff
 
-**Updated:** 2026-11-17 (alpha.29.19.2: one-shot commands end quietly on a closed pipe)
-**Latest published release:** `0.1.0-alpha.29.19.2`
-**Release:** https://github.com/AlbercoinDev/e-lite/releases/tag/v0.1.0-alpha.29.19.2
+**Updated:** 2026-11-17 (alpha.29.20.0: wallet rawtx budgets, adaptive batches and block join)
+**Latest published release:** `0.1.0-alpha.29.20.0`
+**Release:** https://github.com/AlbercoinDev/e-lite/releases/tag/v0.1.0-alpha.29.20.0
 
 This is the short “where we are”. The invariants live in
 [`AGENTS.md`](../AGENTS.md); the
@@ -88,7 +88,21 @@ no repitas contexto ni rehagas decisiones ya documentadas.
   `docs/ROADMAP.md` is future work only, and `docs/AUDIT.md` holds the open
   findings (`docs/audit/FIXED.md` is the fixed history).
 
-## Last change (alpha.29.19.2): closed output
+## Last change (alpha.29.20.0): wallet rawtx budgets and block join
+
+- Session budget 40 s -> 3 s; wallet txid budget 8 s; wallet block budget 20 s
+  (12 s queue + 8 s network) instead of 60 s network + 120 s queue.
+- A failed session records its real latency, not the whole budget.
+- Adaptive batch size per server (50 -> halved down to 2) after a provider
+  closes; `electrum.blockstream.info` accepts 20 txids and closes above that.
+- A `transaction.get` of a pruned tx starts the block download on demand and
+  joins the download already in flight instead of spending the txid budget.
+- Decoy wallets use a quarter of the session slots; real sessions go first.
+
+Measured over Tor: a 50-tx Electrum batch answers in 0.3-1.2 s and a 1.9 MB
+block downloads at ~581 KiB/s. The old 40/60 s budgets were ~20x the p95.
+
+## Previous change (alpha.29.19.2): closed output
 
 A one-shot command whose stdout is closed early (`e-lite status --json | head
 -1`) ends quietly by SIGPIPE instead of a FATAL abort (AUD-192); the daemons

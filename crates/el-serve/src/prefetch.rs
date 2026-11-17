@@ -92,6 +92,19 @@ impl Prefetcher {
         )
     }
 
+    /// True when this block is already queued, prefetched or being fetched.
+    /// A transaction request enqueues a block only once; the download itself
+    /// deduplicates by hash.
+    pub fn wants(&self, hash: &Hash32) -> bool {
+        if self.tx.is_none() {
+            return true;
+        }
+        match self.seen.lock() {
+            Ok(seen) => seen.contains(hash),
+            Err(_) => true,
+        }
+    }
+
     /// Enqueue one block with the history transactions it contains.
     /// Duplicates and a full queue are dropped silently: prefetch is an
     /// optimisation, never a correctness path.

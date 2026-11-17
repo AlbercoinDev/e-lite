@@ -1,5 +1,39 @@
 # Changelog
 
+## 0.1.0-alpha.29.20.0 — 2026-11-17
+
+Wallet loads over Tor were dominated by the per-txid path: a provider could
+hold a transaction for 40 s, the path had a 60 s budget, and the whole block
+(which is what actually serves a pruned transaction) was only fetched after
+that. Measured with real providers over Tor: a 50-tx Electrum batch answers in
+0.3-1.2 s (0.2-1.2 s p95) and a 1.9 MB block downloads at ~581 KiB/s.
+
+### Changed
+
+- The per-txid session budget is **3 s** (was 40 s): a provider that misses it
+  is replaced instead of holding the wallet. `rawtx` wallet budgets are now
+  **8 s** for the txid path and **20 s** for a block request (12 s of queue and
+  8 s of network, was 60 s network + 120 s queue).
+- A failed session records its **real** latency (a fast rejection used to
+  count as 40 s, skewing the server ranking).
+- Decoy wallets use their own small session pool (a quarter of the slots): the
+  three decoy wallets never queue ahead of the real wallet. Real sessions are
+  dispatched first.
+- A `transaction.get` of a pruned transaction now **starts the block download**
+  on demand and any `tx.get` of the same block **joins** the download in flight
+  instead of spending the txid budget; the block is fetched once and its
+  transactions are cached.
+- The batch size per server is **adaptive**: 50 by default, halved (down to 2)
+  when a provider closes the connection. Measured: `electrum.blockstream.info`
+  accepts 20 txids and closes above that, so every 50-tx session to it failed.
+
+### Tests
+
+- A provider that rejects large batches is retried with smaller ones and
+  every transaction is served (`a_provider_that_rejects_a_batch_is_retried_with_a_smaller_one`).
+- The block path keeps its request deadline and the race still waits for a
+  recovering endpoint with the new budgets.
+
 ## 0.1.0-alpha.29.19.2 — 2026-11-17
 
 ### Fixed

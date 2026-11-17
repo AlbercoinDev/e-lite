@@ -253,6 +253,19 @@ e-lite run --network mainnet --allow-mainnet \
 | `--set server.tls_cert=<path>`, `--set server.tls_key=<path>` | `server.tls_cert`, `server.tls_key` | auto-generated local CA + leaf |
 | `--set server.tls_auto_cert=false` | `server.tls_auto_cert` | `true` |
 
+### Wallet request budgets (alpha.29.20.0)
+
+- A per-txid session gets **3 s**; a provider that misses it is replaced.
+- The txid path gets **8 s** per transaction. A pruned `transaction.get` starts
+  the block download on demand, and any later request of the same block joins
+  the download in flight instead of spending the txid budget.
+- A wallet block request gets **20 s** (12 s of queue + 8 s of network). A
+  1.9 MB block takes ~3.2 s over Tor at 581 KiB/s.
+- The batch size per server is **adaptive**: 50 by default and halved (down to
+  2) when a provider closes the connection. Measured:
+  `electrum.blockstream.info` accepts 20 txids and closes above that.
+- Decoy wallets use a quarter of the session slots; real sessions go first.
+
 ## Listener defaults per network
 
 Empty values are filled from the active network, so several e-lite instances
