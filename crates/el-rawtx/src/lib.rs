@@ -14,6 +14,7 @@ pub mod esplora;
 pub(crate) mod health;
 pub mod p2p;
 pub mod privacy;
+mod socks;
 pub mod txbatch;
 pub mod txcache;
 pub mod txsource;

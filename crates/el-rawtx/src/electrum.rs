@@ -10,7 +10,7 @@
 //! Tor exit, and every transaction is verified against the local index.
 
 use crate::health::{Blame, HealthMap, TRANSIENT_BASE, TRANSIENT_CAP};
-use crate::p2p::{socks_connect, split_host_port};
+use crate::socks::{socks_connect, split_host_port};
 use crate::txsource::{TxBatch, TxSource, MAX_TX_BYTES};
 use crate::{AttemptCtl, RawtxError, Result};
 use el_model::sync::Mutex;
