@@ -134,7 +134,11 @@ policy, a wrapper script) is required for that.
 - The console shows `supervisor: the node ended abnormally (...); restarting
   in N s`; the new node's first line, also in `e-lite.log`, is `restarted
   automatically after the previous run ended abnormally (<cause>); restart N`.
-- `--no-supervise` or `E_LITE_NO_SUPERVISE=1` runs a single process, as
+- `/status.supervisor` shows `supervised`, `restarts` and `last_reason` (the
+  end of the previous node); `/metrics` has `e_lite_restarts_total` and
+  `e_lite_supervised`.
+- `--no-supervise`, `[safety] supervise = false` or `E_LITE_NO_SUPERVISE=1`
+  runs a single process, as
   before, for operators who already have their own supervisor.
   `index --no-follow` (a one-shot run) is never supervised.
 

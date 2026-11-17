@@ -445,7 +445,7 @@ These are escape hatches for measurements, not normal configuration:
 | `--log-max-mib <n>` | `logging.max_mib` | `16` (0 disables rotation) |
 | `--log-level <level>` | `logging.level` | `debug` (alpha; stable: `info`) |
 | `--no-log-file` | — | logging enabled |
-| `--no-supervise` | — (`E_LITE_NO_SUPERVISE=1`) | automatic restart enabled |
+| `--no-supervise` | `[safety] supervise = false` (`E_LITE_NO_SUPERVISE=1`) | automatic restart enabled |
 
 `logging.level` selects how much extra detail is logged:
 `info` < `debug` < `trace`. The historical `[e-lite]` lines are INFO and are

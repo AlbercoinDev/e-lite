@@ -261,3 +261,4 @@ level = "debug"
 
 [safety]
 allow_mainnet = false               # mainnet requires explicit opt-in
+supervise = true                    # restart the node after a crash or OOM kill (false = --no-supervise)

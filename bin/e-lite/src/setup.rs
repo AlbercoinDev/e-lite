@@ -1374,6 +1374,7 @@ pub(crate) fn build_shared(
         );
     }
     publish_memory(&shared);
+    supervisor::publish(&shared.stats);
     spawn_p2p_refresh(Arc::clone(&shared), cfg);
     Ok(shared)
 }

@@ -151,6 +151,24 @@ pub(crate) fn wanted(daemon_command: bool, no_supervise_flag: bool, one_shot: bo
         && std::env::var(DISABLE_ENV).map_or(true, |v| v != "1")
 }
 
+/// What the parent passed on, for `/status.supervisor` and `/metrics`.
+pub(crate) fn publish(stats: &el_serve::Stats) {
+    stats
+        .supervised
+        .store(std::env::var_os(CHILD_ENV).is_some(), Ordering::Relaxed);
+    let restarts: u64 = std::env::var(RESTARTS_ENV)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    stats.restarts.store(restarts, Ordering::Relaxed);
+    if restarts > 0 {
+        if let (Ok(reason), Ok(mut slot)) = (std::env::var(REASON_ENV), stats.restart_reason.lock())
+        {
+            *slot = reason;
+        }
+    }
+}
+
 /// The line the restarted node prints first, from what its parent passed on.
 pub(crate) fn restart_note() -> Option<String> {
     let restarts: u32 = std::env::var(RESTARTS_ENV).ok()?.parse().ok()?;

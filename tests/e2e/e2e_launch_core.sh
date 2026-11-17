@@ -45,6 +45,10 @@ grep -q "restarted automatically after the previous run ended abnormally" "$RUN/
   || fail "the restarted node did not say why" "$RUN/serve.log"
 grep -q "adopted Core pid $CORE_PID" "$RUN/serve.log" || fail "Core was not adopted" "$RUN/serve.log"
 kill -0 "$CORE_PID" || fail "Core was lost"
+[ "$(status "$METRICS" supervisor.restarts)" = 1 ] || fail "/status.supervisor.restarts is not 1"
+[ "$(status "$METRICS" supervisor.supervised)" = true ] || fail "/status.supervisor.supervised"
+status "$METRICS" supervisor.last_reason | grep -q "signal 6" || fail "/status.supervisor.last_reason"
+curl -s "http://127.0.0.1:$METRICS/metrics" | grep -qx "e_lite_restarts_total 1" || fail "/metrics restarts"
 NODE="$(node_of "$ELITE")"
 
 echo "== the index keeps following the chain =="
@@ -85,4 +89,11 @@ elite_start "$RUN/single.log" run --config "$CONF" --no-supervise
 wait_ready "$METRICS" "$RUN/single.log"
 pgrep -P "$ELITE" -x e-lite >/dev/null && fail "--no-supervise still started a child node"
 elite_stop "$ELITE" "$RUN/single.log"
+
+echo "== [safety] supervise = false: one process too =="
+elite_start "$RUN/single2.log" run --config "$CONF" --set safety.supervise=false
+wait_ready "$METRICS" "$RUN/single2.log"
+pgrep -P "$ELITE" -x e-lite >/dev/null && fail "supervise = false still started a child node"
+[ "$(status "$METRICS" supervisor.supervised)" = false ] || fail "/status says supervised"
+elite_stop "$ELITE" "$RUN/single2.log"
 echo "launch-core OK"

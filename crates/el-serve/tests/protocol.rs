@@ -1281,9 +1281,9 @@ fn metrics_follow_the_status_document() {
         metrics.contains("e_lite_state{state=\"READY\"}"),
         "{metrics}"
     );
-    // 39 numeric metrics plus the state: each with HELP, TYPE and a number.
+    // 41 numeric metrics plus the state: each with HELP, TYPE and a number.
     let samples: Vec<&str> = metrics.lines().filter(|l| !l.starts_with('#')).collect();
-    assert_eq!(samples.len(), 40, "{metrics}");
+    assert_eq!(samples.len(), 42, "{metrics}");
     for line in &samples {
         let (name, value) = line.rsplit_once(' ').unwrap();
         value.parse::<u64>().unwrap_or_else(|_| panic!("{line}"));

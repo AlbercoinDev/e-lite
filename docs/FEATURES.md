@@ -127,7 +127,7 @@ available**.
 | Optional Tor expert bundle | stable | `--with-tor` default; `--without-tor` |
 | `.deb`, tarball, release checksums | stable | GitHub Releases |
 | All-in-one test harness | experimental | `scripts/e-lite-all-in-one.sh` |
-| Automatic restart after a fatal error | experimental | built into `run`/`serve`/`index`, no init system (systemd) required: a watching parent restarts the node after an abnormal end (abort after a fatal internal error, crash, OOM kill) with backoff 1..60 s, and gives up after 5 in 10 minutes; a clean stop or an error exit is final; Core keeps running and is adopted; `--no-supervise`/`E_LITE_NO_SUPERVISE=1` disables it. Boot-time start is left to the host |
+| Automatic restart after a fatal error | experimental | built into `run`/`serve`/`index`, no init system (systemd) required: a watching parent restarts the node after an abnormal end (abort after a fatal internal error, crash, OOM kill) with backoff 1..60 s, and gives up after 5 in 10 minutes; a clean stop or an error exit is final; Core keeps running and is adopted; `--no-supervise`, `[safety] supervise = false` or `E_LITE_NO_SUPERVISE=1` disables it; restarts and the last cause are in `/status.supervisor` and `/metrics`. Boot-time start is left to the host |
 | Container image | **not available** | roadmap |
 
 ## Compatibility

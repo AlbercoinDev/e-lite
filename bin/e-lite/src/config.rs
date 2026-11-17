@@ -785,11 +785,24 @@ impl Default for RawtxCfg {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, serde::Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SafetyCfg {
     #[serde(default)]
     pub allow_mainnet: bool,
+    /// `run`/`serve`/`index` restart the node after an abnormal end. `false`
+    /// is the same as `--no-supervise`: one process, no restarts.
+    #[serde(default = "d_true")]
+    pub supervise: bool,
+}
+
+impl Default for SafetyCfg {
+    fn default() -> Self {
+        SafetyCfg {
+            allow_mainnet: false,
+            supervise: true,
+        }
+    }
 }
 
 fn d_network() -> String {
@@ -1461,6 +1474,19 @@ mod tests {
         cfg.core.core_datadir = Some("/srv/bitcoin".to_string());
         cfg.network.data_dir = Some("/srv/e-lite".to_string());
         assert!(cfg.validate().is_ok());
+    }
+
+    /// The supervisor is on unless the configuration says otherwise, with or
+    /// without a `[safety]` section.
+    #[test]
+    fn supervise_defaults_to_on() {
+        assert!(Config::default().safety.supervise);
+        let no_section: Config = toml::from_str("[network]\nname = \"regtest\"\n").unwrap();
+        assert!(no_section.safety.supervise);
+        let other_key: Config = toml::from_str("[safety]\nallow_mainnet = true\n").unwrap();
+        assert!(other_key.safety.supervise);
+        let off: Config = toml::from_str("[safety]\nsupervise = false\n").unwrap();
+        assert!(!off.safety.supervise);
     }
 
     #[test]

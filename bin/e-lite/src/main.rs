@@ -253,7 +253,14 @@ fn main() {
             args.command,
             Some(Command::Run | Command::Serve | Command::Index)
         );
-        if supervisor::wanted(daemon, args.no_supervise, args.no_follow) {
+        // `[safety] supervise = false` (or `--set safety.supervise=false`)
+        // means the same as `--no-supervise`. A config that does not load
+        // keeps the supervisor: the node reports the error and its exit code
+        // is final.
+        let config_off = daemon
+            && Config::load_with_overrides(args.config.as_deref(), &args.set)
+                .is_ok_and(|c| !c.safety.supervise);
+        if supervisor::wanted(daemon, args.no_supervise || config_off, args.no_follow) {
             if let Some(code) = supervisor::run() {
                 std::process::exit(code);
             }

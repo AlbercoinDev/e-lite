@@ -246,6 +246,11 @@ pub struct Stats {
     pub mem_reserve_mib: AtomicU64,
     pub mem_budget_mib: AtomicU64,
     pub tor_bootstrapped: AtomicBool,
+    /// The node runs under e-lite's own supervisor, how many times it was
+    /// restarted and why the previous node ended.
+    pub supervised: AtomicBool,
+    pub restarts: AtomicU64,
+    pub restart_reason: Mutex<String>,
     /// Managed Tor: effective loopback SOCKS port (0 = unknown/not managed)
     /// and whether a control port exists (e-lite does not create one).
     pub tor_managed: AtomicBool,
@@ -373,6 +378,9 @@ impl Default for Stats {
             mem_reserve_mib: AtomicU64::new(0),
             mem_budget_mib: AtomicU64::new(0),
             tor_bootstrapped: AtomicBool::new(false),
+            supervised: AtomicBool::new(false),
+            restarts: AtomicU64::new(0),
+            restart_reason: Mutex::new(String::new()),
             tor_managed: AtomicBool::new(false),
             tor_socks_port: AtomicU64::new(0),
             tor_control_port: AtomicU64::new(0),

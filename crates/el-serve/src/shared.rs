@@ -303,6 +303,16 @@ impl Shared {
             "onion_plain_port": self.onion_plain_port,
             "onion_tls_port": self.onion_tls_port,
             "tor_bootstrapped": self.stats.tor_bootstrapped.load(Ordering::Relaxed),
+            "supervisor": {
+                "supervised": self.stats.supervised.load(Ordering::Relaxed),
+                "restarts": self.stats.restarts.load(Ordering::Relaxed),
+                "last_reason": self
+                    .stats
+                    .restart_reason
+                    .lock()
+                    .map(|r| r.clone())
+                    .unwrap_or_default(),
+            },
             "tor": {
                 "managed": self.stats.tor_managed.load(Ordering::Relaxed),
                 "socks_port": self.stats.tor_socks_port.load(Ordering::Relaxed),

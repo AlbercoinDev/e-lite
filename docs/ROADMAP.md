@@ -68,7 +68,6 @@ older notes still match. New findings of that review are AUD-173..181 in
 | P2 | Container image (Docker/Podman) | reproducible runtime, mounts for Core/index; no secrets baked in. UmbrelOS notes are in `TUNING.md`. |
 | P2 | Electrum/Sparrow matrix | scripted versions for 1.4; document known limitations. |
 | P2 | Core version matrix | test the oldest supported and the latest official Core; fail clearly. |
-| P3 | Restart diagnostics | the built-in restart is delivered (`FEATURES.md`). Still missing: the restart count and last cause in `/status` and `/metrics`, and a config key next to the `--no-supervise` flag. |
 | P3 | Cross-container sync coordination | the per-user IBD lock does not cross mount namespaces; needs a shared lock medium or orchestrator policy. |
 | P3 | Plugin/extension surface | only after core stability; avoid freezing unstable APIs. |
 

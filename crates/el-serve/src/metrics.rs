@@ -88,6 +88,8 @@ e_lite_rate_limited_total counter rate_limited Requests delayed by the per-clien
 e_lite_providers_healthy gauge providers_healthy Public providers that answered the startup probe
 e_lite_last_block_ms gauge last_block_ms Duration of the last applied block
 e_lite_uptime_seconds gauge uptime_seconds Process uptime
+e_lite_supervised gauge supervisor.supervised 1 when the node runs under e-lite's own supervisor
+e_lite_restarts_total counter supervisor.restarts Automatic restarts after an abnormal end
 ";
 
 /// The table above as `(name, kind, path, help)`.
