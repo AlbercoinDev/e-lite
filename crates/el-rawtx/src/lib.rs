@@ -571,6 +571,9 @@ pub struct RawtxConfig {
     pub sessions_total: usize,
     /// Random delay before a per-txid session, milliseconds (0-250).
     pub jitter_ms: u64,
+    /// History blocks queued per history response. 0 = auto (block mode
+    /// prefetches, per-txid mode only on demand).
+    pub prefetch_history_blocks: usize,
 }
 
 impl RawtxConfig {
@@ -610,6 +613,7 @@ impl RawtxConfig {
             decoy_sessions: DecoySessions::SameRound,
             sessions_total: 16,
             jitter_ms: 50,
+            prefetch_history_blocks: 0,
         }
     }
 }

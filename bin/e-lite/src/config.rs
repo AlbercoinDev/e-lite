@@ -692,6 +692,10 @@ pub struct RawtxCfg {
     /// the timing correlation with the wallet connection.
     #[serde(default = "d_jitter_ms")]
     pub jitter_ms: u64,
+    /// History blocks queued per history response (0..4096). 0 = auto: block
+    /// mode prefetches the history, per-txid mode only on demand.
+    #[serde(default = "d_prefetch_history_blocks")]
+    pub prefetch_history_blocks: usize,
     /// `privacy.toml` path. Empty = next to config.toml (AUD-163).
     #[serde(default)]
     pub privacy_file: Option<String>,
@@ -763,6 +767,7 @@ impl Default for RawtxCfg {
             decoy_sessions: d_decoy_sessions(),
             sessions_total: d_sessions_total(),
             jitter_ms: d_jitter_ms(),
+            prefetch_history_blocks: d_prefetch_history_blocks(),
             privacy_file: None,
             privacy_overrides: Vec::new(),
         }
@@ -872,6 +877,9 @@ fn d_sessions_total() -> usize {
 }
 fn d_jitter_ms() -> u64 {
     50
+}
+fn d_prefetch_history_blocks() -> usize {
+    0
 }
 fn d_p2p_timeout() -> u64 {
     8
@@ -1212,6 +1220,9 @@ impl Config {
         if self.rawtx.jitter_ms > 250 {
             return Err("[rawtx] jitter_ms must be 0..250".to_string());
         }
+        if self.rawtx.prefetch_history_blocks > 4096 {
+            return Err("[rawtx] prefetch_history_blocks must be 0..4096".to_string());
+        }
         if self.index.reorg_window == 0 {
             return Err("[index] reorg_window must be >= 1".to_string());
         }
@@ -1497,6 +1508,7 @@ mod tests {
         assert_eq!(cfg.rawtx.decoy_sessions, "same_round");
         assert_eq!(cfg.rawtx.sessions_total, 16);
         assert_eq!(cfg.rawtx.jitter_ms, 50);
+        assert_eq!(cfg.rawtx.prefetch_history_blocks, 0);
         assert!(cfg.validate().is_ok());
 
         let mut bad = Config::default();
@@ -1517,6 +1529,9 @@ mod tests {
         bad.rawtx.sessions_total = 16;
         bad.rawtx.jitter_ms = 251;
         assert!(bad.validate().is_err());
+        bad.rawtx.jitter_ms = 50;
+        bad.rawtx.prefetch_history_blocks = 4097;
+        assert!(bad.validate().is_err());
     }
 
     #[test]
@@ -1531,6 +1546,7 @@ mod tests {
                 "rawtx.decoy_sessions=background".to_string(),
                 "rawtx.sessions_total=24".to_string(),
                 "rawtx.jitter_ms=0".to_string(),
+                "rawtx.prefetch_history_blocks=128".to_string(),
             ],
         )
         .unwrap();
@@ -1541,6 +1557,7 @@ mod tests {
         assert_eq!(cfg.rawtx.decoy_sessions, "background");
         assert_eq!(cfg.rawtx.sessions_total, 24);
         assert_eq!(cfg.rawtx.jitter_ms, 0);
+        assert_eq!(cfg.rawtx.prefetch_history_blocks, 128);
     }
 
     #[test]

@@ -480,6 +480,7 @@ fn slow_fixture(delay: Duration) -> (Arc<Shared>, Hash32, std::path::PathBuf) {
                 decoy_sessions: el_rawtx::DecoySessions::SameRound,
                 sessions_total: 16,
                 jitter_ms: 50,
+                prefetch_history_blocks: 0,
             },
         )
         .unwrap()

@@ -605,11 +605,16 @@ pub(crate) fn history_entries_with_code(
                 .resolver
                 .want_history(current_client(), script, &refs);
         }
-        return Ok(out);
+        // In per-txid mode the history prefetch is off by default: no block
+        // is requested before the wallet asks for a transaction. An explicit
+        // `rawtx.prefetch_history_blocks > 0` turns it on.
+        if shared.prefetch.per_history() == 0 {
+            return Ok(out);
+        }
     }
     let mut prefetched = 0usize;
     for (hash, height, txids) in prefetch_blocks {
-        if prefetched >= PREFETCH_PER_HISTORY {
+        if prefetched >= shared.prefetch.per_history() {
             break;
         }
         if shared.prefetch.enqueue(hash, height, txids) {

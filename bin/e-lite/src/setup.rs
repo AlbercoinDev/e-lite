@@ -735,6 +735,7 @@ pub(crate) fn build_resolver(
             .unwrap_or(el_rawtx::DecoySessions::SameRound),
         sessions_total: cfg.rawtx.sessions_total,
         jitter_ms: cfg.rawtx.jitter_ms,
+        prefetch_history_blocks: cfg.rawtx.prefetch_history_blocks,
     };
     let resolver = Resolver::new(Arc::clone(store), &rc)?;
     match resolver.tx_mode_servers() {
@@ -1080,12 +1081,29 @@ pub(crate) fn build_shared(
     // Opt-in (AUD-134). P2P may gain peers later, so the configured sources
     // count, not the ones usable right now.
     let prefetch = if cfg.rawtx.prefetch && cfg.rawtx.enabled {
+        // 0 = auto: block mode prefetches the history, per-txid mode only on
+        // demand (no block leaves before the wallet asks). An explicit value
+        // turns it on in both modes.
+        let per_history = if cfg.rawtx.prefetch_history_blocks > 0 {
+            cfg.rawtx.prefetch_history_blocks
+        } else {
+            let tx_mode = privacy::load(cfg, config_path().as_deref(), false)
+                .map(|loaded| loaded.params.mode == el_rawtx::ExternalMode::Tx)
+                .unwrap_or(true);
+            if tx_mode {
+                0
+            } else {
+                el_serve::PREFETCH_PER_HISTORY
+            }
+        };
+        let queue = (per_history.max(64) * 4).clamp(256, 4096);
         // Every download slot but the one kept for the wallet (AUD-160).
         el_serve::Prefetcher::new(
             Arc::clone(&resolver),
             Arc::clone(&readers),
             cfg.rawtx.max_parallel_fetches.saturating_sub(1).max(1),
-            el_serve::PREFETCH_QUEUE,
+            queue,
+            per_history,
         )
     } else {
         el_serve::Prefetcher::disabled()

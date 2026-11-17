@@ -247,6 +247,7 @@ e-lite run --network mainnet --allow-mainnet \
 | `--set rawtx.decoy_sessions=same_round\|background` | decoy wallets in the same round or one in the background | `same_round` |
 | `--set rawtx.sessions_total=<n>` | concurrent per-txid sessions | `16` |
 | `--set rawtx.jitter_ms=<n>` | random delay before a session (0-250) | `50` |
+| `--set rawtx.prefetch_history_blocks=<n>` | blocks queued per history response; 0 = auto (block mode prefetches, per-txid mode on demand) | `0` |
 | `--set rawtx.privacy_file=<path>` | `privacy.toml` location (empty: next to config.toml) | empty |
 | `--set privacy.<section>.<key>=<v>` | override one `privacy.toml` value for this run (range-checked, see `docs/PRIVACY-TUNING.md`) | — |
 | `--set rawtx.p2p_timeout_seconds=<n>` | P2P connect/handshake/block timeout | `8` |

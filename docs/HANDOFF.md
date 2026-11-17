@@ -1,8 +1,8 @@
 # Session handoff
 
-**Updated:** 2026-11-17 (alpha.29.21.0: concurrent txid/block race and wallet config keys)
-**Latest published release:** `0.1.0-alpha.29.21.0`
-**Release:** https://github.com/AlbercoinDev/e-lite/releases/tag/v0.1.0-alpha.29.21.0
+**Updated:** 2026-11-17 (alpha.29.22.0: configurable history prefetch)
+**Latest published release:** `0.1.0-alpha.29.22.0`
+**Release:** https://github.com/AlbercoinDev/e-lite/releases/tag/v0.1.0-alpha.29.22.0
 
 This is the short “where we are”. The invariants live in
 [`AGENTS.md`](../AGENTS.md); the
@@ -88,7 +88,14 @@ no repitas contexto ni rehagas decisiones ya documentadas.
   `docs/ROADMAP.md` is future work only, and `docs/AUDIT.md` holds the open
   findings (`docs/audit/FIXED.md` is the fixed history).
 
-## Last change (alpha.29.21.0): concurrent race and wallet config
+## Last change (alpha.29.22.0): configurable history prefetch
+
+- `rawtx.prefetch_history_blocks` (0..4096, default 0 = auto): block mode
+  prefetches up to 256 blocks per history, per-txid mode only on demand; an
+  explicit value enables it in both modes.
+- The prefetch queue is sized from that value (256..4096).
+
+## Previous change (alpha.29.21.0): concurrent race and wallet config
 
 - `rawtx.path` (auto/tx/block), `wallet_deadline_seconds`, `txid_attempt_seconds`,
   `txid_race`, `decoy_sessions`, `sessions_total` and `jitter_ms`, validated,

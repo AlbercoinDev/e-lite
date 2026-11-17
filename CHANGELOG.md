@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.1.0-alpha.29.22.0 — 2026-11-17
+
+### Added
+
+- `rawtx.prefetch_history_blocks` (0..4096, default `0` = auto): blocks queued
+  per history response. `0` keeps the privacy default — block mode prefetches
+  up to 256 blocks, per-txid mode only fetches on demand; a positive value
+  enables the history prefetch in both modes.
+- The prefetch queue is sized from that value (`per_history * 4`, clamped to
+  256..4096) instead of a fixed 1024.
+
+### Changed
+
+- In per-txid mode, an explicit `prefetch_history_blocks > 0` now enqueues the
+  history blocks after `want_history`; `0` keeps the on-demand-only behaviour.
+
+### Tests
+
+- Config defaults, overrides and validation for `prefetch_history_blocks`.
+
 ## 0.1.0-alpha.29.21.0 — 2026-11-17
 
 ### Added

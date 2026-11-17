@@ -9,10 +9,11 @@ use super::*;
 /// subsequent `blockchain.transaction.get` calls hit the block cache instead of
 /// waiting for a provider. Deduplicated by height, bounded queue, and only used
 /// when external sources exist.
-/// History blocks queued per history response. The wallet asks for these
-/// transactions right after the history; starting them now is what makes a
-/// cold load over Tor fast (AUD-160).
-pub const PREFETCH_PER_HISTORY: usize = 64;
+/// Default history blocks queued per response when the configuration leaves
+/// `rawtx.prefetch_history_blocks = 0` (block privacy mode). The wallet asks
+/// for these transactions right after the history; starting them now is what
+/// makes a cold load over Tor fast (AUD-160).
+pub const PREFETCH_PER_HISTORY: usize = 256;
 /// Prefetch queue length.
 pub const PREFETCH_QUEUE: usize = 1024;
 
@@ -24,6 +25,8 @@ pub struct Prefetcher {
     seen: Arc<Mutex<HashSet<Hash32>>>,
     queued: Arc<AtomicU64>,
     done: Arc<AtomicU64>,
+    /// Blocks queued per history response (0 = disabled, on demand only).
+    per_history: usize,
 }
 
 impl Prefetcher {
@@ -33,6 +36,7 @@ impl Prefetcher {
             seen: Arc::new(Mutex::new(HashSet::new())),
             queued: Arc::new(AtomicU64::new(0)),
             done: Arc::new(AtomicU64::new(0)),
+            per_history: 0,
         }
     }
 
@@ -41,6 +45,7 @@ impl Prefetcher {
         _readers: Arc<ReaderTracker>,
         workers: usize,
         queue: usize,
+        per_history: usize,
     ) -> Self {
         let (tx, rx) = mpsc::sync_channel::<PrefetchJob>(queue.max(1));
         let rx = Arc::new(Mutex::new(rx));
@@ -81,6 +86,7 @@ impl Prefetcher {
             seen: Arc::clone(&seen),
             queued: Arc::new(AtomicU64::new(0)),
             done,
+            per_history,
         }
     }
 
@@ -90,6 +96,11 @@ impl Prefetcher {
             self.queued.load(Ordering::Relaxed),
             self.done.load(Ordering::Relaxed),
         )
+    }
+
+    /// Blocks queued per history response; 0 means on demand only.
+    pub fn per_history(&self) -> usize {
+        self.per_history
     }
 
     /// True when this block is already queued, prefetched or being fetched.
