@@ -75,7 +75,7 @@ Left open by the 2026-11 review ([`reviews/2026-11-analisis.md`](reviews/2026-11
 
 | Priority | Item | Why / acceptance |
 |---|---|---|
-| P2 | Table tests for `lag_guard` | `bin/e-lite/src/pipeline.rs`: only `byte_window` is unit-tested; the pause/resume/watermark decisions are covered by e2e only. Add a table of (Core state, lag, disk) → action before changing it. |
+| P2 | Table tests for `lag_guard` | `bin/e-lite/src/pipeline/core_pace.rs` (`lag_guard`, `byte_window`): only `byte_window` is unit-tested; the pause/resume/watermark decisions are covered by e2e only. Add a table of (Core state, lag, disk) → action before changing it. |
 | P2 | Second review pass | `bin/e-lite/src/tuning/` and `crates/el-rawtx/src/p2p.rs` were reviewed by structure, targeted searches and tests, not line by line. |
 | P3 | Defaults quoted in the docs | `scripts/check-docs.sh` checks links, versions and source references; extend it to the default values quoted in `docs/` (a `config.example.toml` key followed by its value). |
 | P3 | Cost of `panic = "unwind"` | AUD-173 switched release builds to unwind; binary size and IBD speed before/after were not measured. |
