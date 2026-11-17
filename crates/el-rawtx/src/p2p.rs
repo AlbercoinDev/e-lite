@@ -10,10 +10,9 @@ use crate::{AttemptCtl, BlockSource, Endpoint, FetchMode, RawtxError, RawtxStats
 use bip324::io::{Payload, Protocol};
 use bip324::{PacketType, Role};
 use el_model::sync::Mutex;
-use el_model::{Chain, Hash32};
+use el_model::{sha256d, Chain, Hash32};
 use rand::seq::SliceRandom;
 use rand::thread_rng;
-use sha2::{Digest, Sha256};
 use std::collections::HashSet;
 use std::fmt;
 use std::io::{self, BufReader, Read, Write};
@@ -189,19 +188,8 @@ impl Write for DeadlineIo {
     }
 }
 
-fn sha256d(data: &[u8]) -> [u8; 32] {
-    let mut h = Sha256::new();
-    h.update(data);
-    let first = h.finalize();
-    let mut h2 = Sha256::new();
-    h2.update(first);
-    let mut out = [0u8; 32];
-    out.copy_from_slice(&h2.finalize());
-    out
-}
-
 fn checksum(payload: &[u8]) -> [u8; 4] {
-    let d = sha256d(payload);
+    let d = sha256d(&[payload]);
     [d[0], d[1], d[2], d[3]]
 }
 

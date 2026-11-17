@@ -448,3 +448,27 @@ pub(crate) fn cmd_run(cfg: &Config, chain: Chain) -> R<()> {
     );
     result
 }
+
+pub(crate) fn publish_tor_ports(cfg: &Config, rt: Option<&tor::TorRuntime>, shared: &Shared) {
+    shared
+        .stats
+        .tor_managed
+        .store(cfg.tor.managed(), Ordering::Relaxed);
+    let port = rt
+        .map(|r| r.socks_port() as u64)
+        .or_else(|| {
+            if cfg.rawtx.enabled {
+                cfg.rawtx
+                    .tor_socks
+                    .as_deref()
+                    .and_then(|s| s.rsplit_once(':'))
+                    .and_then(|(_, p)| p.parse::<u64>().ok())
+            } else {
+                None
+            }
+        })
+        .or_else(|| (cfg.tor.socks_port > 0).then_some(cfg.tor.socks_port as u64))
+        .unwrap_or(0);
+    shared.stats.tor_socks_port.store(port, Ordering::Relaxed);
+    shared.stats.tor_control_port.store(0, Ordering::Relaxed);
+}

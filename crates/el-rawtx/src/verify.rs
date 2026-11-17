@@ -6,20 +6,7 @@
 
 use crate::{RawtxError, Result};
 use bitcoin::{Block, Transaction};
-use el_model::{merkle_root, Hash32};
-use sha2::{Digest, Sha256};
-
-fn sha256d(a: &[u8], b: &[u8]) -> [u8; 32] {
-    let mut h = Sha256::new();
-    h.update(a);
-    h.update(b);
-    let first = h.finalize();
-    let mut h2 = Sha256::new();
-    h2.update(first);
-    let mut out = [0u8; 32];
-    out.copy_from_slice(&h2.finalize());
-    out
-}
+use el_model::{merkle_root, sha256d, Hash32};
 
 /// Decode and verify a block against the indexed header.
 pub fn verify_block(
@@ -136,7 +123,7 @@ pub fn verify_witness_commitment(block: &Block) -> Result<()> {
             }
             let root = merkle_root(&wtxids)
                 .ok_or_else(|| RawtxError::Verify("empty witness tree".into()))?;
-            let computed = sha256d(&root.reversed().0, reserved);
+            let computed = sha256d(&[&root.reversed().0, reserved]);
             if computed.as_slice() != commitment.as_slice() {
                 return Err(RawtxError::Verify("witness commitment mismatch".into()));
             }
@@ -172,7 +159,7 @@ mod tests {
     };
 
     fn commitment_script(root: &Hash32, reserved: &[u8; 32]) -> ScriptBuf {
-        let c = sha256d(&root.reversed().0, reserved);
+        let c = sha256d(&[&root.reversed().0, reserved]);
         let mut s = vec![0x6a, 0x24, 0xaa, 0x21, 0xa9, 0xed];
         s.extend_from_slice(&c);
         ScriptBuf::from_bytes(s)

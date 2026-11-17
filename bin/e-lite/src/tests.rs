@@ -30,10 +30,10 @@ fn tip(height: u32) -> IndexedTip {
 fn disk_resume_is_adaptive() {
     let mut cfg = Config::default();
     cfg.pruning.min_free_gib = 2;
-    assert_eq!(disk_low_bytes(&cfg), 2 * GIB_BYTES);
-    assert_eq!(disk_resume_bytes(&cfg), 3 * GIB_BYTES);
+    assert_eq!(disk_low_bytes(&cfg), 2 * GIB);
+    assert_eq!(disk_resume_bytes(&cfg), 3 * GIB);
     cfg.pruning.min_free_gib = 10;
-    assert_eq!(disk_resume_bytes(&cfg), 15 * GIB_BYTES);
+    assert_eq!(disk_resume_bytes(&cfg), 15 * GIB);
 }
 
 #[test]

@@ -43,30 +43,6 @@ pub(crate) fn cmd_init(cfg: &Config, chain: Chain) -> R<()> {
 
 /// Publish the effective Tor SOCKS port (not the configured `0 = auto`) and
 /// the fact that e-lite never allocates a Tor control port.
-pub(crate) fn publish_tor_ports(cfg: &Config, rt: Option<&tor::TorRuntime>, shared: &Shared) {
-    shared
-        .stats
-        .tor_managed
-        .store(cfg.tor.managed(), Ordering::Relaxed);
-    let port = rt
-        .map(|r| r.socks_port() as u64)
-        .or_else(|| {
-            if cfg.rawtx.enabled {
-                cfg.rawtx
-                    .tor_socks
-                    .as_deref()
-                    .and_then(|s| s.rsplit_once(':'))
-                    .and_then(|(_, p)| p.parse::<u64>().ok())
-            } else {
-                None
-            }
-        })
-        .or_else(|| (cfg.tor.socks_port > 0).then_some(cfg.tor.socks_port as u64))
-        .unwrap_or(0);
-    shared.stats.tor_socks_port.store(port, Ordering::Relaxed);
-    shared.stats.tor_control_port.store(0, Ordering::Relaxed);
-}
-
 pub(crate) fn cmd_doctor(cfg: &Config, chain: Chain) -> R<()> {
     let mut problems: Vec<String> = Vec::new();
     println!("e-lite {} doctor", VERSION);
@@ -330,11 +306,11 @@ pub(crate) fn cmd_doctor(cfg: &Config, chain: Chain) -> R<()> {
     let data_free = el_chain::disk_free_bytes(&cfg.data_dir(chain)).unwrap_or(0);
     println!(
         "disk free: index {} GiB, core datadir {} GiB (guard pauses below {} GiB)",
-        data_free / (1024 * 1024 * 1024),
-        core_free / (1024 * 1024 * 1024),
+        data_free / GIB,
+        core_free / GIB,
         cfg.pruning.min_free_gib
     );
-    let min_free = cfg.pruning.min_free_gib.saturating_mul(1024 * 1024 * 1024);
+    let min_free = cfg.pruning.min_free_gib.saturating_mul(GIB);
     if data_free < min_free || core_free < min_free {
         println!(
             "disk note: free space is below the guard; indexing and Core downloads will pause"
@@ -699,18 +675,7 @@ pub(crate) fn cmd_onion(
 /// Free space on the filesystem holding `path` (walks up when it does not
 /// exist yet). `None` when statvfs fails.
 pub(crate) fn free_bytes(path: &std::path::Path) -> Option<u64> {
-    use std::os::unix::ffi::OsStrExt;
-    let mut probe = path.to_path_buf();
-    loop {
-        let c = std::ffi::CString::new(probe.as_os_str().as_bytes()).ok()?;
-        let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
-        if unsafe { libc::statvfs(c.as_ptr(), &mut stat) } == 0 {
-            return Some((stat.f_bavail as u64).saturating_mul(stat.f_frsize as u64));
-        }
-        if !probe.pop() {
-            return None;
-        }
-    }
+    path.ancestors().find_map(el_chain::disk_free_bytes)
 }
 
 /// `e-lite cache status|clear`: the only command that deletes files, and it
@@ -945,7 +910,7 @@ pub(crate) fn cmd_status(cfg: &Config, chain: Chain, as_json: bool) -> R<()> {
         "indexed_height": tip.as_ref().map(|t| t.height).unwrap_or(0),
         "txnum": tip.as_ref().map(|t| t.txnum).unwrap_or(0),
         "db_bytes": store.disk_usage_bytes(),
-        "disk_free_bytes": el_serve::disk_free_bytes(&cfg.data_dir(chain)),
+        "disk_free_bytes": el_chain::disk_free_bytes(&cfg.data_dir(chain)).unwrap_or(0),
         "data_dir": cfg.data_dir(chain).display().to_string(),
         "onion": tor::read_hostname(&cfg.tor_dir(chain)).unwrap_or_default(),
         "onion_plain_port": tor::effective_onion_ports(cfg).0,

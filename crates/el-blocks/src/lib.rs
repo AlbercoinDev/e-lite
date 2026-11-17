@@ -169,15 +169,7 @@ fn header_hash(header: &[u8]) -> Result<Hash32> {
             reason: format!("header is {} bytes", header.len()),
         });
     }
-    let mut h = Sha256::new();
-    h.update(header);
-    let first = h.finalize();
-    let mut h2 = Sha256::new();
-    h2.update(first);
-    let digest = h2.finalize();
-    let mut raw = [0u8; 32];
-    raw.copy_from_slice(&digest);
-    Ok(Hash32(raw).reversed())
+    Ok(Hash32(el_model::sha256d(&[header])).reversed())
 }
 
 fn read_at(file: &File, offset: u64, buf: &mut [u8]) -> Result<bool> {

@@ -37,6 +37,9 @@ use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::{Duration, Instant, SystemTime};
 use tuning::{CommitReason, Tunables};
 
+/// One gibibyte, for the GiB settings and disk thresholds.
+pub(crate) const GIB: u64 = 1024 * 1024 * 1024;
+
 type E = Box<dyn std::error::Error + Send + Sync>;
 type R<T> = std::result::Result<T, E>;
 

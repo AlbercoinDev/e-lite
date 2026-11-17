@@ -496,8 +496,3 @@ pub(crate) fn top_level_snapshot_bytes(dir: &std::path::Path) -> u64 {
         })
         .sum()
 }
-
-/// Free bytes on the filesystem containing `path` (0 when it cannot be read).
-pub fn disk_free_bytes(path: &std::path::Path) -> u64 {
-    el_chain::disk_free_bytes(path).unwrap_or(0)
-}

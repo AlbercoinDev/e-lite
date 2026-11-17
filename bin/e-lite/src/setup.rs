@@ -350,14 +350,6 @@ pub(crate) fn core_identity(core: &CoreClient, chain: Chain) -> R<NetworkIdentit
     Ok(identity)
 }
 
-pub(crate) fn total_ram_mib() -> Option<u64> {
-    tuning::total_ram_mib()
-}
-
-pub(crate) fn effective_cache_mib(cfg: &Config) -> u64 {
-    tuning::initial_cache_mib(cfg)
-}
-
 pub(crate) fn min_free_bytes(cfg: &Config, chain: Chain) -> Option<u64> {
     match (
         el_chain::disk_free_bytes(&cfg.data_dir(chain)),
@@ -370,20 +362,18 @@ pub(crate) fn min_free_bytes(cfg: &Config, chain: Chain) -> Option<u64> {
     }
 }
 
-pub(crate) const GIB_BYTES: u64 = 1024 * 1024 * 1024;
-
 pub(crate) fn disk_low_bytes(cfg: &Config) -> u64 {
-    cfg.pruning.min_free_gib.saturating_mul(GIB_BYTES)
+    cfg.pruning.min_free_gib.saturating_mul(GIB)
 }
 
 pub(crate) fn disk_critical_bytes(cfg: &Config) -> u64 {
-    let configured = cfg.pruning.critical_free_gib.saturating_mul(GIB_BYTES);
+    let configured = cfg.pruning.critical_free_gib.saturating_mul(GIB);
     if configured == 0 {
         return 0;
     }
     // Keep at least a small drain window below the download pause threshold.
     configured
-        .min(disk_low_bytes(cfg).saturating_sub(GIB_BYTES / 4))
+        .min(disk_low_bytes(cfg).saturating_sub(GIB / 4))
         .max(1)
 }
 
@@ -391,7 +381,7 @@ pub(crate) fn disk_critical_bytes(cfg: &Config) -> u64 {
 /// avoids the "never resumes on a small disk" problem of a fixed +5 GiB.
 pub(crate) fn disk_resume_bytes(cfg: &Config) -> u64 {
     let low = disk_low_bytes(cfg);
-    low.saturating_add((low / 2).clamp(512 * 1024 * 1024, 5 * GIB_BYTES))
+    low.saturating_add((low / 2).clamp(512 * 1024 * 1024, 5 * GIB))
 }
 
 pub(crate) fn warn_if_disk_low(cfg: &Config, chain: Chain) {
@@ -417,7 +407,7 @@ pub(crate) fn open_store_with(
 ) -> R<Arc<Store>> {
     let dir = cfg.data_dir(chain);
     let cache_bytes = (cache_mib as usize) * 1024 * 1024;
-    let ram_mib = total_ram_mib().unwrap_or(cache_mib.max(512));
+    let ram_mib = tuning::total_ram_mib().unwrap_or(cache_mib.max(512));
     let write_mib = if cfg.index.write_buffer_mib > 0 {
         cfg.index.write_buffer_mib
     } else {
@@ -491,7 +481,7 @@ pub(crate) fn open_store(cfg: &Config, chain: Chain) -> R<Arc<Store>> {
     let jobs = std::thread::available_parallelism()
         .map(|n| n.get().clamp(1, 8))
         .unwrap_or(4);
-    open_store_with(cfg, chain, effective_cache_mib(cfg), jobs)
+    open_store_with(cfg, chain, tuning::initial_cache_mib(cfg), jobs)
 }
 
 pub(crate) fn build_bulk(
@@ -1330,4 +1320,117 @@ pub(crate) fn start_transports(shared: &Arc<Shared>, cfg: &Config) -> R<Transpor
         notifications,
         memory,
     })
+}
+
+/// Wait until Core is reachable and the database identity is verified or
+/// initialized. With `require_core = false`, an existing database may be used
+/// while Core is down (serving cached data).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn ensure_identity_blocking(
+    cfg: &Config,
+    chain: Chain,
+    store: &Store,
+    core: &CoreClient,
+    core_sup: &mut CoreSupervisor,
+    shutdown: &Arc<AtomicBool>,
+    require_core: bool,
+    shared: Option<&Arc<Shared>>,
+) -> R<Option<NetworkIdentity>> {
+    // Enforce `managed` ownership before trusting a Core that is already up.
+    if cfg.core.manage != CoreManage::External {
+        if let Err(se) = core_sup.ensure_started(core) {
+            if cfg.core.manage == CoreManage::Managed {
+                return fail(format!("cannot start managed Core: {se}"));
+            }
+            eprintln!("[e-lite] Core start: {se}");
+        }
+    }
+    let stored = stored_identity(store, chain)?;
+    if let Some(id) = &stored {
+        match core_identity(core, chain) {
+            Ok(live) => {
+                verify_identity(id, &live)?;
+                if let Some(sh) = shared {
+                    sh.set_identity(live.clone());
+                    sh.set_state(state::BUILDING);
+                }
+                return Ok(Some(live));
+            }
+            Err(_) if !require_core => {
+                // Offline serve: keep the pinned identity and let the caller
+                // print a single "serving cached index" line.
+                if let Some(sh) = shared {
+                    sh.set_state(state::CORE_UNAVAILABLE);
+                }
+                return Ok(Some(id.clone()));
+            }
+            Err(_) => {}
+        }
+    }
+
+    let mut backoff = 1u64;
+    let mut loading_logged = false;
+    loop {
+        if shutdown.load(Ordering::SeqCst) {
+            return Ok(None);
+        }
+        match core_identity(core, chain) {
+            Ok(live) => {
+                if let Some(id) = &stored {
+                    verify_identity(id, &live)?;
+                } else {
+                    store.init_identity(&live)?;
+                    println!(
+                        "initialized {} at {}",
+                        chain.name(),
+                        cfg.data_dir(chain).display()
+                    );
+                    println!("genesis: {}", live.genesis);
+                }
+                if let Some(sh) = shared {
+                    sh.set_identity(live.clone());
+                    sh.set_state(state::BUILDING);
+                }
+                return Ok(Some(live));
+            }
+            Err(e) => {
+                let msg = e.to_string();
+                let loading = msg.contains("Loading block index")
+                    || msg.contains("Verifying blocks")
+                    || msg.contains("(code -28)");
+                if let Some(sh) = shared {
+                    sh.set_state(if stored.is_some() {
+                        state::CORE_UNAVAILABLE
+                    } else {
+                        state::WAITING_FOR_CORE
+                    });
+                }
+                match core_sup.ensure_started(core) {
+                    Ok(CoreStartOutcome::Started) => {
+                        eprintln!("[e-lite] started Core; waiting for its RPC")
+                    }
+                    Ok(_) => {}
+                    Err(se) if cfg.core.manage == CoreManage::Managed => {
+                        return fail(format!("cannot start managed Core: {se}"));
+                    }
+                    Err(se) => eprintln!("[e-lite] Core start: {se}"),
+                }
+                if loading {
+                    if !loading_logged {
+                        eprintln!(
+                            "[e-lite] Core is loading its block index; waiting for RPC readiness"
+                        );
+                        loading_logged = true;
+                    }
+                } else {
+                    eprintln!("[e-lite] waiting for Bitcoin Core ({msg}); retrying in {backoff}s");
+                    loading_logged = false;
+                }
+                if !sleep_with_flag(backoff, shutdown) {
+                    return Ok(None);
+                }
+                backoff = (backoff * 2).min(30);
+            }
+        }
+    }
 }

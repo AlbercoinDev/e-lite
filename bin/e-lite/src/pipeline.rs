@@ -5,7 +5,6 @@ use super::*;
 // ------------------------------------------------------------------- indexing
 
 pub(crate) const CATCH_UP_BLOCKS: u64 = 512;
-pub(crate) const GIB: u64 = 1024 * 1024 * 1024;
 
 pub(crate) type FetchResult =
     std::result::Result<(u64, el_index::PreparedBlock, el_index::PrefetchedPrevouts), E>;
@@ -112,15 +111,11 @@ impl Indexer {
         let now = Instant::now();
         if let Some(sh) = &shared {
             sh.stats.scheduler_high_bytes.store(
-                cfg.pruning
-                    .max_bulk_lag_gib
-                    .saturating_mul(1024 * 1024 * 1024),
+                cfg.pruning.max_bulk_lag_gib.saturating_mul(GIB),
                 Ordering::Relaxed,
             );
             sh.stats.scheduler_low_bytes.store(
-                cfg.pruning
-                    .core_resume_ahead_gib
-                    .saturating_mul(1024 * 1024 * 1024),
+                cfg.pruning.core_resume_ahead_gib.saturating_mul(GIB),
                 Ordering::Relaxed,
             );
         }
@@ -2150,7 +2145,7 @@ pub(crate) fn supervisor_config(
                     cfg.pruning
                         .prune_defer_free_gib
                         .max(cfg.pruning.min_free_gib)
-                        .saturating_mul(GIB_BYTES),
+                        .saturating_mul(GIB),
                 )
             }
         },
@@ -2518,119 +2513,6 @@ pub(crate) fn sleep_with_flag(seconds: u64, flag: &Arc<AtomicBool>) -> bool {
         std::thread::sleep(Duration::from_secs(1));
     }
     !flag.load(Ordering::SeqCst)
-}
-
-/// Wait until Core is reachable and the database identity is verified or
-/// initialized. With `require_core = false`, an existing database may be used
-/// while Core is down (serving cached data).
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn ensure_identity_blocking(
-    cfg: &Config,
-    chain: Chain,
-    store: &Store,
-    core: &CoreClient,
-    core_sup: &mut CoreSupervisor,
-    shutdown: &Arc<AtomicBool>,
-    require_core: bool,
-    shared: Option<&Arc<Shared>>,
-) -> R<Option<NetworkIdentity>> {
-    // Enforce `managed` ownership before trusting a Core that is already up.
-    if cfg.core.manage != CoreManage::External {
-        if let Err(se) = core_sup.ensure_started(core) {
-            if cfg.core.manage == CoreManage::Managed {
-                return fail(format!("cannot start managed Core: {se}"));
-            }
-            eprintln!("[e-lite] Core start: {se}");
-        }
-    }
-    let stored = stored_identity(store, chain)?;
-    if let Some(id) = &stored {
-        match core_identity(core, chain) {
-            Ok(live) => {
-                verify_identity(id, &live)?;
-                if let Some(sh) = shared {
-                    sh.set_identity(live.clone());
-                    sh.set_state(state::BUILDING);
-                }
-                return Ok(Some(live));
-            }
-            Err(_) if !require_core => {
-                // Offline serve: keep the pinned identity and let the caller
-                // print a single "serving cached index" line.
-                if let Some(sh) = shared {
-                    sh.set_state(state::CORE_UNAVAILABLE);
-                }
-                return Ok(Some(id.clone()));
-            }
-            Err(_) => {}
-        }
-    }
-
-    let mut backoff = 1u64;
-    let mut loading_logged = false;
-    loop {
-        if shutdown.load(Ordering::SeqCst) {
-            return Ok(None);
-        }
-        match core_identity(core, chain) {
-            Ok(live) => {
-                if let Some(id) = &stored {
-                    verify_identity(id, &live)?;
-                } else {
-                    store.init_identity(&live)?;
-                    println!(
-                        "initialized {} at {}",
-                        chain.name(),
-                        cfg.data_dir(chain).display()
-                    );
-                    println!("genesis: {}", live.genesis);
-                }
-                if let Some(sh) = shared {
-                    sh.set_identity(live.clone());
-                    sh.set_state(state::BUILDING);
-                }
-                return Ok(Some(live));
-            }
-            Err(e) => {
-                let msg = e.to_string();
-                let loading = msg.contains("Loading block index")
-                    || msg.contains("Verifying blocks")
-                    || msg.contains("(code -28)");
-                if let Some(sh) = shared {
-                    sh.set_state(if stored.is_some() {
-                        state::CORE_UNAVAILABLE
-                    } else {
-                        state::WAITING_FOR_CORE
-                    });
-                }
-                match core_sup.ensure_started(core) {
-                    Ok(CoreStartOutcome::Started) => {
-                        eprintln!("[e-lite] started Core; waiting for its RPC")
-                    }
-                    Ok(_) => {}
-                    Err(se) if cfg.core.manage == CoreManage::Managed => {
-                        return fail(format!("cannot start managed Core: {se}"));
-                    }
-                    Err(se) => eprintln!("[e-lite] Core start: {se}"),
-                }
-                if loading {
-                    if !loading_logged {
-                        eprintln!(
-                            "[e-lite] Core is loading its block index; waiting for RPC readiness"
-                        );
-                        loading_logged = true;
-                    }
-                } else {
-                    eprintln!("[e-lite] waiting for Bitcoin Core ({msg}); retrying in {backoff}s");
-                    loading_logged = false;
-                }
-                if !sleep_with_flag(backoff, shutdown) {
-                    return Ok(None);
-                }
-                backoff = (backoff * 2).min(30);
-            }
-        }
-    }
 }
 
 /// Reload the hot subset of the config. Cold fields are reported but require a

@@ -3,19 +3,12 @@
 //! Hashes are handled in *internal* (little-endian wire) order for hashing and
 //! converted back to display order for callers.
 
+use crate::hash;
 use crate::types::Hash32;
-use sha2::{Digest, Sha256};
 
+/// Hash of two child nodes.
 fn sha256d(a: &[u8; 32], b: &[u8; 32]) -> [u8; 32] {
-    let mut h = Sha256::new();
-    h.update(a);
-    h.update(b);
-    let first = h.finalize();
-    let mut h2 = Sha256::new();
-    h2.update(first);
-    let mut out = [0u8; 32];
-    out.copy_from_slice(&h2.finalize());
-    out
+    hash::sha256d(&[a, b])
 }
 
 /// Compute the merkle root for an ordered list of TXIDs (display order).
