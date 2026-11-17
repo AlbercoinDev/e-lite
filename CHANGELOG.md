@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.1.0-alpha.29.19.2 — 2026-11-17
+
+### Fixed
+
+- A one-shot command whose output is closed early (`e-lite status --json |
+  head -1`) no longer reports "FATAL: internal error" and aborts with a core
+  dump: it ends quietly by SIGPIPE like any Unix tool (AUD-192). `run`,
+  `serve` and `index` still ignore SIGPIPE. Covered by
+  `bin/e-lite/tests/closed_output.rs`.
+
 ## 0.1.0-alpha.29.19.1 — 2026-11-17
 
 Cleanup and reorganization. No change to what e-lite does,

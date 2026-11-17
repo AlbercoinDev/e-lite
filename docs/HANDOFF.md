@@ -1,8 +1,8 @@
 # Session handoff
 
-**Updated:** 2026-11-17 (alpha.29.19.1: cleanup and reorganization)
-**Latest published release:** `0.1.0-alpha.29.19.1`
-**Release:** https://github.com/AlbercoinDev/e-lite/releases/tag/v0.1.0-alpha.29.19.1
+**Updated:** 2026-11-17 (alpha.29.19.2: one-shot commands end quietly on a closed pipe)
+**Latest published release:** `0.1.0-alpha.29.19.2`
+**Release:** https://github.com/AlbercoinDev/e-lite/releases/tag/v0.1.0-alpha.29.19.2
 
 This is the short “where we are”. The invariants live in
 [`AGENTS.md`](../AGENTS.md); the
@@ -88,31 +88,18 @@ no repitas contexto ni rehagas decisiones ya documentadas.
   `docs/ROADMAP.md` is future work only, and `docs/AUDIT.md` holds the open
   findings (`docs/audit/FIXED.md` is the fixed history).
 
-## Last change (alpha.29.19.1): cleanup and reorganization
+## Last change (alpha.29.19.2): closed output
+
+A one-shot command whose stdout is closed early (`e-lite status --json | head
+-1`) ends quietly by SIGPIPE instead of a FATAL abort (AUD-192); the daemons
+still ignore SIGPIPE.
+
+## Previous change (alpha.29.19.1): cleanup and reorganization
 
 No behaviour change except the
 all-in-one `--quick` fix; see `CHANGELOG.md`. Documentation has
 one home per topic (`docs/README.md` is the map), the pipeline is split under
 `bin/e-lite/src/pipeline/`, and the source layout is in `ARCHITECTURE.md`.
-
-## Previous change (alpha.29.19.0): fixes, identity backup, shorter CLI
-
-Full list in `CHANGELOG.md`; earlier releases are only there.
-
-- **Fixed**: AUD-182..188 (shared block verified once, Tor retry on a new
-  circuit, slot freed on disconnect, merkle tree per block, verbose
-  `transaction.get` across a reorg, one deadline per request, unusable sync
-  lock).
-- **Added**: `export-identity`/`import-identity` (AUD-189); restart count and
-  cause in `/status.supervisor` and `/metrics`, `[safety] supervise`
-  (AUD-190); `tests/e2e/e2e_privacy.sh`.
-- **Changed**: indexing errors classified by a `Fatal` type (AUD-175); the
-  command line keeps the daily options and the rest become `--set`
-  (`DEPRECATED_FLAGS`, removed two releases later).
-- **Removed** (owner decision): `prefetch_deadline_ms`, `cgroup_io_weight`,
-  `adaptive_memtables`, `E_LITE_LAG_POLICY=drain`, the block-count lag window,
-  `scheduler = "alternate"`, the dynamic ZFS ARC manager and `arc-setup`.
-  Their keys are accepted with a warning (`RETIRED_KEYS`).
 
 ## Pending measurements
 

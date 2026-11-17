@@ -48,6 +48,11 @@ import-snapshot  restore --input into an empty target (atomic: staged, then rena
 version          print version
 ```
 
+The one-shot commands (everything but `run`, `serve` and `index`) behave like
+any Unix tool when their output is closed early: `e-lite status --json | head -1`
+ends the command quietly by SIGPIPE (shell status 141). `run`, `serve` and
+`index` ignore SIGPIPE: they keep running when the terminal goes away.
+
 ## Common options
 
 | Flag | Meaning |

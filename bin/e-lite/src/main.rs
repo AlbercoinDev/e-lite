@@ -247,15 +247,35 @@ fn install_panic_hook() {
     }));
 }
 
+/// A one-shot command (`status`, `cache`, `doctor`, `help`, ...) whose output
+/// is closed early, as in `e-lite status --json | head -1`, ends quietly like
+/// any other Unix tool (AUD-192). Rust starts with SIGPIPE ignored, so the
+/// write failed with EPIPE, `println!` panicked and the panic hook reported a
+/// FATAL internal error and aborted. Sockets are not affected: on Linux the
+/// standard library sends with `MSG_NOSIGNAL`. The daemons keep SIGPIPE
+/// ignored: they write to a log tee and must outlive a closed terminal.
+fn end_quietly_on_closed_output() {
+    // SAFETY: called once at startup, before any thread is spawned.
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
+}
+
 fn main() {
     install_panic_hook();
-    // A daemon command becomes a watching parent plus the node as its child,
-    // so a fatal error is followed by a restart without any init system.
-    if let Ok(args) = parse_args() {
-        let daemon = matches!(
+    let parsed = parse_args();
+    let daemon = parsed.as_ref().is_ok_and(|args| {
+        matches!(
             args.command,
             Some(Command::Run | Command::Serve | Command::Index)
-        );
+        )
+    });
+    if !daemon {
+        end_quietly_on_closed_output();
+    }
+    // A daemon command becomes a watching parent plus the node as its child,
+    // so a fatal error is followed by a restart without any init system.
+    if let Ok(args) = parsed {
         // `[safety] supervise = false` (or `--set safety.supervise=false`)
         // means the same as `--no-supervise`. A config that does not load
         // keeps the supervisor: the node reports the error and its exit code
