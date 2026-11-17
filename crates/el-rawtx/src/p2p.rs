@@ -7,14 +7,16 @@
 
 use crate::health::{Blame, HealthMap};
 use crate::socks::{socks_connect, SocksError};
-use crate::{AttemptCtl, BlockSource, Endpoint, FetchMode, RawtxError, RawtxStats, Result};
+use crate::{
+    AttemptCtl, BlockSource, Endpoint, FetchMode, RawtxError, RawtxStats, Result, Semaphore,
+};
 use bip324::io::{Payload, Protocol};
 use bip324::{PacketType, Role};
 use el_model::sync::Mutex;
 use el_model::{sha256d, Chain, Hash32};
 use rand::seq::SliceRandom;
 use rand::thread_rng;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io::{self, BufReader, Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -96,6 +98,10 @@ pub struct P2pSource {
     /// it when P2P is the only external source; otherwise Esplora already
     /// forces its own attempt and a dead peer list is not paid for again.
     force_when_cooling: AtomicBool,
+    /// Blocks this source may have in flight with one peer at a time.
+    per_peer_in_flight: usize,
+    /// One semaphore per peer, created on first use.
+    peer_slots: Mutex<HashMap<String, Arc<Semaphore>>>,
     stats: Option<Arc<RawtxStats>>,
 }
 
@@ -403,8 +409,29 @@ impl P2pSource {
             good: Mutex::new(HashSet::new()),
             proxy_down_until: Mutex::new(None),
             force_when_cooling: AtomicBool::new(false),
+            per_peer_in_flight: 3,
+            peer_slots: Mutex::new(HashMap::new()),
             stats: None,
         }
+    }
+
+    /// Blocks that may be in flight with one peer at a time (1..=4).
+    pub fn with_blocks_per_peer(mut self, blocks: usize) -> Self {
+        self.per_peer_in_flight = blocks.clamp(1, 4);
+        self
+    }
+
+    /// The in-flight budget of one peer. Split out so the policy can be
+    /// tested without a socket.
+    fn peer_slot(&self, key: &str) -> Arc<Semaphore> {
+        let mut map = self
+            .peer_slots
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        Arc::clone(
+            map.entry(key.to_string())
+                .or_insert_with(|| Semaphore::new(self.per_peer_in_flight)),
+        )
     }
 
     /// Per-attempt limit for connections made through Tor (default: the
@@ -956,6 +983,15 @@ impl BlockSource for P2pSource {
         if call_deadline.saturating_duration_since(Instant::now()) < self.min_attempt() {
             return Err(RawtxError::Unavailable("p2p deadline reached".into()));
         }
+        // At most N blocks in flight with one peer (rawtx.p2p_blocks_per_peer):
+        // a peer that is slow keeps its slots but does not open circuits for
+        // every queued block at once.
+        let slot = self.peer_slot(&endpoint.key);
+        let Some(_permit) = slot.acquire_until(call_deadline, 0) else {
+            return Err(RawtxError::Unavailable(
+                "p2p peer in-flight limit reached".into(),
+            ));
+        };
         self.bump(|stats| {
             stats.p2p_attempts.fetch_add(1, Ordering::Relaxed);
         });
@@ -1029,6 +1065,50 @@ impl BlockSource for P2pSource {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_peer_keeps_only_the_configured_blocks_in_flight() {
+        let source = P2pSource::new(
+            Vec::new(),
+            None,
+            Duration::from_secs(1),
+            Chain::Regtest,
+            false,
+            false,
+            Duration::from_secs(1),
+        )
+        .with_blocks_per_peer(2);
+        let slot = source.peer_slot("peer.example:8333");
+        let first = slot.acquire_until(Instant::now() + Duration::from_millis(50), 0);
+        let second = slot.acquire_until(Instant::now() + Duration::from_millis(50), 0);
+        assert!(first.is_some() && second.is_some());
+        assert!(
+            slot.acquire_until(Instant::now() + Duration::from_millis(5), 0)
+                .is_none(),
+            "a third block must wait for a slot"
+        );
+        drop(first);
+        assert!(slot
+            .acquire_until(Instant::now() + Duration::from_millis(50), 0)
+            .is_some());
+        drop(second);
+    }
+
+    #[test]
+    fn the_per_peer_budget_is_clamped_to_one_to_four() {
+        let source = P2pSource::new(
+            Vec::new(),
+            None,
+            Duration::from_secs(1),
+            Chain::Regtest,
+            false,
+            false,
+            Duration::from_secs(1),
+        )
+        .with_blocks_per_peer(9);
+        assert_eq!(source.per_peer_in_flight, 4);
+    }
+
     use bitcoin::absolute::LockTime;
     use bitcoin::block::Header;
     use bitcoin::hashes::Hash;

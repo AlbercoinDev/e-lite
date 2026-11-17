@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.1.0-alpha.29.23.0 — 2026-11-17
+
+### Added
+
+- `rawtx.p2p_blocks_per_peer` (1..4, default 3): each P2P peer has its own
+  in-flight budget, so up to that many blocks are requested from one peer at
+  a time instead of opening a circuit for every queued block.
+- `rawtx.provider_quota` (0 or 1.0..4.0, default 1.5): long-term per-provider
+  quota as a multiple of the fair share (`spread`). An operator that already
+  received more than its share moves behind the others in the candidate order,
+  so traffic rotates instead of concentrating on the two fastest providers.
+  `0` disables the rotation.
+
+### Tests
+
+- The per-peer budget clamps to 1..4 and a peer admits only that many
+  concurrent permits.
+- The quota moves an over-quota operator behind the others, rotates the lead
+  between two operators over repeated rounds, and is a no-op when disabled or
+  with no traffic yet.
+
 ## 0.1.0-alpha.29.22.0 — 2026-11-17
 
 ### Added

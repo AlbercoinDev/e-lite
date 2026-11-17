@@ -696,6 +696,13 @@ pub struct RawtxCfg {
     /// mode prefetches the history, per-txid mode only on demand.
     #[serde(default = "d_prefetch_history_blocks")]
     pub prefetch_history_blocks: usize,
+    /// Blocks in flight with one P2P peer (1..4).
+    #[serde(default = "d_p2p_blocks_per_peer")]
+    pub p2p_blocks_per_peer: usize,
+    /// Long-term per-provider quota as a multiple of the fair share
+    /// (0 disables; otherwise 1.0..4.0).
+    #[serde(default = "d_provider_quota")]
+    pub provider_quota: f64,
     /// `privacy.toml` path. Empty = next to config.toml (AUD-163).
     #[serde(default)]
     pub privacy_file: Option<String>,
@@ -768,6 +775,8 @@ impl Default for RawtxCfg {
             sessions_total: d_sessions_total(),
             jitter_ms: d_jitter_ms(),
             prefetch_history_blocks: d_prefetch_history_blocks(),
+            p2p_blocks_per_peer: d_p2p_blocks_per_peer(),
+            provider_quota: d_provider_quota(),
             privacy_file: None,
             privacy_overrides: Vec::new(),
         }
@@ -880,6 +889,12 @@ fn d_jitter_ms() -> u64 {
 }
 fn d_prefetch_history_blocks() -> usize {
     0
+}
+fn d_p2p_blocks_per_peer() -> usize {
+    3
+}
+fn d_provider_quota() -> f64 {
+    1.5
 }
 fn d_p2p_timeout() -> u64 {
     8
@@ -1223,6 +1238,12 @@ impl Config {
         if self.rawtx.prefetch_history_blocks > 4096 {
             return Err("[rawtx] prefetch_history_blocks must be 0..4096".to_string());
         }
+        if !(1..=4).contains(&self.rawtx.p2p_blocks_per_peer) {
+            return Err("[rawtx] p2p_blocks_per_peer must be 1..4".to_string());
+        }
+        if self.rawtx.provider_quota != 0.0 && !(1.0..=4.0).contains(&self.rawtx.provider_quota) {
+            return Err("[rawtx] provider_quota must be 0 (off) or 1.0..4.0".to_string());
+        }
         if self.index.reorg_window == 0 {
             return Err("[index] reorg_window must be >= 1".to_string());
         }
@@ -1509,6 +1530,8 @@ mod tests {
         assert_eq!(cfg.rawtx.sessions_total, 16);
         assert_eq!(cfg.rawtx.jitter_ms, 50);
         assert_eq!(cfg.rawtx.prefetch_history_blocks, 0);
+        assert_eq!(cfg.rawtx.p2p_blocks_per_peer, 3);
+        assert_eq!(cfg.rawtx.provider_quota, 1.5);
         assert!(cfg.validate().is_ok());
 
         let mut bad = Config::default();
@@ -1532,6 +1555,14 @@ mod tests {
         bad.rawtx.jitter_ms = 50;
         bad.rawtx.prefetch_history_blocks = 4097;
         assert!(bad.validate().is_err());
+        bad.rawtx.prefetch_history_blocks = 0;
+        bad.rawtx.p2p_blocks_per_peer = 5;
+        assert!(bad.validate().is_err());
+        bad.rawtx.p2p_blocks_per_peer = 3;
+        bad.rawtx.provider_quota = 0.5;
+        assert!(bad.validate().is_err());
+        bad.rawtx.provider_quota = 0.0;
+        assert!(bad.validate().is_ok());
     }
 
     #[test]
@@ -1547,6 +1578,8 @@ mod tests {
                 "rawtx.sessions_total=24".to_string(),
                 "rawtx.jitter_ms=0".to_string(),
                 "rawtx.prefetch_history_blocks=128".to_string(),
+                "rawtx.p2p_blocks_per_peer=2".to_string(),
+                "rawtx.provider_quota=2.0".to_string(),
             ],
         )
         .unwrap();
@@ -1558,6 +1591,8 @@ mod tests {
         assert_eq!(cfg.rawtx.sessions_total, 24);
         assert_eq!(cfg.rawtx.jitter_ms, 0);
         assert_eq!(cfg.rawtx.prefetch_history_blocks, 128);
+        assert_eq!(cfg.rawtx.p2p_blocks_per_peer, 2);
+        assert_eq!(cfg.rawtx.provider_quota, 2.0);
     }
 
     #[test]

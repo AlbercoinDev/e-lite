@@ -481,6 +481,8 @@ fn slow_fixture(delay: Duration) -> (Arc<Shared>, Hash32, std::path::PathBuf) {
                 sessions_total: 16,
                 jitter_ms: 50,
                 prefetch_history_blocks: 0,
+                p2p_blocks_per_peer: 3,
+                provider_quota: 1.5,
             },
         )
         .unwrap()

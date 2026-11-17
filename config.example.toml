@@ -215,6 +215,9 @@ sessions_total = 16                # concurrent per-txid sessions (1-32)
 jitter_ms = 50                     # random delay before a session (0-250)
 prefetch_history_blocks = 0        # blocks queued per history response; 0 = auto:
                                    # block mode prefetches, per-txid mode on demand only
+p2p_blocks_per_peer = 3            # blocks in flight with one P2P peer (1-4)
+provider_quota = 1.5               # long-term per-provider quota (multiple of the
+                                   # fair share); 0 disables the rotation
 p2p_timeout_seconds = 8             # direct P2P attempt (connect 4 s, stall 6 s)
 p2p_tor_timeout_seconds = 30        # P2P attempt through Tor (connect 10 s, onion
                                     # 20 s; stall 12 s; whole block within this)

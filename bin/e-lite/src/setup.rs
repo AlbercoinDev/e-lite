@@ -736,6 +736,8 @@ pub(crate) fn build_resolver(
         sessions_total: cfg.rawtx.sessions_total,
         jitter_ms: cfg.rawtx.jitter_ms,
         prefetch_history_blocks: cfg.rawtx.prefetch_history_blocks,
+        p2p_blocks_per_peer: cfg.rawtx.p2p_blocks_per_peer,
+        provider_quota: cfg.rawtx.provider_quota,
     };
     let resolver = Resolver::new(Arc::clone(store), &rc)?;
     match resolver.tx_mode_servers() {

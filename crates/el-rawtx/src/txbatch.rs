@@ -26,7 +26,7 @@ use el_store::Store;
 use rand::seq::SliceRandom;
 use rand::thread_rng;
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar};
 use std::time::{Duration, Instant};
 
@@ -102,6 +102,11 @@ struct Shared {
     decoy_mode: DecoySessions,
     /// Random delay before a session, milliseconds.
     jitter_ms: u64,
+    /// Long-term per-provider quota (multiple of the fair share; 0 = off).
+    provider_quota: f64,
+    /// Items sent per operator since start and the total, for the quota.
+    provider_counts: Mutex<HashMap<String, u64>>,
+    provider_total: AtomicU64,
     /// Longest batch a server accepted, learned after a session failure: a
     /// provider that closes connections above 20 items (measured) is not asked
     /// for 50 again in the same process.
@@ -148,6 +153,7 @@ impl TxMode {
         sessions_total: usize,
         decoy_mode: DecoySessions,
         jitter_ms: u64,
+        provider_quota: f64,
     ) -> Option<Self> {
         if sources.is_empty() {
             return None;
@@ -161,6 +167,13 @@ impl TxMode {
             decoy_sessions: Semaphore::new((sessions_total / 4).max(1)),
             decoy_mode,
             jitter_ms: jitter_ms.min(250),
+            provider_quota: if provider_quota <= 0.0 {
+                0.0
+            } else {
+                provider_quota.clamp(1.0, 4.0)
+            },
+            provider_counts: Mutex::new(HashMap::new()),
+            provider_total: AtomicU64::new(0),
             batch_caps: Mutex::new(HashMap::new()),
             params,
             books: Mutex::new((HashMap::new(), VecDeque::new())),
@@ -551,6 +564,27 @@ fn dispatch(shared: &Arc<Shared>, reqs: Vec<Req>) {
     let mut order: Vec<usize> = (0..servers.len()).collect();
     order.shuffle(&mut rng);
     order.sort_by(|&a, &b| rank[a].total_cmp(&rank[b]));
+    // Long-term quota: an operator that already received more than its share
+    // of the traffic moves behind the others, so the load rotates instead of
+    // concentrating on the two fastest providers.
+    let operators: Vec<String> = servers
+        .iter()
+        .map(|(_, key, _)| server_operator(key))
+        .collect();
+    let (counts, total) = {
+        let counts = shared
+            .provider_counts
+            .lock()
+            .map(|m| m.clone())
+            .unwrap_or_default();
+        (counts, shared.provider_total.load(Ordering::Relaxed))
+    };
+    let quota_share = if shared.provider_quota > 0.0 && spread > 0 {
+        shared.provider_quota / spread as f64
+    } else {
+        0.0
+    };
+    let order = quota_order(&order, &operators, &counts, total, quota_share);
     let target = spread.max(servers.len().div_ceil(2));
     let mut seen_operators: HashSet<String> = HashSet::new();
     let mut candidates: Vec<usize> = Vec::new();
@@ -594,6 +628,11 @@ fn dispatch(shared: &Arc<Shared>, reqs: Vec<Req>) {
                 .unwrap_or(candidates[0]);
             *counts.entry(servers[pick].1.clone()).or_insert(0) += 1;
             per_server.entry(pick).or_default().push(item);
+            let operator = server_operator(&servers[pick].1);
+            if let Ok(mut totals) = shared.provider_counts.lock() {
+                *totals.entry(operator).or_insert(0) += 1;
+            }
+            shared.provider_total.fetch_add(1, Ordering::Relaxed);
         }
     }
     drop(spread_counts);
@@ -750,6 +789,37 @@ fn retry_or_fail(shared: &Arc<Shared>, mut r: Req, key: &str, why: &str) {
     }
 }
 
+/// Move operators that are over their long-term quota behind the others.
+/// `quota_share <= 0` disables the rotation; with no traffic yet the order is
+/// unchanged.
+fn quota_order(
+    order: &[usize],
+    operators: &[String],
+    counts: &HashMap<String, u64>,
+    total: u64,
+    quota_share: f64,
+) -> Vec<usize> {
+    if quota_share <= 0.0 || total == 0 {
+        return order.to_vec();
+    }
+    let limit = quota_share * total as f64;
+    let mut under = Vec::with_capacity(order.len());
+    let mut over = Vec::new();
+    for &index in order {
+        let sent = counts
+            .get(operators.get(index).map(String::as_str).unwrap_or(""))
+            .copied()
+            .unwrap_or(0) as f64;
+        if sent < limit {
+            under.push(index);
+        } else {
+            over.push(index);
+        }
+    }
+    under.extend(over);
+    under
+}
+
 /// Registrable-suffix approximation used to keep two endpoints of the same
 /// operator out of the preferred candidate set (`mempool.space` API, onion
 /// and Electrum count as one).
@@ -771,5 +841,43 @@ fn server_operator(key: &str) -> String {
         format!("{}.{}", parts[parts.len() - 2], parts[parts.len() - 1])
     } else {
         host
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn over_quota_operators_move_to_the_back() {
+        let operators = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+        let mut counts = HashMap::new();
+        counts.insert("a".to_string(), 90);
+        counts.insert("b".to_string(), 5);
+        counts.insert("c".to_string(), 5);
+        let order = vec![0, 1, 2];
+        // Fair share 1/3, quota 1.5x: `a` is far above it.
+        let rotated = quota_order(&order, &operators, &counts, 100, 1.5 / 3.0);
+        assert_eq!(rotated, vec![1, 2, 0]);
+        // A disabled quota keeps the latency order.
+        assert_eq!(quota_order(&order, &operators, &counts, 100, 0.0), order);
+        // No traffic yet: unchanged.
+        assert_eq!(quota_order(&order, &operators, &counts, 0, 0.5), order);
+    }
+
+    #[test]
+    fn traffic_rotates_between_operators() {
+        let operators = vec!["a".to_string(), "b".to_string()];
+        let mut counts: HashMap<String, u64> = HashMap::new();
+        let mut first = 0usize;
+        for _ in 0..20 {
+            let out = quota_order(&[0, 1], &operators, &counts, 10, 0.75);
+            first += usize::from(out[0] == 1);
+            let chosen = operators[out[0]].clone();
+            *counts.entry(chosen).or_insert(0) += 5;
+        }
+        // Neither operator is always first: the quota rotates the lead.
+        assert!(first > 0, "the second operator must lead sometimes");
+        assert!(first < 20, "the first operator must lead sometimes");
     }
 }

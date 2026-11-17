@@ -1,8 +1,8 @@
 # Session handoff
 
-**Updated:** 2026-11-17 (alpha.29.22.0: configurable history prefetch)
-**Latest published release:** `0.1.0-alpha.29.22.0`
-**Release:** https://github.com/AlbercoinDev/e-lite/releases/tag/v0.1.0-alpha.29.22.0
+**Updated:** 2026-11-17 (alpha.29.23.0: P2P per-peer budget and provider quota)
+**Latest published release:** `0.1.0-alpha.29.23.0`
+**Release:** https://github.com/AlbercoinDev/e-lite/releases/tag/v0.1.0-alpha.29.23.0
 
 This is the short “where we are”. The invariants live in
 [`AGENTS.md`](../AGENTS.md); the
@@ -88,7 +88,14 @@ no repitas contexto ni rehagas decisiones ya documentadas.
   `docs/ROADMAP.md` is future work only, and `docs/AUDIT.md` holds the open
   findings (`docs/audit/FIXED.md` is the fixed history).
 
-## Last change (alpha.29.22.0): configurable history prefetch
+## Last change (alpha.29.23.0): P2P budget and provider quota
+
+- `rawtx.p2p_blocks_per_peer` (1..4, default 3): per-peer in-flight budget.
+- `rawtx.provider_quota` (0 or 1.0..4.0, default 1.5): long-term per-operator
+  quota as a multiple of the fair share; over-quota operators rotate behind
+  the others.
+
+## Previous change (alpha.29.22.0): configurable history prefetch
 
 - `rawtx.prefetch_history_blocks` (0..4096, default 0 = auto): block mode
   prefetches up to 256 blocks per history, per-txid mode only on demand; an

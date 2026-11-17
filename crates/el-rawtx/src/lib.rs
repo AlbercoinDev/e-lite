@@ -574,6 +574,11 @@ pub struct RawtxConfig {
     /// History blocks queued per history response. 0 = auto (block mode
     /// prefetches, per-txid mode only on demand).
     pub prefetch_history_blocks: usize,
+    /// Blocks in flight with one P2P peer at a time (1..=4).
+    pub p2p_blocks_per_peer: usize,
+    /// Long-term per-provider quota as a multiple of the fair share
+    /// (`spread`); 0 disables it, otherwise 1.0..=4.0.
+    pub provider_quota: f64,
 }
 
 impl RawtxConfig {
@@ -614,6 +619,8 @@ impl RawtxConfig {
             sessions_total: 16,
             jitter_ms: 50,
             prefetch_history_blocks: 0,
+            p2p_blocks_per_peer: 3,
+            provider_quota: 1.5,
         }
     }
 }
@@ -810,6 +817,7 @@ pub struct Resolver {
     decoy_sessions: DecoySessions,
     sessions_total: usize,
     jitter_ms: u64,
+    provider_quota: f64,
     /// Verified external blocks kept in memory for a burst of requests.
     recent: Mutex<VecDeque<(Hash32, Arc<bitcoin::Block>)>>,
     cache_dir: std::path::PathBuf,
@@ -862,6 +870,7 @@ impl Resolver {
                             Duration::from_secs(cfg.provider_cooldown_seconds.max(1)),
                         )
                         .with_tor_timeout(cfg.p2p_tor_timeout)
+                        .with_blocks_per_peer(cfg.p2p_blocks_per_peer)
                         .with_stats(Arc::clone(&stats)),
                     ));
                 }
@@ -934,6 +943,11 @@ impl Resolver {
             decoy_sessions: cfg.decoy_sessions,
             sessions_total: cfg.sessions_total.clamp(1, 32),
             jitter_ms: cfg.jitter_ms.min(250),
+            provider_quota: if cfg.provider_quota <= 0.0 {
+                0.0
+            } else {
+                cfg.provider_quota.clamp(1.0, 4.0)
+            },
             recent: Mutex::new(VecDeque::new()),
             cache_dir,
             decoys: cfg.decoys,
@@ -1024,6 +1038,7 @@ impl Resolver {
             cfg.sessions_total,
             cfg.decoy_sessions,
             cfg.jitter_ms,
+            cfg.provider_quota,
         )
     }
 
@@ -1043,6 +1058,7 @@ impl Resolver {
             self.sessions_total,
             self.decoy_sessions,
             self.jitter_ms,
+            self.provider_quota,
         );
         self
     }
