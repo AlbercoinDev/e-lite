@@ -54,6 +54,9 @@ hashes. Every fetched block is verified before use:
 A malicious source can withhold data, but cannot forge a block without breaking
 these checks.
 
+The two modes, why decoys are wallets and every parameter are in
+[`PRIVACY-TUNING.md`](PRIVACY-TUNING.md); this section is the summary.
+
 ## Default providers
 
 Public servers are **not compiled into e-lite**. The effective list lives in an

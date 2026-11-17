@@ -6,8 +6,8 @@
 
 This audit is not a claim of formal verification. It records static checks,
 manual review areas, concrete findings and residual risks. Fixed findings
-(AUD-001..190, except the ones listed below) are in [`audit/FIXED.md`](audit/FIXED.md). The review itself, in
-Spanish, is [`ANALISIS.md`](ANALISIS.md).
+(AUD-001..190, except the ones listed below) are in [`audit/FIXED.md`](audit/FIXED.md). The 2026-11 review, in
+Spanish, is [`reviews/2026-11-analisis.md`](reviews/2026-11-analisis.md).
 
 ## Baseline
 
@@ -75,7 +75,7 @@ Additional checks performed:
 | AUD-140 | P2 | Snapshot export | `export-snapshot` needs the service stopped: it takes the database lock. | Accepted: online export is not planned (owner decision 2026-11-16). `docs/OPERATIONS.md` says to stop e-lite first. |
 | AUD-015 | P2 | Electrum concurrency | One OS thread per client; a client can still consume CPU with expensive queries within its budget. | `max_clients`, read/write timeouts, 1 MiB request cap, per-client token bucket, 1,000 outpoint subscriptions. |
 | AUD-090 | P2 | Cross-container sync | The per-user sync lock is a local file lock; two containers (for example Umbrel apps) with different mount namespaces do not see it and can still run two intensive syncs. | Documented in TUNING.md; a real fix needs a shared lock medium or an orchestrator-level policy. |
-| AUD-017 | P3 | Docs drift | Historically `prune=550`, `lag 512`, snapshots and TLS claims appeared inconsistently. | Documentation rewritten in alpha.16; `AGENTS.md`/`docs/PROJECT_MEMORY.md` enforce consistency. |
+| AUD-017 | P3 | Docs drift | Historically `prune=550`, `lag 512`, snapshots and TLS claims appeared inconsistently. | Documentation rewritten in alpha.16; `AGENTS.md` and `scripts/check-docs.sh` enforce consistency. |
 | AUD-040 | P3 | Fee estimate | `blockchain.estimatefee` returns a relayfee/mempool fallback instead of `-1` when Core has no estimate; the protocol allows `-1`. | Intentional compatibility choice: some wallets (Sparrow) treat `-1` as a send failure. Documented in `docs/FEATURES.md`; revisit if wallets handle `-1` correctly. |
 | AUD-041 | P3 | Version negotiation | The spec says to close when client and server ranges do not intersect. e-lite instead downgrades to the newest implemented version at or below the client maximum, so a client requesting `1.4.3`/`1.5` connects on `1.4.2` and `1.7` on `1.6`. | Deliberate leniency for wallet compatibility; the negotiated version is returned so a compliant client adapts. Only a client maximum below 1.4 is refused. Tests cover the matrix; documented in `AGENTS.md`/`FEATURES.md`. Confirmed by the owner on 2026-11-16 (AUD-178 closed): `client_min` is not enforced; the reply carries the negotiated version, so a strict client can close. |
 

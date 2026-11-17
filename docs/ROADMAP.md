@@ -69,6 +69,17 @@ older notes still match. Findings still open are in [`AUDIT.md`](AUDIT.md).
 | P3 | Cross-container sync coordination | the per-user IBD lock does not cross mount namespaces; needs a shared lock medium or orchestrator policy. |
 | P3 | Plugin/extension surface | only after core stability; avoid freezing unstable APIs. |
 
+## Review follow-ups
+
+Left open by the 2026-11 review ([`reviews/2026-11-analisis.md`](reviews/2026-11-analisis.md)).
+
+| Priority | Item | Why / acceptance |
+|---|---|---|
+| P2 | Table tests for `lag_guard` | `bin/e-lite/src/pipeline.rs`: only `byte_window` is unit-tested; the pause/resume/watermark decisions are covered by e2e only. Add a table of (Core state, lag, disk) → action before changing it. |
+| P2 | Second review pass | `bin/e-lite/src/tuning/` and `crates/el-rawtx/src/p2p.rs` were reviewed by structure, targeted searches and tests, not line by line. |
+| P3 | Defaults quoted in the docs | `scripts/check-docs.sh` checks links, versions and source references; extend it to the default values quoted in `docs/` (a `config.example.toml` key followed by its value). |
+| P3 | Cost of `panic = "unwind"` | AUD-173 switched release builds to unwind; binary size and IBD speed before/after were not measured. |
+
 ## Cleanup scheduled
 
 | When | Item |

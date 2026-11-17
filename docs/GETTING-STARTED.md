@@ -4,15 +4,10 @@ This guide is for **testing from zero**. Installation variants are in
 [`INSTALL.md`](INSTALL.md); operation details are in
 [`OPERATIONS.md`](OPERATIONS.md).
 
-## 0. One-line setup
+## 0. Install
 
-```bash
-# e-lite only
-curl -fsSL https://github.com/AlbercoinDev/e-lite/releases/latest/download/install.sh | sh
-
-# e-lite + latest official Bitcoin Core (recommended)
-curl -fsSL https://github.com/AlbercoinDev/e-lite/releases/latest/download/install.sh | sh -s -- --with-core --yes
-```
+Install e-lite with Core using the one-line command in
+[`INSTALL.md`](INSTALL.md#one-line-install-or-update), then check it:
 
 ```bash
 export PATH="$HOME/.local/bin:$PATH"

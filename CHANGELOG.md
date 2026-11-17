@@ -48,7 +48,7 @@ variants nobody used by default.
 ## 0.1.0-alpha.29.18.0 — 2026-11-16
 
 Code and documentation review. Write-up (Spanish):
-[`docs/ANALISIS.md`](docs/ANALISIS.md).
+[`docs/ANALISIS.md`](docs/reviews/2026-11-analisis.md).
 
 ### Upgrade notes
 

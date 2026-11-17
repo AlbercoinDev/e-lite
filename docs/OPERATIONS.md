@@ -197,23 +197,12 @@ ambiguous; e-lite then refuses to guess and asks for an explicit
 
 ## Electrum TLS
 
-TLS is **on by default** on a separate listener. Without operator PEMs, e-lite
-generates a **local CA** and a server certificate signed by it in
-`<data-dir>/tls/`, and prints both fingerprints. Trust **`ca.crt`** in the
-wallet, not `self-signed.crt`: the latter is the server chain (leaf + CA).
-This is required by Java-based wallets such as Sparrow, which reject a
-non-CA certificate used as a `TrustAnchor`. The SANs include `localhost`, the
-loopback addresses, the hostname, the local LAN IPs and the onion address.
-Disable TLS with `tls = false` or `--no-tls`.
-
-Existing installations migrate automatically on the next start: e-lite creates
-the CA, re-signs the leaf and rewrites `self-signed.crt`. Remove the old
-trusted server certificate from the wallet and import the new `ca.crt`. Verify
-with:
-
-```bash
-openssl verify -CAfile <data-dir>/tls/ca.crt <data-dir>/tls/self-signed.crt
-```
+TLS is **on by default** on a separate listener. Without operator PEMs e-lite
+generates a local CA and a leaf in `<data-dir>/tls/`; wallets trust **`ca.crt`**.
+The identity, the SANs, Java wallets and verification are explained in
+[`TOR.md`](TOR.md#tls-certificate-and-wallet-trust). Disable TLS with
+`tls = false` or `--no-tls`. This section covers the listeners and an
+operator-managed certificate.
 
 ```toml
 [server]
@@ -287,35 +276,14 @@ stream {
 
 ## Tor onion (managed)
 
-`[tor] mode = "managed"` (the default) makes e-lite run its own Tor process and
-publish Electrum as an onion service. The address is stable across restarts and
-is created automatically on the first `run`/`serve`:
-
-```
-[e-lite] Tor onion: <56 chars>.onion:55011 (plain), :55022 (tls)
-[e-lite] Tor ready (bootstrapped 100%)
-```
-
-- plain: `<addr>.onion:<network plain port>`
-- TLS: `<addr>.onion:<network TLS port>`
-
-The TLS port uses an automatically generated local CA + leaf certificate unless
-`[server] tls_cert`/`tls_key` are configured; the SAN includes the onion address.
-TLS works the same when Tor is off or unavailable; only the onion is lost.
-
-```bash
-e-lite onion show  --network mainnet --allow-mainnet
-e-lite onion reset --network mainnet --allow-mainnet --yes   # stop e-lite first
-```
-
-`reset` moves the onion keys to `<data-dir>/tor/onion.prev`; the next start
-generates a new address. `tor/` and `tls/` are excluded from snapshots.
-
-The onion has **no client authentication**; the per-client rate limiter
-(200 req/s, burst 5000) is a throttle, not access control. Keep the address
-private, use a dedicated instance and a firewall/access policy if needed. See
-[`TOR.md`](TOR.md) for installation, the bundled Tor, troubleshooting and the
-security model.
+`[tor] mode = "managed"` (the default) runs e-lite's own Tor and publishes the
+plain and TLS listeners as a stable onion service, created on the first
+`run`/`serve`. `e-lite onion show` prints the address; `e-lite onion reset`
+(with e-lite stopped) moves the keys aside so the next start creates a new one.
+The onion has **no client authentication**; the per-client rate limiter is a
+throttle, not access control. `tor/` and `tls/` are excluded from snapshots;
+back them up with `e-lite export-identity`. Installation, ports, the bundled Tor,
+troubleshooting and the security model are in [`TOR.md`](TOR.md).
 
 ## Pruning
 

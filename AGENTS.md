@@ -7,9 +7,7 @@ where the detail lives; defaults, ranges and history are in `docs/`, not here.
 
 1. [`docs/HANDOFF.md`](docs/HANDOFF.md): current state, open risks, next steps.
 2. [`docs/README.md`](docs/README.md): the documentation map.
-3. [`docs/PROJECT_MEMORY.md`](docs/PROJECT_MEMORY.md): the human companion of
-   this file.
-4. `CHANGELOG.md` and the latest git tag: the version. Never trust a version
+3. `CHANGELOG.md` and the latest git tag: the version. Never trust a version
    number written in a document over the code and the tag.
 
 The durable context is in the repo: do not ask the user to paste history. If

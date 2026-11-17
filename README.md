@@ -75,28 +75,13 @@ See [`docs/CLI.md`](docs/CLI.md) for every flag and `--set` example.
 
 ## Documentation
 
-| Document | Contents |
-|---|---|
-| [`docs/HANDOFF.md`](docs/HANDOFF.md) | Current state, open risks, next steps |
-| [`docs/INSTALL.md`](docs/INSTALL.md) | Install/update, Core, `.deb`, source, first run |
-| [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) | Components, execution modes, local/LAN/WAN Core |
-| [`docs/OPERATIONS.md`](docs/OPERATIONS.md) | Pruning, disks, remote Core, monitoring, troubleshooting |
-| [`docs/PRIVACY.md`](docs/PRIVACY.md) | Local vs external data, Tor/clearnet, providers |
-| [`docs/PRIVACY-TUNING.md`](docs/PRIVACY-TUNING.md) | `privacy.toml`: per-txid mode, decoy wallets, presets and ranges |
-| [`docs/FEATURES.md`](docs/FEATURES.md) | What exists today, with status |
-| [`docs/ROADMAP.md`](docs/ROADMAP.md) | Future features and proposed improvements |
-| [`docs/CLI.md`](docs/CLI.md) | All command-line flags, `--set`, tuning examples |
-| [`docs/TUNING.md`](docs/TUNING.md) | HDD/SSD/NVMe profiles, adaptive tuning, hot reload |
-| [`docs/ELECTRUM_PROTOCOL.md`](docs/ELECTRUM_PROTOCOL.md) | Methods, versions, notifications and limits |
-| [`docs/TOR.md`](docs/TOR.md) | Managed Tor, onion access, TLS certificate and reset |
-| [`docs/GETTING-STARTED.md`](docs/GETTING-STARTED.md) | Acceptance tests from scratch |
-| [`docs/TESTS.md`](docs/TESTS.md) | Test suites, prerequisites, CI vs local |
-| [`docs/RELEASING.md`](docs/RELEASING.md) | Version bump, tag, workflows and artifacts |
-| [`docs/AUDIT.md`](docs/AUDIT.md) | Open findings and residual risks |
-| [`docs/PROJECT_MEMORY.md`](docs/PROJECT_MEMORY.md) | Project invariants and documentation rules |
+The map is [`docs/README.md`](docs/README.md). The usual entry points:
 
-Architecture decisions are in [`docs/adr/`](docs/adr/README.md); dated
-measurements in [`docs/benchmarks/`](docs/benchmarks/README.md).
+- [`docs/INSTALL.md`](docs/INSTALL.md) and
+  [`docs/OPERATIONS.md`](docs/OPERATIONS.md) to install and run it;
+- [`docs/FEATURES.md`](docs/FEATURES.md) for what exists today and
+  [`docs/PRIVACY.md`](docs/PRIVACY.md) for what leaves the machine;
+- [`docs/HANDOFF.md`](docs/HANDOFF.md) for the current state of the project.
 
 ## Networks and requirements
 

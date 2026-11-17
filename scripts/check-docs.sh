@@ -133,7 +133,11 @@ for path in files:
 # Source references ----------------------------------------------------------
 # Histories describe the tree of their time and are not checked.
 historical = ("CHANGELOG.md", os.path.join("docs", "audit", "FIXED.md"))
-historical_dirs = (os.path.join("docs", "adr"), os.path.join("docs", "benchmarks"))
+historical_dirs = (
+    os.path.join("docs", "adr"),
+    os.path.join("docs", "benchmarks"),
+    os.path.join("docs", "reviews"),
+)
 source_ref = re.compile(r"`((?:crates|bin)/[A-Za-z0-9_\-/]+\.rs)`(?: \(([^)]*)\))?")
 identifier = re.compile(r"`([A-Za-z_][A-Za-z0-9_:]*)`")
 sources = {}

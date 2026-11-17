@@ -1,11 +1,15 @@
-# A/B protocol (mainnet and other test machines)
+# Manual A/B runs on a real node
 
-These are the measurements that decide the remaining tuning defaults. e-lite
-does not change them automatically; run one variant at a time on any test
-machine and keep the previous CSV. On a closed box (Umbrel, appliance) the
-protocol is the same: run the variant, then pass the log or CSV to the
-analysis. `tests/manual/ab_umbrel.sh` is the generic sampler despite its historical
-name.
+`ab_umbrel.sh` samples a running e-lite's `/status` into a CSV so two
+configurations can be compared on the same machine (mainnet or any test box).
+It does not change configuration or restart anything. The name is historical:
+it works on any host, not only Umbrel.
+
+These measurements decide tuning defaults; e-lite does not change them
+automatically. Run one variant at a time and keep the previous CSV. On a closed
+box (Umbrel, appliance) the protocol is the same: run the variant, then pass the
+log or CSV to the analysis. The compaction (`background_jobs`) experiment is
+already decided; see [`docs/TUNING.md`](../../docs/TUNING.md#compaction-debt-l0-files-and-background_jobs).
 
 ## 0. Baseline
 
@@ -59,7 +63,7 @@ if it approaches 1 GiB or the OOM killer fires, revert.
 
 ## 3. Byte watermark
 
-After the 29.8.3 slow block average has produced a normal phase:
+After a normal Core/e-lite phase:
 
 ```toml
 [pruning]
@@ -70,35 +74,6 @@ core_resume_ahead_gib = 5
 Run `tests/manual/ab_umbrel.sh bulk20g 1800`. Keep it only if the phase switch cost
 does not outweigh the shorter queues; the CSV's `backlog_bytes` shows the
 actual bytes.
-
-## 4. Compaction (`background_jobs`)
-
-Baseline evidence (mainnet, end of IBD, ~5 blocks/s): `pending_compaction`
-grew 49 → 185 GiB in one hour with `running 1` the whole time, commit/blk went
-from 57-80 ms to 150-210 ms, and one 45.5 s commit was unexplained. With the
-default plan on a 4-core host, `max_background_jobs = 2` means one flush and
-one compaction thread.
-
-```toml
-[index]
-background_jobs = 4    # two flush + two compaction threads (4-core host)
-```
-
-Run for 30-60 min in the same phase as the baseline and compare the 10-minute
-`rocksdb:` lines (and `/status.rocksdb`):
-
-| Signal | Keep 4 if… |
-|---|---|
-| `running` | goes from constant `1` to `2` (compactions in flight) |
-| `pending_compaction` | stops growing at the same block rate, or falls |
-| `l0` | stays bounded instead of climbing between lines |
-| commit/blk | returns to the pre-degradation cost; `commit spike:` lines stop appearing |
-| `memory.available_mib` | does not regress (more compaction threads need CPU/RAM headroom) |
-
-If the debt stops growing but commit spikes remain, capture a
-`[e-lite] commit spike:` line: it now includes running compactions, L0 files,
-memtable, pending compaction and the Core backlog. Changing this default
-requires the same evidence on a slow-disk class before shipping.
 
 ## How to read the CSV
 

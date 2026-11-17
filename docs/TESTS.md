@@ -82,7 +82,7 @@ not synthetic and is not run in CI. Dated results are in
 
 | Script | Covers |
 |---|---|
-| `ab_umbrel.sh` | Samples a running `/status` for a labelled A/B run; see [`docs/AB_TESTS.md`](AB_TESTS.md). It does not change config or restart anything. |
+| `ab_umbrel.sh` | Samples a running `/status` for a labelled A/B run; see [`tests/manual/README.md`](../tests/manual/README.md). It does not change config or restart anything. |
 
 `tests/lib/e2e.py history <port> <scripthash>` is also what the all-in-one
 harness (`scripts/e-lite-all-in-one.sh`) uses to count history entries.

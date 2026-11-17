@@ -1,15 +1,20 @@
 # Análisis de e-lite
 
-**Fecha:** 2026-11-15 · **Base:** `v0.1.0-alpha.29.17.0` · **Publicado
-como:** `v0.1.0-alpha.29.18.0` (rama de la revisión: `review/analisis-2026-11`).
+**Fecha:** 2026-11-15/17 · **Base:** `v0.1.0-alpha.29.17.0` · **Publicado
+como:** `v0.1.0-alpha.29.18.0` y `v0.1.0-alpha.29.19.0`.
+
+> **Informe cerrado.** Describe el árbol de su fecha y no se actualiza. Lo que
+> quedó abierto está en [`AUDIT.md`](../AUDIT.md) y
+> [`ROADMAP.md`](../ROADMAP.md); el comportamiento actual, en
+> [`FEATURES.md`](../FEATURES.md).
 
 Este documento recoge la revisión completa del proyecto: qué hace la
 aplicación, el análisis en tres partes (sincronización e indexación, servicio a
 las wallets, copias de seguridad), los cambios hechos durante la revisión, el
 plan de mejoras que ya estaba escrito y las propuestas nuevas.
 
-Los identificadores `AUD-nnn` remiten a [`AUDIT.md`](AUDIT.md) (abiertos) y a
-[`audit/FIXED.md`](audit/FIXED.md) (corregidos).
+Los identificadores `AUD-nnn` remiten a [`AUDIT.md`](../AUDIT.md) (abiertos) y a
+[`audit/FIXED.md`](../audit/FIXED.md) (corregidos).
 
 ## Resumen
 
@@ -360,7 +365,7 @@ y e2e de regtest, no con una medición) y una carga real de wallet sobre Tor.
 
 ## 6. Plan de mejoras ya escrito
 
-Resumen de [`ROADMAP.md`](ROADMAP.md) y [`AUDIT.md`](AUDIT.md) tal como quedan.
+Resumen de [`ROADMAP.md`](../ROADMAP.md) y [`AUDIT.md`](../AUDIT.md) tal como quedan.
 
 | Prioridad | Mejora | Estado |
 |---|---|---|
