@@ -245,7 +245,7 @@ e-lite run --network mainnet --allow-mainnet \
 | `--set rawtx.enabled=false` | `rawtx.enabled=false` | enabled |
 | `--no-tls` | `server.tls` | `true` |
 | `--tls-listen <addr>` | `server.tls_listen` | host of `listen` + network TLS port |
-| `--set server.tls_cert=<path>`, `--set server.tls_key=<path>` | `server.tls_cert`, `server.tls_key` | auto-generated self-signed |
+| `--set server.tls_cert=<path>`, `--set server.tls_key=<path>` | `server.tls_cert`, `server.tls_key` | auto-generated local CA + leaf |
 | `--set server.tls_auto_cert=false` | `server.tls_auto_cert` | `true` |
 
 ## Listener defaults per network
@@ -305,7 +305,7 @@ e-lite onion reset --network mainnet --allow-mainnet --yes --purge   # delete in
 e-lite run --network mainnet --allow-mainnet --no-tor
 ```
 
-See [`TOR.md`](TOR.md) for installation, ports, the self-signed TLS certificate,
+See [`TOR.md`](TOR.md) for installation, ports, the generated TLS certificate (local CA + leaf),
 reset semantics and security.
 
 ## Rawtx cache maintenance (`cache`)

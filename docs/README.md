@@ -21,7 +21,7 @@ Start here:
 14. [`RELEASING.md`](RELEASING.md) — version bump, tag, workflows and artifacts.
 15. [`AB_TESTS.md`](AB_TESTS.md) — concrete mainnet/Umbrel A/B protocol.
 16. [`AUDIT.md`](AUDIT.md) — open findings and residual risks.
-    [`audit/FIXED.md`](audit/FIXED.md) — fixed findings (AUD-001..173, 180, 181).
+    [`audit/FIXED.md`](audit/FIXED.md) — fixed findings (AUD-001..190, except the ones open in AUDIT).
 17. [`PROJECT_MEMORY.md`](PROJECT_MEMORY.md) — project invariants.
 18. [`ANALISIS.md`](ANALISIS.md) — análisis del proyecto (en español):
     funcionalidad, sincronización e indexación, servicio a las wallets, copias

@@ -2,12 +2,11 @@
 
 **Base:** `0.1.0-alpha.29.4.5` → current release · **Scope:** `bin/e-lite`,
 `crates/*`, snapshots, the Electrum server and the external path.
-**Status:** open findings and residual risks as of the 2026-11-15 review of
-`0.1.0-alpha.29.17.0`, released as `0.1.0-alpha.29.18.0`.
+**Status:** open findings and residual risks of the current release.
 
 This audit is not a claim of formal verification. It records static checks,
 manual review areas, concrete findings and residual risks. Fixed findings
-(AUD-001..173, 180, 181) are in [`audit/FIXED.md`](audit/FIXED.md). The review itself, in
+(AUD-001..190, except the ones listed below) are in [`audit/FIXED.md`](audit/FIXED.md). The review itself, in
 Spanish, is [`ANALISIS.md`](ANALISIS.md).
 
 ## Baseline
@@ -15,7 +14,7 @@ Spanish, is [`ANALISIS.md`](ANALISIS.md).
 ```text
 cargo fmt --check                                      OK
 cargo clippy --workspace --all-targets -- -D warnings  OK
-cargo test --workspace                                 390 tests OK (6 ignored)
+cargo test --workspace                                 OK
 tests/run-e2e.sh --release launch_core regtest          OK
 scripts/check-docs.sh                                  OK
 tests/e2e/e2e_regtest.sh                               OK
@@ -28,6 +27,7 @@ tests/e2e/e2e_snapshot.sh                              OK
 tests/e2e/e2e_multi_instance.sh                        OK
 tests/e2e/e2e_pruned_ibd.sh                            OK
 tests/e2e/e2e_recovery.sh                              OK
+tests/e2e/e2e_privacy.sh                               OK
 ```
 
 Run on the review branch on 2026-11-16, with the automatic restart on;
@@ -67,7 +67,7 @@ Additional checks performed:
 
 | ID | Sev. | Area | Risk | Current mitigation |
 |---|---|---|---|---|
-| AUD-010 | P1 | Electrum exposure | No client authentication; a non-loopback listener accepts any client that can reach the port, and TLS only encrypts the transport. | Loopback default, startup warning, optional TLS with certificate reload, per-client token bucket (alpha.28; auto on non-loopback), `max_clients`; use firewall/IP allowlist/SSH/VPN/Tor. Wallet-compatible authentication is not planned (Electrum has no standard auth). |
+| AUD-010 | P1 | Electrum exposure | No client authentication; a non-loopback listener accepts any client that can reach the port, and TLS only encrypts the transport. | Loopback default, startup warning, optional TLS with certificate reload, per-client token bucket (200 req/s, burst 5000, on for every client), `max_clients`; use firewall/IP allowlist/SSH/VPN/Tor. Wallet-compatible authentication is not planned (Electrum has no standard auth). |
 | AUD-011 | P1 | Core RPC | HTTP only, no TLS. Credentials/cookie traverse the connection in clear text. | Loopback default; LAN/WAN requires SSH/VPN; documented. |
 | AUD-012 | P2 | External rawtx | A provider can withhold data; with the per-txid default it learns which txids a load touches (hidden among decoy wallets), with `preset = "max"` it learns block hashes. | Per-txid with decoy wallets or whole blocks only (`max`), random source order, Tor by default, validation against the index and cache; `use_tor = false` is an explicit opt-out. |
 | AUD-013 | P2 | Silent payments | BIP352 scan key/indexer not implemented; only the opt-in gate exists. | Methods return an explicit error; feature not advertised. |
@@ -99,7 +99,7 @@ Additional checks performed:
   defaults; the cache shrinks in 12.5 % steps with an explicit page-cache
   floor.
 - `unsafe`: libc calls only, with checked return values: `statvfs`
-  (`el-chain`, `tuning.rs`, `diagnostics.rs`), `getrlimit` (`el-store`),
+  (`el-chain`, `tuning/machine.rs`, `diagnostics.rs`), `getrlimit` (`el-store`),
   `kill` (`core_supervisor.rs`, `tor.rs`), `flock`/`getuid` (`ibd_lock.rs`),
   `pipe`/`dup`/`dup2`/`close` for the log tee (`logging.rs`), `localtime_r`
   (`main.rs`) and `geteuid`. None in the index, the Electrum server or the

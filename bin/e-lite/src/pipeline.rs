@@ -741,8 +741,8 @@ impl Indexer {
         }
     }
 
-    /// Track the current scheduler phase and its rate. `phase`: 0 overlap,
-    /// 1 Core paused/e-lite draining, 2 Core downloading/e-lite paused.
+    /// Track the current scheduler phase and its rate. `phase`: 0 overlap
+    /// (Core and e-lite both work), 1 Core paused while e-lite drains.
     fn update_phase(&self, phase: u64, committed: u64) {
         let changed = self.phase.swap(phase, Ordering::Relaxed) != phase;
         if changed {

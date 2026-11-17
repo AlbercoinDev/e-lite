@@ -17,7 +17,7 @@ e-lite run --network signet --prune-mib 1
 - Electrum: `0.0.0.0:55022` (TLS) and loopback-only `127.0.0.1:55011` (plain)
   for mainnet (`plain_lan = true` puts plain on `0.0.0.0` as well);
   testnet4 uses `55111`/`55122`, signet `55211`/`55222`, regtest `55311`/`55322`.
-  TLS is on by default and uses a generated self-signed certificate unless
+  TLS is on by default and uses a generated local CA + leaf certificate unless
   `[server] tls_cert/tls_key` are set. Status/metrics: `127.0.0.1:55084`
   (`55184`, `55284`, `55384`).
 - Stop with Ctrl+C/SIGTERM. With `stop_on_exit=true`, a Core started by e-lite is
@@ -299,7 +299,7 @@ is created automatically on the first `run`/`serve`:
 - plain: `<addr>.onion:<network plain port>`
 - TLS: `<addr>.onion:<network TLS port>`
 
-The TLS port uses an automatically generated self-signed certificate unless
+The TLS port uses an automatically generated local CA + leaf certificate unless
 `[server] tls_cert`/`tls_key` are configured; the SAN includes the onion address.
 TLS works the same when Tor is off or unavailable; only the onion is lost.
 
@@ -311,7 +311,8 @@ e-lite onion reset --network mainnet --allow-mainnet --yes   # stop e-lite first
 `reset` moves the onion keys to `<data-dir>/tor/onion.prev`; the next start
 generates a new address. `tor/` and `tls/` are excluded from snapshots.
 
-The onion has **no client authentication or rate limiting**. Keep the address
+The onion has **no client authentication**; the per-client rate limiter
+(200 req/s, burst 5000) is a throttle, not access control. Keep the address
 private, use a dedicated instance and a firewall/access policy if needed. See
 [`TOR.md`](TOR.md) for installation, the bundled Tor, troubleshooting and the
 security model.

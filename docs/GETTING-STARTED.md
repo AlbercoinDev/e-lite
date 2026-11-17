@@ -59,7 +59,7 @@ Expected:
   (plain) for mainnet;
   signet uses `55211`/`55222`; metrics at `127.0.0.1:55084` (`55284` signet).
 - TLS is enabled by default on the network TLS port with a generated
-  self-signed certificate; `--no-tls` disables it. Operator PEMs:
+  certificate signed by a local CA (`tls/ca.crt`); `--no-tls` disables it. Operator PEMs:
   `--tls-listen`, `[server] tls_cert`/`tls_key` (see
   [`OPERATIONS.md`](OPERATIONS.md#electrum-tls)).
 

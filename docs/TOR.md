@@ -11,7 +11,7 @@ On `e-lite run` or `e-lite serve` with the default configuration:
 
 - a v3 onion address, e.g. `abcdef...xyz.onion`;
 - plain Electrum on the network plain port (`50011`-style defaults below);
-- TLS Electrum on the network TLS port (self-signed certificate by default);
+- TLS Electrum on the network TLS port (generated local CA + leaf by default);
 - the same Tor SOCKS proxy used for external rawtx/repair requests.
 
 The onion mirrors the active network's ports, so instances do not collide:
@@ -215,7 +215,8 @@ The address is case-insensitive and must be copied exactly (56 characters plus
 
 - A Tor onion hides the server IP and encrypts the transport, but it is still
   reachable by anyone who knows the address.
-- e-lite **does not authenticate clients and does not rate limit** them. Use a
+- e-lite **does not authenticate clients**; the per-client rate limiter is a
+  throttle, not access control. Use a
   dedicated instance, keep the address private, monitor clients, and put a
   firewall or access policy in front if the threat model requires it.
 - Only loopback Electrum targets are published; e-lite refuses `0.0.0.0` and

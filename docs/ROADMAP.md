@@ -10,8 +10,7 @@ the signal that would move it to `FEATURES.md`. No dates are promised.
 What is left of the 29.15.0 audit (AUD-167) after the 2026-11-15 review, which
 fixed items 4, 5, 12, 14 and 15 (AUD-169..173 in
 [`audit/FIXED.md`](audit/FIXED.md)) and documented item 16. Numbers are kept so
-older notes still match. New findings of that review are AUD-173..181 in
-[`AUDIT.md`](AUDIT.md).
+older notes still match. Findings still open are in [`AUDIT.md`](AUDIT.md).
 
 | # | Pri | Item | Where |
 |---|---|---|---|
@@ -36,9 +35,9 @@ older notes still match. New findings of that review are AUD-173..181 in
 | Priority | Item | Why / acceptance |
 |---|---|---|
 | P2 | HDD sequential mode/readahead | fewer readers in file order, `fadvise`/readahead; A/B on HDD. |
-| P2 | Adaptive controller v2 | partial: dedicated 5 s/30 s thread, fitted memory plan, real `commit/blk`, starvation readers, p95 signals, opt-in hot memtables. Still missing: compaction-driven control and per-profile benchmark tables. |
+| P2 | Adaptive controller v2 | partial: dedicated 5 s/30 s thread, fitted memory plan, real `commit/blk`, starvation readers, p95 signals. Still missing: compaction-driven control and per-profile benchmark tables. |
 | P2 | Compaction/job tuning | partial: per-disk `jobs` and per-family L0/statistics. Still missing: pause/batch when `pending_compaction` grows. |
-| P3 | Commit-group batching | interval/batch extend to 30 s/4096 in bulk; make the durability tradeoff explicit and tested per workload. |
+| P3 | Commit-group batching | bulk groups use 20-60 s by disk class and 512 blocks; make the durability tradeoff explicit and tested per workload. |
 | P3 | UTXO/prefetch pipeline experiments | measure before changing the hot path. |
 
 ## Storage savings
@@ -57,7 +56,7 @@ older notes still match. New findings of that review are AUD-173..181 in
 |---|---|---|
 | P2 | Decoy scheduling improvements | avoid temporal correlation while keeping bandwidth bounded. |
 | P2 | Tor stream isolation against a real Tor | per-request SOCKS credentials are unit-tested against a fake SOCKS server; still missing a real-Tor test that checks distinct circuits. |
-| P3 | Redaction audit of `/status` and `/metrics` | logs are covered by `tests/log_redaction.rs`; extend the check to the HTTP output. |
+| P3 | Redaction audit of `/status` and `/metrics` | logs are covered by `bin/e-lite/tests/log_redaction.rs`; extend the check to the HTTP output. |
 | P3 | `privacy.toml` per network | optional once the shared-file docs are corrected; needs a migration decision. |
 
 ## Compatibility and operations

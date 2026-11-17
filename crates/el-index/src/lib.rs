@@ -293,7 +293,8 @@ impl PreparedBlock {
 /// Apply one block into `batch`, updating the overlay. The caller commits the
 /// batch (plus the tip) atomically and then appends `txids` to the flat file.
 /// This compatibility wrapper prepares the block in the caller's thread; the
-/// indexer uses `prepare_block_bytes` in its reader threads and `apply_prepared`.
+/// indexer uses `prepare_block_bytes` in its reader threads and
+/// `apply_prepared_deferred_undo`.
 pub fn apply_block(
     store: &Store,
     height: u32,

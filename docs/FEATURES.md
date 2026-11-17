@@ -46,7 +46,7 @@ available**.
 | Broadcast package | experimental | Core `submitpackage`, stable success/errors result; protocol 1.6 |
 | Outpoint status/subscriptions | experimental | protocol 1.7; on-demand history scan, no extra index writes |
 | Scriptpubkey methods | experimental | protocol 1.7; scripthash logic with dict results and `10001` |
-| TLS Electrum | experimental | on by default (`server.tls`); auto self-signed cert or operator PEM; reload on change; no client auth |
+| TLS Electrum | experimental | on by default (`server.tls`); auto-generated local CA + leaf, or operator PEM; reload on change; no client auth |
 | Rate limiting | experimental | per-client token bucket, 200 req/s burst 5000 for every client; over-budget requests wait instead of failing; no client auth |
 | Plain listener on loopback | experimental | plain Electrum binds `127.0.0.1` by default (same-host wallets, onion target); `plain_lan`/`--plain-lan` or an explicit `listen` exposes it; TLS binds `0.0.0.0` (AUD-147) |
 | JSON-RPC batches | experimental | an array of requests on one line gets one array of responses in order (max 1000 per batch); items run in parallel (8) unless the batch has `server.version` or an unsubscribe. Sparrow only sends batches to servers it recognises by name: `[server] advertise_electrumx_compat = true` (opt-in) makes the banner `e-lite X (electrumx-compatible)`, which Sparrow recognises |
@@ -79,7 +79,7 @@ available**.
 | External fetch mode | experimental | default `balanced`: loose transactions by txid (Electrum/Esplora) with decoy wallets, verified against the index; `preset = "max"`: whole blocks by hash only, never txid |
 | Tor SOCKS5h, fail-closed | experimental | Tor only by default (`rawtx.use_tor`); opt-in `tor_fallback_clearnet` uses clearnet if Tor fails; `allow_clearnet` forces it; `use_tor = false` (`--no-rawtx-tor`) is the explicit direct opt-out and is independent of the onion listener (`/status.rawtx.path`) |
 | Managed Tor + onion service | experimental | network plain/TLS ports; `e-lite onion show/reset`; Tor ends with e-lite however e-lite ends, and a Tor left by an older run is stopped at start |
-| Auto self-signed TLS cert | experimental | generated without Tor; SAN includes localhost, hostname and onion; reloaded on change |
+| Auto-generated TLS identity (local CA + leaf) | experimental | generated without Tor; SAN includes localhost, hostname and onion; reloaded on change |
 | Decoys and random source order | experimental | `decoys=1` per real external download (wallet or prefetch), served one at a time by a background thread outside the wallet's download slots, paused while a provider rate-limits; a decoy failure never cools a provider/peer; at most 32 owed (`/status.rawtx.decoys_pending`) |
 | Rawtx cache | experimental | 256 MiB default; verified transactions with merkle branch (whole blocks only for prune repair, max 64 MiB); last 8 external blocks in memory; `cache_dir` can point at tmpfs to avoid disk |
 | Electrum rate limit | experimental | 200 req/s, burst 5000 for every client; over-budget requests wait, never error; `0` disables |
@@ -110,7 +110,7 @@ available**.
 | Application log `e-lite.log` | experimental | tee of console; 16 MiB rotation; `[logging] file`/`--no-log-file` |
 | Disk breakdown | experimental | `/status.disk`: index, txids, rawtx cache, log and snapshot bytes |
 | Wallet banner | experimental | built-in INDEXING/READY + template file |
-| Adaptive memory budget | experimental | fitted to available RAM; hot cache ceiling and opt-in hot memtables; 75 % ceiling; reserve |
+| Adaptive memory budget | experimental | fitted to available RAM; hot cache ceiling; 75 % ceiling; reserve |
 | READY / FULLY SYNCED status | experimental | log, `/status`, `/metrics`, `e-lite status` |
 | Ordered startup/shutdown | experimental | `run` waits for Core; threads joined before Core stop |
 | Snapshot export (index only) | experimental | needs the instance stopped (it takes the database lock); a failed export removes its partial archive. `export-snapshot --output`: manifest format 3 (network/genesis/tip/schema/digest; manifest first, index stored, formats 1-2 still import); the nested Core datadir is excluded |

@@ -186,7 +186,7 @@ Each rule names where the detail is. Read it before touching that area.
 - Requests do not identify e-lite (AUD-133), and each Esplora request over Tor
   uses its own circuit.
 - Logs never print a script hash, txid or the block hash of a wallet request
-  (`tests/log_redaction.rs`). Debug lines are aggregate counts and latencies.
+  (`bin/e-lite/tests/log_redaction.rs`). Debug lines are aggregate counts and latencies.
   INFO lines never change format; extra detail goes to `debug:`/`trace:`.
 - Decoys and prefetch run outside the wallet's download slots and never
   change provider health. The prefetch is an optimisation, never correctness.
