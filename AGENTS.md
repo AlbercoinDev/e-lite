@@ -167,7 +167,7 @@ Each rule names where the detail is. Read it before touching that area.
   `public-servers.toml` means local data only: no hidden fallback list.
   Clearnet entries must be HTTPS; a plain Electrum entry only for `.onion` or
   a local server (AUD-171).
-- Every download is a race over shuffled endpoints (`Resolver::race`). Never
+- Every download is a race over shuffled endpoints (`Resolver::race`, `crates/el-rawtx/src/race.rs`). Never
   go back to serial sources or to preferring the provider that answered last
   (AUD-135, AUD-160).
 - Provider health depends on the failure (`crates/el-rawtx/src/health.rs`,
