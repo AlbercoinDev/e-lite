@@ -103,7 +103,6 @@ version          print version
 | `--set index.commit_sync=<mode>` | `index.commit_sync` | `auto` (`txids` in bulk, `always` live) |
 | `--set index.prefetch_blocks=<n>` | `index.prefetch_blocks` | `0` (auto; >0 caps the window) |
 | `--set index.max_open_files=<n>` | `index.max_open_files` | `0` (8192; 2048/4096 for 8-16 GB) |
-| `--set index.adaptive_memtables=true` / `--set index.adaptive_memtables=false` | `index.adaptive_memtables` | `false` |
 | `--set index.batch_blocks=<n>` | `index.batch_blocks` | `256`/profile, capped at 512 |
 | `--set index.reorg_window=<n>` | `index.reorg_window` | `288` |
 | `--set index.milestone_blocks=<n>` | `index.milestone_blocks` | `10000` |
@@ -534,8 +533,8 @@ replacement. They will be removed two releases later.
 | `--log-max-mib <v>` | `--set logging.max_mib=<v>` |
 | `--p2p-peers <a,b>` | `--set 'rawtx.p2p_peers=["a","b"]'` |
 | `--tls` | `--set server.tls=true` |
-| `--adaptive-memtables` | `--set index.adaptive_memtables=true` |
-| `--no-adaptive-memtables` | `--set index.adaptive_memtables=false` |
+| `--adaptive-memtables` | accepted and ignored: the setting was removed |
+| `--no-adaptive-memtables` | accepted and ignored: the setting was removed |
 | `--pause-core-during-bulk` | `--set pruning.pause_core_during_bulk=true` |
 | `--no-pause-core-during-bulk` | `--set pruning.pause_core_during_bulk=false` |
 | `--tor-plain` | `--set tor.plain=true` |

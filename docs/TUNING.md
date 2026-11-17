@@ -320,13 +320,9 @@ bound raw block bytes, so a group of large-but-transaction-light blocks cannot
 inflate the `WriteBatch`.
 - Memtables are weighted by write pressure: `utxo` 6, `history` and
   `utxo_by_script` 4, `blocks`/`tx_occurrences` 2, `meta`/`undo` 1. The shared
-  `WriteBufferManager` still enforces the total. By default the budget is fixed
-  at startup; under critical memory (`MemAvailable < 256 MiB`) it is halved as
-  a one-way safety valve, which can force a flush and is logged. With
-  `[index] adaptive_memtables = true` the controller re-fits the WBM and every
-  CF's `write_buffer_size` to `effective/16` (512 MiB..2 GiB) after a
-  10-minute persistent target and a 10-minute cooldown; cache changes have
-  priority and an explicit `write_buffer_mib` disables the feature.
+  `WriteBufferManager` still enforces the total. The budget is fixed at
+  startup; under critical memory (`MemAvailable < 256 MiB`) it is halved as a
+  one-way safety valve, which can force a flush and is logged.
 - `[core] io_priority = 0..7` applies best-effort `ionice` to a Core launched
   or adopted by e-lite. It is a warning, not fatal, when the kernel does not
   support it (NVMe `none`).

@@ -1,4 +1,5 @@
-//! The adaptive controller: readers, batch, cache, memtables and ZFS ARC.
+//! The adaptive controller: readers, batch, cache and ZFS ARC; memtables only
+//! shrink, as a safety valve, when memory is critical.
 
 use super::*;
 
@@ -228,90 +229,6 @@ impl Tunables {
         (max, margin, effective, reserve)
     }
 
-    fn memtable_step(&self, store: &Store, mem: &MemoryInfo) -> Option<String> {
-        if !self.adaptive_memtables.load(Ordering::Relaxed) || self.memtables_locked {
-            return None;
-        }
-        let current = self
-            .cache_mib()
-            .saturating_add(self.memtables_mib.load(Ordering::Relaxed))
-            .saturating_add(self.runtime_mib);
-        let effective = self
-            .total_mib
-            .min(mem.available_mib.saturating_add(current))
-            .max(128);
-        let target = (effective / 16).clamp(512, 2048);
-        let current_mem = self.memtables_mib.load(Ordering::Relaxed);
-        if target.abs_diff(current_mem) < 128 {
-            if let Ok(mut since) = self.memtable_target_since.lock() {
-                *since = None;
-            }
-            return None;
-        }
-        let grow = target > current_mem;
-        let margin = (effective / 8).clamp(256, 2048);
-        let reserve = self.dynamic_reserve_mib(mem);
-        let allowed = if grow {
-            mem.available_mib
-                >= reserve
-                    .saturating_add(self.cache_mib())
-                    .saturating_add(target)
-                    .saturating_add(margin)
-        } else {
-            mem.available_mib < reserve.saturating_add(512)
-                || self.cache_mib() <= self.cache_floor_mib
-        };
-        if !allowed {
-            if let Ok(mut since) = self.memtable_target_since.lock() {
-                *since = None;
-            }
-            return None;
-        }
-        {
-            let Ok(mut since) = self.memtable_target_since.lock() else {
-                return None;
-            };
-            match *since {
-                Some((t, at)) if t == target => {
-                    if at.elapsed() < Duration::from_secs(600) {
-                        return None;
-                    }
-                }
-                _ => {
-                    *since = Some((target, Instant::now()));
-                    return None;
-                }
-            }
-        }
-        if let Ok(last) = self.last_memtable_change.lock() {
-            if let Some(at) = *last {
-                if at.elapsed() < Duration::from_secs(600) {
-                    return None;
-                }
-            }
-        }
-        if let Err(e) = store.set_write_buffer_bytes(target as usize * 1024 * 1024) {
-            eprintln!("[e-lite] cannot adjust memtables to {target} MiB: {e}");
-            return None;
-        }
-        self.memtables_mib.store(target, Ordering::Relaxed);
-        if let Ok(mut since) = self.memtable_target_since.lock() {
-            *since = None;
-        }
-        if let Ok(mut last) = self.last_memtable_change.lock() {
-            *last = Some(Instant::now());
-        }
-        let direction = if grow { "up" } else { "down" };
-        eprintln!(
-            "[e-lite] memory: memtable budget {current_mem} -> {target} MiB ({direction}); \
-             available {} MiB, effective {} MiB",
-            mem.available_mib, effective
-        );
-        Some(format!(
-            "memtables {direction}: {current_mem} -> {target} MiB"
-        ))
-    }
-
     fn memory_step(&self, store: &Store, stats: Option<&Stats>) -> Option<String> {
         let mem = memory_info();
         // Growing the cache only because RAM is free is not evidence that it
@@ -340,12 +257,6 @@ impl Tunables {
         if dir == 0 {
             if let Ok(mut streak) = self.mem_streak.lock() {
                 *streak = (0, 0);
-            }
-            if let Some(reason) = self.memtable_step(store, &mem) {
-                if let Some(stats) = stats {
-                    self.publish(store, stats);
-                }
-                return Some(reason);
             }
             return None;
         }

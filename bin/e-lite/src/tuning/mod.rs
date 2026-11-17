@@ -201,10 +201,6 @@ pub struct Tunables {
     arc_managed: AtomicBool,
     arc_state: Mutex<ArcManagerState>,
     /// Opt-in routine memtable resize. The target must persist for 10 min.
-    adaptive_memtables: AtomicBool,
-    memtables_locked: bool,
-    memtable_target_since: Mutex<Option<(u64, Instant)>>,
-    last_memtable_change: Mutex<Option<Instant>>,
     resume_shrunk: AtomicBool,
 
     // Exportable performance signals.
@@ -492,12 +488,6 @@ impl Tunables {
             zfs_arc_min_mib: AtomicU64::new(cfg.index.zfs_arc_min_mib),
             arc_managed: AtomicBool::new(false),
             arc_state: Mutex::new(ArcManagerState::default()),
-            adaptive_memtables: AtomicBool::new(
-                cfg.index.adaptive_memtables && cfg.index.write_buffer_mib == 0,
-            ),
-            memtables_locked: cfg.index.write_buffer_mib > 0,
-            memtable_target_since: Mutex::new(None),
-            last_memtable_change: Mutex::new(None),
             reader_streak: Mutex::new((0, 0)),
             resume_shrunk: AtomicBool::new(false),
             read_ms: AtomicU64::new(0),
@@ -895,10 +885,6 @@ impl Tunables {
             changed.push("profile");
         }
         self.adaptive.store(cfg.index.adaptive, Ordering::Relaxed);
-        self.adaptive_memtables.store(
-            cfg.index.adaptive_memtables && cfg.index.write_buffer_mib == 0,
-            Ordering::Relaxed,
-        );
         self.readers_locked
             .store(cfg.index.readers > 0, Ordering::Relaxed);
         self.commit_locked

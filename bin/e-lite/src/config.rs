@@ -239,10 +239,6 @@ pub struct IndexCfg {
     /// RocksDB write-buffer budget in MiB across all column families. 0 = auto.
     #[serde(default)]
     pub write_buffer_mib: u64,
-    /// Let the controller resize the shared memtable budget at runtime. Off by
-    /// default: shrinking can force a flush and stall commits.
-    #[serde(default)]
-    pub adaptive_memtables: bool,
     /// RocksDB `max_open_files` (fds kept for table/index/filter readers).
     /// 0 = 8192; lowering to 2048/4096 shrinks `table_readers` memory on
     /// 8-16 GiB hosts, at the cost of reopened table readers.
@@ -300,7 +296,6 @@ impl Default for IndexCfg {
             commit_interval_ms: 0,
             prefetch_blocks: 0,
             write_buffer_mib: 0,
-            adaptive_memtables: false,
             max_open_files: 0,
             memory_reserve_mib: 0,
             memory_fraction: 0.0,
@@ -1379,6 +1374,10 @@ pub const RETIRED_KEYS: &[(&str, &str)] = &[
         "removed in 0.1.0-alpha.29.19.0; prefetch always completes",
     ),
     (
+        "index.adaptive_memtables",
+        "removed in 0.1.0-alpha.29.19.0; memtables are fixed at startup and only shrink when memory is critical",
+    ),
+    (
         "core.cgroup_io_weight",
         "removed in 0.1.0-alpha.29.19.0; [core] io_priority (ionice) remains",
     ),
@@ -1700,8 +1699,6 @@ mod tests {
 
     #[test]
     fn opt_in_knobs_are_validated() {
-        let cfg = Config::default();
-        assert!(!cfg.index.adaptive_memtables);
         let mut fds = Config::default();
         fds.index.max_open_files = 128;
         assert!(fds.validate().is_err());

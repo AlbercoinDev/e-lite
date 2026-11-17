@@ -61,9 +61,8 @@ the per-client rate limiter are implemented; client authentication is not.
   HDD/network, capped by the effective room; `cache_mib` is a maximum. The hot
   controller follows
   `MemAvailable`, shrinks below the reserve and grows only with a proportional
-  margin and slow prefetch. Memtables are fitted at startup; with
-  `[index] adaptive_memtables = true` the controller re-fits the shared WBM and
-  the per-CF buffers after a persistent target (opt-in). Every knob can be
+  margin and slow prefetch. Memtables are fitted at startup and only
+  shrink, as a safety valve, when memory is critical. Every knob can be
   overridden from the CLI or `--set`.
 - Bulk commits are bounded by 250k transactions, 512 blocks, raw bytes
   (`clamp(RAM/128, 64-256 MiB)`) or 20-60 s by disk class (minimum 8 blocks/60 s);
