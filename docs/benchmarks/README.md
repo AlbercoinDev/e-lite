@@ -3,7 +3,7 @@
 Dated measurements, not capacity claims. Each document records its host,
 build profile and corpus, so results are comparable only on the same machine.
 Use `tests/bench/bench_ibd.sh` and `tests/bench/bench_index.sh` to reproduce
-the synthetic runs, and `scripts/benchmark-index.sh` against a real node or
+the synthetic runs, and `tests/bench/bench_node.sh` against a real node or
 index.
 
 | Document | Date | What it measures |

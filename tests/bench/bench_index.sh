@@ -3,7 +3,8 @@
 # several tuning variants, printing one CSV row per run.
 #
 #   BLOCKS=5000 tests/bench/bench_index.sh
-#   VARIANTS="default readers-4 batch-64" tests/bench/bench_index.sh
+#   VARIANTS="default::|readers-4:4:|batch-64::64" tests/bench/bench_index.sh
+#     (pipe-separated name:readers:batch; an empty field keeps the plan value)
 #
 # Never point this at an existing datadir: it creates and deletes its own.
 set -euo pipefail

@@ -1,19 +1,20 @@
 #!/usr/bin/env bash
-# Run e-lite for a fixed window and print the indexing metrics it produced.
-# The real workload is whatever Core/index you point it at; this is a wrapper,
-# not a synthetic benchmark.
+# Run e-lite for a fixed window against a real Core/index and print the
+# indexing metrics it produced. A wrapper, not a synthetic benchmark (that is
+# bench_index.sh). The log goes to target/bench-logs/ (BENCH_LOG_DIR), never
+# into the data directory.
 #
 # Usage:
-#   scripts/benchmark-index.sh <network> <data-dir> <core-datadir> [seconds] [-- extra e-lite flags]
+#   tests/bench/bench_node.sh <network> <data-dir> <core-datadir> [seconds] [-- extra e-lite flags]
 #
 # Example:
-#   scripts/benchmark-index.sh mainnet "$DATA" "$CORE" 600 -- \
+#   tests/bench/bench_node.sh mainnet "$DATA" "$CORE" 600 -- \
 #     --core-rpc http://127.0.0.1:8332 --manage managed --prune-mib 1 \
 #     --allow-mainnet --set index.profile=ssd --set index.adaptive=false
 set -euo pipefail
 
 if [ "$#" -lt 3 ]; then
-  sed -n '2,16p' "$0" | sed 's/^# \{0,1\}//'
+  sed -n '2,13p' "$0" | sed 's/^# \{0,1\}//'
   exit 2
 fi
 
@@ -24,11 +25,14 @@ EXTRA=()
 if [ "${1:-}" = "--" ]; then shift; fi
 EXTRA=("$@")
 
-BIN="${E_LITE_BIN:-$(dirname "$0")/../target/release/e-lite}"
-[ -x "$BIN" ] || BIN="$(dirname "$0")/../target/debug/e-lite"
+ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
+BIN="${E_LITE_BIN:-$ROOT/target/release/e-lite}"
+[ -x "$BIN" ] || BIN="$ROOT/target/debug/e-lite"
 [ -x "$BIN" ] || { echo "e-lite binary not found (set E_LITE_BIN)" >&2; exit 1; }
 
-LOG="$DATA/benchmark-$(date +%Y%m%d-%H%M%S).log"
+LOG_DIR="${BENCH_LOG_DIR:-$ROOT/target/bench-logs}"
+mkdir -p "$LOG_DIR"
+LOG="$LOG_DIR/bench_node-$NETWORK-$(date +%Y%m%d-%H%M%S).log"
 echo "== e-lite benchmark =="
 echo "network: $NETWORK  data: $DATA  core: $CORE  seconds: $SECONDS_TO_RUN"
 echo "log: $LOG"

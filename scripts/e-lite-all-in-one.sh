@@ -10,7 +10,7 @@
 #
 # Modes:
 #   quick      regtest: start e-lite + Core, mine 101 blocks, query, report
-#   suite      run the local e2e suite (launch, wait, pruned, regtest, resilience)
+#   suite      run every regtest e2e suite (tests/run-e2e.sh)
 #   acceptance full signet/testnet4 sync from zero, no prune gaps, Electrum query
 set -euo pipefail
 
@@ -105,6 +105,9 @@ case "$MODE" in quick|suite|acceptance) ;; *) die "bad --mode: $MODE" ;; esac
 case "$NETWORK" in regtest|signet|testnet4|mainnet) ;; *) die "bad --network: $NETWORK" ;; esac
 if [ "$MODE" = "quick" ] && [ "$NETWORK" != "regtest" ]; then
   die "quick mode only supports regtest; use --mode acceptance for $NETWORK"
+fi
+if [ "$MODE" = "suite" ] && [ "$NETWORK" != "regtest" ]; then
+  die "suite mode runs the regtest suites; use --mode acceptance for $NETWORK"
 fi
 if [ "$MODE" = "acceptance" ] && { [ "$NETWORK" = "regtest" ] || [ "$NETWORK" = "mainnet" ]; }; then
   die "acceptance mode supports signet or testnet4 (mainnet needs a snapshot/full node)"
@@ -344,7 +347,7 @@ wait_ready() {
   for _ in $(seq 1 240); do
     local s
     s="$(status_json)"
-    printf '%s' "$s" | grep -q '"state": "READY"' && return 0
+    printf '%s' "$s" | grep -q '"state":"READY"' && return 0
     sleep 0.5
   done
   return 1
@@ -439,28 +442,14 @@ run_suite() {
   write_config
   RESET="$saved_reset"
   export E_LITE_BIN="$PREFIX/e-lite"
+  # tests/run-e2e.sh knows every regtest suite; it keeps the logs and fails a
+  # suite that leaves a process behind.
   local failed=0
-  : >"$TMP/results.txt"
-  local scripts=(
-    tests/e2e/e2e_launch_core.sh
-    tests/e2e/e2e_wait_core.sh
-    tests/e2e/e2e_external_pruned.sh
-    tests/e2e/e2e_pruned_ibd.sh
-    tests/e2e/e2e_regtest.sh
-    tests/e2e/e2e_resilience.sh
-  )
-  for s in "${scripts[@]}"; do
-    log "Running $s"
-    if ( cd "$ROOT" && "$s" >"$TMP/$(basename "$s").log" 2>&1 ); then
-      info "PASS $s"
-      echo "PASS $s" >>"$TMP/results.txt"
-    else
-      info "FAIL $s"
-      echo "FAIL $s" >>"$TMP/results.txt"
-      tail -30 "$TMP/$(basename "$s").log" >&2 || true
-      failed=1
-    fi
-  done
+  if ( cd "$ROOT" && E2E_LOG_DIR="$TMP/e2e-logs" tests/run-e2e.sh ) | tee "$TMP/results.txt"; then
+    info "every regtest suite passed"
+  else
+    failed=1
+  fi
   report_common
   [ "$failed" -eq 0 ] || die "one or more e2e tests failed"
   log "suite OK"

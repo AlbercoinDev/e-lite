@@ -26,7 +26,7 @@ Rules:
 ```bash
 tests/run-e2e.sh                    # all regtest suites (or: tests/run-e2e.sh regtest)
 tests/e2e/e2e_regtest.sh            # one suite on its own
-tests/bench/bench_index.sh          # BLOCKS=5000 VARIANTS="default readers-4"
+BLOCKS=5000 VARIANTS="default::|readers-4:4:" tests/bench/bench_index.sh
 tests/manual/ab_umbrel.sh baseline 1800
 ```
 

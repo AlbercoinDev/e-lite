@@ -71,11 +71,11 @@ Wallet protocol helpers (`e2e_electrum16.py`, `e2e_electrum17.py`,
 
 | Script | Covers |
 |---|---|
-| `bench_index.sh` | Mines a disposable regtest chain and indexes it with several tuning variants, one CSV row per run. |
-| `bench_ibd.sh` | Joint Core IBD + e-lite indexing with a feeder node and sampling (`bench_sample.py`, `bench_run.py`). |
+| `bench_index.sh` | Mines a disposable regtest chain and indexes it with several tuning variants (`bench_run.py` records time and peak memory), one CSV row per run. |
+| `bench_ibd.sh` | Joint Core IBD + e-lite indexing with a feeder node, sampled by `bench_sample.py`. |
+| `bench_node.sh` | Runs e-lite for a fixed window against a real node/index and prints the progress, milestone and tuning lines; the log goes to `target/bench-logs/`. Not synthetic. |
 
-`scripts/benchmark-index.sh` wraps a real node/index for a fixed window; it is
-not synthetic and is not run in CI. Dated results are in
+None of them runs in CI. Dated results are in
 [`docs/benchmarks/`](benchmarks/README.md).
 
 ## Manual (`tests/manual/`)
