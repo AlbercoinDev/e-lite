@@ -1,6 +1,6 @@
 # Session handoff
 
-**Updated:** 2026-11-17 (cleanup and reorganization on `cleanup/2026-11`, after alpha.29.19.0)
+**Updated:** 2026-11-17 (cleanup and reorganization in `main`, after alpha.29.19.0)
 **Latest published release:** `0.1.0-alpha.29.19.0` (29.18.0 is tagged on its own commit, `98ffbe7`)
 **Release:** https://github.com/AlbercoinDev/e-lite/releases/tag/v0.1.0-alpha.29.19.0
 
@@ -90,7 +90,7 @@ no repitas contexto ni rehagas decisiones ya documentadas.
 
 ## Unreleased (2026-11-17): cleanup and reorganization
 
-On branch `cleanup/2026-11`, not merged. No behaviour change except the
+In `main`, not tagged. No behaviour change except the
 all-in-one `--quick` fix; see `CHANGELOG.md` ("Unreleased"). Documentation has
 one home per topic (`docs/README.md` is the map), the pipeline is split under
 `bin/e-lite/src/pipeline/`, and the source layout is in `ARCHITECTURE.md`.
