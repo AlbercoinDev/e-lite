@@ -231,6 +231,10 @@ pub const WALLET_BLOCK_BUDGET: Duration = Duration::from_secs(20);
 /// Eight seconds covers a 1.9 MB block on a slow circuit and leaves the race
 /// engine room to retry a recovering endpoint (MIN_ATTEMPT * 3).
 pub const WALLET_BLOCK_NET: Duration = Duration::from_secs(8);
+/// Head start given to a block download already in flight before the per-txid
+/// path starts (`rawtx.txid_race`): both run concurrently and the first
+/// verified answer wins.
+pub const RACE_HEAD_START: Duration = Duration::from_millis(250);
 /// Extra time a follower waits beyond the leader's deadline.
 pub const FOLLOWER_GRACE: Duration = Duration::from_secs(5);
 /// A block whose download just failed is answered from that failure for this
@@ -415,6 +419,62 @@ pub trait BlockSource: Send + Sync {
     }
 }
 
+/// How a pruned transaction is resolved.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExternalPath {
+    /// Race the block download against the per-txid path (default).
+    Auto,
+    /// Try the loose transaction first and fall back to the block.
+    Tx,
+    /// Whole block only; no txid leaves the node.
+    Block,
+}
+
+impl ExternalPath {
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "auto" => Some(Self::Auto),
+            "tx" => Some(Self::Tx),
+            "block" => Some(Self::Block),
+            _ => None,
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Tx => "tx",
+            Self::Block => "block",
+        }
+    }
+}
+
+/// When the decoy wallets' sessions run.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DecoySessions {
+    /// In the same dispatch round as the real wallet (default).
+    SameRound,
+    /// Only when the real queue is empty, or one wallet if it is not.
+    Background,
+}
+
+impl DecoySessions {
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "same_round" | "same-round" => Some(Self::SameRound),
+            "background" => Some(Self::Background),
+            _ => None,
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::SameRound => "same_round",
+            Self::Background => "background",
+        }
+    }
+}
+
 #[derive(Default)]
 pub struct RawtxStats {
     pub cache_hits: AtomicU64,
@@ -449,6 +509,13 @@ pub struct RawtxStats {
     pub tx_verified: AtomicU64,
     pub tx_verify_failed: AtomicU64,
     pub tx_fallback: AtomicU64,
+    /// A wallet transaction was served from a block download already in
+    /// flight instead of starting the per-txid path.
+    pub block_joins: AtomicU64,
+    /// Wallet requests resolved by the block path in `auto` (it was racing a
+    /// per-txid attempt) and by the txid path while a block was in flight.
+    pub race_wins_block: AtomicU64,
+    pub race_wins_txid: AtomicU64,
 }
 
 #[derive(Clone, Debug)]
@@ -490,6 +557,20 @@ pub struct RawtxConfig {
     pub privacy: PrivacyParams,
     /// Public Electrum servers (`host:port:s|t`) for the per-txid mode.
     pub electrum_servers: Vec<String>,
+    /// How a pruned transaction is resolved (auto races the block).
+    pub path: ExternalPath,
+    /// Total wallet request deadline (queue + network).
+    pub wallet_deadline_seconds: u64,
+    /// Budget of one per-txid attempt.
+    pub txid_attempt_seconds: u64,
+    /// Give an in-flight block a short head start before the txid path.
+    pub txid_race: bool,
+    /// Decoy sessions in the same round or only in the background.
+    pub decoy_sessions: DecoySessions,
+    /// Global concurrent per-txid sessions.
+    pub sessions_total: usize,
+    /// Random delay before a per-txid session, milliseconds (0-250).
+    pub jitter_ms: u64,
 }
 
 impl RawtxConfig {
@@ -522,6 +603,13 @@ impl RawtxConfig {
             chain,
             privacy: PrivacyParams::default(),
             electrum_servers: Vec::new(),
+            path: ExternalPath::Auto,
+            wallet_deadline_seconds: 12,
+            txid_attempt_seconds: 3,
+            txid_race: true,
+            decoy_sessions: DecoySessions::SameRound,
+            sessions_total: 16,
+            jitter_ms: 50,
         }
     }
 }
@@ -709,6 +797,15 @@ pub struct Resolver {
     /// unknown, which stays on the whole-block path.
     prune_height: std::sync::atomic::AtomicU32,
     privacy: PrivacyParams,
+    /// How a pruned transaction is resolved and its budgets.
+    path: ExternalPath,
+    wallet_deadline: Duration,
+    txid_attempt: Duration,
+    txid_race: bool,
+    /// Per-txid session policy, also used by `with_tx_sources` in tests.
+    decoy_sessions: DecoySessions,
+    sessions_total: usize,
+    jitter_ms: u64,
     /// Verified external blocks kept in memory for a burst of requests.
     recent: Mutex<VecDeque<(Hash32, Arc<bitcoin::Block>)>>,
     cache_dir: std::path::PathBuf,
@@ -826,6 +923,13 @@ impl Resolver {
             tx_mode,
             prune_height: std::sync::atomic::AtomicU32::new(0),
             privacy: cfg.privacy.clone(),
+            path: cfg.path,
+            wallet_deadline: Duration::from_secs(cfg.wallet_deadline_seconds.clamp(3, 60)),
+            txid_attempt: Duration::from_secs(cfg.txid_attempt_seconds.clamp(1, 30)),
+            txid_race: cfg.txid_race,
+            decoy_sessions: cfg.decoy_sessions,
+            sessions_total: cfg.sessions_total.clamp(1, 32),
+            jitter_ms: cfg.jitter_ms.min(250),
             recent: Mutex::new(VecDeque::new()),
             cache_dir,
             decoys: cfg.decoys,
@@ -913,6 +1017,9 @@ impl Resolver {
             cfg.privacy.clone(),
             secret,
             stats,
+            cfg.sessions_total,
+            cfg.decoy_sessions,
+            cfg.jitter_ms,
         )
     }
 
@@ -929,6 +1036,9 @@ impl Resolver {
             self.privacy.clone(),
             secret,
             Arc::clone(&self.stats),
+            self.sessions_total,
+            self.decoy_sessions,
+            self.jitter_ms,
         );
         self
     }
@@ -1193,46 +1303,71 @@ impl Resolver {
             return Ok(hex);
         }
         // 2) The block without asking outside: memory, block cache, Core.
-        let block = if let Some((block, _)) = self.local_block(&rec) {
-            block
-        } else {
+        let mut block = self.local_block(&rec).map(|(block, _)| block);
+        if block.is_none() {
+            // One deadline for the whole wallet request
+            // (rawtx.wallet_deadline_seconds): queue and both paths share it.
+            let request_deadline = Instant::now() + self.wallet_deadline;
             let pruned_below = self.prune_height.load(Ordering::Relaxed);
-            let mut block = None;
-            if pruned_below > 0 && height < pruned_below {
-                // A prefetch or another tx.get already started this block:
-                // join it instead of spending the txid budget (AUD-160).
-                if self.block_inflight(&rec.hash) {
-                    if let Ok((joined, _)) = self.fetch_external_block(
-                        &rec,
-                        priority,
-                        Some(Instant::now() + WALLET_BLOCK_BUDGET),
-                    ) {
-                        block = Some(joined);
+            let pruned = pruned_below > 0 && height < pruned_below;
+            // `block`: whole block only. No tx_mode (block privacy mode or no
+            // per-txid sources) also means the block path.
+            let block_only = self.path == ExternalPath::Block || self.tx_mode.is_none();
+            let mut raced = false;
+            if pruned && !block_only {
+                // A prefetch or another tx.get already started this block: in
+                // `auto` it gets a short head start and the per-txid path runs
+                // concurrently; the first verified answer wins.
+                if self.txid_race && self.path == ExternalPath::Auto {
+                    if let Some(entry) = self.inflight_entry(&rec.hash) {
+                        raced = true;
+                        if let Some(Ok(joined)) =
+                            entry.wait_outcome(RACE_HEAD_START.min(self.txid_attempt))
+                        {
+                            self.stats.block_joins.fetch_add(1, Ordering::Relaxed);
+                            block = Some(joined);
+                        }
                     }
                 }
                 if block.is_none() {
                     // 3) Per-txid mode (AUD-163): the loose transaction,
-                    //    verified against the index. It gets a short budget
-                    //    (8 s, two 3 s session attempts) and then the block.
+                    //    verified against the index, with its own short budget
+                    //    (rawtx.txid_attempt_seconds); the block keeps the rest.
                     if let Some(tm) = &self.tx_mode {
                         if let Some(pos) = self.position_of(txid, height) {
                             let t = TxRef { txid, height, pos };
-                            if let Ok(hex) = tm.fetch(ctx, t, Instant::now() + WALLET_TX_BUDGET) {
-                                return Ok(hex);
+                            let now = Instant::now();
+                            let attempt = (now + self.txid_attempt).min(request_deadline);
+                            if attempt > now {
+                                if let Ok(hex) = tm.fetch(ctx, t, attempt) {
+                                    if raced {
+                                        self.stats.race_wins_txid.fetch_add(1, Ordering::Relaxed);
+                                    }
+                                    return Ok(hex);
+                                }
                             }
                         }
                     }
                 }
             }
-            // 4) Whole block from external sources.
-            match block {
-                Some(block) => block,
-                None => {
-                    self.external_block(&rec, priority, Some(Instant::now() + WALLET_BLOCK_BUDGET))?
-                        .0
+            if block.is_none() {
+                // 4) Whole block from external sources, with what is left.
+                let joining = self.block_inflight(&rec.hash);
+                let (fetched, _) = self.external_block(
+                    &rec,
+                    priority,
+                    Some(request_deadline.max(Instant::now() + MIN_ATTEMPT)),
+                )?;
+                if joining {
+                    self.stats.block_joins.fetch_add(1, Ordering::Relaxed);
                 }
+                if raced {
+                    self.stats.race_wins_block.fetch_add(1, Ordering::Relaxed);
+                }
+                block = Some(fetched);
             }
-        };
+        }
+        let block = block.expect("a block was fetched or joined");
         let hex = self
             .cache_txs(&rec, &block, &[txid])?
             .pop()
@@ -1240,7 +1375,11 @@ impl Resolver {
         Ok(hex)
     }
 
-    /// True when another caller is already downloading this block.
+    /// The in-flight download of this block, when another caller started it.
+    fn inflight_entry(&self, hash: &Hash32) -> Option<Arc<race::InflightBlock>> {
+        self.inflight.lock().ok()?.get(hash).cloned()
+    }
+
     fn block_inflight(&self, hash: &Hash32) -> bool {
         self.inflight
             .lock()

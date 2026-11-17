@@ -202,6 +202,17 @@ max_parallel_fetches = 16           # external block downloads in flight (the pr
                                     # never takes the last free one); attempts in
                                     # flight (hedges included) are capped at twice
                                     # this, at most 24 (Tor allows 32 pending circuits)
+# How a pruned transaction is resolved:
+#   auto  = the on-demand block download races the per-txid path (default)
+#   tx    = loose transaction first, whole block as fallback
+#   block = whole blocks only; no txid leaves the node
+path = "auto"
+wallet_deadline_seconds = 12       # total per wallet request (queue + network)
+txid_attempt_seconds = 3           # replace a provider that misses this
+txid_race = true                   # auto: short head start for an in-flight block
+decoy_sessions = "same_round"      # or "background" (one decoy wallet while real wait)
+sessions_total = 16                # concurrent per-txid sessions (1-32)
+jitter_ms = 50                     # random delay before a session (0-250)
 p2p_timeout_seconds = 8             # direct P2P attempt (connect 4 s, stall 6 s)
 p2p_tor_timeout_seconds = 30        # P2P attempt through Tor (connect 10 s, onion
                                     # 20 s; stall 12 s; whole block within this)

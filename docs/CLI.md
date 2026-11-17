@@ -240,6 +240,13 @@ e-lite run --network mainnet --allow-mainnet \
 | `--set rawtx.tor_request_timeout_seconds=<n>` | absolute per-attempt budget through Tor (new circuit + whole block) | `60` |
 | `--set rawtx.provider_cooldown_seconds=<n>` | cool down a failed provider (Tor or direct) | `300` |
 | `--set rawtx.max_parallel_fetches=<n>` | concurrent external block downloads | `16` |
+| `--set rawtx.path=auto\|tx\|block` | how a pruned transaction is resolved: race the block (auto), txid first (tx) or block only | `auto` |
+| `--set rawtx.wallet_deadline_seconds=<n>` | total per wallet request (queue + network) | `12` |
+| `--set rawtx.txid_attempt_seconds=<n>` | replace a per-txid provider that misses this | `3` |
+| `--set rawtx.txid_race=<bool>` | in `auto`, give an in-flight block a short head start | `true` |
+| `--set rawtx.decoy_sessions=same_round\|background` | decoy wallets in the same round or one in the background | `same_round` |
+| `--set rawtx.sessions_total=<n>` | concurrent per-txid sessions | `16` |
+| `--set rawtx.jitter_ms=<n>` | random delay before a session (0-250) | `50` |
 | `--set rawtx.privacy_file=<path>` | `privacy.toml` location (empty: next to config.toml) | empty |
 | `--set privacy.<section>.<key>=<v>` | override one `privacy.toml` value for this run (range-checked, see `docs/PRIVACY-TUNING.md`) | — |
 | `--set rawtx.p2p_timeout_seconds=<n>` | P2P connect/handshake/block timeout | `8` |

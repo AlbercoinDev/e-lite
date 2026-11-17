@@ -726,6 +726,15 @@ pub(crate) fn build_resolver(
         chain,
         privacy: privacy_params.clone(),
         electrum_servers,
+        path: el_rawtx::ExternalPath::parse(&cfg.rawtx.path)
+            .unwrap_or(el_rawtx::ExternalPath::Auto),
+        wallet_deadline_seconds: cfg.rawtx.wallet_deadline_seconds,
+        txid_attempt_seconds: cfg.rawtx.txid_attempt_seconds,
+        txid_race: cfg.rawtx.txid_race,
+        decoy_sessions: el_rawtx::DecoySessions::parse(&cfg.rawtx.decoy_sessions)
+            .unwrap_or(el_rawtx::DecoySessions::SameRound),
+        sessions_total: cfg.rawtx.sessions_total,
+        jitter_ms: cfg.rawtx.jitter_ms,
     };
     let resolver = Resolver::new(Arc::clone(store), &rc)?;
     match resolver.tx_mode_servers() {

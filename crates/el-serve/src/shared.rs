@@ -462,9 +462,12 @@ impl Shared {
                     "rejected": rawtx.tx_verify_failed.load(Ordering::Relaxed),
                     "block_fallback": rawtx.tx_fallback.load(Ordering::Relaxed),
                 },
+                "block_joins": rawtx.block_joins.load(Ordering::Relaxed),
                 "race": {
                     "attempts": rawtx.race_attempts.load(Ordering::Relaxed),
                     "hedges": rawtx.race_hedges.load(Ordering::Relaxed),
+                    "wins_txid": rawtx.race_wins_txid.load(Ordering::Relaxed),
+                    "wins_block": rawtx.race_wins_block.load(Ordering::Relaxed),
                     "wins_esplora": rawtx.race_wins_esplora.load(Ordering::Relaxed),
                     "wins_p2p": rawtx.race_wins_p2p.load(Ordering::Relaxed),
                     "wins_other": rawtx.race_wins_other.load(Ordering::Relaxed),

@@ -1,5 +1,41 @@
 # Changelog
 
+## 0.1.0-alpha.29.21.0 — 2026-11-17
+
+### Added
+
+- **Concurrent txid/block race (A2).** In `rawtx.path = auto` (default) a
+  pruned `transaction.get` gives the block download already in flight a short
+  head start (250 ms) and runs the per-txid path concurrently; the first
+  verified answer wins and the other continues in the background. The whole
+  request shares one `wallet_deadline_seconds` (default 12 s).
+- **Wallet configuration**: `rawtx.path` (`auto`/`tx`/`block`),
+  `wallet_deadline_seconds`, `txid_attempt_seconds`, `txid_race`,
+  `decoy_sessions` (`same_round`/`background`), `sessions_total` and
+  `jitter_ms`, with validation. Defaults reproduce the previous behaviour
+  except for the documented budgets.
+- `decoy_sessions = "background"` keeps one decoy wallet while real requests
+  wait; `same_round` (default) keeps all of them in the same dispatch.
+- `sessions_total` caps the per-txid sessions globally (default 16).
+- `jitter_ms` adds a random 0-250 ms delay before a session (default 50) to
+  break the timing correlation with the wallet connection.
+- Operators are deduplicated in the preferred candidate set: the API, onion
+  and Electrum endpoints of the same operator are not the first two choices.
+- `/status.rawtx` exposes `block_joins` and `race.wins_txid`/`wins_block`.
+
+### Changed
+
+- External Esplora requests negotiate HTTP/2 (reqwest `http2`), so several
+  requests share one TLS connection.
+- The per-txid session pool, decoy pool and candidate selection read the new
+  configuration instead of the privacy preset alone.
+
+### Tests
+
+- New config validation cases for the wallet keys (`rawtx.path`,
+  deadlines, `decoy_sessions`, `sessions_total`, `jitter_ms`).
+- Existing resolver, txmode and serve suites pass with the new defaults.
+
 ## 0.1.0-alpha.29.20.0 — 2026-11-17
 
 Wallet loads over Tor were dominated by the per-txid path: a provider could

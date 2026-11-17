@@ -665,6 +665,33 @@ pub struct RawtxCfg {
     pub esplora_urls: Vec<String>,
     #[serde(default)]
     pub p2p_peers: Vec<String>,
+    /// How a pruned transaction is resolved: `auto` races the block download
+    /// against the per-txid path, `tx` tries the loose transaction first and
+    /// `block` fetches the whole block only (no txid leaves the node).
+    #[serde(default = "d_rawtx_path")]
+    pub path: String,
+    /// Total wallet request deadline (queue + network), seconds.
+    #[serde(default = "d_wallet_deadline")]
+    pub wallet_deadline_seconds: u64,
+    /// Budget of one per-txid attempt, seconds; the provider is replaced
+    /// when it misses it.
+    #[serde(default = "d_txid_attempt")]
+    pub txid_attempt_seconds: u64,
+    /// In `auto`, give an in-flight block a short head start and race it
+    /// against the per-txid path.
+    #[serde(default = "d_true")]
+    pub txid_race: bool,
+    /// `same_round` (default) sends the decoy wallets in the same dispatch as
+    /// the real one; `background` keeps only one while real requests wait.
+    #[serde(default = "d_decoy_sessions")]
+    pub decoy_sessions: String,
+    /// Global concurrent per-txid sessions (1..32).
+    #[serde(default = "d_sessions_total")]
+    pub sessions_total: usize,
+    /// Random delay before a per-txid session, milliseconds (0..250): breaks
+    /// the timing correlation with the wallet connection.
+    #[serde(default = "d_jitter_ms")]
+    pub jitter_ms: u64,
     /// `privacy.toml` path. Empty = next to config.toml (AUD-163).
     #[serde(default)]
     pub privacy_file: Option<String>,
@@ -729,6 +756,13 @@ impl Default for RawtxCfg {
             p2p_v2: true,
             esplora_urls: Vec::new(),
             p2p_peers: Vec::new(),
+            path: d_rawtx_path(),
+            wallet_deadline_seconds: d_wallet_deadline(),
+            txid_attempt_seconds: d_txid_attempt(),
+            txid_race: true,
+            decoy_sessions: d_decoy_sessions(),
+            sessions_total: d_sessions_total(),
+            jitter_ms: d_jitter_ms(),
             privacy_file: None,
             privacy_overrides: Vec::new(),
         }
@@ -820,6 +854,24 @@ fn d_provider_cooldown() -> u64 {
 }
 fn d_max_parallel_fetches() -> usize {
     16
+}
+fn d_rawtx_path() -> String {
+    "auto".to_string()
+}
+fn d_wallet_deadline() -> u64 {
+    12
+}
+fn d_txid_attempt() -> u64 {
+    3
+}
+fn d_decoy_sessions() -> String {
+    "same_round".to_string()
+}
+fn d_sessions_total() -> usize {
+    16
+}
+fn d_jitter_ms() -> u64 {
+    50
 }
 fn d_p2p_timeout() -> u64 {
     8
@@ -1137,6 +1189,29 @@ impl Config {
         if self.index.batch_blocks == 0 {
             return Err("[index] batch_blocks must be >= 1".to_string());
         }
+        if el_rawtx::ExternalPath::parse(&self.rawtx.path).is_none() {
+            return Err("[rawtx] path must be auto, tx or block".to_string());
+        }
+        if !(3..=60).contains(&self.rawtx.wallet_deadline_seconds) {
+            return Err("[rawtx] wallet_deadline_seconds must be 3..60".to_string());
+        }
+        if !(1..=30).contains(&self.rawtx.txid_attempt_seconds) {
+            return Err("[rawtx] txid_attempt_seconds must be 1..30".to_string());
+        }
+        if self.rawtx.txid_attempt_seconds > self.rawtx.wallet_deadline_seconds {
+            return Err(
+                "[rawtx] txid_attempt_seconds must not exceed wallet_deadline_seconds".to_string(),
+            );
+        }
+        if el_rawtx::DecoySessions::parse(&self.rawtx.decoy_sessions).is_none() {
+            return Err("[rawtx] decoy_sessions must be same_round or background".to_string());
+        }
+        if !(1..=32).contains(&self.rawtx.sessions_total) {
+            return Err("[rawtx] sessions_total must be 1..32".to_string());
+        }
+        if self.rawtx.jitter_ms > 250 {
+            return Err("[rawtx] jitter_ms must be 0..250".to_string());
+        }
         if self.index.reorg_window == 0 {
             return Err("[index] reorg_window must be >= 1".to_string());
         }
@@ -1410,6 +1485,62 @@ mod tests {
         assert_eq!(cfg.pruning.max_core_lag_blocks, 192);
         assert_eq!(cfg.rawtx.cache_mib, 256);
         assert!(cfg.rawtx.esplora_urls.is_empty());
+    }
+
+    #[test]
+    fn wallet_rawtx_defaults_and_validation() {
+        let cfg = Config::default();
+        assert_eq!(cfg.rawtx.path, "auto");
+        assert_eq!(cfg.rawtx.wallet_deadline_seconds, 12);
+        assert_eq!(cfg.rawtx.txid_attempt_seconds, 3);
+        assert!(cfg.rawtx.txid_race);
+        assert_eq!(cfg.rawtx.decoy_sessions, "same_round");
+        assert_eq!(cfg.rawtx.sessions_total, 16);
+        assert_eq!(cfg.rawtx.jitter_ms, 50);
+        assert!(cfg.validate().is_ok());
+
+        let mut bad = Config::default();
+        bad.rawtx.path = "sometimes".into();
+        assert!(bad.validate().is_err());
+        bad.rawtx.path = "auto".into();
+        bad.rawtx.wallet_deadline_seconds = 2;
+        assert!(bad.validate().is_err());
+        bad.rawtx.wallet_deadline_seconds = 12;
+        bad.rawtx.txid_attempt_seconds = 13;
+        assert!(bad.validate().is_err());
+        bad.rawtx.txid_attempt_seconds = 3;
+        bad.rawtx.decoy_sessions = "later".into();
+        assert!(bad.validate().is_err());
+        bad.rawtx.decoy_sessions = "background".into();
+        bad.rawtx.sessions_total = 0;
+        assert!(bad.validate().is_err());
+        bad.rawtx.sessions_total = 16;
+        bad.rawtx.jitter_ms = 251;
+        assert!(bad.validate().is_err());
+    }
+
+    #[test]
+    fn wallet_rawtx_keys_parse_from_overrides() {
+        let cfg = Config::load_with_overrides(
+            None,
+            &[
+                "rawtx.path=block".to_string(),
+                "rawtx.wallet_deadline_seconds=20".to_string(),
+                "rawtx.txid_attempt_seconds=4".to_string(),
+                "rawtx.txid_race=false".to_string(),
+                "rawtx.decoy_sessions=background".to_string(),
+                "rawtx.sessions_total=24".to_string(),
+                "rawtx.jitter_ms=0".to_string(),
+            ],
+        )
+        .unwrap();
+        assert_eq!(cfg.rawtx.path, "block");
+        assert_eq!(cfg.rawtx.wallet_deadline_seconds, 20);
+        assert_eq!(cfg.rawtx.txid_attempt_seconds, 4);
+        assert!(!cfg.rawtx.txid_race);
+        assert_eq!(cfg.rawtx.decoy_sessions, "background");
+        assert_eq!(cfg.rawtx.sessions_total, 24);
+        assert_eq!(cfg.rawtx.jitter_ms, 0);
     }
 
     #[test]

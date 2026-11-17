@@ -58,6 +58,27 @@ impl InflightBlock {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = deadline;
     }
+
+    /// Wait up to `timeout` for this download to finish. `None` when it is
+    /// still running; the caller then races the per-txid path against it.
+    pub(super) fn wait_outcome(&self, timeout: Duration) -> Option<Result<Arc<bitcoin::Block>>> {
+        let deadline = Instant::now() + timeout;
+        let mut done = self.done.lock().ok()?;
+        while !*done {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return None;
+            }
+            let (guard, _) = self
+                .cv
+                .wait_timeout(done, left.min(Duration::from_millis(50)))
+                .ok()?;
+            done = guard;
+        }
+        drop(done);
+        let result = self.result.lock().ok()?.clone();
+        Some(result.unwrap_or_else(|| Err(RawtxError::Unavailable("inflight result lost".into()))))
+    }
 }
 
 impl Resolver {

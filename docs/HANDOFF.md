@@ -1,8 +1,8 @@
 # Session handoff
 
-**Updated:** 2026-11-17 (alpha.29.20.0: wallet rawtx budgets, adaptive batches and block join)
-**Latest published release:** `0.1.0-alpha.29.20.0`
-**Release:** https://github.com/AlbercoinDev/e-lite/releases/tag/v0.1.0-alpha.29.20.0
+**Updated:** 2026-11-17 (alpha.29.21.0: concurrent txid/block race and wallet config keys)
+**Latest published release:** `0.1.0-alpha.29.21.0`
+**Release:** https://github.com/AlbercoinDev/e-lite/releases/tag/v0.1.0-alpha.29.21.0
 
 This is the short “where we are”. The invariants live in
 [`AGENTS.md`](../AGENTS.md); the
@@ -88,7 +88,17 @@ no repitas contexto ni rehagas decisiones ya documentadas.
   `docs/ROADMAP.md` is future work only, and `docs/AUDIT.md` holds the open
   findings (`docs/audit/FIXED.md` is the fixed history).
 
-## Last change (alpha.29.20.0): wallet rawtx budgets and block join
+## Last change (alpha.29.21.0): concurrent race and wallet config
+
+- `rawtx.path` (auto/tx/block), `wallet_deadline_seconds`, `txid_attempt_seconds`,
+  `txid_race`, `decoy_sessions`, `sessions_total` and `jitter_ms`, validated,
+  with defaults that keep the previous behaviour.
+- `auto` races the in-flight block against the per-txid path (250 ms head
+  start, one request deadline) and the first verified answer wins.
+- Operator dedupe in the candidate set, HTTP/2 for Esplora, and
+  `/status.rawtx.block_joins` + `race.wins_txid/wins_block`.
+
+## Previous change (alpha.29.20.0): wallet rawtx budgets and block join
 
 - Session budget 40 s -> 3 s; wallet txid budget 8 s; wallet block budget 20 s
   (12 s queue + 8 s network) instead of 60 s network + 120 s queue.

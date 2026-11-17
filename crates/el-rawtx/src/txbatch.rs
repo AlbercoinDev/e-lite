@@ -18,13 +18,14 @@ use crate::decoy_wallets::{DecoyBook, DecoyPicker, TxRef};
 use crate::privacy::PrivacyParams;
 use crate::txcache::{CachedTx, TxCache};
 use crate::txsource::TxSource;
+use crate::DecoySessions;
 use crate::{AttemptCtl, RawtxError, RawtxStats, Result, Semaphore};
 use el_model::sync::Mutex;
 use el_model::{Hash32, ScriptHash};
 use el_store::Store;
 use rand::seq::SliceRandom;
 use rand::thread_rng;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar};
 use std::time::{Duration, Instant};
@@ -97,6 +98,10 @@ struct Shared {
     /// Decoy sessions get their own small pool so three decoy wallets never
     /// take the slots the real wallet is waiting for.
     decoy_sessions: Arc<Semaphore>,
+    /// Same round as the real wallet, or mostly background.
+    decoy_mode: DecoySessions,
+    /// Random delay before a session, milliseconds.
+    jitter_ms: u64,
     /// Longest batch a server accepted, learned after a session failure: a
     /// provider that closes connections above 20 items (measured) is not asked
     /// for 50 again in the same process.
@@ -140,6 +145,9 @@ impl TxMode {
         params: PrivacyParams,
         secret: [u8; 32],
         stats: Arc<RawtxStats>,
+        sessions_total: usize,
+        decoy_mode: DecoySessions,
+        jitter_ms: u64,
     ) -> Option<Self> {
         if sources.is_empty() {
             return None;
@@ -149,8 +157,10 @@ impl TxMode {
             store,
             txcache,
             sources,
-            sessions: Semaphore::new(params.parallel_sessions.max(1)),
-            decoy_sessions: Semaphore::new((params.parallel_sessions / 4).max(1)),
+            sessions: Semaphore::new(sessions_total.max(1)),
+            decoy_sessions: Semaphore::new((sessions_total / 4).max(1)),
+            decoy_mode,
+            jitter_ms: jitter_ms.min(250),
             batch_caps: Mutex::new(HashMap::new()),
             params,
             books: Mutex::new((HashMap::new(), VecDeque::new())),
@@ -494,7 +504,17 @@ fn dispatch(shared: &Arc<Shared>, reqs: Vec<Req>) {
     let mut groups: Vec<((u64, usize), Vec<Item>)> = Vec::new();
     for (ctx, real) in by_ctx {
         let n = real.len();
-        let decoys = shared.with_book(ctx, |book, _| book.take(n));
+        // Background decoys keep only the first wallet while real requests
+        // are waiting; the same round (default) keeps all of them, which is
+        // what hides the real group among look-alikes.
+        let background = matches!(shared.decoy_mode, DecoySessions::Background);
+        let decoys = shared.with_book(ctx, |book, _| {
+            let mut taken = book.take(n);
+            if background {
+                taken.retain(|(wallet, _)| *wallet == 0);
+            }
+            taken
+        });
         let k = shared.with_book(ctx, |book, _| book.wallets());
         groups.push(((ctx, 0), real.into_iter().map(Item::Real).collect()));
         let mut per_wallet: Vec<Vec<Item>> = (0..k).map(|_| Vec::new()).collect();
@@ -526,13 +546,30 @@ fn dispatch(shared: &Arc<Shared>, reqs: Vec<Req>) {
         })
         .collect();
     // Candidates: the faster half of the servers, never fewer than `spread`.
+    // One endpoint per operator first (anti-collusion: mempool.space API,
+    // onion and Electrum are the same operator), then the rest to fill.
     let mut order: Vec<usize> = (0..servers.len()).collect();
     order.shuffle(&mut rng);
     order.sort_by(|&a, &b| rank[a].total_cmp(&rank[b]));
-    let candidates: Vec<usize> = order
-        .into_iter()
-        .take(spread.max(servers.len().div_ceil(2)))
-        .collect();
+    let target = spread.max(servers.len().div_ceil(2));
+    let mut seen_operators: HashSet<String> = HashSet::new();
+    let mut candidates: Vec<usize> = Vec::new();
+    for &index in &order {
+        if candidates.len() >= target {
+            break;
+        }
+        if seen_operators.insert(server_operator(&servers[index].1)) {
+            candidates.push(index);
+        }
+    }
+    for &index in &order {
+        if candidates.len() >= target {
+            break;
+        }
+        if !candidates.contains(&index) {
+            candidates.push(index);
+        }
+    }
     let mut spread_counts = shared.spread.lock().unwrap_or_else(|p| p.into_inner());
     for (group_key, group) in groups {
         // Each item goes to the candidate that has received the fewest items
@@ -597,6 +634,13 @@ fn run_session(shared: &Arc<Shared>, src: Arc<dyn TxSource>, key: &str, items: V
     shared.sessions_active.fetch_add(1, Ordering::SeqCst);
     let _guard = SessionGuard(&shared.sessions_active);
     let has_real = items.iter().any(|item| matches!(item, Item::Real(_)));
+    if has_real && shared.jitter_ms > 0 {
+        // Small random delay: it breaks the timing correlation between the
+        // wallet's connection and its first provider request at a negligible
+        // cost (at most `jitter_ms`).
+        let delay = rand::random::<u64>() % shared.jitter_ms.max(1);
+        std::thread::sleep(Duration::from_millis(delay));
+    }
     // Decoy sessions use a small separate pool so three decoy wallets never
     // take the session slots a real transaction is waiting for. Dropping a
     // decoy when the pool is full is harmless: it is background noise.
@@ -703,5 +747,29 @@ fn retry_or_fail(shared: &Arc<Shared>, mut r: Req, key: &str, why: &str) {
                 "tx mode: {MAX_TX_ATTEMPTS} servers failed ({why})"
             ))),
         );
+    }
+}
+
+/// Registrable-suffix approximation used to keep two endpoints of the same
+/// operator out of the preferred candidate set (`mempool.space` API, onion
+/// and Electrum count as one).
+fn server_operator(key: &str) -> String {
+    let host = key
+        .split("//")
+        .last()
+        .unwrap_or(key)
+        .split('/')
+        .next()
+        .unwrap_or(key)
+        .split(':')
+        .next()
+        .unwrap_or(key)
+        .trim_start_matches("www.")
+        .to_ascii_lowercase();
+    let parts: Vec<&str> = host.split('.').collect();
+    if parts.len() >= 2 {
+        format!("{}.{}", parts[parts.len() - 2], parts[parts.len() - 1])
+    } else {
+        host
     }
 }

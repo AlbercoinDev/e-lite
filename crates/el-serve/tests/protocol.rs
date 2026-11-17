@@ -473,6 +473,13 @@ fn slow_fixture(delay: Duration) -> (Arc<Shared>, Hash32, std::path::PathBuf) {
                 chain: Chain::Regtest,
                 privacy: el_rawtx::PrivacyParams::default(),
                 electrum_servers: Vec::new(),
+                path: el_rawtx::ExternalPath::Auto,
+                wallet_deadline_seconds: 12,
+                txid_attempt_seconds: 3,
+                txid_race: true,
+                decoy_sessions: el_rawtx::DecoySessions::SameRound,
+                sessions_total: 16,
+                jitter_ms: 50,
             },
         )
         .unwrap()
