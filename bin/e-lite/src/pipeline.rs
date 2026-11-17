@@ -51,10 +51,6 @@ pub(crate) struct Indexer {
     pub(crate) bulk_lag_baseline: AtomicU64,
     pub(crate) bulk_started: AtomicBool,
     pub(crate) bulk_full_pause: AtomicBool,
-    /// Opt-in drain-time lag policy (`E_LITE_LAG_POLICY=drain`). The default
-    /// keeps the block window with a fixed baseline (no ratchet).
-    pub(crate) lag_policy_drain: bool,
-    pub(crate) lag_target_secs: u64,
     /// `true` when `[pruning] scheduler = "alternate"`: Core downloads and
     /// e-lite indexes in alternating phases. `false` keeps the overlap.
     pub(crate) scheduler_alternate: bool,
@@ -121,15 +117,6 @@ impl Indexer {
         let start_height = tip.as_ref().map(|t| t.height as u64).unwrap_or(0);
         let start_txnum = tip.as_ref().map(|t| t.txnum).unwrap_or(0);
         let now = Instant::now();
-        let lag_policy_drain = matches!(
-            std::env::var("E_LITE_LAG_POLICY").ok().as_deref(),
-            Some("drain")
-        );
-        let lag_target_secs = std::env::var("E_LITE_LAG_TARGET_SECONDS")
-            .ok()
-            .and_then(|v| v.parse::<u64>().ok())
-            .unwrap_or(1_800)
-            .clamp(120, 6 * 3_600);
         let requested_alternate = cfg.pruning.scheduler.eq_ignore_ascii_case("alternate");
         let scheduler_alternate = requested_alternate && can_control_core;
         if requested_alternate && !can_control_core {
@@ -192,8 +179,6 @@ impl Indexer {
             bulk_lag_baseline: AtomicU64::new(u64::MAX),
             bulk_started: AtomicBool::new(false),
             bulk_full_pause: AtomicBool::new(false),
-            lag_policy_drain,
-            lag_target_secs,
             scheduler_alternate,
             high_since: Mutex::new(None),
             low_since: Mutex::new(None),
@@ -994,22 +979,6 @@ impl Indexer {
                     bulk_full = true;
                     limit = ahead.max(1);
                     resume = ahead.max(1);
-                } else if self.lag_policy_drain {
-                    let rate = self.tunables.recent_blocks_rate();
-                    if rate > 0 {
-                        let (pause_at, resume_at) =
-                            bulk_drain_window(rate, self.lag_target_secs, ahead.max(1));
-                        limit = pause_at;
-                        resume = resume_at;
-                    } else {
-                        let baseline = self.bulk_lag_baseline.load(Ordering::Relaxed);
-                        let (new_baseline, pause_at, resume_at) =
-                            bulk_lag_window(lag, baseline, bulk_blocks, paused);
-                        self.bulk_lag_baseline
-                            .store(new_baseline, Ordering::Relaxed);
-                        limit = pause_at;
-                        resume = resume_at;
-                    }
                 } else {
                     let baseline = self.bulk_lag_baseline.load(Ordering::Relaxed);
                     let (new_baseline, pause_at, resume_at) =
@@ -2254,18 +2223,6 @@ pub(crate) fn commit_sync_policy(mode: &str, ibd: bool, height: u64, core_tip: u
     }
 }
 
-/// Drain-time window: pause Core when the index would need more than
-/// `target_secs` to consume the backlog at `rate` blocks/s; resume at half.
-/// The thresholds depend only on the measured rate and the configured target,
-/// never on the lag observed at resume, so they cannot ratchet upwards.
-pub(crate) fn bulk_drain_window(rate: u64, target_secs: u64, min_resume: u64) -> (u64, u64) {
-    let pause = rate
-        .saturating_mul(target_secs)
-        .max(min_resume.saturating_mul(2));
-    let resume = (pause / 2).max(min_resume);
-    (pause, resume)
-}
-
 /// Bulk lag guard window. `u64::MAX` means "no baseline yet". The baseline
 /// follows the lowest lag seen **while Core is downloading**. While paused it
 /// must stay fixed; otherwise every block indexed would lower the resume
@@ -3057,13 +3014,6 @@ pub(crate) fn index_loop(
         mem_memtables,
         mem_runtime
     );
-    if idx.lag_policy_drain {
-        eprintln!(
-            "[e-lite] lag policy=drain target={}s (Core pauses when the index would need \
-             more than that to drain the backlog)",
-            idx.lag_target_secs
-        );
-    }
     spawn_core_observer(&idx, Arc::clone(&flag));
     if let Some(sh) = &shared {
         idx.tunables.publish(&idx.store, &sh.stats);

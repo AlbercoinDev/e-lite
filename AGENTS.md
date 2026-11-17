@@ -88,8 +88,7 @@ Each rule names where the detail is. Read it before touching that area.
 - Pause/resume state follows the result of `setnetworkactive`. An external
   Core is never configured, paused or restarted.
 - Take `IbdLock` before the first catch-up call when Core is in IBD.
-- `scheduler = "alternate"` and `E_LITE_LAG_POLICY=drain` stay opt-in until a
-  mainnet A/B says otherwise.
+- `scheduler = "alternate"` stays opt-in until a mainnet A/B says otherwise.
 - Bulk commits are bounded by transactions, blocks, bytes and time; do not
   turn the interval into a per-second timer.
 - Start indexing before the provider gate: a provider outage must not stop

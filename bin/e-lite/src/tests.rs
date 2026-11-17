@@ -149,19 +149,6 @@ fn undo_window_is_measured_from_the_real_commit_tip() {
 }
 
 #[test]
-fn bulk_drain_window_does_not_ratchet() {
-    // 4 blocks/s, 30 min target -> pause at 7200, resume at 3600.
-    assert_eq!(bulk_drain_window(4, 1_800, 100), (7_200, 3_600));
-    // The same inputs produce the same thresholds after a resume; no
-    // dependency on the lag observed at that moment.
-    assert_eq!(bulk_drain_window(4, 1_800, 100), (7_200, 3_600));
-    // Low rates still leave the configured minimum ahead.
-    assert_eq!(bulk_drain_window(1, 1_800, 2_000), (4_000, 2_000));
-    // A very high rate is bounded by the time target, not by a fixed lag.
-    assert_eq!(bulk_drain_window(10, 600, 100), (6_000, 3_000));
-}
-
-#[test]
 fn bulk_lag_window_bounds_additional_growth() {
     // First call on a 317k backlog: pause only after 20k more.
     assert_eq!(

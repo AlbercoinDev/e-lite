@@ -395,8 +395,6 @@ These are escape hatches for measurements, not normal configuration:
 
 | Variable | Effect |
 |---|---|
-| `E_LITE_LAG_POLICY=drain` | Use the opt-in drain-time lag watermark instead of the fixed block window |
-| `E_LITE_LAG_TARGET_SECONDS=<n>` | Drain target for `drain` (default 1800, clamped 120..21600) |
 | `E_LITE_NO_SYNC_LOCK=1` | Allow two intensive syncs at once (not recommended) |
 | `E_LITE_NO_SUPERVISE=1` | Run `run`/`serve`/`index` as a single process, without the automatic restart after a fatal error (same as `--no-supervise`) |
 | `E_LITE_ALLOW_LOW_MEMORY=1` | Bypass the RAM preflight (CI only) |

@@ -306,10 +306,7 @@ and the controller treats it as one system:
   by `max_bulk_lag_blocks/2` per cycle (14,884 → 24,858 → 34,858 in a real
   29.5.0 log). The default is now an absolute byte window
   (`max_bulk_lag_gib`/`core_resume_ahead_gib`); the legacy block window is used
-  only when the GiB value is 0. `E_LITE_LAG_POLICY=drain` opts into a
-  time-based watermark: pause when the index would need more than
-  `E_LITE_LAG_TARGET_SECONDS` (default 1800) to drain the backlog at the last
-  commit cycle's rate, resume at half. It is opt-in until a mainnet A/B.
+  only when the GiB value is 0.
 - RocksDB properties are classified correctly: `estimate-pending-compaction-
   bytes`, `cur-size-all-mem-tables`, `total-sst-files-size` and
   `estimate-table-readers-mem` are per-CF and are summed; `num-running-

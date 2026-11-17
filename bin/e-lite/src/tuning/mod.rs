@@ -749,18 +749,6 @@ impl Tunables {
         (blocks as f64 / span).round() as u64
     }
 
-    /// Blocks/s over the last commit cycle; falls back to the since-start
-    /// average only until a cycle is available. Do not take the maximum: an
-    /// optimistic rate would allow a larger backlog than the target.
-    pub fn recent_blocks_rate(&self) -> u64 {
-        let recent = self.recent_blocks_per_sec.load(Ordering::Relaxed);
-        if recent > 0 {
-            recent
-        } else {
-            self.blocks_per_sec.load(Ordering::Relaxed)
-        }
-    }
-
     /// Called after a successful prune so the controller ignores the stall.
     pub fn note_prune(&self) {
         if let Ok(mut last) = self.last_prune.lock() {
