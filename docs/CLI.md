@@ -35,6 +35,12 @@ cache clear      delete the rawtx cache (needs --yes; --dry-run previews it).
 export-snapshot  print the canonical digest or write --output
                  (--with-core bundles the network's Core chain data with a
                  SHA-256 per file; index stored, Core gzip 3; --compress-level sets both)
+export-identity  write the TLS identity (CA + leaf), the onion keys, decoy.key
+                 and the three configuration files to --output (0600; private
+                 keys, not encrypted; refuses while e-lite runs)
+import-identity  restore them from --input; files that differ are kept unless
+                 --yes; on a host with no config yet the archived config.toml
+                 says where the data dir is (--data-dir still wins)
 import-snapshot  restore --input into an empty target (atomic: staged, then renamed)
                  (--verify checks per-file hashes; --verify=full opens the
                  restored Core and runs a bounded verifychain;
@@ -60,8 +66,8 @@ version          print version
 | `--block-source <src>` | `auto`, `rpc`, `files` |
 | `--manage <mode>` | `external`, `auto`, `managed` |
 | `--prune-mib <n>` | `1` manual (default), `0` full, `>=550` auto + opt-in |
-| `--output <path>` | snapshot file for `export-snapshot` |
-| `--input <path>` | snapshot file for `import-snapshot` |
+| `--output <path>` | file written by `export-snapshot` / `export-identity` |
+| `--input <path>` | file read by `import-snapshot` / `import-identity` |
 | `--with-core`, `--no-hash-files`, `--compress-level <n>` | export-snapshot: bundle the Core chain data (`blocks/`, `chainstate/`, `indexes/` only; never wallets, keys or `bitcoin.conf`), with a SHA-256 per file unless `--no-hash-files` (gzip: index 0, Core 3; the flag sets both) |
 | `--verify [basic\|full]` | import-snapshot: per-file hash check, or open the restored Core and `verifychain` |
 | `--expect-digest <hex>` | import-snapshot: refuse unless the recomputed index digest equals the `logical_snapshot_hash` printed by your export |

@@ -171,6 +171,10 @@ If Tor is unavailable, the clearnet plain and TLS listeners keep working; only
 the onion is missing. The same is true in reverse: `[tor] mode = "off"` serves
 TLS with the generated certificate.
 
+The CA, the leaf and the onion keys are not part of a snapshot. Back them up
+with `e-lite export-identity` (see `OPERATIONS.md`) so a restored node keeps
+the same onion address and the CA your wallets already trust.
+
 Some wallets accept self-signed certificates for `.onion`; others do not. Plain
 Electrum on the network port remains available.
 

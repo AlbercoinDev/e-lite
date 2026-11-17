@@ -350,6 +350,26 @@ e-lite import-snapshot --network mainnet --allow-mainnet \
   --verify=full --expect-digest <logical_snapshot_hash from the export>
 ```
 
+A snapshot is chain data only: it never carries the TLS identity, the onion
+keys or the decoy secret (`import-snapshot` refuses them). Keep those in a
+separate, small identity backup, so a restore keeps the same onion address,
+the CA your wallets already trust and the same decoy wallets:
+
+```bash
+# Backup (e-lite stopped). Holds private keys: encrypt it before it leaves.
+e-lite export-identity --network mainnet --output /backups/identity-mainnet.tar.gz
+gpg -c /backups/identity-mainnet.tar.gz
+
+# Restore after import-snapshot (works on a host with no config yet)
+e-lite import-identity --network mainnet --data-dir ~/e-lite/mainnet \
+  --input /backups/identity-mainnet.tar.gz
+```
+
+It contains `<data-dir>/tls/`, the onion service directory, `decoy.key`,
+`config.toml`, `public-servers.toml` and `privacy.toml`, with their modes.
+Nothing else is ever written on import; a file that exists with different
+contents is kept unless you pass `--yes`.
+
 - `--with-core` bundles the network's Core **chain data** (`<data-dir>/bitcoin`)
   under `bitcoin/` in the archive: only `blocks/`, `chainstate/` and
   `indexes/` of that network. Wallets (whatever their name), Core's onion/I2P

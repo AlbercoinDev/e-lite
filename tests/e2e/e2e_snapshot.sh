@@ -15,6 +15,13 @@ make_conf() {
     index.batch_blocks=32 pruning.max_core_lag_blocks=64
 }
 make_conf "$CONF" "$DATA" "$ELECTRUM"
+# The source instance serves TLS, so it has an identity worth carrying.
+python3 - "$CONF" "$((ELECTRUM + 3))" <<'PY2'
+import sys
+path, port = sys.argv[1], sys.argv[2]
+text = open(path).read().replace("tls = false", f'tls = true\ntls_listen = "127.0.0.1:{port}"')
+open(path, "w").write(text)
+PY2
 make_conf "$CONF2" "$DATA2" "$((ELECTRUM + 1))"
 make_conf "$CONF3" "$DATA3" "$((ELECTRUM + 2))"
 for d in "$DATA" "$DATA2" "$DATA3"; do core_track "$d/bitcoin" "$RPC"; done
@@ -98,5 +105,31 @@ echo "== import --verify=full opens the restored Core and verifies it =="
   --verify=full >"$RUN/import2.log"
 cat "$RUN/import2.log"
 grep -q "verify=full: OK" "$RUN/import2.log" || fail "full verification failed" "$RUN/import2.log"
+
+echo "== identity: export, then restore next to the restored snapshot =="
+"$BIN" export-identity --config "$CONF" --output "$RUN/identity.tar.gz" >"$RUN/identity-export.log" \
+  || fail "export-identity failed" "$RUN/identity-export.log"
+[ "$(stat -c %a "$RUN/identity.tar.gz")" = 600 ] || fail "identity archive is not 0600"
+grep -q "PRIVATE KEYS" "$RUN/identity-export.log" || fail "no private-key warning" "$RUN/identity-export.log"
+tar -tzf "$RUN/identity.tar.gz" | grep -q '^data/tls/ca.key$' || fail "CA key missing from the identity"
+tar -tzf "$RUN/identity.tar.gz" | grep -Eq '^(bitcoin/|data/CURRENT)' && fail "chain data in the identity archive"
+[ -e "$DATA2/tls/ca.crt" ] && fail "the snapshot restored the TLS identity (it must not)"
+# A fresh host: the config file does not exist yet, it comes from the archive.
+"$BIN" import-identity --network regtest --config "$RUN/fresh/config.toml" --data-dir "$DATA2" \
+  --input "$RUN/identity.tar.gz" >"$RUN/identity-import.log" 2>&1 \
+  || fail "import-identity failed" "$RUN/identity-import.log"
+[ -f "$RUN/fresh/config.toml" ] || fail "config.toml not restored" "$RUN/identity-import.log"
+FP=$(openssl x509 -in "$DATA/tls/self-signed.crt" -noout -fingerprint -sha256)
+FP2=$(openssl x509 -in "$DATA2/tls/self-signed.crt" -noout -fingerprint -sha256)
+[ "$FP" = "$FP2" ] || fail "restored certificate differs"
+cmp -s "$DATA/tls/ca.key" "$DATA2/tls/ca.key" || fail "restored CA key differs"
+[ "$(stat -c %a "$DATA2/tls/ca.key")" = 600 ] || fail "restored CA key is not 0600"
+echo "== a second import that would change a file is refused =="
+echo different >"$DATA2/tls/ca.crt"
+if "$BIN" import-identity --network regtest --config "$RUN/fresh/config.toml" --data-dir "$DATA2" \
+    --input "$RUN/identity.tar.gz" >"$RUN/identity-again.log" 2>&1; then
+  fail "a differing file was replaced without --yes"
+fi
+grep -q -- "--yes" "$RUN/identity-again.log" || fail "refusal does not mention --yes" "$RUN/identity-again.log"
 
 echo "e2e_snapshot: OK"

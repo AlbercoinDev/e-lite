@@ -3,6 +3,7 @@ mod core_plan;
 mod core_probe;
 mod core_supervisor;
 mod ibd_lock;
+mod identity;
 mod logging;
 mod privacy;
 mod public_servers;
@@ -260,9 +261,14 @@ fn main() {
 }
 
 fn run() -> R<()> {
-    let args = parse_args()?;
+    let mut args = parse_args()?;
     let _ = CONFIG_PATH.set(Config::resolve_path(args.config.as_deref()));
     let cmd = args.command.unwrap_or(Command::Help);
+    if cmd == Command::ImportIdentity && config_path().is_some_and(|p| !p.exists()) {
+        // The configuration file is one of the things being restored: a
+        // `--config` path that does not exist yet is where it will go.
+        args.config = None;
+    }
     if cmd == Command::Help {
         print_help();
         return Ok(());
@@ -277,7 +283,10 @@ fn run() -> R<()> {
         return cmd_arc_setup(args.apply);
     }
 
-    let (cfg, chain) = if matches!(cmd, Command::Cache | Command::Privacy) {
+    let (cfg, chain) = if matches!(
+        cmd,
+        Command::Cache | Command::Privacy | Command::ExportIdentity | Command::ImportIdentity
+    ) {
         // Maintenance: no Core probe and no database open (a running daemon
         // holds the RocksDB lock).
         effective_config_with(&args, false)?
@@ -348,6 +357,14 @@ fn run() -> R<()> {
             args.input.as_deref(),
             args.verify.as_deref(),
             args.expect_digest.as_deref(),
+        ),
+        Command::ExportIdentity => cmd_export_identity(&cfg, chain, args.output.as_deref()),
+        Command::ImportIdentity => cmd_import_identity(
+            &cfg,
+            chain,
+            args.input.as_deref(),
+            args.yes,
+            args.data_dir.as_deref(),
         ),
         Command::Help | Command::Version | Command::ArcSetup => unreachable!(),
     }

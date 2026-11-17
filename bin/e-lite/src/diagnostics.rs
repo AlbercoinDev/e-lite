@@ -1374,3 +1374,70 @@ pub(crate) fn http_get(addr: &str, path: &str) -> R<String> {
         .ok_or("malformed HTTP response")?;
     Ok(body)
 }
+
+/// `e-lite export-identity --output <file>`: the TLS identity, the onion
+/// keys, the decoy secret and the configuration files (AUD-143).
+pub(crate) fn cmd_export_identity(cfg: &Config, chain: Chain, output: Option<&str>) -> R<()> {
+    let output = output.ok_or("export-identity requires --output <file.tar.gz>")?;
+    let layout = identity::Layout::of(cfg, chain, config_path().as_deref());
+    let done = identity::export(&layout, chain, VERSION, std::path::Path::new(output))?;
+    for name in &done.files {
+        println!("  {name}");
+    }
+    println!(
+        "identity of {} written to {output} ({} files, {} bytes, mode 0600)",
+        chain.name(),
+        done.files.len(),
+        done.bytes
+    );
+    println!(
+        "This file holds PRIVATE KEYS (TLS, onion service, decoy secret) and is not \
+         encrypted. Encrypt it before it leaves this machine, for example:\n  \
+         gpg -c {output}"
+    );
+    Ok(())
+}
+
+/// `e-lite import-identity --input <file> [--yes]`.
+pub(crate) fn cmd_import_identity(
+    cfg: &Config,
+    chain: Chain,
+    input: Option<&str>,
+    overwrite: bool,
+    data_dir: Option<&str>,
+) -> R<()> {
+    let input = input.ok_or("import-identity requires --input <file.tar.gz>")?;
+    // No configuration on this host yet: the archived one says where the
+    // data directory is (`--data-dir` still wins).
+    let archived = match config_path() {
+        Some(path) if path.exists() => None,
+        _ => identity::archived_config(std::path::Path::new(input))?,
+    };
+    let restored_cfg = match archived {
+        Some(text) => {
+            let mut restored: Config = toml::from_str(&text)
+                .map_err(|e| format!("the archived config.toml is not valid: {e}"))?;
+            if let Some(dir) = data_dir {
+                restored.network.data_dir = Some(dir.to_string());
+            }
+            Some(restored)
+        }
+        None => None,
+    };
+    let cfg = restored_cfg.as_ref().unwrap_or(cfg);
+    let layout = identity::Layout::of(cfg, chain, config_path().as_deref());
+    let done = identity::import(&layout, chain, std::path::Path::new(input), overwrite)?;
+    for path in &done.written {
+        println!("  written   {}", path.display());
+    }
+    for path in &done.unchanged {
+        println!("  unchanged {}", path.display());
+    }
+    println!(
+        "identity of {} restored: {} written, {} already in place",
+        chain.name(),
+        done.written.len(),
+        done.unchanged.len()
+    );
+    Ok(())
+}

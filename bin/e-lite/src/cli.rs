@@ -14,6 +14,8 @@ pub(crate) enum Command {
     Status,
     ExportSnapshot,
     ImportSnapshot,
+    ExportIdentity,
+    ImportIdentity,
     Core,
     Onion,
     Cache,
@@ -345,6 +347,8 @@ pub(crate) fn parse_args() -> R<Args> {
                     "privacy" => Command::Privacy,
                     "export-snapshot" => Command::ExportSnapshot,
                     "import-snapshot" => Command::ImportSnapshot,
+                    "export-identity" => Command::ExportIdentity,
+                    "import-identity" => Command::ImportIdentity,
                     "arc-setup" => Command::ArcSetup,
                     "version" => Command::Version,
                     "help" => Command::Help,
@@ -385,6 +389,10 @@ COMMANDS:
                      (--verify checks per-file hashes; --verify=full opens the
                      restored Core and runs a bounded verifychain;
                      --expect-digest <hex> requires the digest you recorded)
+    export-identity  write the TLS identity, onion keys, decoy secret and the
+                     configuration files to --output (private keys, not
+                     encrypted; stop e-lite first)
+    import-identity  restore them from --input (--yes replaces files that differ)
     arc-setup        let e-lite manage the ZFS ARC cap without root
                      (prints the chgrp/chmod + systemd unit; --apply as root)
     version          print version
@@ -422,8 +430,8 @@ OPTIONS:
     --no-rawtx              disable external rawtx sources
     --no-follow             stop when caught up (only for `index`)
     --json                  JSON output for status
-    --output <path>         snapshot file for export-snapshot
-    --input <path>          snapshot file for import-snapshot
+    --output <path>         file written by export-snapshot / export-identity
+    --input <path>          file read by import-snapshot / import-identity
     --with-core             export-snapshot: bundle the network's Core datadir
     --no-hash-files         export-snapshot: skip the SHA-256 of every Core file
     --compress-level <n>    export-snapshot gzip level for both sections (0..9;

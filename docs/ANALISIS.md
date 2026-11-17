@@ -232,7 +232,7 @@ el bloqueo global durante los commits (AUD-177).
 |---|---|---|---|
 | AUD-172 | P3 | Una exportación fallida dejaba el archivo parcial `.tmp` (cientos de GiB con `--with-core`). | **Corregido** |
 | AUD-140 | P2 | La exportación exige parar el servicio: necesita el bloqueo de la base de datos. | Aceptado: no habrá exportación en caliente (decisión del dueño) |
-| AUD-143 | P3 | La copia no lleva la identidad (TLS, onion): tras restaurar cambia la dirección onion y las wallets deben importar una CA nueva. | Abierto |
+| AUD-143 | P3 | La copia no lleva la identidad (TLS, onion): tras restaurar cambia la dirección onion y las wallets deben importar una CA nueva. | Hecho como archivo aparte: `export-identity` / `import-identity` (AUD-189); queda la copia incremental |
 | AUD-176 | P3 | El digest recorre y resume **todas** las filas del índice, en un solo hilo, al exportar y otra vez al importar: el índice entero leído dos veces. | Abierto |
 | — | doc | `OPERATIONS.md` decía que al restaurar no había "cambio de TLS"; en realidad se genera una CA nueva. | **Corregido** |
 
@@ -441,7 +441,9 @@ cambiaría: la copia de datos es pública y grande, la identidad es secreta y
 pequeña, y la importación rechaza secretos a propósito. Propongo un archivo
 aparte y cifrado (`tls/`, `tor/`, `decoy.key` y los tres ficheros de
 configuración) con su propio comando. Es lo único de una instancia que no se
-puede reconstruir, y hoy no tiene copia.
+puede reconstruir. **Hecho** (AUD-189): `export-identity` / `import-identity`,
+sin cifrado propio (no se añadió dependencia); la documentación indica cifrarlo
+con `gpg -c`.
 
 ### 5. Exportación en caliente (AUD-140) — descartada por el dueño
 

@@ -49,7 +49,6 @@ older notes still match. New findings of that review are AUD-173..181 in
 | P1 | History compaction / deduplication (schema v3, AUD-130) | reduce the index from ~260 GiB to an estimated ~130-150 GiB: `txnum` u40 references, 16-byte scripthash and 8-byte txid prefixes verified against `txids.dat`, 1-byte history value, trimmed UTXO values, zstd bottommost. Design and per-table bytes in AUDIT AUD-130. **Decision: from-zero reindex, no in-place migration; deferred by the owner.** First step: measure per-CF SST size (`/status.rocksdb.cf`) and row counts on the owner's node and reindex testnet4 with both schemas; proceed only if it saves >= 35 %. |
 | P2 | 40-bit tx refs / compact occurrence encoding | storage reduction with migration and BIP30 tests. |
 | P2 | zstd/bottommost compression experiments | measure size vs CPU on HDD/SSD; no silent format change; applies to newly compacted data. |
-| P2 | Identity backup (AUD-143) | a small, separate, encrypted archive of `tls/`, `tor/`, `decoy.key` and the three config files, so a restore keeps the onion address, the CA wallets trust and the decoy wallets. Kept apart from the snapshot on purpose: the snapshot is public chain data and `import-snapshot` refuses secrets. |
 | P3 | Incremental/encrypted snapshots | per-file sizes/SHA-256 and `--verify=full` are delivered; incremental backups and confidentiality of the chain-data archive are less urgent than the row above. |
 | P3 | Undo retention policy | the bounded reorg window is conservative; tune only with recovery tests. |
 
