@@ -177,7 +177,8 @@ PY
 # Without --yes nothing is deleted.
 "$BIN" cache clear --network regtest --data-dir "$DATA" > "$RUN/cache-dry.txt"
 grep -q "nothing was deleted" "$RUN/cache-dry.txt"
-"$BIN" cache status --network regtest --data-dir "$DATA" --json | grep -qE '"files": [1-9]'
+cache_status=$("$BIN" cache status --network regtest --data-dir "$DATA" --json)
+grep -qE '"files": [1-9]' <<<"$cache_status" || fail "the rawtx cache is empty"
 # With --yes the cache goes and the index stays.
 "$BIN" cache clear --network regtest --data-dir "$DATA" --yes --json > "$RUN/cache-clear.json"
 python3 - "$RUN/cache-clear.json" <<'PY'
@@ -189,7 +190,10 @@ print("cache cleared:", st["removed"])
 PY
 [ -f "$DATA/CURRENT" ] || fail "cache clear removed the index"
 [ -d "$CORE/regtest/blocks" ] || fail "cache clear removed the Core datadir"
-"$BIN" cache clear --network regtest --data-dir "$DATA" --yes --json | grep -q '"files": 0'
+# Capture first: `| grep -q` closes the pipe at the first match and the
+# command would then write to a closed stdout.
+second_clear=$("$BIN" cache clear --network regtest --data-dir "$DATA" --yes --json)
+grep -q '"files": 0' <<<"$second_clear" || fail "a second cache clear found files"
 
 echo "== snapshot export/import =="
 SNAP="$RUN/snapshot.tar.gz"

@@ -1,8 +1,8 @@
 # Session handoff
 
-**Updated:** 2026-11-17 (cleanup and reorganization in `main`, after alpha.29.19.0)
-**Latest published release:** `0.1.0-alpha.29.19.0` (29.18.0 is tagged on its own commit, `98ffbe7`)
-**Release:** https://github.com/AlbercoinDev/e-lite/releases/tag/v0.1.0-alpha.29.19.0
+**Updated:** 2026-11-17 (alpha.29.19.1: cleanup and reorganization)
+**Latest published release:** `0.1.0-alpha.29.19.1`
+**Release:** https://github.com/AlbercoinDev/e-lite/releases/tag/v0.1.0-alpha.29.19.1
 
 This is the short “where we are”. The invariants live in
 [`AGENTS.md`](../AGENTS.md); the
@@ -88,14 +88,14 @@ no repitas contexto ni rehagas decisiones ya documentadas.
   `docs/ROADMAP.md` is future work only, and `docs/AUDIT.md` holds the open
   findings (`docs/audit/FIXED.md` is the fixed history).
 
-## Unreleased (2026-11-17): cleanup and reorganization
+## Last change (alpha.29.19.1): cleanup and reorganization
 
-In `main`, not tagged. No behaviour change except the
-all-in-one `--quick` fix; see `CHANGELOG.md` ("Unreleased"). Documentation has
+No behaviour change except the
+all-in-one `--quick` fix; see `CHANGELOG.md`. Documentation has
 one home per topic (`docs/README.md` is the map), the pipeline is split under
 `bin/e-lite/src/pipeline/`, and the source layout is in `ARCHITECTURE.md`.
 
-## Last change (alpha.29.19.0): fixes, identity backup, shorter CLI
+## Previous change (alpha.29.19.0): fixes, identity backup, shorter CLI
 
 Full list in `CHANGELOG.md`; earlier releases are only there.
 

@@ -1,8 +1,8 @@
 # Changelog
 
-## Unreleased
+## 0.1.0-alpha.29.19.1 — 2026-11-17
 
-Cleanup and reorganization of 2026-11-17. No change to what e-lite does,
+Cleanup and reorganization. No change to what e-lite does,
 except the all-in-one script fix.
 
 ### Fixed
@@ -11,6 +11,9 @@ except the all-in-one script fix.
   `"state": "READY"` while `/status` is compact JSON. Its suite mode now runs
   every regtest suite through `tests/run-e2e.sh` (it listed 6 of 11) and
   refuses a non-regtest network.
+- `e2e_regtest.sh` no longer pipes a command into `grep -q`: the early close
+  made e-lite write to a closed stdout and abort, a flaky failure. The abort
+  itself is AUD-192 (P3, open).
 
 ### Changed
 
