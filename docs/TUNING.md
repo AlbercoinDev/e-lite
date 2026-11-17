@@ -304,9 +304,9 @@ and the controller treats it as one system:
 - The lag window no longer rewrites its baseline on every resume. The old code
   did `baseline = lag` when Core resumed, which raised the next pause threshold
   by `max_bulk_lag_blocks/2` per cycle (14,884 → 24,858 → 34,858 in a real
-  29.5.0 log). The default is now an absolute byte window
-  (`max_bulk_lag_gib`/`core_resume_ahead_gib`); the legacy block window is used
-  only when the GiB value is 0.
+  29.5.0 log). The window is now an absolute byte window
+  (`max_bulk_lag_gib`/`core_resume_ahead_gib`); the block-count window was
+  removed in 0.1.0-alpha.29.19.0.
 - RocksDB properties are classified correctly: `estimate-pending-compaction-
   bytes`, `cur-size-all-mem-tables`, `total-sst-files-size` and
   `estimate-table-readers-mem` are per-CF and are summed; `num-running-
@@ -408,10 +408,8 @@ again.
 
 A 20,000-block lag is ~10 GiB at height 100k and ~30 GiB at height 800k, so the
 watermark is `lag_blocks × avg_block_bytes`. The average is an EWMA of the raw
-serialized blocks applied (`/status.scheduler.backlog_bytes`). To keep the old
-block window, set `max_bulk_lag_gib = 0`; then
-`max_bulk_lag_blocks`/`core_resume_ahead_blocks` apply with their historical
-growth-relative semantics.
+serialized blocks applied (`/status.scheduler.backlog_bytes`). The old
+block-count window was removed: `max_bulk_lag_gib` must be at least 1.
 
 ### `scheduler = "overlap" | "alternate"`
 

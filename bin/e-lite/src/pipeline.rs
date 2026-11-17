@@ -48,7 +48,6 @@ pub(crate) struct Indexer {
     pub(crate) progress_start_txnum: u64,
     pub(crate) milestone: Mutex<MilestoneState>,
     pub(crate) milestone_sizes_running: Arc<AtomicBool>,
-    pub(crate) bulk_lag_baseline: AtomicU64,
     pub(crate) bulk_started: AtomicBool,
     pub(crate) bulk_full_pause: AtomicBool,
     /// `true` when `[pruning] scheduler = "alternate"`: Core downloads and
@@ -176,7 +175,6 @@ impl Indexer {
                 last_at: now,
             }),
             milestone_sizes_running: Arc::new(AtomicBool::new(false)),
-            bulk_lag_baseline: AtomicU64::new(u64::MAX),
             bulk_started: AtomicBool::new(false),
             bulk_full_pause: AtomicBool::new(false),
             scheduler_alternate,
@@ -879,21 +877,10 @@ impl Indexer {
         let lag = info.blocks.saturating_sub(committed);
         let avg = self.tunables.avg_block_bytes();
         let backlog = backlog_bytes(lag, avg);
-        let bulk_blocks = if self.cfg.core.prune_mib == 1 {
-            self.cfg.pruning.max_bulk_lag_blocks as u64
-        } else {
-            0
-        };
-        let bulk_gib = if self.cfg.core.prune_mib == 1 {
-            self.cfg.pruning.max_bulk_lag_gib
-        } else {
-            0
-        };
-        let bulk = self.cfg.core.prune_mib == 1 && (bulk_blocks > 0 || bulk_gib > 0);
+        let bulk = self.cfg.core.prune_mib == 1 && self.cfg.pruning.max_bulk_lag_gib > 0;
         let auto_enabled = self.cfg.core.prune_mib != 1 && self.cfg.pruning.max_core_lag_blocks > 0;
-        let high_bytes = (bulk_gib > 0).then(|| bulk_gib.saturating_mul(GIB));
-        let low_bytes =
-            (bulk_gib > 0).then(|| self.cfg.pruning.core_resume_ahead_gib.saturating_mul(GIB));
+        let high_bytes = bulk.then(|| self.cfg.pruning.max_bulk_lag_gib.saturating_mul(GIB));
+        let low_bytes = bulk.then(|| self.cfg.pruning.core_resume_ahead_gib.saturating_mul(GIB));
         if let Some(sh) = &self.shared {
             sh.stats
                 .scheduler_backlog_bytes
@@ -916,7 +903,6 @@ impl Indexer {
             .unwrap_or(false);
 
         if !bulk && !auto_enabled {
-            self.bulk_lag_baseline.store(u64::MAX, Ordering::Relaxed);
             self.set_index_paused(false);
             self.release_lag_pause(paused, "resumed Core downloads");
             return;
@@ -932,64 +918,37 @@ impl Indexer {
         if bulk {
             is_bulk = true;
             if !info.initialblockdownload {
-                self.bulk_lag_baseline.store(u64::MAX, Ordering::Relaxed);
                 self.bulk_started.store(false, Ordering::Relaxed);
                 self.bulk_full_pause.store(false, Ordering::Relaxed);
                 self.set_index_paused(false);
                 self.release_lag_pause(paused, "resumed Core downloads after IBD");
                 return;
             }
-            if let (Some(high), Some(low)) = (high_bytes, low_bytes) {
-                let high_blocks = (high / avg.max(1)).max(1);
-                let low_blocks = (low / avg.max(1)).max(1);
-                if self.cfg.pruning.pause_core_during_bulk {
-                    let first = !self.bulk_started.swap(true, Ordering::SeqCst);
-                    if first && backlog >= high {
-                        self.bulk_full_pause.store(true, Ordering::SeqCst);
-                        self.tunables.reset_resume_shrink();
-                    }
-                } else {
-                    self.bulk_started.store(true, Ordering::Relaxed);
-                }
-                bulk_full = self.bulk_full_pause.load(Ordering::SeqCst);
-                limit = high_blocks;
-                resume = low_blocks;
-                let (raw_pause, raw_resume) = byte_window(backlog, high, low, reader_pressure);
-                pause_due = if reader_pressure {
-                    true
-                } else {
-                    self.dwell_reached(&self.high_since, raw_pause, 10)
-                };
-                resume_due = self.dwell_reached(&self.low_since, raw_resume, 10);
-                if pause_due {
-                    let _ = self.dwell_reached(&self.low_since, false, 10);
+            let high = high_bytes.unwrap_or(u64::MAX);
+            let low = low_bytes.unwrap_or(0);
+            let high_blocks = (high / avg.max(1)).max(1);
+            let low_blocks = (low / avg.max(1)).max(1);
+            if self.cfg.pruning.pause_core_during_bulk {
+                let first = !self.bulk_started.swap(true, Ordering::SeqCst);
+                if first && backlog >= high {
+                    self.bulk_full_pause.store(true, Ordering::SeqCst);
+                    self.tunables.reset_resume_shrink();
                 }
             } else {
-                let ahead = self.cfg.pruning.core_resume_ahead_blocks as u64;
-                if self.cfg.pruning.pause_core_during_bulk {
-                    let first = !self.bulk_started.swap(true, Ordering::SeqCst);
-                    if first && lag > ahead {
-                        self.bulk_full_pause.store(true, Ordering::SeqCst);
-                        self.tunables.reset_resume_shrink();
-                    }
-                } else {
-                    self.bulk_started.store(true, Ordering::Relaxed);
-                }
-                if self.bulk_full_pause.load(Ordering::SeqCst) {
-                    bulk_full = true;
-                    limit = ahead.max(1);
-                    resume = ahead.max(1);
-                } else {
-                    let baseline = self.bulk_lag_baseline.load(Ordering::Relaxed);
-                    let (new_baseline, pause_at, resume_at) =
-                        bulk_lag_window(lag, baseline, bulk_blocks, paused);
-                    self.bulk_lag_baseline
-                        .store(new_baseline, Ordering::Relaxed);
-                    limit = pause_at;
-                    resume = resume_at;
-                }
-                pause_due = lag > limit || reader_pressure;
-                resume_due = lag <= resume && !reader_pressure;
+                self.bulk_started.store(true, Ordering::Relaxed);
+            }
+            bulk_full = self.bulk_full_pause.load(Ordering::SeqCst);
+            limit = high_blocks;
+            resume = low_blocks;
+            let (raw_pause, raw_resume) = byte_window(backlog, high, low, reader_pressure);
+            pause_due = if reader_pressure {
+                true
+            } else {
+                self.dwell_reached(&self.high_since, raw_pause, 10)
+            };
+            resume_due = self.dwell_reached(&self.low_since, raw_resume, 10);
+            if pause_due {
+                let _ = self.dwell_reached(&self.low_since, false, 10);
             }
         } else {
             if !info.pruned {
@@ -1012,7 +971,6 @@ impl Indexer {
             resume_due = lag <= resume && !reader_pressure;
         }
 
-        let baseline = self.bulk_lag_baseline.load(Ordering::Relaxed);
         if !paused && pause_due {
             match self.core.set_network_active(false) {
                 Ok(_) => {
@@ -1031,19 +989,13 @@ impl Indexer {
                                 resume,
                                 backlog / GIB
                             );
-                        } else if high_bytes.is_some() {
+                        } else {
                             eprintln!(
                                 "[e-lite] lag {lag} blocks, backlog {} GiB (high {} GiB, low \
                                  {} GiB, reader {reader_pressure}): paused Core downloads",
                                 backlog / GIB,
                                 high_bytes.unwrap_or(0) / GIB,
                                 low_bytes.unwrap_or(0) / GIB
-                            );
-                        } else {
-                            eprintln!(
-                                "[e-lite] lag {lag} blocks (baseline {baseline}, max growth \
-                                 {bulk_blocks}, reader {reader_pressure}): paused Core downloads \
-                                 until the index catches up"
                             );
                         }
                     } else {
@@ -1067,9 +1019,6 @@ impl Indexer {
                     self.lag_paused.store(false, Ordering::Relaxed);
                     self.mark_paused(false);
                     let prewarm = is_bulk && self.bulk_full_pause.swap(false, Ordering::SeqCst);
-                    if is_bulk && prewarm {
-                        self.bulk_lag_baseline.store(lag, Ordering::Relaxed);
-                    }
                     self.set_index_paused(is_bulk && self.scheduler_alternate);
                     if let Some(sh) = &self.shared {
                         sh.stats.core_network_active.store(true, Ordering::Relaxed);
@@ -1479,8 +1428,8 @@ impl Indexer {
     /// 512-block call is in progress.
     fn live_lag_check(&self, info: &BlockchainInfo, committed: u64, last_check: &mut Instant) {
         let auto_prune = self.cfg.core.prune_mib >= 550;
-        let guarded = auto_prune
-            || (self.cfg.core.prune_mib == 1 && self.cfg.pruning.max_bulk_lag_blocks > 0);
+        let guarded =
+            auto_prune || (self.cfg.core.prune_mib == 1 && self.cfg.pruning.max_bulk_lag_gib > 0);
         if !guarded || !info.pruned || last_check.elapsed() < Duration::from_millis(100) {
             return;
         }
@@ -2223,10 +2172,6 @@ pub(crate) fn commit_sync_policy(mode: &str, ibd: bool, height: u64, core_tip: u
     }
 }
 
-/// Bulk lag guard window. `u64::MAX` means "no baseline yet". The baseline
-/// follows the lowest lag seen **while Core is downloading**. While paused it
-/// must stay fixed; otherwise every block indexed would lower the resume
-/// threshold and Core would resume immediately.
 /// Unindexed backlog in bytes. Heights are not comparable (a block at 818k is
 /// several times a block at 100k), so the high/low watermarks are bytes.
 pub(crate) fn backlog_bytes(lag_blocks: u64, avg_block_bytes: u64) -> u64 {
@@ -2245,30 +2190,6 @@ pub(crate) fn byte_window(
     (
         backlog >= high || reader_pressure,
         backlog <= low && !reader_pressure,
-    )
-}
-
-pub(crate) fn bulk_lag_window(
-    lag: u64,
-    baseline: u64,
-    limit: u64,
-    paused: bool,
-) -> (u64, u64, u64) {
-    let base = if paused {
-        if baseline == u64::MAX {
-            lag
-        } else {
-            baseline
-        }
-    } else if baseline == u64::MAX || lag < baseline {
-        lag
-    } else {
-        baseline
-    };
-    (
-        base,
-        base.saturating_add(limit),
-        base.saturating_add(limit / 2),
     )
 }
 
@@ -2869,9 +2790,7 @@ pub(crate) fn reload_hot(
                 || new.index.milestone_blocks != old.index.milestone_blocks
                 || new.index.milestone_seconds != old.index.milestone_seconds
                 || new.pruning.max_core_lag_blocks != old.pruning.max_core_lag_blocks
-                || new.pruning.max_bulk_lag_blocks != old.pruning.max_bulk_lag_blocks
                 || new.pruning.max_bulk_lag_gib != old.pruning.max_bulk_lag_gib
-                || new.pruning.core_resume_ahead_blocks != old.pruning.core_resume_ahead_blocks
                 || new.pruning.core_resume_ahead_gib != old.pruning.core_resume_ahead_gib
                 || new.pruning.pause_core_during_bulk != old.pruning.pause_core_during_bulk
                 || new.pruning.scheduler != old.pruning.scheduler

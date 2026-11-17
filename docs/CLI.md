@@ -172,11 +172,9 @@ e-lite import-snapshot --network mainnet --allow-mainnet \
 | Option | TOML field | Default |
 |---|---|---|
 | `--set pruning.max_core_lag_blocks=<n>` | `pruning.max_core_lag_blocks` | `192` (auto-prune only) |
-| `--set pruning.max_bulk_lag_blocks=<n>` | `pruning.max_bulk_lag_blocks` | `20000` (legacy) |
 | `--set pruning.max_bulk_lag_gib=<n>` | `pruning.max_bulk_lag_gib` | `30` |
 | `--set pruning.pause_core_during_bulk=true` | `pruning.pause_core_during_bulk` | `true` |
 | `--set pruning.pause_core_during_bulk=false` | same | disable the full bulk pause |
-| `--set pruning.core_resume_ahead_blocks=<n>` | `pruning.core_resume_ahead_blocks` | `5000` (legacy) |
 | `--set pruning.core_resume_ahead_gib=<n>` | `pruning.core_resume_ahead_gib` | `7` |
 | `--set pruning.scheduler=<mode>` | `pruning.scheduler` | `overlap` |
 | `--set pruning.prune_defer_free_gib=<n>` | `pruning.prune_defer_free_gib` | `20` |
@@ -197,9 +195,8 @@ By default (`pause_core_during_bulk = true`), a long bulk catch-up pauses
 Core's P2P when the unindexed backlog reaches `max_bulk_lag_gib` (30 GiB) and
 resumes it at `core_resume_ahead_gib` (7 GiB). The backlog is
 `lag_blocks × avg_block_bytes`, so the threshold means the same disk footprint
-at 100k and at 800k; blocks are not comparable across heights. The older
-`max_bulk_lag_blocks`/`core_resume_ahead_blocks` pair is still honoured only
-when the corresponding GiB value is `0`.
+at 100k and at 800k; blocks are not comparable across heights.
+`max_bulk_lag_gib` must be at least 1.
 
 `scheduler = "overlap"` (default) keeps e-lite indexing while Core downloads.
 `scheduler = "alternate"` pauses e-lite indexing during the Core phase and
@@ -510,9 +507,9 @@ replacement. They will be removed two releases later.
 | `--milestone-blocks <v>` | `--set index.milestone_blocks=<v>` |
 | `--milestone-seconds <v>` | `--set index.milestone_seconds=<v>` |
 | `--max-core-lag-blocks <v>` | `--set pruning.max_core_lag_blocks=<v>` |
-| `--max-bulk-lag-blocks <v>` | `--set pruning.max_bulk_lag_blocks=<v>` |
+| `--max-bulk-lag-blocks <v>` | accepted and ignored: the setting was removed |
 | `--max-bulk-lag-gib <v>` | `--set pruning.max_bulk_lag_gib=<v>` |
-| `--core-resume-ahead-blocks <v>` | `--set pruning.core_resume_ahead_blocks=<v>` |
+| `--core-resume-ahead-blocks <v>` | accepted and ignored: the setting was removed |
 | `--core-resume-ahead-gib <v>` | `--set pruning.core_resume_ahead_gib=<v>` |
 | `--prune-defer-free-gib <v>` | `--set pruning.prune_defer_free_gib=<v>` |
 | `--min-gain-blocks <v>` | `--set pruning.min_gain_blocks=<v>` |

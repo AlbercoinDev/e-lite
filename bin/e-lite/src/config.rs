@@ -552,27 +552,17 @@ pub struct PruningCfg {
     /// `prune_mib = 1` (manual) or `0` (full node).
     #[serde(default)]
     pub allow_auto_prune: bool,
-    /// Opt-in download throttle for manual pruning / bulk catch-up. When the
-    /// index lags Core by more than this many blocks during IBD, e-lite pauses
-    /// Core's P2P until the index halves the gap. 0 disables it.
-    #[serde(default = "d_max_bulk_lag")]
-    pub max_bulk_lag_blocks: u32,
-    /// Absolute unindexed backlog in GiB. This is the preferred unit: a block
-    /// at 800k is several times larger than one at 100k. 0 = use the legacy
-    /// block window above.
+    /// Manual pruning: pause Core's downloads when the unindexed backlog
+    /// reaches this many GiB. Bytes, not blocks: a block at 800k is several
+    /// times larger than one at 100k. Must be at least 1.
     #[serde(default = "d_max_bulk_lag_gib")]
     pub max_bulk_lag_gib: u64,
     /// Pause Core during a long bulk catch-up and pre-warm its networking when
     /// the index is close to catching up.
     #[serde(default = "d_true")]
     pub pause_core_during_bulk: bool,
-    /// Resume Core's networking this many blocks before the tip so peers can
-    /// reconnect while e-lite finishes the catch-up. Used only when
-    /// `core_resume_ahead_gib = 0`.
-    #[serde(default = "d_core_resume_ahead")]
-    pub core_resume_ahead_blocks: u32,
-    /// Absolute low-water mark in GiB. Core resumes when the unindexed backlog
-    /// falls to this; it is the byte equivalent of `core_resume_ahead_blocks`.
+    /// Low-water mark in GiB: Core resumes when the unindexed backlog falls to
+    /// this, so its peers reconnect while e-lite finishes the catch-up.
     #[serde(default = "d_core_resume_ahead_gib")]
     pub core_resume_ahead_gib: u64,
     /// `overlap`: e-lite keeps indexing while Core downloads. `alternate`:
@@ -611,10 +601,8 @@ impl Default for PruningCfg {
             critical_free_gib: d_critical_free(),
             max_core_lag_blocks: d_max_lag(),
             allow_auto_prune: false,
-            max_bulk_lag_blocks: d_max_bulk_lag(),
             max_bulk_lag_gib: d_max_bulk_lag_gib(),
             pause_core_during_bulk: true,
-            core_resume_ahead_blocks: d_core_resume_ahead(),
             core_resume_ahead_gib: d_core_resume_ahead_gib(),
             scheduler: d_scheduler(),
             prune_defer_free_gib: d_prune_defer_free(),
@@ -884,16 +872,10 @@ fn d_min_gain_live() -> u32 {
     // prune once a day (~220 MiB) instead of holding ~7.5 GiB for ~35 days.
     144
 }
-fn d_max_bulk_lag() -> u32 {
-    20_000
-}
 fn d_max_bulk_lag_gib() -> u64 {
     // ~20k mainnet blocks at the 2026 height; the byte value keeps the phase
     // comparable as blocks grow.
     30
-}
-fn d_core_resume_ahead() -> u32 {
-    5_000
 }
 fn d_core_resume_ahead_gib() -> u64 {
     7
@@ -1239,9 +1221,14 @@ impl Config {
                     .to_string(),
             );
         }
-        if self.pruning.max_bulk_lag_gib > 0
-            && self.pruning.core_resume_ahead_gib >= self.pruning.max_bulk_lag_gib
-        {
+        if self.pruning.max_bulk_lag_gib == 0 {
+            return Err(
+                "[pruning] max_bulk_lag_gib must be at least 1 (the block-count window that 0 \
+                 used to select was removed in 0.1.0-alpha.29.19.0)"
+                    .to_string(),
+            );
+        }
+        if self.pruning.core_resume_ahead_gib >= self.pruning.max_bulk_lag_gib {
             return Err(
                 "[pruning] core_resume_ahead_gib must be lower than max_bulk_lag_gib".to_string(),
             );
@@ -1376,6 +1363,14 @@ pub const RETIRED_KEYS: &[(&str, &str)] = &[
     (
         "index.adaptive_memtables",
         "removed in 0.1.0-alpha.29.19.0; memtables are fixed at startup and only shrink when memory is critical",
+    ),
+    (
+        "pruning.max_bulk_lag_blocks",
+        "removed in 0.1.0-alpha.29.19.0; max_bulk_lag_gib is the only window",
+    ),
+    (
+        "pruning.core_resume_ahead_blocks",
+        "removed in 0.1.0-alpha.29.19.0; core_resume_ahead_gib is the only window",
     ),
     (
         "core.cgroup_io_weight",
@@ -1652,14 +1647,14 @@ mod tests {
             &[
                 "index.profile=ssd".to_string(),
                 "index.readers=6".to_string(),
-                "pruning.max_bulk_lag_blocks=20000".to_string(),
+                "pruning.max_bulk_lag_gib=40".to_string(),
                 "rawtx.p2p_peers=[\"1.2.3.4:8333\"]".to_string(),
             ],
         )
         .unwrap();
         assert_eq!(cfg.index.profile, "ssd");
         assert_eq!(cfg.index.readers, 6);
-        assert_eq!(cfg.pruning.max_bulk_lag_blocks, 20_000);
+        assert_eq!(cfg.pruning.max_bulk_lag_gib, 40);
         assert_eq!(cfg.rawtx.p2p_peers, vec!["1.2.3.4:8333"]);
     }
 
@@ -1674,7 +1669,6 @@ mod tests {
         assert_eq!(cfg.pruning.max_bulk_lag_gib, 30);
         assert_eq!(cfg.pruning.core_resume_ahead_gib, 7);
         assert_eq!(cfg.pruning.scheduler, "overlap");
-        assert_eq!(cfg.pruning.max_bulk_lag_blocks, 20_000);
 
         let mut alt = Config::default();
         alt.pruning.scheduler = "alternate".to_string();
@@ -1695,6 +1689,11 @@ mod tests {
         inverted.pruning.max_bulk_lag_gib = 10;
         inverted.pruning.core_resume_ahead_gib = 10;
         assert!(inverted.validate().is_err());
+
+        let mut zero = Config::default();
+        zero.pruning.max_bulk_lag_gib = 0;
+        let err = zero.validate().unwrap_err();
+        assert!(err.contains("max_bulk_lag_gib"), "{err}");
     }
 
     #[test]

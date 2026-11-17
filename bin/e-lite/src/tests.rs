@@ -149,32 +149,6 @@ fn undo_window_is_measured_from_the_real_commit_tip() {
 }
 
 #[test]
-fn bulk_lag_window_bounds_additional_growth() {
-    // First call on a 317k backlog: pause only after 20k more.
-    assert_eq!(
-        bulk_lag_window(317_000, u64::MAX, 20_000, false),
-        (317_000, 337_000, 327_000)
-    );
-    // If the index catches up below the baseline while downloading, the
-    // window follows down.
-    assert_eq!(
-        bulk_lag_window(300_000, 317_000, 20_000, false),
-        (300_000, 320_000, 310_000)
-    );
-    // While paused the baseline must NOT follow the lag down, otherwise
-    // the resume threshold drops below the current lag and Core resumes
-    // immediately.
-    assert_eq!(
-        bulk_lag_window(330_000, 317_000, 20_000, true),
-        (317_000, 337_000, 327_000)
-    );
-    assert_eq!(
-        bulk_lag_window(326_999, 317_000, 20_000, true),
-        (317_000, 337_000, 327_000)
-    );
-}
-
-#[test]
 fn byte_backlog_is_height_independent() {
     // 20 GiB is ~41k early blocks (0.5 MB) but only ~13.6k at 818k
     // (1.5 MB). The byte watermark is the one that bounds the disk.

@@ -331,9 +331,9 @@ throttles requests. By default it evaluates pruning every **5,000** safe blocks
 Core may return a lower height because it prunes whole files.
 
 During a long bulk catch-up, Core is paused by default
-(`pause_core_during_bulk`). It resumes early, `core_resume_ahead_blocks` (5,000)
-before the tip, so peers reconnect while e-lite finishes; the relative
-`max_bulk_lag_blocks` (20,000) guard bounds additional separation afterwards.
+(`pause_core_during_bulk`) when the unindexed backlog reaches
+`max_bulk_lag_gib` (30 GiB). It resumes early, when the backlog falls to
+`core_resume_ahead_gib` (7 GiB), so peers reconnect while e-lite finishes.
 
 Automatic mode: a 224-block lag guard, fast tip checks and a bounded verified
 gap-repair path protect the index. It is opt-in.
