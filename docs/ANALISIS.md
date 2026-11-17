@@ -138,7 +138,7 @@ en ocho atómicos. Funciona, pero cualquier cambio ahí necesita tests de tabla
 antes de tocarlo.
 
 Límites de escala: el coste por bloque lo domina la resolución de *prevouts*
-(100–1500 ms según `AGENTS.md`), que crece con el conjunto UTXO; el índice
+(100–1500 ms según `TUNING.md`), que crece con el conjunto UTXO; el índice
 ocupa ~260 GiB en mainnet (AUD-130), que es el coste principal en disco.
 
 ## 3. Parte funcional: gestión de información a las wallets
@@ -501,7 +501,7 @@ cubrir las cuatro políticas con una tabla. Hoy solo tienen test las piezas
   desbloquea y no requiere escribir código.
 - **`scripts/check-docs.sh` como puerta permanente**: la comprobación nueva
   habría detectado las 10 referencias rotas que dejó la última reorganización.
-  Conviene ampliarla a los valores por defecto citados en `AGENTS.md`, que hoy
+  Conviene ampliarla a los valores por defecto citados en `docs/` (antes en `AGENTS.md`), que hoy
   se mantienen a mano.
 
 ### 10. Simplificación: dónde sobra y en qué orden lo quitaría
@@ -537,7 +537,7 @@ externas, así que esa propuesta ya no figura):
 | 4 | Grupo de hilos acotado en el servidor (AUD-174) | hasta ~128 hilos por conexión | medición de carga de wallet |
 | 6 | **Hecho (2026-11-16)**: `AGENTS.md` pasa de 727 a 247 líneas: reglas agrupadas con su `AUD` y el documento donde está el detalle; los valores por defecto quedan solo en `docs/` | duplicación que había que mantener a mano | — |
 
-Sobre eficiencia: según la medición de mainnet anotada en `AGENTS.md`, el
+Sobre eficiencia: según la medición de mainnet anotada en `TUNING.md`, el
 coste por bloque en la sincronización inicial lo domina la precarga de salidas
 previas (100–1.500 ms frente a ~25 ms de decodificar). Ahí está la mejora
 grande. No la he medido en esta revisión.

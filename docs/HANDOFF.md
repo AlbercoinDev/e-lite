@@ -1,9 +1,8 @@
 # Session handoff
 
-**Updated:** 2026-11-17 (fixes, identity backup, shorter CLI, optional variants removed)
-**Latest published release:** `0.1.0-alpha.29.17.0`
-**Release:** https://github.com/AlbercoinDev/e-lite/releases/tag/v0.1.0-alpha.29.17.0
-**In `main`, not tagged yet:** `0.1.0-alpha.29.18.0` plus the `Unreleased` section of `CHANGELOG.md` (the owner decides the version and the tag; see `RELEASING.md`)
+**Updated:** 2026-11-17 (alpha.29.19.0: fixes, identity backup, shorter CLI, optional variants removed)
+**Latest published release:** `0.1.0-alpha.29.19.0` (29.18.0 is tagged on its own commit, `98ffbe7`)
+**Release:** https://github.com/AlbercoinDev/e-lite/releases/tag/v0.1.0-alpha.29.19.0
 
 This is the short “where we are”. The invariants live in
 [`AGENTS.md`](../AGENTS.md) and [`PROJECT_MEMORY.md`](PROJECT_MEMORY.md); the
@@ -90,9 +89,9 @@ no repitas contexto ni rehagas decisiones ya documentadas.
   `docs/ROADMAP.md` is future work only, and `docs/AUDIT.md` holds the open
   findings (`docs/audit/FIXED.md` is the fixed history).
 
-## Unreleased (2026-11-17): fixes, identity backup, shorter CLI
+## Last change (alpha.29.19.0): fixes, identity backup, shorter CLI
 
-Not tagged. Full list in `CHANGELOG.md` ("Unreleased"); Spanish summary in
+Full list in `CHANGELOG.md`; Spanish summary in
 `ANALISIS.md` section 5.
 
 - **Fixed**: AUD-182..188 (shared block verified once, Tor retry on a new
@@ -110,7 +109,7 @@ Not tagged. Full list in `CHANGELOG.md` ("Unreleased"); Spanish summary in
   `scheduler = "alternate"`, the dynamic ZFS ARC manager and `arc-setup`.
   Their keys are accepted with a warning (`RETIRED_KEYS`).
 
-## Last change (alpha.29.18.0): the 2026-11-15 review
+## Previous change (alpha.29.18.0): the 2026-11-15 review
 
 Full write-up in Spanish: [`ANALISIS.md`](ANALISIS.md).
 

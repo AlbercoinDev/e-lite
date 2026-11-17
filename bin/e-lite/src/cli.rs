@@ -88,7 +88,7 @@ pub(crate) enum Retired {
 /// Flags replaced by `--set` (2026-11-17). Each one still works, as a `--set`
 /// in the same position (a later explicit `--set` of the same key wins), and
 /// prints one deprecation line. To be removed two releases after
-/// 0.1.0-alpha.29.18.0 (ROADMAP).
+/// 0.1.0-alpha.29.19.0 (ROADMAP).
 pub(crate) const DEPRECATED_FLAGS: &[(&str, &str, Retired)] = &[
     ("--blocks-dir", "core.blocks_dir", Retired::Str),
     ("--block-source", "index.block_source", Retired::Str),

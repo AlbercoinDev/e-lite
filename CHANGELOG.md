@@ -1,8 +1,8 @@
 # Changelog
 
-## Unreleased
+## 0.1.0-alpha.29.19.0 — 2026-11-17
 
-Not tagged. Work list of 2026-11-16/17: fixes verified in the code, an
+Work list of 2026-11-16/17: fixes verified in the code, an
 identity backup, a shorter command line and the removal of the optional
 variants nobody used by default.
 
