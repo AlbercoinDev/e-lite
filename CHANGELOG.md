@@ -1,5 +1,43 @@
 # Changelog
 
+## Unreleased
+
+Cleanup and reorganization of 2026-11-17. No change to what e-lite does,
+except the all-in-one script fix.
+
+### Fixed
+
+- `scripts/e-lite-all-in-one.sh --quick` always timed out: it waited for
+  `"state": "READY"` while `/status` is compact JSON. Its suite mode now runs
+  every regtest suite through `tests/run-e2e.sh` (it listed 6 of 11) and
+  refuses a non-regtest network.
+
+### Changed
+
+- Documentation: one home per topic. `PROJECT_MEMORY.md` is removed (its
+  content was already in `AGENTS.md`, `HANDOFF.md` and `TUNING.md`);
+  `ANALISIS.md` is now the closed report `docs/reviews/2026-11-analisis.md`;
+  `AB_TESTS.md` is `tests/manual/README.md`; TLS and the onion are explained
+  in `TOR.md` only; `HANDOFF.md` keeps the state, not the release history.
+  About twenty stale statements were corrected (rate limiter, hot memtables,
+  AUD ranges, TLS wording, a wrong test path).
+- `scripts/check-docs.sh` also fails on a bare `tests/<name>.rs` path and on
+  an `AUD-001..N` range that does not match `docs/audit/FIXED.md`.
+- `scripts/benchmark-index.sh` is `tests/bench/bench_node.sh`, and its log goes
+  to `target/bench-logs/` instead of the index data directory.
+
+### Internal
+
+- Unused public items and dependencies removed (`el_model::TxRef`,
+  `start_server`, `raw_mempool_verbose` and others; `hex`, `sha2` and `serde`
+  where unused); test-only code is `#[cfg(test)]`.
+- One `el_model::sha256d` instead of four copies; one free-space probe.
+- `bin/e-lite/src/pipeline.rs` is split by responsibility into `pipeline/`
+  (`core_pace`, `supervise`, `progress`, `run`); el-rawtx's SOCKS client and
+  external block race have their own modules (`socks.rs`, `race.rs`); unit
+  tests live next to the module they test.
+- AUD-191 (P3, open): the managed Tor's private-file writer is not atomic.
+
 ## 0.1.0-alpha.29.19.0 — 2026-11-17
 
 Work list of 2026-11-16/17: fixes verified in the code, an
