@@ -855,7 +855,9 @@ mod tests {
             format: FORMAT_V2,
             version: "0.1.0-test".to_string(),
             network: Chain::Regtest.name().to_string(),
-            genesis: "0f9188f13cb7b2c71f2a335e3a4fc328bf5beb4360cfaf49b1de24b1bd3a4b19".to_string(),
+            // The real regtest genesis, not a look-alike: a test that checks
+            // the genesis must fail for the right reason.
+            genesis: Chain::Regtest.known_genesis().unwrap().to_hex(),
             height: 900,
             hash: "aa".repeat(32),
             schema: SCHEMA_VERSION,
@@ -875,6 +877,16 @@ mod tests {
                 sha256: None,
             }],
         }
+    }
+
+    /// The sample manifest describes a real regtest snapshot (the genesis
+    /// itself is checked against the restored database at import).
+    #[test]
+    fn the_sample_manifest_uses_the_real_regtest_genesis() {
+        let m = sample_manifest();
+        assert_eq!(m.genesis, Chain::Regtest.known_genesis().unwrap().to_hex());
+        assert!(check_manifest_header(&m, Chain::Regtest).is_ok());
+        assert!(check_manifest_header(&m, Chain::Signet).is_err());
     }
 
     #[test]

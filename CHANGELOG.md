@@ -26,6 +26,7 @@ variants nobody used by default.
 
 ### Changed
 
+- The snapshot test fixture uses the real regtest genesis instead of a look-alike hash.
 - Whether an indexing error stops the node or is retried no longer depends on the words in its message (AUD-175).
 - **The command line keeps only the options of daily use** (`e-lite --help`: about 45, including subcommand arguments and explicit permissions). Every other setting is a config key, in `config.toml` or with `--set section.key=value`. The ~70 retired flags (`--readers`, `--profile`, `--cache-mib`, `--tor-mode`, `--decoys`, ...) still work for now: each acts like its `--set` in the same position and prints the replacement; the full table is in `docs/CLI.md` ("Retired flags"). **Upgrade note:** a retired flag no longer beats a `--set` of the same key given after it; the later one wins.
 

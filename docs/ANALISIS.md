@@ -315,7 +315,7 @@ automático activo y los tests ya reunificados:
 |---|---|
 | `cargo fmt --check` | correcto |
 | `cargo clippy --workspace --all-targets -- -D warnings` | correcto |
-| `cargo test --workspace` | 389 tests correctos, 6 ignorados (350 antes de la revisión; 373 tras la primera tanda) |
+| `cargo test --workspace` | 390 tests correctos, 6 ignorados (350 antes de la revisión; 373 tras la primera tanda) |
 | `tests/run-e2e.sh --release launch_core regtest` (binario release, con `panic = "unwind"`) | correcto |
 | `scripts/check-docs.sh` | correcto (38 documentos) |
 | `tests/run-e2e.sh`: las once suites e2e de regtest (`defaults`, `external_pruned`, `launch_core`, `multi_instance`, `privacy`, `pruned_ibd`, `recovery`, `regtest`, `resilience`, `snapshot`, `wait_core`) | correctas en la última pasada (2026-11-17, unos 6 minutos), sin procesos residuales |
