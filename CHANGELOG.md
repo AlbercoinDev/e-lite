@@ -1,5 +1,42 @@
 # Changelog
 
+## 0.1.0-alpha.29.25.1 — 2026-11-17
+
+### Fixed
+
+- **Tor saturation (wallet loads failing with EAGAIN/429).** Measured on a
+  mainnet node: 16 concurrent block downloads plus the per-txid sessions and
+  decoys filled Tor's SOCKS backlog (`socks connect: Resource temporarily
+  unavailable`), tripped the P2P proxy pause and ended in Esplora 429s; every
+  path failed at once. All external streams now go through a **governor**
+  (`rawtx.tor_streams`, default 8) with wallet > prefetch > decoy priority:
+  the next freed stream goes to the highest-priority waiter, a wallet never
+  queues behind a decoy, and the fast path (free slot, no pause) is granted
+  with zero added latency.
+- **Global pause instead of per-request failures.** A refused stream (EAGAIN,
+  proxy unavailable, 429) pauses new streams for 0.5-4 s (exponential
+  backoff) instead of letting each request fail; **any success lifts the
+  pause at once** and wakes the waiters, so a request finishes when its
+  result arrives and no later than Tor's refusal.
+- **Transient failures no longer reach the wallet** on the block path: a
+  deadline, 429, stall or slot wait is retried (up to twice) inside the
+  wallet deadline while a concurrent txid attempt landing is picked up
+  between attempts.
+- **Per-transport client timeouts.** A wallet behind the onion service
+  arrives at the listener from loopback: those clients now get 1800 s idle
+  and 120 s write timeouts (clearnet/LAN stays at 600/30), so Tor latency
+  and big answers do not drop the connection.
+- **Warm circuits before service.** A provider heartbeat (one probe per
+  minute, already running for the readiness gate) keeps third-party Tor
+  circuits established once the node is serving wallets: the first
+  `transaction.get` of a load finds a ready provider and an established
+  circuit instead of paying the setup.
+
+### Added
+
+- `/status.rawtx.tor_governor` (`total`, `in_use`, `pauses`, `paused`) and
+  the `rawtx.tor_streams` key (2..32, default 8).
+
 ## 0.1.0-alpha.29.25.0 — 2026-11-17
 
 ### Fixed

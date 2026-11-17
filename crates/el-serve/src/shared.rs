@@ -208,6 +208,15 @@ impl Shared {
             .lock()
             .map(|v| v.clone())
             .unwrap_or_else(|_| json!({}));
+        let tor_governor = {
+            let (total, in_use, pauses, paused) = self.resolver.governor_stats();
+            json!({
+                "total": total,
+                "in_use": in_use,
+                "pauses": pauses,
+                "paused": paused,
+            })
+        };
         json!({
             "version": VERSION,
             "network": id.chain.name(),
@@ -444,6 +453,7 @@ impl Shared {
                 "unavailable": rawtx.unavailable.load(Ordering::Relaxed),
                 "tx_get_failures": self.stats.tx_get_failures.to_json(),
                 "external_sources": self.resolver.external_sources(),
+                "tor_governor": tor_governor,
                 "p2p_attempts": rawtx.p2p_attempts.load(Ordering::Relaxed),
                 "p2p_failures": rawtx.p2p_failures.load(Ordering::Relaxed),
                 "p2p_skipped": rawtx.p2p_skipped.load(Ordering::Relaxed),

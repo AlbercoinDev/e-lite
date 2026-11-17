@@ -218,6 +218,9 @@ jitter_ms = 50                     # random delay before a session (0-250)
 prefetch_history_blocks = 0        # blocks queued per history response; 0 = auto:
                                    # block mode prefetches, per-txid mode on demand only
 p2p_blocks_per_peer = 3            # blocks in flight with one P2P peer (1-4)
+tor_streams = 8                    # global budget of concurrent Tor streams (block
+                                   # downloads, txid sessions and decoys share it);
+                                   # a home Tor chokes above ~8
 provider_quota = 1.5               # long-term per-provider quota (multiple of the
                                    # fair share); 0 disables the rotation
 p2p_timeout_seconds = 8             # direct P2P attempt (connect 4 s, stall 6 s)

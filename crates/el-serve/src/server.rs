@@ -132,6 +132,12 @@ pub fn start_listener_on(
                 let _ = stream.shutdown(std::net::Shutdown::Both);
                 continue;
             }
+            // A loopback peer is the managed Tor handing us an onion client
+            // (or a local one): both get the more generous timeouts.
+            let tor_client = stream
+                .peer_addr()
+                .map(|addr| addr.ip().is_loopback())
+                .unwrap_or(false);
             let wire = match &tls {
                 Some(watcher) => Wire::tls(watcher.config(), stream),
                 None => Wire::plain(stream),
@@ -149,7 +155,7 @@ pub fn start_listener_on(
                     continue;
                 }
             };
-            let client = shared.clients.register(wire);
+            let client = shared.clients.register(wire, tor_client);
             let slot = ClientSlot {
                 shared: Arc::clone(&shared),
                 client,
@@ -231,8 +237,8 @@ pub(crate) struct WireReader {
 impl WireReader {
     pub(crate) fn new(client: Arc<ClientState>) -> Self {
         Self {
+            idle_deadline: Instant::now() + client.idle_timeout,
             client,
-            idle_deadline: Instant::now() + CLIENT_IDLE_TIMEOUT,
             poll: CLIENT_READ_POLL,
         }
     }
@@ -274,7 +280,7 @@ impl Read for WireReader {
                 self.client.flush_pending();
                 match read {
                     Ok(n) => {
-                        self.idle_deadline = Instant::now() + CLIENT_IDLE_TIMEOUT;
+                        self.idle_deadline = Instant::now() + self.client.idle_timeout;
                         return Ok(n);
                     }
                     Err(e)

@@ -704,6 +704,10 @@ pub struct RawtxCfg {
     /// (0 disables; otherwise 1.0..4.0).
     #[serde(default = "d_provider_quota")]
     pub provider_quota: f64,
+    /// Global budget of concurrent Tor streams (block downloads, per-txid
+    /// sessions and decoys share it). A home Tor chokes above ~8.
+    #[serde(default = "d_tor_streams")]
+    pub tor_streams: usize,
     /// `privacy.toml` path. Empty = next to config.toml (AUD-163).
     #[serde(default)]
     pub privacy_file: Option<String>,
@@ -778,6 +782,7 @@ impl Default for RawtxCfg {
             prefetch_history_blocks: d_prefetch_history_blocks(),
             p2p_blocks_per_peer: d_p2p_blocks_per_peer(),
             provider_quota: d_provider_quota(),
+            tor_streams: d_tor_streams(),
             privacy_file: None,
             privacy_overrides: Vec::new(),
         }
@@ -896,6 +901,9 @@ fn d_p2p_blocks_per_peer() -> usize {
 }
 fn d_provider_quota() -> f64 {
     1.5
+}
+fn d_tor_streams() -> usize {
+    8
 }
 fn d_p2p_timeout() -> u64 {
     8
@@ -1245,6 +1253,9 @@ impl Config {
         if self.rawtx.provider_quota != 0.0 && !(1.0..=4.0).contains(&self.rawtx.provider_quota) {
             return Err("[rawtx] provider_quota must be 0 (off) or 1.0..4.0".to_string());
         }
+        if !(2..=32).contains(&self.rawtx.tor_streams) {
+            return Err("[rawtx] tor_streams must be 2..32".to_string());
+        }
         if self.index.reorg_window == 0 {
             return Err("[index] reorg_window must be >= 1".to_string());
         }
@@ -1533,6 +1544,7 @@ mod tests {
         assert_eq!(cfg.rawtx.prefetch_history_blocks, 0);
         assert_eq!(cfg.rawtx.p2p_blocks_per_peer, 3);
         assert_eq!(cfg.rawtx.provider_quota, 1.5);
+        assert_eq!(cfg.rawtx.tor_streams, 8);
         assert!(cfg.validate().is_ok());
 
         let mut bad = Config::default();
@@ -1563,6 +1575,9 @@ mod tests {
         bad.rawtx.provider_quota = 0.5;
         assert!(bad.validate().is_err());
         bad.rawtx.provider_quota = 0.0;
+        bad.rawtx.tor_streams = 1;
+        assert!(bad.validate().is_err());
+        bad.rawtx.tor_streams = 8;
         assert!(bad.validate().is_ok());
     }
 
@@ -1581,6 +1596,7 @@ mod tests {
                 "rawtx.prefetch_history_blocks=128".to_string(),
                 "rawtx.p2p_blocks_per_peer=2".to_string(),
                 "rawtx.provider_quota=2.0".to_string(),
+                "rawtx.tor_streams=6".to_string(),
             ],
         )
         .unwrap();
@@ -1594,6 +1610,7 @@ mod tests {
         assert_eq!(cfg.rawtx.prefetch_history_blocks, 128);
         assert_eq!(cfg.rawtx.p2p_blocks_per_peer, 2);
         assert_eq!(cfg.rawtx.provider_quota, 2.0);
+        assert_eq!(cfg.rawtx.tor_streams, 6);
     }
 
     #[test]

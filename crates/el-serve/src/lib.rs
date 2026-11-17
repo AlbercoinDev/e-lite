@@ -166,6 +166,12 @@ const CLIENT_READ_POLL_BUSY: Duration = Duration::from_millis(10);
 /// A client that sends nothing for this long is disconnected.
 const CLIENT_IDLE_TIMEOUT: Duration = Duration::from_secs(600);
 const CLIENT_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
+/// A wallet behind the onion service reaches the listener from loopback (the
+/// Tor process maps the hidden service to it): Tor adds latency to every
+/// request and to big answers, so these clients get longer timeouts than a
+/// clearnet/LAN one.
+const TOR_CLIENT_IDLE_TIMEOUT: Duration = Duration::from_secs(1800);
+const TOR_CLIENT_WRITE_TIMEOUT: Duration = Duration::from_secs(120);
 /// Notifications are pushed from one thread for every client (AUD-146).
 const NOTIFY_WRITE_TIMEOUT: Duration = Duration::from_secs(2);
 /// A TLS client gets this long to finish the handshake.

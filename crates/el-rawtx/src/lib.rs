@@ -11,6 +11,7 @@ pub mod core_source;
 pub mod decoy_wallets;
 pub mod electrum;
 pub mod esplora;
+pub mod governor;
 pub(crate) mod health;
 pub mod p2p;
 pub mod privacy;
@@ -123,6 +124,7 @@ pub use core_source::CoreBlockSource;
 pub use decoy_wallets::TxRef;
 pub use electrum::{ElectrumServer, ElectrumTxSource};
 pub use esplora::{isolated_tor_client, EsploraSource};
+pub use governor::{GovernorPermit, Lane, TorGovernor};
 pub use p2p::{P2pSource, PeerHint};
 pub use privacy::{ExternalMode, PrivacyParams};
 pub use txsource::{EsploraTxSource, TxBatch, TxSource};
@@ -587,6 +589,9 @@ pub struct RawtxConfig {
     /// Long-term per-provider quota as a multiple of the fair share
     /// (`spread`); 0 disables it, otherwise 1.0..=4.0.
     pub provider_quota: f64,
+    /// Global budget of concurrent Tor streams (block downloads, per-txid
+    /// sessions and decoys share it). A home Tor chokes above ~8.
+    pub tor_streams: usize,
 }
 
 impl RawtxConfig {
@@ -629,6 +634,7 @@ impl RawtxConfig {
             prefetch_history_blocks: 0,
             p2p_blocks_per_peer: 3,
             provider_quota: 1.5,
+            tor_streams: 8,
         }
     }
 }
@@ -835,14 +841,14 @@ pub struct Resolver {
     inflight: Mutex<HashMap<Hash32, Arc<race::InflightBlock>>>,
     /// Blocks whose download failed recently, with the error (AUD-158).
     failed: Mutex<HashMap<Hash32, (Instant, RawtxError)>>,
-    external_slots: Arc<Semaphore>,
+    /// Global budget of concurrent Tor streams (block downloads, per-txid
+    /// sessions and decoys share it), wallet > prefetch > decoy.
+    governor: Arc<TorGovernor>,
     /// Attempts running at once over every download (hedges included),
     /// well below Tor's 32 pending circuits.
     external_attempts: Arc<Semaphore>,
     /// Wallet downloads running now; decoys wait for them (bandwidth).
     wallet_downloads: Arc<AtomicU64>,
-    /// Wallet downloads waiting for a slot: the prefetch steps aside.
-    wallet_slot_waiters: Arc<AtomicU64>,
     decoy_lane: Arc<DecoyLane>,
 }
 
@@ -859,6 +865,7 @@ impl Resolver {
         let mut p2p = None;
         let tor = cfg.tor_socks.clone();
         let stats = Arc::new(RawtxStats::default());
+        let governor = TorGovernor::new(cfg.tor_streams);
 
         if cfg.enabled {
             // Created even with no peers yet: the list is refreshed from Core
@@ -879,6 +886,7 @@ impl Resolver {
                         )
                         .with_tor_timeout(cfg.p2p_tor_timeout)
                         .with_blocks_per_peer(cfg.p2p_blocks_per_peer)
+                        .with_governor(Arc::clone(&governor))
                         .with_stats(Arc::clone(&stats)),
                     ));
                 }
@@ -893,10 +901,12 @@ impl Resolver {
                     Duration::from_secs(cfg.tor_request_timeout_seconds.max(1)),
                     Duration::from_secs(cfg.provider_cooldown_seconds.max(1)),
                 ) {
-                    Ok(s) => external.push(Arc::new(s.with_tor_timeouts(
-                        Duration::from_secs(cfg.tor_connect_timeout_seconds.max(1)),
-                        Duration::from_secs(cfg.tor_stall_timeout_seconds.max(1)),
-                    ))),
+                    Ok(s) => external.push(Arc::new(
+                        s.with_governor(Arc::clone(&governor)).with_tor_timeouts(
+                            Duration::from_secs(cfg.tor_connect_timeout_seconds.max(1)),
+                            Duration::from_secs(cfg.tor_stall_timeout_seconds.max(1)),
+                        ),
+                    )),
                     Err(e) => eprintln!("[e-lite] esplora disabled: {e}"),
                 }
             }
@@ -929,7 +939,13 @@ impl Resolver {
             None
         };
         let tx_mode = if cfg.enabled && cfg.privacy.mode == ExternalMode::Tx {
-            Self::build_tx_mode(&store, cfg, txcache.clone(), Arc::clone(&stats))
+            Self::build_tx_mode(
+                &store,
+                cfg,
+                txcache.clone(),
+                Arc::clone(&stats),
+                Arc::clone(&governor),
+            )
         } else {
             None
         };
@@ -963,7 +979,7 @@ impl Resolver {
             chain: cfg.chain,
             inflight: Mutex::new(HashMap::new()),
             failed: Mutex::new(HashMap::new()),
-            external_slots: Semaphore::new(cfg.max_parallel_fetches),
+            governor,
             external_attempts: Semaphore::new(
                 cfg.max_parallel_fetches
                     .max(1)
@@ -971,7 +987,6 @@ impl Resolver {
                     .clamp(2, 24),
             ),
             wallet_downloads: Arc::new(AtomicU64::new(0)),
-            wallet_slot_waiters: Arc::new(AtomicU64::new(0)),
             decoy_lane: DecoyLane::new(),
         })
     }
@@ -987,6 +1002,7 @@ impl Resolver {
         cfg: &RawtxConfig,
         txcache: Option<Arc<TxCache>>,
         stats: Arc<RawtxStats>,
+        governor: Arc<TorGovernor>,
     ) -> Option<txbatch::TxMode> {
         let tor = cfg.tor_socks.clone();
         if tor.is_none() && !cfg.allow_clearnet {
@@ -1047,6 +1063,7 @@ impl Resolver {
             cfg.decoy_sessions,
             cfg.jitter_ms,
             cfg.provider_quota,
+            governor,
         )
     }
 
@@ -1067,6 +1084,7 @@ impl Resolver {
             self.decoy_sessions,
             self.jitter_ms,
             self.provider_quota,
+            Arc::clone(&self.governor),
         );
         self
     }
@@ -1478,6 +1496,16 @@ impl Resolver {
         ]
         .iter()
         .any(|needle| text.contains(needle))
+    }
+
+    /// State of the Tor stream governor, for `/status`.
+    pub fn governor_stats(&self) -> (usize, usize, usize, bool) {
+        (
+            self.governor.total(),
+            self.governor.in_use(),
+            self.governor.pauses(),
+            self.governor.paused(),
+        )
     }
 
     /// The in-flight download of this block, when another caller started it.

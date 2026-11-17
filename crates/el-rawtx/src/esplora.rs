@@ -4,6 +4,7 @@
 //! SOCKS5h proxy and `.onion` endpoints are allowed; without Tor, external
 //! clearnet is refused unless `allow_clearnet` is explicitly enabled.
 
+use crate::governor::TorGovernor;
 use crate::health::{Blame, HealthMap, TRANSIENT_BASE, TRANSIENT_CAP};
 use crate::{AttemptCtl, BlockSource, Endpoint, FetchMode, RawtxError, Result};
 use el_model::Hash32;
@@ -11,6 +12,7 @@ use rand::seq::SliceRandom;
 use rand::thread_rng;
 use std::io::Read;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 pub struct EsploraSource {
@@ -33,6 +35,8 @@ pub struct EsploraSource {
     fallback_clearnet: bool,
     allow_clearnet: bool,
     fallback_warned: AtomicBool,
+    /// Shared Tor stream governor; a 429 pauses every stream briefly.
+    governor: Option<Arc<TorGovernor>>,
     /// Cooldown after a hard failure (wrong answer from the provider).
     cooldown: Duration,
     tor_health: HealthMap,
@@ -215,6 +219,7 @@ impl EsploraSource {
             fallback_clearnet,
             allow_clearnet,
             fallback_warned: AtomicBool::new(false),
+            governor: None,
             cooldown,
             tor_health: HealthMap::new(),
             direct_health: HealthMap::new(),
@@ -223,6 +228,12 @@ impl EsploraSource {
 
     /// Set the Tor circuit/connect and stall timeouts (capped by the attempt
     /// limit).
+    /// The Tor stream governor (pause on rate limits).
+    pub fn with_governor(mut self, governor: Arc<TorGovernor>) -> Self {
+        self.governor = Some(governor);
+        self
+    }
+
     pub fn with_tor_timeouts(mut self, connect: Duration, stall: Duration) -> Self {
         self.tor_connect = connect.max(Duration::from_secs(1)).min(self.attempt_limit);
         self.tor_stall = stall.max(Duration::from_secs(1)).min(self.attempt_limit);
@@ -451,6 +462,9 @@ impl BlockSource for EsploraSource {
             return match Self::fetch_with(&client, base, hash, attempt, ctl) {
                 Ok(bytes) => {
                     self.tor_health.succeed(base);
+                    if let Some(governor) = &self.governor {
+                        governor.healthy();
+                    }
                     Ok(bytes)
                 }
                 Err((e, blame)) => {
@@ -460,6 +474,11 @@ impl BlockSource for EsploraSource {
                     }
                     if !quiet && !ctl.aborted() {
                         self.fail_tor(base, blame);
+                    }
+                    if matches!(blame, Blame::RateLimited(_)) {
+                        if let Some(governor) = &self.governor {
+                            governor.pause();
+                        }
                     }
                     Err(RawtxError::Unavailable(format!("tor {e}")))
                 }
@@ -474,6 +493,9 @@ impl BlockSource for EsploraSource {
             return match Self::fetch_with(client, base, hash, attempt, ctl) {
                 Ok(bytes) => {
                     self.direct_health.succeed(base);
+                    if let Some(governor) = &self.governor {
+                        governor.healthy();
+                    }
                     if via_fallback && !self.fallback_warned.swap(true, Ordering::Relaxed) {
                         eprintln!(
                             "[e-lite] WARNING: Tor request failed; using clearnet for {base} (operator IP exposed)"

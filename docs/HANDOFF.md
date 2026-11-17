@@ -1,8 +1,8 @@
 # Session handoff
 
 **Updated:** 2026-11-17 (alpha.29.24.0: txid-first cold loads, 35 s wallet deadline)
-**Latest published release:** `0.1.0-alpha.29.25.0`
-**Release:** https://github.com/AlbercoinDev/e-lite/releases/tag/v0.1.0-alpha.29.25.0
+**Latest published release:** `0.1.0-alpha.29.25.1`
+**Release:** https://github.com/AlbercoinDev/e-lite/releases/tag/v0.1.0-alpha.29.25.1
 
 This is the short “where we are”. The invariants live in
 [`AGENTS.md`](../AGENTS.md); the
@@ -88,7 +88,15 @@ no repitas contexto ni rehagas decisiones ya documentadas.
   `docs/ROADMAP.md` is future work only, and `docs/AUDIT.md` holds the open
   findings (`docs/audit/FIXED.md` is the fixed history).
 
-## Last change (alpha.29.25.0): the cheap path first
+## Last change (alpha.29.25.1): Tor stream governor
+
+- `rawtx.tor_streams` (default 8) caps every external stream (blocks, txid
+  sessions, decoys) with wallet > prefetch > decoy priority; a refused stream
+  (EAGAIN, 429) pauses new streams 0.5-4 s and any success lifts the pause.
+- Onion clients (loopback peers) get 1800 s idle / 120 s write timeouts.
+- Provider heartbeat keeps circuits warm while the node serves wallets.
+
+## Previous change (alpha.29.25.0): the cheap path first
 
 - `auto` runs two per-txid session attempts (6 s) before any block; the block
   gets 20 s of network and retries for transient failures inside the 45 s

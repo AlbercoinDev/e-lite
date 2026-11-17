@@ -276,7 +276,7 @@ fn notify_never_waits_for_a_busy_connection() {
     let peer = std::net::TcpStream::connect(addr).unwrap();
     let (server_side, _) = listener.accept().unwrap();
     let registry = ClientRegistry::new();
-    let client = registry.register(Wire::plain(server_side).unwrap());
+    let client = registry.register(Wire::plain(server_side).unwrap(), false);
 
     // The client's own thread holds the lock (a long response or poll).
     let busy = client.writer.lock().unwrap();
@@ -360,7 +360,7 @@ fn a_dead_connection_stops_reading_at_once() {
     let _peer = std::net::TcpStream::connect(addr).unwrap();
     let (server_side, _) = listener.accept().unwrap();
     let registry = ClientRegistry::new();
-    let client = registry.register(Wire::plain(server_side).unwrap());
+    let client = registry.register(Wire::plain(server_side).unwrap(), false);
     let mut reader = WireReader::new(Arc::clone(&client));
 
     client.alive.store(false, Ordering::SeqCst);
@@ -382,7 +382,7 @@ fn a_panicking_line_releases_its_place_and_closes_the_connection() {
     let _peer = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
     let (server_side, _) = listener.accept().unwrap();
     let registry = ClientRegistry::new();
-    let client = registry.register(Wire::plain(server_side).unwrap());
+    let client = registry.register(Wire::plain(server_side).unwrap(), false);
     let in_flight = (std::sync::Mutex::new(0usize), Condvar::new());
     let closing = AtomicBool::new(false);
 

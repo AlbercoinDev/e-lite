@@ -738,6 +738,7 @@ pub(crate) fn build_resolver(
         prefetch_history_blocks: cfg.rawtx.prefetch_history_blocks,
         p2p_blocks_per_peer: cfg.rawtx.p2p_blocks_per_peer,
         provider_quota: cfg.rawtx.provider_quota,
+        tor_streams: cfg.rawtx.tor_streams,
     };
     let resolver = Resolver::new(Arc::clone(store), &rc)?;
     match resolver.tx_mode_servers() {

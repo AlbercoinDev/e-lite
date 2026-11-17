@@ -9,6 +9,7 @@ use crate::health::{Blame, HealthMap};
 use crate::socks::{socks_connect, SocksError};
 use crate::{
     AttemptCtl, BlockSource, Endpoint, FetchMode, RawtxError, RawtxStats, Result, Semaphore,
+    TorGovernor,
 };
 use bip324::io::{Payload, Protocol};
 use bip324::{PacketType, Role};
@@ -100,6 +101,8 @@ pub struct P2pSource {
     force_when_cooling: AtomicBool,
     /// Blocks this source may have in flight with one peer at a time.
     per_peer_in_flight: usize,
+    /// Shared Tor stream governor; a proxy refusal pauses every stream.
+    governor: Option<Arc<TorGovernor>>,
     /// One semaphore per peer, created on first use.
     peer_slots: Mutex<HashMap<String, Arc<Semaphore>>>,
     stats: Option<Arc<RawtxStats>>,
@@ -410,6 +413,7 @@ impl P2pSource {
             proxy_down_until: Mutex::new(None),
             force_when_cooling: AtomicBool::new(false),
             per_peer_in_flight: 3,
+            governor: None,
             peer_slots: Mutex::new(HashMap::new()),
             stats: None,
         }
@@ -418,6 +422,12 @@ impl P2pSource {
     /// Blocks that may be in flight with one peer at a time (1..=4).
     pub fn with_blocks_per_peer(mut self, blocks: usize) -> Self {
         self.per_peer_in_flight = blocks.clamp(1, 4);
+        self
+    }
+
+    /// The Tor stream governor (pause on proxy refusals).
+    pub fn with_governor(mut self, governor: Arc<TorGovernor>) -> Self {
+        self.governor = Some(governor);
         self
     }
 
@@ -489,6 +499,15 @@ impl P2pSource {
     fn set_proxy_down(&self, down: bool) {
         if let Ok(mut until) = self.proxy_down_until.lock() {
             *until = down.then(|| Instant::now() + PROXY_PAUSE);
+        }
+        // Tor refused a connection: hold every external stream for a moment
+        // instead of piling up more refusals.
+        if let Some(governor) = &self.governor {
+            if down {
+                governor.pause();
+            } else {
+                governor.healthy();
+            }
         }
     }
 

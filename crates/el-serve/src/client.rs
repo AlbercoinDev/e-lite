@@ -93,6 +93,11 @@ pub struct ClientState {
     /// large response (30 s write timeout) or polls the socket. Whoever holds
     /// the lock delivers the queue when it releases it.
     pub pending_notes: Mutex<VecDeque<Vec<u8>>>,
+    /// The client arrived over the onion (loopback peer with managed Tor):
+    /// its timeouts are more generous than a clearnet/LAN client's.
+    pub tor_client: bool,
+    pub write_timeout: Duration,
+    pub idle_timeout: Duration,
 }
 
 /// Hex characters of `server.ping` pongs one connection may request in total.
@@ -345,17 +350,17 @@ impl ClientState {
                 Ok(mut p) => p.drain(..).collect(),
                 Err(_) => return,
             };
-            let _ = writer
-                .socket()
-                .set_write_timeout(Some(NOTIFY_WRITE_TIMEOUT));
+            let _ = writer.socket().set_write_timeout(Some(if self.tor_client {
+                NOTIFY_WRITE_TIMEOUT * 4
+            } else {
+                NOTIFY_WRITE_TIMEOUT
+            }));
             let ok = batch
                 .iter()
                 .try_for_each(|bytes| writer.write_all(bytes))
                 .and_then(|_| writer.flush())
                 .is_ok();
-            let _ = writer
-                .socket()
-                .set_write_timeout(Some(CLIENT_WRITE_TIMEOUT));
+            let _ = writer.socket().set_write_timeout(Some(self.write_timeout));
             if !ok {
                 // A partial frame may be on the wire: the stream is unusable.
                 self.alive.store(false, Ordering::SeqCst);
@@ -429,7 +434,7 @@ impl ClientRegistry {
         )
     }
 
-    pub fn register(&self, wire: Wire) -> Arc<ClientState> {
+    pub fn register(&self, wire: Wire, tor_client: bool) -> Arc<ClientState> {
         let id = self.next.fetch_add(1, Ordering::SeqCst) + 1;
         let tls = wire.is_tls();
         let state = Arc::new(ClientState {
@@ -453,6 +458,17 @@ impl ClientRegistry {
             pong_budget: AtomicU64::new(MAX_PONG_BYTES),
             stats: Mutex::new(ClientStats::empty()),
             pending_notes: Mutex::new(VecDeque::new()),
+            tor_client,
+            write_timeout: if tor_client {
+                TOR_CLIENT_WRITE_TIMEOUT
+            } else {
+                CLIENT_WRITE_TIMEOUT
+            },
+            idle_timeout: if tor_client {
+                TOR_CLIENT_IDLE_TIMEOUT
+            } else {
+                CLIENT_IDLE_TIMEOUT
+            },
         });
         if let Ok(mut c) = self.clients.lock() {
             c.insert(id, Arc::clone(&state));

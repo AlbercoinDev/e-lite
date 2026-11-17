@@ -402,6 +402,30 @@ pub(crate) fn cmd_run(cfg: &Config, chain: Chain) -> R<()> {
             spawn_provider_reprobe(Arc::clone(&shared), cfg.clone());
         }
     }
+    // Keep the third-party Tor circuits warm: a heartbeat probe every 60 s
+    // means a wallet connecting after FULLY SYNCED finds a ready provider and
+    // an established circuit instead of paying the circuit setup on its first
+    // transaction. The probe is one stream; it skips nothing else.
+    if cfg.rawtx.enabled && cfg.rawtx.use_esplora && !shared.public_servers.is_empty() {
+        let heartbeat_shared = Arc::clone(&shared);
+        let heartbeat_cfg = cfg.clone();
+        let heartbeat_flag = Arc::clone(&flag);
+        let _ = std::thread::Builder::new()
+            .name("provider-heartbeat".into())
+            .spawn(move || {
+                while !heartbeat_flag.load(Ordering::SeqCst)
+                    && !heartbeat_shared.shutdown.load(Ordering::SeqCst)
+                {
+                    std::thread::sleep(Duration::from_secs(60));
+                    if heartbeat_flag.load(Ordering::SeqCst)
+                        || heartbeat_shared.shutdown.load(Ordering::SeqCst)
+                    {
+                        break;
+                    }
+                    refresh_providers(&heartbeat_shared, &heartbeat_cfg, false);
+                }
+            });
+    }
     let transports = match start_transports(&shared, cfg) {
         Ok(t) => t,
         Err(e) => {

@@ -15,6 +15,7 @@
 //! falls back to the whole-block path.
 
 use crate::decoy_wallets::{DecoyBook, DecoyPicker, TxRef};
+use crate::governor::{Lane, TorGovernor};
 use crate::privacy::PrivacyParams;
 use crate::txcache::{CachedTx, TxCache};
 use crate::txsource::TxSource;
@@ -102,6 +103,8 @@ struct Shared {
     decoy_mode: DecoySessions,
     /// Random delay before a session, milliseconds.
     jitter_ms: u64,
+    /// Shared Tor stream governor: a session holds one stream.
+    governor: Arc<TorGovernor>,
     /// Long-term per-provider quota (multiple of the fair share; 0 = off).
     provider_quota: f64,
     /// Items sent per operator since start and the total, for the quota.
@@ -154,6 +157,7 @@ impl TxMode {
         decoy_mode: DecoySessions,
         jitter_ms: u64,
         provider_quota: f64,
+        governor: Arc<TorGovernor>,
     ) -> Option<Self> {
         if sources.is_empty() {
             return None;
@@ -174,6 +178,7 @@ impl TxMode {
             },
             provider_counts: Mutex::new(HashMap::new()),
             provider_total: AtomicU64::new(0),
+            governor,
             batch_caps: Mutex::new(HashMap::new()),
             params,
             books: Mutex::new((HashMap::new(), VecDeque::new())),
@@ -673,6 +678,20 @@ fn run_session(shared: &Arc<Shared>, src: Arc<dyn TxSource>, key: &str, items: V
     shared.sessions_active.fetch_add(1, Ordering::SeqCst);
     let _guard = SessionGuard(&shared.sessions_active);
     let has_real = items.iter().any(|item| matches!(item, Item::Real(_)));
+    // One Tor stream per session, under the global governor: a wallet
+    // session never queues behind a decoy session.
+    let lane = if has_real { Lane::Wallet } else { Lane::Decoy };
+    let Some(_governor) = shared
+        .governor
+        .acquire(lane, Instant::now() + crate::EXTERNAL_QUEUE_MAX)
+    else {
+        for item in &items {
+            if let Item::Real(r) = item {
+                retry_or_fail(shared, r.clone(), key, "tor stream budget busy");
+            }
+        }
+        return;
+    };
     if has_real && shared.jitter_ms > 0 {
         // Small random delay: it breaks the timing correlation between the
         // wallet's connection and its first provider request at a negligible
@@ -728,6 +747,9 @@ fn run_session(shared: &Arc<Shared>, src: Arc<dyn TxSource>, key: &str, items: V
     let ctl = AttemptCtl::new();
     let started = Instant::now();
     let result = src.fetch_from(key, &txids, started + SESSION_BUDGET, &ctl);
+    if result.is_ok() {
+        shared.governor.healthy();
+    }
     // Real time, success or failure: a fast rejection must not look like a
     // 40 s stall (the old code used the whole session budget on failure).
     let ms = started.elapsed().as_millis() as f64;

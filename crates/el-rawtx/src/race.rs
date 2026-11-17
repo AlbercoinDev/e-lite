@@ -113,7 +113,6 @@ impl Resolver {
                 Some(existing) => {
                     if priority == Priority::Wallet {
                         existing.wallet_waiting.store(true, Ordering::Relaxed);
-                        self.external_slots.cv.notify_all();
                     }
                     (Arc::clone(existing), false)
                 }
@@ -219,35 +218,25 @@ impl Resolver {
         // A prefetch that a wallet joined becomes a wallet download (AUD-165).
         let wallet = priority == Priority::Wallet || entry.wallet_waiting.load(Ordering::Relaxed);
         // The queue gets whatever the request budget leaves after the network
-        // part (12 s of queue and 8 s of network for a wallet request, 20 s
-        // total); the full 120 s for a background prefetch.
+        // part (~25 s of queue and 20 s of network for a wallet request, 45 s
+        // total); the full 120 s for a background prefetch. The governor caps
+        // every Tor stream (block downloads, per-txid sessions, decoys) with
+        // wallet > prefetch > decoy priority, so a cold burst waits for a
+        // slot instead of saturating Tor.
         let budget = if wallet {
             WALLET_BLOCK_NET
         } else {
             EXTERNAL_BUDGET
         };
+        let lane = if wallet { Lane::Wallet } else { Lane::Prefetch };
         let queue_deadline = entry
             .deadline()
             .checked_sub(budget)
             .unwrap_or_else(Instant::now);
-        let mut permit = None;
-        while Instant::now() < queue_deadline {
-            let wallet =
-                priority == Priority::Wallet || entry.wallet_waiting.load(Ordering::Relaxed);
-            let step = queue_deadline.min(Instant::now() + Duration::from_millis(250));
-            if wallet {
-                let _waiting = Busy::new(&self.wallet_slot_waiters);
-                permit = self.external_slots.acquire_until(step, 0);
-            } else if self.wallet_slot_waiters.load(Ordering::Relaxed) == 0 {
-                permit = self.external_slots.acquire_until(step, 1);
-            } else {
-                std::thread::sleep(Duration::from_millis(50));
-            }
-            if permit.is_some() {
-                break;
-            }
-        }
-        let Some(_permit) = permit else {
+        let Some(_permit) = self
+            .governor
+            .acquire(lane, queue_deadline.max(Instant::now() + MIN_ATTEMPT))
+        else {
             self.stats.unavailable.fetch_add(1, Ordering::Relaxed);
             return Err(RawtxError::Unavailable(
                 "every download slot stayed busy until the deadline".into(),
@@ -274,7 +263,10 @@ impl Resolver {
         let wallet = priority == Priority::Wallet || entry.wallet_waiting.load(Ordering::Relaxed);
         let _wallet = wallet.then(|| Busy::new(&self.wallet_downloads));
         let result = self.race(hash, deadline, plan, wallet);
-        if result.is_err() {
+        if result.is_ok() {
+            // A success means Tor is healthy: lift any pause at once.
+            self.governor.healthy();
+        } else {
             self.stats.unavailable.fetch_add(1, Ordering::Relaxed);
         }
         result
