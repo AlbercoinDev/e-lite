@@ -62,8 +62,8 @@ version          print version
 | `--core-rpc <url>` | Core RPC URL (HTTP; use SSH/VPN for WAN) |
 | `--set core.require_loopback_rpc=true` | refuse a non-loopback Core RPC endpoint |
 | `--rpc-user`, `--rpc-password`, `--cookie-file` | Core credentials |
-| `--core-datadir <path>`, `--blocks-dir <path>` | Core datadir (default `<data-dir>/bitcoin`) / block files |
-| `--block-source <src>` | `auto`, `rpc`, `files` |
+| `--core-datadir <path>`, `--set core.blocks_dir=<path>` | Core datadir (default `<data-dir>/bitcoin`) / block files |
+| `--set index.block_source=<src>` | `auto`, `rpc`, `files` |
 | `--manage <mode>` | `external`, `auto`, `managed` |
 | `--prune-mib <n>` | `1` manual (default), `0` full, `>=550` auto + opt-in |
 | `--output <path>` | file written by `export-snapshot` / `export-identity` |
@@ -74,43 +74,47 @@ version          print version
 | `--yes`, `-y` | onion reset / cache clear: do not ask for confirmation (required by `cache clear`) |
 | `--dry-run` | cache clear: report what would be removed and delete nothing |
 | `--json` | machine-readable output (`status`, `cache status`, `cache clear`) |
-| `--min-free-gib <n>`, `--critical-free-gib <n>` | disk guards |
+| `--set pruning.min_free_gib=<n>`, `--set pruning.critical_free_gib=<n>` | disk guards |
 | `--listen <addr>`, `--metrics <addr>` | Electrum plain / metrics listeners |
-| `--tls` / `--no-tls` | enable (default) or disable Electrum TLS |
-| `--tls-listen <addr>`, `--tls-cert`, `--tls-key` | TLS listener and PEM files |
-| `--json` | JSON output for `status` |
+| `--no-tls` | disable Electrum TLS (on by default) |
+| `--tls-listen <addr>`, `--set server.tls_cert=<path>`, `--set server.tls_key=<path>` | TLS listener and PEM files |
 | `--allow-mainnet` | required for mainnet |
 | `--set <key=value>` | override any TOML field |
+| `--help`, `--version` | usage, or the version |
+| `--core-arg <arg>` | extra bitcoind argument, appended to `[core] extra_args` (repeatable) |
+| `--no-tor`, `--no-rawtx-tor`, `--allow-clearnet` | no managed Tor; direct external fetches; clearnet allowed |
+| `--no-supervise`, `--no-follow`, `--no-log-file` | one process; stop when caught up (`index`); no application log |
+| `--allow-auto-prune`, `--allow-low-memory`, `--purge`, `--log-level <level>` | explicit permissions and logging |
 
 ## Tuning and performance
 
-| Flag | TOML field | Default |
+| Option | TOML field | Default |
 |---|---|---|
-| `--profile <name>` | `index.profile` | `auto` |
-| `--adaptive` / `--no-adaptive` | `index.adaptive` | `true` |
-| `--readers <n>` | `index.readers` | `0` (profile/auto) |
-| `--cache-mib <n>` | `index.cache_mib` | `0` (auto; explicit = maximum) |
-| `--write-buffer-mib <n>` | `index.write_buffer_mib` | `0` (effective/16, 512 MiB..2 GiB) |
-| `--memory-reserve-mib <n>` | `index.memory_reserve_mib` | `0` (clamp(effective/8, 2-4 GiB)) |
-| `--memory-fraction <f>` | `index.memory_fraction` | `0` (0.75 of **effective** RAM) |
+| `--set index.profile=<name>` | `index.profile` | `auto` |
+| `--set index.adaptive=true` / `--set index.adaptive=false` | `index.adaptive` | `true` |
+| `--set index.readers=<n>` | `index.readers` | `0` (profile/auto) |
+| `--set index.cache_mib=<n>` | `index.cache_mib` | `0` (auto; explicit = maximum) |
+| `--set index.write_buffer_mib=<n>` | `index.write_buffer_mib` | `0` (effective/16, 512 MiB..2 GiB) |
+| `--set index.memory_reserve_mib=<n>` | `index.memory_reserve_mib` | `0` (clamp(effective/8, 2-4 GiB)) |
+| `--set index.memory_fraction=<f>` | `index.memory_fraction` | `0` (0.75 of **effective** RAM) |
 | `--allow-low-memory` | `index.allow_low_memory` | `false` (unsupported; CI/regtest only) |
-| `--background-jobs <n>` | `index.background_jobs` | `0` (profile, capped by CPUs) |
-| `--commit-interval-ms <n>` | `index.commit_interval_ms` | `0` (profile; 500..30000) |
-| `--commit-sync <mode>` | `index.commit_sync` | `auto` (`txids` in bulk, `always` live) |
-| `--prefetch-blocks <n>` | `index.prefetch_blocks` | `0` (auto; >0 caps the window) |
-| `--prefetch-deadline-ms <n>` | `index.prefetch_deadline_ms` | `0` (off; 50..60000) |
-| `--max-open-files <n>` | `index.max_open_files` | `0` (8192; 2048/4096 for 8-16 GB) |
-| `--adaptive-memtables` / `--no-adaptive-memtables` | `index.adaptive_memtables` | `false` |
-| `--batch <n>` | `index.batch_blocks` | `256`/profile, capped at 512 |
-| `--reorg-window <n>` | `index.reorg_window` | `288` |
-| `--milestone-blocks <n>` | `index.milestone_blocks` | `10000` |
-| `--milestone-seconds <n>` | `index.milestone_seconds` | `21600` |
+| `--set index.background_jobs=<n>` | `index.background_jobs` | `0` (profile, capped by CPUs) |
+| `--set index.commit_interval_ms=<n>` | `index.commit_interval_ms` | `0` (profile; 500..30000) |
+| `--set index.commit_sync=<mode>` | `index.commit_sync` | `auto` (`txids` in bulk, `always` live) |
+| `--set index.prefetch_blocks=<n>` | `index.prefetch_blocks` | `0` (auto; >0 caps the window) |
+| `--set index.prefetch_deadline_ms=<n>` | `index.prefetch_deadline_ms` | `0` (off; 50..60000) |
+| `--set index.max_open_files=<n>` | `index.max_open_files` | `0` (8192; 2048/4096 for 8-16 GB) |
+| `--set index.adaptive_memtables=true` / `--set index.adaptive_memtables=false` | `index.adaptive_memtables` | `false` |
+| `--set index.batch_blocks=<n>` | `index.batch_blocks` | `256`/profile, capped at 512 |
+| `--set index.reorg_window=<n>` | `index.reorg_window` | `288` |
+| `--set index.milestone_blocks=<n>` | `index.milestone_blocks` | `10000` |
+| `--set index.milestone_seconds=<n>` | `index.milestone_seconds` | `21600` |
 | `--set index.zfs_arc_dynamic=false` | dynamic ZFS ARC cap (grow during IBD/drain, shrink when synced; see `arc-setup`) | `true` |
 | `--set index.zfs_arc_max_mib=<n>` | ARC cap during IBD/drain (0 = half of RAM) | `0` |
 | `--set index.zfs_arc_min_mib=<n>` | ARC cap once fully synced (floor 512) | `1024` |
 
 `auto` uses the disk `rotational` hint. Virtual disks and some RAID/USB devices
-report it incorrectly; set `--profile ssd` or `--profile nvme` when you know the
+report it incorrectly; set `--set index.profile=ssd` or `--set index.profile=nvme` when you know the
 real hardware.
 
 Explicit readers/commit values lock that knob. `cache_mib` is a **maximum**: the
@@ -124,33 +128,33 @@ what the OS has free. See [`TUNING.md`](TUNING.md#memory-budget-fitted-to-availa
 Normal PC with NVMe and 16-32 GiB RAM:
 
 ```bash
-e-lite run --network mainnet --allow-mainnet --profile nvme
+e-lite run --network mainnet --allow-mainnet --set index.profile=nvme
 ```
 
 Normal PC with SATA SSD:
 
 ```bash
-e-lite run --network mainnet --allow-mainnet --profile ssd
+e-lite run --network mainnet --allow-mainnet --set index.profile=ssd
 ```
 
 Laptop/HDD or a disk that reports `rotational=1`:
 
 ```bash
-e-lite run --network signet --profile hdd
+e-lite run --network signet --set index.profile=hdd
 ```
 
 Low-RAM machine or container (1-4 GiB):
 
 ```bash
-e-lite run --network signet --profile hdd \
-  --cache-mib 256 --write-buffer-mib 128 --background-jobs 2
+e-lite run --network signet --set index.profile=hdd \
+  --set index.cache_mib=256 --set index.write_buffer_mib=128 --set index.background_jobs=2
 ```
 
 Fixed values, no controller:
 
 ```bash
 e-lite run --network mainnet --allow-mainnet \
-  --profile ssd --no-adaptive --readers 4 --cache-mib 1024 --commit-interval-ms 3000
+  --set index.profile=ssd --set index.adaptive=false --set index.readers=4 --set index.cache_mib=1024 --set index.commit_interval_ms=3000
 ```
 
 Snapshot backup of one network, restored on another host (run per network;
@@ -167,30 +171,30 @@ e-lite import-snapshot --network mainnet --allow-mainnet \
 
 ## Pruning and Core
 
-| Flag | TOML field | Default |
+| Option | TOML field | Default |
 |---|---|---|
-| `--max-core-lag-blocks <n>` | `pruning.max_core_lag_blocks` | `192` (auto-prune only) |
-| `--max-bulk-lag-blocks <n>` | `pruning.max_bulk_lag_blocks` | `20000` (legacy) |
-| `--max-bulk-lag-gib <n>` | `pruning.max_bulk_lag_gib` | `30` |
-| `--pause-core-during-bulk` | `pruning.pause_core_during_bulk` | `true` |
-| `--no-pause-core-during-bulk` | same | disable the full bulk pause |
-| `--core-resume-ahead-blocks <n>` | `pruning.core_resume_ahead_blocks` | `5000` (legacy) |
-| `--core-resume-ahead-gib <n>` | `pruning.core_resume_ahead_gib` | `7` |
-| `--scheduler <mode>` | `pruning.scheduler` | `overlap` |
-| `--prune-defer-free-gib <n>` | `pruning.prune_defer_free_gib` | `20` |
-| `--min-gain-blocks <n>` | `pruning.min_gain_blocks` | `5000` |
+| `--set pruning.max_core_lag_blocks=<n>` | `pruning.max_core_lag_blocks` | `192` (auto-prune only) |
+| `--set pruning.max_bulk_lag_blocks=<n>` | `pruning.max_bulk_lag_blocks` | `20000` (legacy) |
+| `--set pruning.max_bulk_lag_gib=<n>` | `pruning.max_bulk_lag_gib` | `30` |
+| `--set pruning.pause_core_during_bulk=true` | `pruning.pause_core_during_bulk` | `true` |
+| `--set pruning.pause_core_during_bulk=false` | same | disable the full bulk pause |
+| `--set pruning.core_resume_ahead_blocks=<n>` | `pruning.core_resume_ahead_blocks` | `5000` (legacy) |
+| `--set pruning.core_resume_ahead_gib=<n>` | `pruning.core_resume_ahead_gib` | `7` |
+| `--set pruning.scheduler=<mode>` | `pruning.scheduler` | `overlap` |
+| `--set pruning.prune_defer_free_gib=<n>` | `pruning.prune_defer_free_gib` | `20` |
+| `--set pruning.min_gain_blocks=<n>` | `pruning.min_gain_blocks` | `5000` |
 | `--set pruning.min_gain_live_blocks=<n>` | once fully synced, prune every N safe blocks (0 = `min_gain_blocks`) | `144` |
-| `--min-free-gib <n>` | `pruning.min_free_gib` (pause Core downloads below it) | `10` |
-| `--critical-free-gib <n>` | `pruning.critical_free_gib` (pause indexing below it) | `1` |
-| `--prune-interval-seconds <n>` | `pruning.prune_interval_seconds` | `30` |
-| `--poll-seconds <n>` | `pruning.poll_seconds` | `10` |
-| `--repair-max-gap-blocks <n>` | `pruning.repair_max_gap_blocks` | `2048` |
+| `--set pruning.min_free_gib=<n>` | `pruning.min_free_gib` (pause Core downloads below it) | `10` |
+| `--set pruning.critical_free_gib=<n>` | `pruning.critical_free_gib` (pause indexing below it) | `1` |
+| `--set pruning.prune_interval_seconds=<n>` | `pruning.prune_interval_seconds` | `30` |
+| `--set pruning.poll_seconds=<n>` | `pruning.poll_seconds` | `10` |
+| `--set pruning.repair_max_gap_blocks=<n>` | `pruning.repair_max_gap_blocks` | `2048` |
 | `--allow-auto-prune` | `pruning.allow_auto_prune` | `false` |
 | `--core-arg <arg>` | `core.extra_args` (appended) | none |
-| `--core-io-priority <0-7>` | `core.io_priority` | unset (opt-in ionice) |
-| `--core-cgroup-io-weight <n>` | `core.cgroup_io_weight` | unset (opt-in cgroup v2 io.weight) |
-| `--stop-on-exit` / `--no-stop-on-exit` | `core.stop_on_exit` | `true` |
-| `--restart` / `--no-restart` | `core.restart` | `true` |
+| `--set core.io_priority=<0-7>` | `core.io_priority` | unset (opt-in ionice) |
+| `--set core.cgroup_io_weight=<n>` | `core.cgroup_io_weight` | unset (opt-in cgroup v2 io.weight) |
+| `--set core.stop_on_exit=true` / `--set core.stop_on_exit=false` | `core.stop_on_exit` | `true` |
+| `--set core.restart=true` / `--set core.restart=false` | `core.restart` | `true` |
 
 By default (`pause_core_during_bulk = true`), a long bulk catch-up pauses
 Core's P2P when the unindexed backlog reaches `max_bulk_lag_gib` (30 GiB) and
@@ -226,21 +230,21 @@ e-lite run --network mainnet --allow-mainnet \
 
 ## Rawtx, server and TLS
 
-| Flag | TOML field | Default |
+| Option | TOML field | Default |
 |---|---|---|
-| `--max-clients <n>` | `server.max_clients` | `32` |
+| `--set server.max_clients=<n>` | `server.max_clients` | `32` |
 | `--set server.rate_limit=<n>` | `server.rate_limit` | `200` for every client; `0` disables |
 | `--set server.rate_burst=<n>` | `server.rate_burst` | `5000` |
-| `--banner-file <path>` | `server.banner_file` | built-in templates |
-| `--p2p-peers <a,b>` | `rawtx.p2p_peers` | discovered from Core |
-| `--no-p2p` | `rawtx.use_p2p=false` | enabled |
-| `--no-esplora` | `rawtx.use_esplora=false` | enabled |
-| `--decoys <n>` | `rawtx.decoys` | `1` per wallet load, served one at a time in the background |
-| `--rawtx-cache-mib <n>` | `rawtx.cache_mib` | `256` |
+| `--set server.banner_file=<path>` | `server.banner_file` | built-in templates |
+| `--set rawtx.p2p_peers=<a,b>` | `rawtx.p2p_peers` | discovered from Core |
+| `--set rawtx.use_p2p=false` | `rawtx.use_p2p=false` | enabled |
+| `--set rawtx.use_esplora=false` | `rawtx.use_esplora=false` | enabled |
+| `--set rawtx.decoys=<n>` | `rawtx.decoys` | `1` per wallet load, served one at a time in the background |
+| `--set rawtx.cache_mib=<n>` | `rawtx.cache_mib` | `256` |
 | `--set rawtx.cache_dir=<path>` | `rawtx.cache_dir` | `<data-dir>/rawtx-cache`; tmpfs keeps it off disk |
-| `--tor-socks <addr>` | `rawtx.tor_socks` | `127.0.0.1:9050` |
+| `--set rawtx.tor_socks=<addr>` | `rawtx.tor_socks` | `127.0.0.1:9050` |
 | `--allow-clearnet` | `rawtx.allow_clearnet` | `false` |
-| `--no-rawtx-tor` / `--rawtx-tor` | `rawtx.use_tor`: fetch wallet data directly (no Tor; your IP is visible) or through Tor | `true` |
+| `--no-rawtx-tor` / `--set rawtx.use_tor=true` | `rawtx.use_tor`: fetch wallet data directly (no Tor; your IP is visible) or through Tor | `true` |
 | `--set rawtx.tor_fallback_clearnet=true` | use clearnet when Tor fails (exposes your IP to the provider) | `false` |
 | `--set rawtx.prefetch=false` | disable the background history prefetch (on by default; it owes decoys like a wallet request) | `true` |
 | `--plain-lan` / `--set server.plain_lan=true` | plain Electrum on `0.0.0.0` | `false` |
@@ -259,10 +263,10 @@ e-lite run --network mainnet --allow-mainnet \
 | `--set public_servers.probe_timeout_seconds=<n>` | per-provider probe timeout (parallel probe; Tor attempts get at least `rawtx.tor_request_timeout_seconds`) | `5` |
 | `--set public_servers.ready_timeout_seconds=<n>` | one readiness round before it is logged and retried | `60` |
 | `--set public_servers.open_without_provider=true` | pruned Core: open Electrum with local data after `ready_timeout_seconds` if no provider answered | `false` |
-| `--no-rawtx` | `rawtx.enabled=false` | enabled |
-| `--tls` / `--no-tls` | `server.tls` | `true` |
+| `--set rawtx.enabled=false` | `rawtx.enabled=false` | enabled |
+| `--no-tls` | `server.tls` | `true` |
 | `--tls-listen <addr>` | `server.tls_listen` | host of `listen` + network TLS port |
-| `--tls-cert`, `--tls-key` | `server.tls_cert`, `server.tls_key` | auto-generated self-signed |
+| `--set server.tls_cert=<path>`, `--set server.tls_key=<path>` | `server.tls_cert`, `server.tls_key` | auto-generated self-signed |
 | `--set server.tls_auto_cert=false` | `server.tls_auto_cert` | `true` |
 
 ## Listener defaults per network
@@ -296,22 +300,22 @@ returning an error, so a wallet's initial gap scan is not aborted.
 
 ## Tor and onion
 
-| Flag | TOML field | Default |
+| Option | TOML field | Default |
 |---|---|---|
-| `--tor-mode <mode>` | `tor.mode` | `managed` |
+| `--set tor.mode=<mode>` | `tor.mode` | `managed` |
 | `--no-tor` | `tor.mode=off` | — |
-| `--tor-plain` / `--no-tor-plain` | `tor.plain` | `true` |
-| `--tor-tls` / `--no-tor-tls` | `tor.tls` | `true` |
-| `--tor-auto-cert` / `--no-tor-auto-cert` | `tor.tls_auto_cert` | `true` |
-| `--tor-onion-port <n>` | `tor.onion_port` | `0` (same as `server.listen`) |
-| `--tor-onion-tls-port <n>` | `tor.onion_tls_port` | `0` (same as `server.tls_listen`) |
-| `--tor-socks-port <n>` | `tor.socks_port` | `0` (per-network: 9050 mainnet, 55150/55250/55350; then 19050+) |
-| `--tor-binary <path>` | `tor.binary` | installer bundle, then PATH |
-| `--tor-target-plain <addr>` | `tor.target_plain` | `server.listen` (wildcard mapped to loopback) |
-| `--tor-target-tls <addr>` | `tor.target_tls` | `server.tls_listen` (wildcard mapped to loopback) |
+| `--set tor.plain=true` / `--set tor.plain=false` | `tor.plain` | `true` |
+| `--set tor.tls=true` / `--set tor.tls=false` | `tor.tls` | `true` |
+| `--set tor.tls_auto_cert=true` / `--set tor.tls_auto_cert=false` | `tor.tls_auto_cert` | `true` |
+| `--set tor.onion_port=<n>` | `tor.onion_port` | `0` (same as `server.listen`) |
+| `--set tor.onion_tls_port=<n>` | `tor.onion_tls_port` | `0` (same as `server.tls_listen`) |
+| `--set tor.socks_port=<n>` | `tor.socks_port` | `0` (per-network: 9050 mainnet, 55150/55250/55350; then 19050+) |
+| `--set tor.binary=<path>` | `tor.binary` | installer bundle, then PATH |
+| `--set tor.target_plain=<addr>` | `tor.target_plain` | `server.listen` (wildcard mapped to loopback) |
+| `--set tor.target_tls=<addr>` | `tor.target_tls` | `server.tls_listen` (wildcard mapped to loopback) |
 
 `mode = managed` starts e-lite's own Tor and publishes Electrum as an onion
-service. `--tor-socks <addr>` (in the previous table) remains the rawtx proxy;
+service. `--set rawtx.tor_socks=<addr>` (in the previous table) remains the rawtx proxy;
 the managed Tor overrides it only when it is unset or still the default
 `127.0.0.1:9050`.
 
@@ -372,7 +376,7 @@ JSON contract (used by the Umbrel app):
 
 `server.banner` returns a dynamic banner. Built-in templates show `INDEXING`
 with height/percent/bar/ETA, or `READY`/`FULLY SYNCED` with the Electrum
-endpoints. Set `--banner-file <path>` (or `[server] banner_file`) to customize:
+endpoints. Set `--set server.banner_file=<path>` (or `[server] banner_file`) to customize:
 
 - the file is created with the default template if it does not exist;
 - a relative path is resolved inside the network `data-dir`;
@@ -439,10 +443,10 @@ These are escape hatches for measurements, not normal configuration:
 
 ## Logging
 
-| Flag | TOML field | Default |
+| Option | TOML field | Default |
 |---|---|---|
-| `--log-file <path>` | `logging.file` | `<data-dir>/e-lite.log` |
-| `--log-max-mib <n>` | `logging.max_mib` | `16` (0 disables rotation) |
+| `--set logging.file=<path>` | `logging.file` | `<data-dir>/e-lite.log` |
+| `--set logging.max_mib=<n>` | `logging.max_mib` | `16` (0 disables rotation) |
 | `--log-level <level>` | `logging.level` | `debug` (alpha; stable: `info`) |
 | `--no-log-file` | — | logging enabled |
 | `--no-supervise` | `[safety] supervise = false` (`E_LITE_NO_SUPERVISE=1`) | automatic restart enabled |
@@ -468,6 +472,90 @@ including progress, milestones, tuning and TLS messages. Rotation keeps one
 backup (`e-lite.log.1`) and the file mode is `0640`. Logs are per network because
 the default path lives in the network data directory. `e-lite core logs` still
 shows Core's own log.
+
+## Retired flags (use `--set`)
+
+Since 0.1.0-alpha.29.19.0 the command line keeps only the options of daily
+use (`e-lite --help`); every other setting is a config key, set in
+`config.toml` or with `--set section.key=value`. The old flags below still
+work for now: each one acts exactly like its `--set` in the same position
+(so a later `--set` of the same key wins) and prints one line naming the
+replacement. They will be removed two releases later.
+
+| Old flag | Use instead |
+|---|---|
+| `--blocks-dir <v>` | `--set core.blocks_dir=<v>` |
+| `--block-source <v>` | `--set index.block_source=<v>` |
+| `--tls-cert <v>` | `--set server.tls_cert=<v>` |
+| `--tls-key <v>` | `--set server.tls_key=<v>` |
+| `--profile <v>` | `--set index.profile=<v>` |
+| `--commit-sync <v>` | `--set index.commit_sync=<v>` |
+| `--scheduler <v>` | `--set pruning.scheduler=<v>` |
+| `--banner-file <v>` | `--set server.banner_file=<v>` |
+| `--tor-socks <v>` | `--set rawtx.tor_socks=<v>` |
+| `--tor-mode <v>` | `--set tor.mode=<v>` |
+| `--tor-binary <v>` | `--set tor.binary=<v>` |
+| `--tor-target-plain <v>` | `--set tor.target_plain=<v>` |
+| `--tor-target-tls <v>` | `--set tor.target_tls=<v>` |
+| `--log-file <v>` | `--set logging.file=<v>` |
+| `--readers <v>` | `--set index.readers=<v>` |
+| `--bulk-readers <v>` | `--set index.readers=<v>` |
+| `--batch <v>` | `--set index.batch_blocks=<v>` |
+| `--reorg-window <v>` | `--set index.reorg_window=<v>` |
+| `--min-free-gib <v>` | `--set pruning.min_free_gib=<v>` |
+| `--cache-mib <v>` | `--set index.cache_mib=<v>` |
+| `--commit-interval-ms <v>` | `--set index.commit_interval_ms=<v>` |
+| `--prefetch-blocks <v>` | `--set index.prefetch_blocks=<v>` |
+| `--write-buffer-mib <v>` | `--set index.write_buffer_mib=<v>` |
+| `--prefetch-deadline-ms <v>` | `--set index.prefetch_deadline_ms=<v>` |
+| `--max-open-files <v>` | `--set index.max_open_files=<v>` |
+| `--memory-reserve-mib <v>` | `--set index.memory_reserve_mib=<v>` |
+| `--memory-fraction <v>` | `--set index.memory_fraction=<v>` |
+| `--background-jobs <v>` | `--set index.background_jobs=<v>` |
+| `--milestone-blocks <v>` | `--set index.milestone_blocks=<v>` |
+| `--milestone-seconds <v>` | `--set index.milestone_seconds=<v>` |
+| `--max-core-lag-blocks <v>` | `--set pruning.max_core_lag_blocks=<v>` |
+| `--max-bulk-lag-blocks <v>` | `--set pruning.max_bulk_lag_blocks=<v>` |
+| `--max-bulk-lag-gib <v>` | `--set pruning.max_bulk_lag_gib=<v>` |
+| `--core-resume-ahead-blocks <v>` | `--set pruning.core_resume_ahead_blocks=<v>` |
+| `--core-resume-ahead-gib <v>` | `--set pruning.core_resume_ahead_gib=<v>` |
+| `--prune-defer-free-gib <v>` | `--set pruning.prune_defer_free_gib=<v>` |
+| `--min-gain-blocks <v>` | `--set pruning.min_gain_blocks=<v>` |
+| `--prune-interval-seconds <v>` | `--set pruning.prune_interval_seconds=<v>` |
+| `--poll-seconds <v>` | `--set pruning.poll_seconds=<v>` |
+| `--repair-max-gap-blocks <v>` | `--set pruning.repair_max_gap_blocks=<v>` |
+| `--critical-free-gib <v>` | `--set pruning.critical_free_gib=<v>` |
+| `--max-clients <v>` | `--set server.max_clients=<v>` |
+| `--core-io-priority <v>` | `--set core.io_priority=<v>` |
+| `--core-cgroup-io-weight <v>` | `--set core.cgroup_io_weight=<v>` |
+| `--decoys <v>` | `--set rawtx.decoys=<v>` |
+| `--rawtx-cache-mib <v>` | `--set rawtx.cache_mib=<v>` |
+| `--tor-onion-port <v>` | `--set tor.onion_port=<v>` |
+| `--tor-onion-tls-port <v>` | `--set tor.onion_tls_port=<v>` |
+| `--tor-socks-port <v>` | `--set tor.socks_port=<v>` |
+| `--log-max-mib <v>` | `--set logging.max_mib=<v>` |
+| `--p2p-peers <a,b>` | `--set 'rawtx.p2p_peers=["a","b"]'` |
+| `--tls` | `--set server.tls=true` |
+| `--adaptive-memtables` | `--set index.adaptive_memtables=true` |
+| `--no-adaptive-memtables` | `--set index.adaptive_memtables=false` |
+| `--pause-core-during-bulk` | `--set pruning.pause_core_during_bulk=true` |
+| `--no-pause-core-during-bulk` | `--set pruning.pause_core_during_bulk=false` |
+| `--tor-plain` | `--set tor.plain=true` |
+| `--no-tor-plain` | `--set tor.plain=false` |
+| `--tor-tls` | `--set tor.tls=true` |
+| `--no-tor-tls` | `--set tor.tls=false` |
+| `--tor-auto-cert` | `--set tor.tls_auto_cert=true` |
+| `--no-tor-auto-cert` | `--set tor.tls_auto_cert=false` |
+| `--adaptive` | `--set index.adaptive=true` |
+| `--no-adaptive` | `--set index.adaptive=false` |
+| `--no-p2p` | `--set rawtx.use_p2p=false` |
+| `--no-esplora` | `--set rawtx.use_esplora=false` |
+| `--stop-on-exit` | `--set core.stop_on_exit=true` |
+| `--no-stop-on-exit` | `--set core.stop_on_exit=false` |
+| `--restart` | `--set core.restart=true` |
+| `--no-restart` | `--set core.restart=false` |
+| `--rawtx-tor` | `--set rawtx.use_tor=true` |
+| `--no-rawtx` | `--set rawtx.enabled=false` |
 
 ## `--set` examples
 

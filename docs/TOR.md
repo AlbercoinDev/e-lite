@@ -106,8 +106,8 @@ CLI equivalents:
 
 ```bash
 e-lite run --network mainnet --allow-mainnet \
-  --tor-mode managed --tor-plain --tor-tls \
-  --tor-onion-port 55011 --tor-onion-tls-port 55022
+  --set tor.mode=managed --set tor.plain=true --set tor.tls=true \
+  --set tor.onion_port=55011 --set tor.onion_tls_port=55022
 ```
 
 Use `--no-tor` to disable Tor for one run.

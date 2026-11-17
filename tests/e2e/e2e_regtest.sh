@@ -22,18 +22,18 @@ SCRIPT_HASH=$(scripthash_of "$CORE" "$RPC_PORT" e2e "$ADDR")
 # Python blocks below import the shared client from tests/lib/e2e.py.
 export PYTHONPATH="$E2E_ROOT/tests/lib${PYTHONPATH:+:$PYTHONPATH}"
 
-COMMON=(--network regtest --core-datadir "$CORE" --core-rpc "http://127.0.0.1:$RPC_PORT" --data-dir "$DATA" --min-free-gib 1 --public-servers "$RUN/public-servers.toml")
+COMMON=(--network regtest --core-datadir "$CORE" --core-rpc "http://127.0.0.1:$RPC_PORT" --data-dir "$DATA" --set pruning.min_free_gib=1 --public-servers "$RUN/public-servers.toml")
 if "$BIN" doctor "${COMMON[@]}" --core-rpc "http://192.0.2.1:8332" \
   --set core.require_loopback_rpc=true >/dev/null 2>&1; then
   fail "strict Core RPC check did not reject a non-loopback endpoint"
 fi
 "$BIN" init "${COMMON[@]}"
 "$BIN" doctor "${COMMON[@]}" --listen "127.0.0.1:$ELECTRUM_PORT" --metrics "127.0.0.1:$METRICS_PORT" \
-  --tls-listen "127.0.0.1:$TLS_PORT" --tls-cert "$TLS_DIR/cert.pem" --tls-key "$TLS_DIR/key.pem" \
+  --tls-listen "127.0.0.1:$TLS_PORT" --set server.tls_cert="$TLS_DIR/cert.pem" --set server.tls_key="$TLS_DIR/key.pem" \
   >"$RUN/doctor.log" 2>&1
 grep -q "public servers:" "$RUN/doctor.log" || fail "doctor did not report the public servers" "$RUN/doctor.log"
 [ -f "$RUN/public-servers.toml" ] || fail "public-servers.toml was not created"
-"$BIN" index "${COMMON[@]}" --no-follow --batch 16 --reorg-window 8 --milestone-blocks 50 \
+"$BIN" index "${COMMON[@]}" --no-follow --set index.batch_blocks=16 --set index.reorg_window=8 --set index.milestone_blocks=50 \
   >"$RUN/index.log" 2>&1
 grep -q "milestone" "$RUN/index.log" || fail "no milestone line" "$RUN/index.log"
 grep -q "%" "$RUN/index.log" || fail "no progress percentage" "$RUN/index.log"
@@ -47,10 +47,10 @@ CUSTOM INDEX {height} {percent} {state}
 CUSTOM READY {height} {percent} {state}
 EOF
 
-elite_start "$RUN/serve.log" run "${COMMON[@]}" --no-follow --reorg-window 8 \
+elite_start "$RUN/serve.log" run "${COMMON[@]}" --no-follow --set index.reorg_window=8 \
   --listen "127.0.0.1:$ELECTRUM_PORT" --metrics "127.0.0.1:$METRICS_PORT" \
-  --tls-listen "127.0.0.1:$TLS_PORT" --tls-cert "$TLS_DIR/cert.pem" --tls-key "$TLS_DIR/key.pem" \
-  --banner-file "$DATA/banner.txt"
+  --tls-listen "127.0.0.1:$TLS_PORT" --set server.tls_cert="$TLS_DIR/cert.pem" --set server.tls_key="$TLS_DIR/key.pem" \
+  --set server.banner_file="$DATA/banner.txt"
 # `run` waits up to 30 s for a freshly created managed Tor to bootstrap
 # before opening the listeners.
 healthy() { curl -sf "http://127.0.0.1:$METRICS_PORT/healthz"; }

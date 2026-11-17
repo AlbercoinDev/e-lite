@@ -24,7 +24,7 @@ e-lite run --network signet --prune-mib 1
   stopped too.
 
 Disk guidance: signet ≥15 GiB free for a from-zero test, testnet4 ≥20 GiB.
-Use `--min-free-gib` and a separate index disk for production.
+Use `[pruning] min_free_gib` and a separate index disk for production.
 
 ## Modes
 
@@ -449,7 +449,7 @@ require restart. Full details in [`TUNING.md`](TUNING.md).
 
 `run`, `index` and `serve` write the same lines shown on screen to
 `<data-dir>/e-lite.log` (per network). Rotation keeps `e-lite.log.1` at 16 MiB by
-default. Override with `--log-file`, `--log-max-mib` or `--no-log-file`, or:
+default. Override with `[logging] file`, `[logging] max_mib` or `--no-log-file`, or:
 
 ```toml
 [logging]
@@ -461,7 +461,7 @@ Core's own log is separate: `<data-dir>/bitcoind.log` (or `[core] log_file`), an
 `e-lite core logs` prints its tail.
 
 `server.banner` uses built-in INDEXING/READY templates. Configure
-`[server] banner_file` (or `--banner-file`) to customize the wallet banner; the
+`[server] banner_file` (or `--set server.banner_file=<path>`) to customize the wallet banner; the
 file is created with the default `[indexing]`/`[ready]` sections if missing.
 The protocol has no banner push, so a connected wallet may need to reconnect.
 

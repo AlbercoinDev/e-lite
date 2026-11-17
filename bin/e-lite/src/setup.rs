@@ -39,15 +39,6 @@ pub(crate) fn effective_config_with(args: &Args, probe_core: bool) -> R<(Config,
     if let Some(d) = &args.core_datadir {
         cfg.core.core_datadir = Some(d.clone());
     }
-    if let Some(d) = &args.blocks_dir {
-        cfg.core.blocks_dir = Some(d.clone());
-    }
-    if let Some(s) = &args.block_source {
-        cfg.index.block_source = s.clone();
-    }
-    if let Some(n) = args.readers {
-        cfg.index.readers = n;
-    }
     if let Some(c) = &args.cookie_file {
         cfg.core.cookie_file = Some(c.clone());
     }
@@ -63,20 +54,8 @@ pub(crate) fn effective_config_with(args: &Args, probe_core: bool) -> R<(Config,
     if let Some(l) = &args.tls_listen {
         cfg.server.tls_listen = l.clone();
     }
-    if let Some(c) = &args.tls_cert {
-        cfg.server.tls_cert = c.clone();
-    }
-    if let Some(k) = &args.tls_key {
-        cfg.server.tls_key = k.clone();
-    }
     if let Some(m) = &args.metrics {
         cfg.metrics.listen = m.clone();
-    }
-    if let Some(b) = args.batch {
-        cfg.index.batch_blocks = b.max(1);
-    }
-    if let Some(w) = args.reorg_window {
-        cfg.index.reorg_window = w.max(1);
     }
     if let Some(m) = &args.manage {
         cfg.core.manage = match m.as_str() {
@@ -93,9 +72,6 @@ pub(crate) fn effective_config_with(args: &Args, probe_core: bool) -> R<(Config,
     if let Some(p) = args.prune_mib {
         cfg.core.prune_mib = p;
     }
-    if let Some(g) = args.min_free_gib {
-        cfg.pruning.min_free_gib = g.max(1);
-    }
     if args.allow_clearnet {
         cfg.rawtx.allow_clearnet = true;
     }
@@ -111,183 +87,20 @@ pub(crate) fn effective_config_with(args: &Args, probe_core: bool) -> R<(Config,
     if args.allow_auto_prune {
         cfg.pruning.allow_auto_prune = true;
     }
-    if args.no_rawtx {
-        cfg.rawtx.enabled = false;
-    }
     if args.no_follow {
         cfg.index.follow = false;
     }
     if args.allow_mainnet {
         cfg.safety.allow_mainnet = true;
     }
-    if let Some(p) = &args.profile {
-        cfg.index.profile = p.clone();
-    }
-    if let Some(a) = args.adaptive {
-        cfg.index.adaptive = a;
-    }
-    if let Some(v) = args.cache_mib {
-        cfg.index.cache_mib = v;
-    }
-    if let Some(v) = args.commit_interval_ms {
-        cfg.index.commit_interval_ms = v;
-    }
-    if let Some(v) = &args.commit_sync {
-        cfg.index.commit_sync = v.clone();
-    }
-    if let Some(v) = args.prefetch_blocks {
-        cfg.index.prefetch_blocks = v;
-    }
-    if let Some(v) = args.write_buffer_mib {
-        cfg.index.write_buffer_mib = v;
-    }
-    if let Some(v) = args.adaptive_memtables {
-        cfg.index.adaptive_memtables = v;
-    }
-    if let Some(v) = args.prefetch_deadline_ms {
-        cfg.index.prefetch_deadline_ms = v;
-    }
-    if let Some(v) = args.max_open_files {
-        cfg.index.max_open_files = v;
-    }
-    if let Some(v) = args.memory_reserve_mib {
-        cfg.index.memory_reserve_mib = v;
-    }
-    if let Some(v) = args.memory_fraction {
-        cfg.index.memory_fraction = v;
-    }
     if args.allow_low_memory {
         cfg.index.allow_low_memory = true;
-    }
-    if let Some(v) = args.background_jobs {
-        cfg.index.background_jobs = v;
-    }
-    if let Some(v) = args.milestone_blocks {
-        cfg.index.milestone_blocks = v;
-    }
-    if let Some(v) = args.milestone_seconds {
-        cfg.index.milestone_seconds = v;
-    }
-    if let Some(v) = args.max_core_lag_blocks {
-        cfg.pruning.max_core_lag_blocks = v;
-    }
-    if let Some(v) = args.max_bulk_lag_blocks {
-        cfg.pruning.max_bulk_lag_blocks = v;
-    }
-    if let Some(v) = args.max_bulk_lag_gib {
-        cfg.pruning.max_bulk_lag_gib = v;
-    }
-    if let Some(v) = args.pause_core_during_bulk {
-        cfg.pruning.pause_core_during_bulk = v;
-    }
-    if let Some(v) = args.core_resume_ahead_blocks {
-        cfg.pruning.core_resume_ahead_blocks = v;
-    }
-    if let Some(v) = args.core_resume_ahead_gib {
-        cfg.pruning.core_resume_ahead_gib = v;
-    }
-    if let Some(v) = args.scheduler.clone() {
-        cfg.pruning.scheduler = v;
-    }
-    if let Some(v) = args.prune_defer_free_gib {
-        cfg.pruning.prune_defer_free_gib = v;
-    }
-    if let Some(v) = args.min_gain_blocks {
-        cfg.pruning.min_gain_blocks = v;
-    }
-    if let Some(v) = args.prune_interval_seconds {
-        cfg.pruning.prune_interval_seconds = v;
-    }
-    if let Some(v) = args.poll_seconds {
-        cfg.pruning.poll_seconds = v;
-    }
-    if let Some(v) = args.repair_max_gap_blocks {
-        cfg.pruning.repair_max_gap_blocks = v;
-    }
-    if let Some(v) = args.critical_free_gib {
-        cfg.pruning.critical_free_gib = v;
-    }
-    if let Some(v) = args.max_clients {
-        cfg.server.max_clients = v;
-    }
-    if let Some(v) = &args.banner_file {
-        cfg.server.banner_file = v.clone();
     }
     if !args.core_args.is_empty() {
         cfg.core.extra_args.extend(args.core_args.iter().cloned());
     }
-    if let Some(v) = args.core_io_priority {
-        cfg.core.io_priority = Some(v);
-    }
-    if let Some(v) = args.core_cgroup_io_weight {
-        cfg.core.cgroup_io_weight = Some(v);
-    }
-    if let Some(v) = &args.p2p_peers {
-        cfg.rawtx.p2p_peers = v
-            .split(',')
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-            .collect();
-    }
-    if args.no_p2p {
-        cfg.rawtx.use_p2p = false;
-    }
-    if args.no_esplora {
-        cfg.rawtx.use_esplora = false;
-    }
-    if let Some(v) = args.decoys {
-        cfg.rawtx.decoys = v;
-    }
-    if let Some(v) = args.rawtx_cache_mib {
-        cfg.rawtx.cache_mib = v;
-    }
-    if let Some(v) = &args.tor_socks {
-        cfg.rawtx.tor_socks = Some(v.clone());
-    }
-    if let Some(v) = &args.tor_mode {
-        cfg.tor.mode = v.clone();
-    }
-    if let Some(v) = args.tor_plain {
-        cfg.tor.plain = v;
-    }
-    if let Some(v) = args.tor_tls {
-        cfg.tor.tls = v;
-    }
-    if let Some(v) = args.tor_auto_cert {
-        cfg.tor.tls_auto_cert = v;
-    }
-    if let Some(v) = args.tor_onion_port {
-        cfg.tor.onion_port = v;
-    }
-    if let Some(v) = args.tor_onion_tls_port {
-        cfg.tor.onion_tls_port = v;
-    }
-    if let Some(v) = args.tor_socks_port {
-        cfg.tor.socks_port = v;
-    }
-    if let Some(v) = &args.tor_binary {
-        cfg.tor.binary = v.clone();
-    }
-    if let Some(v) = &args.tor_target_plain {
-        cfg.tor.target_plain = v.clone();
-    }
-    if let Some(v) = &args.tor_target_tls {
-        cfg.tor.target_tls = v.clone();
-    }
     if args.no_tor {
         cfg.tor.mode = "off".to_string();
-    }
-    if let Some(v) = args.stop_on_exit {
-        cfg.core.stop_on_exit = v;
-    }
-    if let Some(v) = args.restart {
-        cfg.core.restart = v;
-    }
-    if let Some(p) = &args.log_file {
-        cfg.logging.file = Some(p.clone());
-    }
-    if let Some(v) = args.log_max_mib {
-        cfg.logging.max_mib = v;
     }
     if let Some(v) = &args.log_level {
         cfg.logging.level = v.clone();

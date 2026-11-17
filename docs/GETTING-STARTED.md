@@ -60,7 +60,7 @@ Expected:
   signet uses `55211`/`55222`; metrics at `127.0.0.1:55084` (`55284` signet).
 - TLS is enabled by default on the network TLS port with a generated
   self-signed certificate; `--no-tls` disables it. Operator PEMs:
-  `--tls-listen`/`--tls-cert`/`--tls-key` (see
+  `--tls-listen`, `[server] tls_cert`/`tls_key` (see
   [`OPERATIONS.md`](OPERATIONS.md#electrum-tls)).
 
 ## 4. Automated suite
@@ -124,7 +124,7 @@ data dir/network require restart.
 - [ ] `READY`/`FULLY SYNCED` appears in the log/status and `server.banner` shows INDEXING then READY.
 - [ ] Custom `banner_file` is created if missing and its placeholders are substituted.
 - [ ] Prune gate advances in 1k-safe-block steps; free-space deferral is off by default.
-- [ ] `--profile hdd|ssd|nvme|manual` and `--set` work without a config file.
+- [ ] `--set index.profile=hdd|ssd|nvme|manual` and other `--set` keys work without a config file.
 - [ ] Raw tx works from Core/cache; pruned fallback is explicit if unavailable.
 - [ ] Disk-low pauses downloads; indexing continues until the critical floor.
 - [ ] `SIGUSR1` applies hot fields; cold fields are logged.

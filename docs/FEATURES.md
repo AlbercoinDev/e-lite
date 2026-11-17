@@ -110,7 +110,7 @@ available**.
 | Feature | Status | Notes |
 |---|---|---|
 | `/status`, `/metrics`, `/healthz` | experimental | loopback by default; memory and TLS counters |
-| Application log `e-lite.log` | experimental | tee of console; 16 MiB rotation; `--log-file`/`--no-log-file` |
+| Application log `e-lite.log` | experimental | tee of console; 16 MiB rotation; `[logging] file`/`--no-log-file` |
 | Disk breakdown | experimental | `/status.disk`: index, txids, rawtx cache, log and snapshot bytes |
 | Wallet banner | experimental | built-in INDEXING/READY + template file |
 | Adaptive memory budget | experimental | fitted to available RAM; hot cache ceiling and opt-in hot memtables; 75 % ceiling; reserve |

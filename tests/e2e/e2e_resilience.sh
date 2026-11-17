@@ -8,7 +8,7 @@ core_start "$CORE" "$RPC"
 ADDR=$(core_mine_new "$CORE" "$RPC" resil 101)
 SH=$(scripthash_of "$CORE" "$RPC" resil "$ADDR")
 ARGS=(--network regtest --core-datadir "$CORE" --core-rpc "http://127.0.0.1:$RPC"
-  --data-dir "$DATA" --min-free-gib 1 --manage external
+  --data-dir "$DATA" --set pruning.min_free_gib=1 --manage external
   --listen "127.0.0.1:$ELECTRUM" --metrics "127.0.0.1:$METRICS" --no-tls)
 "$BIN" init --network regtest --core-datadir "$CORE" --core-rpc "http://127.0.0.1:$RPC" \
   --data-dir "$DATA" >/dev/null

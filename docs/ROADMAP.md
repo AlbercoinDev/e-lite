@@ -71,6 +71,12 @@ older notes still match. New findings of that review are AUD-173..181 in
 | P3 | Cross-container sync coordination | the per-user IBD lock does not cross mount namespaces; needs a shared lock medium or orchestrator policy. |
 | P3 | Plugin/extension surface | only after core stability; avoid freezing unstable APIs. |
 
+## Cleanup scheduled
+
+| When | Item |
+|---|---|
+| Two releases after 0.1.0-alpha.29.19.0 | Remove `DEPRECATED_FLAGS` (`bin/e-lite/src/cli.rs`): the retired flags then fail as unknown, and their table leaves `docs/CLI.md`. |
+
 ## Explicit non-goals for now
 
 - Public unauthenticated Electrum without TLS/auth.

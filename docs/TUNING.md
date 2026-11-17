@@ -385,8 +385,8 @@ Practical notes:
   at `1024 - reserve`. Raise it (`--ulimit nofile=16384:16384`) for the best
   prevout read speed. e-lite logs the effective value and warns.
 - If the kernel kills the process (`Killed` in the shell), check
-  `dmesg -T | tail` or `journalctl -k`. Lower `--cache-mib`,
-  `--write-buffer-mib` or `--memory-fraction`, not just the cache.
+  `dmesg -T | tail` or `journalctl -k`. Lower `index.cache_mib`,
+  `index.write_buffer_mib` or `index.memory_fraction`, not just the cache.
 - Managed Tor runs inside the same container and shares the budget.
 
 ### UmbrelOS
@@ -592,7 +592,7 @@ lose the last interval, which is reindexed from Core.
 ## Application log
 
 `run`, `index` and `serve` tee stdout/stderr to `<data-dir>/e-lite.log` (same
-lines as the console). Use `--log-file`, `--log-max-mib` or `--no-log-file` to
+lines as the console). Use `[logging] file`, `[logging] max_mib` or `--no-log-file` to
 override; rotation keeps one `e-lite.log.1`.
 
 ## Safety and correctness

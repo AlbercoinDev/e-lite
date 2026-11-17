@@ -35,29 +35,20 @@ pub(crate) struct Args {
     pub(crate) rpc_user: Option<String>,
     pub(crate) rpc_password: Option<String>,
     pub(crate) core_datadir: Option<String>,
-    pub(crate) blocks_dir: Option<String>,
     pub(crate) cookie_file: Option<String>,
     pub(crate) listen: Option<String>,
     pub(crate) tls: Option<bool>,
     pub(crate) plain_lan: bool,
     pub(crate) tls_listen: Option<String>,
-    pub(crate) tls_cert: Option<String>,
-    pub(crate) tls_key: Option<String>,
     pub(crate) metrics: Option<String>,
     pub(crate) allow_mainnet: bool,
     pub(crate) json: bool,
     pub(crate) no_follow: bool,
-    pub(crate) batch: Option<u32>,
-    pub(crate) reorg_window: Option<u32>,
-    pub(crate) block_source: Option<String>,
-    pub(crate) readers: Option<usize>,
     pub(crate) manage: Option<String>,
     pub(crate) prune_mib: Option<u64>,
-    pub(crate) min_free_gib: Option<u64>,
     pub(crate) allow_clearnet: bool,
     pub(crate) use_tor: Option<bool>,
     pub(crate) allow_auto_prune: bool,
-    pub(crate) no_rawtx: bool,
     pub(crate) output: Option<String>,
     pub(crate) input: Option<String>,
     pub(crate) with_core: bool,
@@ -66,74 +57,253 @@ pub(crate) struct Args {
     pub(crate) verify: Option<String>,
     pub(crate) expect_digest: Option<String>,
     pub(crate) set: Vec<String>,
-    pub(crate) profile: Option<String>,
-    pub(crate) adaptive: Option<bool>,
-    pub(crate) cache_mib: Option<u64>,
-    pub(crate) commit_interval_ms: Option<u64>,
-    pub(crate) commit_sync: Option<String>,
-    pub(crate) prefetch_blocks: Option<usize>,
-    pub(crate) write_buffer_mib: Option<u64>,
-    pub(crate) adaptive_memtables: Option<bool>,
-    pub(crate) prefetch_deadline_ms: Option<u64>,
-    pub(crate) max_open_files: Option<u32>,
-    pub(crate) memory_reserve_mib: Option<u64>,
-    pub(crate) memory_fraction: Option<f64>,
     pub(crate) allow_low_memory: bool,
     /// `arc-setup --apply`: run the setup as root (writes the systemd unit).
     pub(crate) apply: bool,
-    pub(crate) background_jobs: Option<usize>,
-    pub(crate) milestone_blocks: Option<u64>,
-    pub(crate) milestone_seconds: Option<u64>,
-    pub(crate) max_core_lag_blocks: Option<u32>,
-    pub(crate) max_bulk_lag_blocks: Option<u32>,
-    pub(crate) max_bulk_lag_gib: Option<u64>,
-    pub(crate) pause_core_during_bulk: Option<bool>,
-    pub(crate) core_resume_ahead_blocks: Option<u32>,
-    pub(crate) core_resume_ahead_gib: Option<u64>,
-    pub(crate) scheduler: Option<String>,
-    pub(crate) prune_defer_free_gib: Option<u64>,
-    pub(crate) min_gain_blocks: Option<u32>,
-    pub(crate) prune_interval_seconds: Option<u64>,
-    pub(crate) poll_seconds: Option<u64>,
-    pub(crate) repair_max_gap_blocks: Option<u32>,
-    pub(crate) critical_free_gib: Option<u64>,
-    pub(crate) max_clients: Option<usize>,
-    pub(crate) banner_file: Option<String>,
     pub(crate) core_args: Vec<String>,
-    pub(crate) core_io_priority: Option<u8>,
-    pub(crate) core_cgroup_io_weight: Option<u64>,
-    pub(crate) p2p_peers: Option<String>,
-    pub(crate) no_p2p: bool,
-    pub(crate) no_esplora: bool,
-    pub(crate) decoys: Option<u32>,
-    pub(crate) rawtx_cache_mib: Option<u64>,
-    pub(crate) tor_socks: Option<String>,
-    pub(crate) tor_mode: Option<String>,
-    pub(crate) tor_plain: Option<bool>,
-    pub(crate) tor_tls: Option<bool>,
-    pub(crate) tor_auto_cert: Option<bool>,
-    pub(crate) tor_onion_port: Option<u16>,
-    pub(crate) tor_onion_tls_port: Option<u16>,
-    pub(crate) tor_socks_port: Option<u16>,
-    pub(crate) tor_binary: Option<String>,
-    pub(crate) tor_target_plain: Option<String>,
-    pub(crate) tor_target_tls: Option<String>,
     pub(crate) no_tor: bool,
     pub(crate) purge: bool,
     pub(crate) yes: bool,
     pub(crate) dry_run: bool,
-    pub(crate) stop_on_exit: Option<bool>,
-    pub(crate) restart: Option<bool>,
-    pub(crate) log_file: Option<String>,
-    pub(crate) log_max_mib: Option<u64>,
     pub(crate) log_level: Option<String>,
     pub(crate) no_log_file: bool,
     pub(crate) no_supervise: bool,
+    /// One line per retired flag that was used, printed by the node.
+    pub(crate) deprecations: Vec<String>,
+}
+
+/// How a retired flag becomes a `--set section.key=value`.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum Retired {
+    /// A string value.
+    Str,
+    /// A non-negative integer.
+    Int,
+    /// An integer, at least 1 (the flag clamped it).
+    IntMin1,
+    Float,
+    /// A comma-separated list of strings.
+    List,
+    /// A switch with this TOML value.
+    Const(&'static str),
+}
+
+/// Flags replaced by `--set` (2026-11-17). Each one still works, as a `--set`
+/// in the same position (a later explicit `--set` of the same key wins), and
+/// prints one deprecation line. To be removed two releases after
+/// 0.1.0-alpha.29.18.0 (ROADMAP).
+pub(crate) const DEPRECATED_FLAGS: &[(&str, &str, Retired)] = &[
+    ("--blocks-dir", "core.blocks_dir", Retired::Str),
+    ("--block-source", "index.block_source", Retired::Str),
+    ("--tls-cert", "server.tls_cert", Retired::Str),
+    ("--tls-key", "server.tls_key", Retired::Str),
+    ("--profile", "index.profile", Retired::Str),
+    ("--commit-sync", "index.commit_sync", Retired::Str),
+    ("--scheduler", "pruning.scheduler", Retired::Str),
+    ("--banner-file", "server.banner_file", Retired::Str),
+    ("--tor-socks", "rawtx.tor_socks", Retired::Str),
+    ("--tor-mode", "tor.mode", Retired::Str),
+    ("--tor-binary", "tor.binary", Retired::Str),
+    ("--tor-target-plain", "tor.target_plain", Retired::Str),
+    ("--tor-target-tls", "tor.target_tls", Retired::Str),
+    ("--log-file", "logging.file", Retired::Str),
+    ("--readers", "index.readers", Retired::Int),
+    ("--bulk-readers", "index.readers", Retired::Int),
+    ("--batch", "index.batch_blocks", Retired::IntMin1),
+    ("--reorg-window", "index.reorg_window", Retired::IntMin1),
+    ("--min-free-gib", "pruning.min_free_gib", Retired::IntMin1),
+    ("--cache-mib", "index.cache_mib", Retired::Int),
+    (
+        "--commit-interval-ms",
+        "index.commit_interval_ms",
+        Retired::Int,
+    ),
+    ("--prefetch-blocks", "index.prefetch_blocks", Retired::Int),
+    ("--write-buffer-mib", "index.write_buffer_mib", Retired::Int),
+    (
+        "--prefetch-deadline-ms",
+        "index.prefetch_deadline_ms",
+        Retired::Int,
+    ),
+    ("--max-open-files", "index.max_open_files", Retired::Int),
+    (
+        "--memory-reserve-mib",
+        "index.memory_reserve_mib",
+        Retired::Int,
+    ),
+    ("--memory-fraction", "index.memory_fraction", Retired::Float),
+    ("--background-jobs", "index.background_jobs", Retired::Int),
+    ("--milestone-blocks", "index.milestone_blocks", Retired::Int),
+    (
+        "--milestone-seconds",
+        "index.milestone_seconds",
+        Retired::Int,
+    ),
+    (
+        "--max-core-lag-blocks",
+        "pruning.max_core_lag_blocks",
+        Retired::Int,
+    ),
+    (
+        "--max-bulk-lag-blocks",
+        "pruning.max_bulk_lag_blocks",
+        Retired::Int,
+    ),
+    (
+        "--max-bulk-lag-gib",
+        "pruning.max_bulk_lag_gib",
+        Retired::Int,
+    ),
+    (
+        "--core-resume-ahead-blocks",
+        "pruning.core_resume_ahead_blocks",
+        Retired::Int,
+    ),
+    (
+        "--core-resume-ahead-gib",
+        "pruning.core_resume_ahead_gib",
+        Retired::Int,
+    ),
+    (
+        "--prune-defer-free-gib",
+        "pruning.prune_defer_free_gib",
+        Retired::Int,
+    ),
+    ("--min-gain-blocks", "pruning.min_gain_blocks", Retired::Int),
+    (
+        "--prune-interval-seconds",
+        "pruning.prune_interval_seconds",
+        Retired::Int,
+    ),
+    ("--poll-seconds", "pruning.poll_seconds", Retired::Int),
+    (
+        "--repair-max-gap-blocks",
+        "pruning.repair_max_gap_blocks",
+        Retired::Int,
+    ),
+    (
+        "--critical-free-gib",
+        "pruning.critical_free_gib",
+        Retired::Int,
+    ),
+    ("--max-clients", "server.max_clients", Retired::Int),
+    ("--core-io-priority", "core.io_priority", Retired::Int),
+    (
+        "--core-cgroup-io-weight",
+        "core.cgroup_io_weight",
+        Retired::Int,
+    ),
+    ("--decoys", "rawtx.decoys", Retired::Int),
+    ("--rawtx-cache-mib", "rawtx.cache_mib", Retired::Int),
+    ("--tor-onion-port", "tor.onion_port", Retired::Int),
+    ("--tor-onion-tls-port", "tor.onion_tls_port", Retired::Int),
+    ("--tor-socks-port", "tor.socks_port", Retired::Int),
+    ("--log-max-mib", "logging.max_mib", Retired::Int),
+    ("--p2p-peers", "rawtx.p2p_peers", Retired::List),
+    ("--tls", "server.tls", Retired::Const("true")),
+    (
+        "--adaptive-memtables",
+        "index.adaptive_memtables",
+        Retired::Const("true"),
+    ),
+    (
+        "--no-adaptive-memtables",
+        "index.adaptive_memtables",
+        Retired::Const("false"),
+    ),
+    (
+        "--pause-core-during-bulk",
+        "pruning.pause_core_during_bulk",
+        Retired::Const("true"),
+    ),
+    (
+        "--no-pause-core-during-bulk",
+        "pruning.pause_core_during_bulk",
+        Retired::Const("false"),
+    ),
+    ("--tor-plain", "tor.plain", Retired::Const("true")),
+    ("--no-tor-plain", "tor.plain", Retired::Const("false")),
+    ("--tor-tls", "tor.tls", Retired::Const("true")),
+    ("--no-tor-tls", "tor.tls", Retired::Const("false")),
+    (
+        "--tor-auto-cert",
+        "tor.tls_auto_cert",
+        Retired::Const("true"),
+    ),
+    (
+        "--no-tor-auto-cert",
+        "tor.tls_auto_cert",
+        Retired::Const("false"),
+    ),
+    ("--adaptive", "index.adaptive", Retired::Const("true")),
+    ("--no-adaptive", "index.adaptive", Retired::Const("false")),
+    ("--no-p2p", "rawtx.use_p2p", Retired::Const("false")),
+    ("--no-esplora", "rawtx.use_esplora", Retired::Const("false")),
+    (
+        "--stop-on-exit",
+        "core.stop_on_exit",
+        Retired::Const("true"),
+    ),
+    (
+        "--no-stop-on-exit",
+        "core.stop_on_exit",
+        Retired::Const("false"),
+    ),
+    ("--restart", "core.restart", Retired::Const("true")),
+    ("--no-restart", "core.restart", Retired::Const("false")),
+    ("--rawtx-tor", "rawtx.use_tor", Retired::Const("true")),
+    ("--no-rawtx", "rawtx.enabled", Retired::Const("false")),
+];
+
+pub(crate) fn retired_flag(flag: &str) -> Option<(&'static str, Retired)> {
+    DEPRECATED_FLAGS
+        .iter()
+        .find(|(name, _, _)| *name == flag)
+        .map(|(_, key, kind)| (*key, *kind))
+}
+
+/// `section.key=value` for a retired flag, reading its value if it takes one.
+pub(crate) fn retired_to_set(flag: &str, value: &mut impl FnMut(&str) -> R<String>) -> R<String> {
+    let (key, kind) = retired_flag(flag).ok_or_else(|| format!("unknown flag: {flag}"))?;
+    let rendered = match kind {
+        Retired::Const(v) => v.to_string(),
+        Retired::Str => toml::Value::String(value(flag)?).to_string(),
+        Retired::Int => value(flag)?
+            .trim()
+            .parse::<u64>()
+            .map_err(|e| format!("{flag}: {e}"))?
+            .to_string(),
+        Retired::IntMin1 => value(flag)?
+            .trim()
+            .parse::<u64>()
+            .map_err(|e| format!("{flag}: {e}"))?
+            .max(1)
+            .to_string(),
+        Retired::Float => value(flag)?
+            .trim()
+            .parse::<f64>()
+            .map_err(|e| format!("{flag}: {e}"))?
+            .to_string(),
+        Retired::List => toml::Value::Array(
+            value(flag)?
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(|s| toml::Value::String(s.to_string()))
+                .collect(),
+        )
+        .to_string(),
+    };
+    Ok(format!("{key}={rendered}"))
 }
 
 pub(crate) fn parse_args() -> R<Args> {
+    parse_args_from(std::env::args().skip(1))
+}
+
+pub(crate) fn parse_args_from(argv: impl IntoIterator<Item = String>) -> R<Args> {
     let mut args = Args::default();
-    let mut it = std::env::args().skip(1);
+    let mut it = argv.into_iter();
     while let Some(raw) = it.next() {
         let (flag, inline) = match raw.split_once('=') {
             Some((f, v)) => (f.to_string(), Some(v.to_string())),
@@ -155,25 +325,16 @@ pub(crate) fn parse_args() -> R<Args> {
             "--data-dir" => args.data_dir = Some(value("--data-dir")?),
             "--core-rpc" => args.rpc_url = Some(value("--core-rpc")?),
             "--core-datadir" => args.core_datadir = Some(value("--core-datadir")?),
-            "--blocks-dir" => args.blocks_dir = Some(value("--blocks-dir")?),
-            "--block-source" => args.block_source = Some(value("--block-source")?),
-            "--bulk-readers" | "--readers" => args.readers = Some(value("--readers")?.parse()?),
             "--cookie-file" => args.cookie_file = Some(value("--cookie-file")?),
             "--rpc-user" => args.rpc_user = Some(value("--rpc-user")?),
             "--rpc-password" => args.rpc_password = Some(value("--rpc-password")?),
             "--listen" => args.listen = Some(value("--listen")?),
             "--tls-listen" => args.tls_listen = Some(value("--tls-listen")?),
-            "--tls" => args.tls = Some(true),
             "--no-tls" => args.tls = Some(false),
             "--plain-lan" => args.plain_lan = true,
-            "--tls-cert" => args.tls_cert = Some(value("--tls-cert")?),
-            "--tls-key" => args.tls_key = Some(value("--tls-key")?),
             "--metrics" => args.metrics = Some(value("--metrics")?),
-            "--batch" => args.batch = Some(value("--batch")?.parse()?),
-            "--reorg-window" => args.reorg_window = Some(value("--reorg-window")?.parse()?),
             "--manage" => args.manage = Some(value("--manage")?),
             "--prune-mib" => args.prune_mib = Some(value("--prune-mib")?.parse()?),
-            "--min-free-gib" => args.min_free_gib = Some(value("--min-free-gib")?.parse()?),
             "--output" => args.output = Some(value("--output")?),
             "--input" => args.input = Some(value("--input")?),
             "--with-core" => args.with_core = true,
@@ -194,130 +355,29 @@ pub(crate) fn parse_args() -> R<Args> {
             }
             "--expect-digest" => args.expect_digest = Some(value("--expect-digest")?),
             "--set" => args.set.push(value("--set")?),
-            "--profile" => args.profile = Some(value("--profile")?),
-            "--cache-mib" => args.cache_mib = Some(value("--cache-mib")?.parse()?),
-            "--commit-interval-ms" => {
-                args.commit_interval_ms = Some(value("--commit-interval-ms")?.parse()?)
-            }
-            "--commit-sync" => args.commit_sync = Some(value("--commit-sync")?),
-            "--prefetch-blocks" => {
-                args.prefetch_blocks = Some(value("--prefetch-blocks")?.parse()?)
-            }
-            "--write-buffer-mib" => {
-                args.write_buffer_mib = Some(value("--write-buffer-mib")?.parse()?)
-            }
-            "--adaptive-memtables" => args.adaptive_memtables = Some(true),
-            "--no-adaptive-memtables" => args.adaptive_memtables = Some(false),
-            "--prefetch-deadline-ms" => {
-                args.prefetch_deadline_ms = Some(value("--prefetch-deadline-ms")?.parse()?)
-            }
-            "--max-open-files" => args.max_open_files = Some(value("--max-open-files")?.parse()?),
-            "--memory-reserve-mib" => {
-                args.memory_reserve_mib = Some(value("--memory-reserve-mib")?.parse()?)
-            }
-            "--memory-fraction" => {
-                args.memory_fraction = Some(value("--memory-fraction")?.parse()?)
-            }
             "--allow-low-memory" => args.allow_low_memory = true,
             "--apply" => args.apply = true,
-            "--background-jobs" => {
-                args.background_jobs = Some(value("--background-jobs")?.parse()?)
-            }
-            "--milestone-blocks" => {
-                args.milestone_blocks = Some(value("--milestone-blocks")?.parse()?)
-            }
-            "--milestone-seconds" => {
-                args.milestone_seconds = Some(value("--milestone-seconds")?.parse()?)
-            }
-            "--max-core-lag-blocks" => {
-                args.max_core_lag_blocks = Some(value("--max-core-lag-blocks")?.parse()?)
-            }
-            "--max-bulk-lag-blocks" => {
-                args.max_bulk_lag_blocks = Some(value("--max-bulk-lag-blocks")?.parse()?)
-            }
-            "--max-bulk-lag-gib" => {
-                args.max_bulk_lag_gib = Some(value("--max-bulk-lag-gib")?.parse()?)
-            }
-            "--pause-core-during-bulk" => args.pause_core_during_bulk = Some(true),
-            "--no-pause-core-during-bulk" => args.pause_core_during_bulk = Some(false),
-            "--core-resume-ahead-blocks" => {
-                args.core_resume_ahead_blocks = Some(value("--core-resume-ahead-blocks")?.parse()?)
-            }
-            "--core-resume-ahead-gib" => {
-                args.core_resume_ahead_gib = Some(value("--core-resume-ahead-gib")?.parse()?)
-            }
-            "--scheduler" => args.scheduler = Some(value("--scheduler")?),
-            "--prune-defer-free-gib" => {
-                args.prune_defer_free_gib = Some(value("--prune-defer-free-gib")?.parse()?)
-            }
-            "--min-gain-blocks" => {
-                args.min_gain_blocks = Some(value("--min-gain-blocks")?.parse()?)
-            }
-            "--prune-interval-seconds" => {
-                args.prune_interval_seconds = Some(value("--prune-interval-seconds")?.parse()?)
-            }
-            "--poll-seconds" => args.poll_seconds = Some(value("--poll-seconds")?.parse()?),
-            "--repair-max-gap-blocks" => {
-                args.repair_max_gap_blocks = Some(value("--repair-max-gap-blocks")?.parse()?)
-            }
-            "--critical-free-gib" => {
-                args.critical_free_gib = Some(value("--critical-free-gib")?.parse()?)
-            }
-            "--max-clients" => args.max_clients = Some(value("--max-clients")?.parse()?),
-            "--banner-file" => args.banner_file = Some(value("--banner-file")?),
             "--core-arg" => args.core_args.push(value("--core-arg")?),
-            "--core-io-priority" => {
-                args.core_io_priority = Some(value("--core-io-priority")?.parse()?)
-            }
-            "--core-cgroup-io-weight" => {
-                args.core_cgroup_io_weight = Some(value("--core-cgroup-io-weight")?.parse()?)
-            }
-            "--p2p-peers" => args.p2p_peers = Some(value("--p2p-peers")?),
-            "--decoys" => args.decoys = Some(value("--decoys")?.parse()?),
-            "--rawtx-cache-mib" => {
-                args.rawtx_cache_mib = Some(value("--rawtx-cache-mib")?.parse()?)
-            }
-            "--tor-socks" => args.tor_socks = Some(value("--tor-socks")?),
-            "--tor-mode" => args.tor_mode = Some(value("--tor-mode")?),
-            "--tor-onion-port" => args.tor_onion_port = Some(value("--tor-onion-port")?.parse()?),
-            "--tor-onion-tls-port" => {
-                args.tor_onion_tls_port = Some(value("--tor-onion-tls-port")?.parse()?)
-            }
-            "--tor-socks-port" => args.tor_socks_port = Some(value("--tor-socks-port")?.parse()?),
-            "--tor-binary" => args.tor_binary = Some(value("--tor-binary")?),
-            "--tor-target-plain" => args.tor_target_plain = Some(value("--tor-target-plain")?),
-            "--tor-target-tls" => args.tor_target_tls = Some(value("--tor-target-tls")?),
-            "--tor-plain" => args.tor_plain = Some(true),
-            "--no-tor-plain" => args.tor_plain = Some(false),
-            "--tor-tls" => args.tor_tls = Some(true),
-            "--no-tor-tls" => args.tor_tls = Some(false),
-            "--tor-auto-cert" => args.tor_auto_cert = Some(true),
-            "--no-tor-auto-cert" => args.tor_auto_cert = Some(false),
             "--no-tor" => args.no_tor = true,
             "--purge" => args.purge = true,
             "--yes" | "-y" => args.yes = true,
             "--dry-run" => args.dry_run = true,
-            "--adaptive" => args.adaptive = Some(true),
-            "--no-adaptive" => args.adaptive = Some(false),
-            "--no-p2p" => args.no_p2p = true,
-            "--no-esplora" => args.no_esplora = true,
-            "--log-file" => args.log_file = Some(value("--log-file")?),
-            "--log-max-mib" => args.log_max_mib = Some(value("--log-max-mib")?.parse()?),
             "--no-log-file" => args.no_log_file = true,
             "--no-supervise" => args.no_supervise = true,
             "--log-level" => args.log_level = Some(value("--log-level")?),
-            "--stop-on-exit" => args.stop_on_exit = Some(true),
-            "--no-stop-on-exit" => args.stop_on_exit = Some(false),
-            "--restart" => args.restart = Some(true),
-            "--no-restart" => args.restart = Some(false),
             "--allow-mainnet" => args.allow_mainnet = true,
             "--allow-clearnet" => args.allow_clearnet = true,
-            "--rawtx-tor" => args.use_tor = Some(true),
             "--no-rawtx-tor" => args.use_tor = Some(false),
             "--allow-auto-prune" => args.allow_auto_prune = true,
-            "--no-rawtx" => args.no_rawtx = true,
             "--json" => args.json = true,
             "--no-follow" => args.no_follow = true,
+            other if retired_flag(other).is_some() => {
+                let item = retired_to_set(other, &mut value)?;
+                args.deprecations.push(format!(
+                    "[e-lite] WARNING: {other} is deprecated and will be removed: use --set {item}"
+                ));
+                args.set.push(item);
+            }
             other if other.starts_with('-') => return fail(format!("unknown flag: {other}")),
             other => {
                 if matches!(
@@ -399,37 +459,55 @@ COMMANDS:
 
 OPTIONS:
     --config <path>         TOML config file (default ~/.config/e-lite/config.toml)
-    --public-servers <path> public-servers.toml (default: next to the config file)
     --network <name>        auto | regtest | signet | testnet4 | mainnet
     --data-dir <path>       index directory
+    --set <key=value>       set any config field for this run, e.g.
+                            --set index.readers=8 --set tor.mode=off
+                            (values: true, 42, ["a","b"], or a bare string;
+                            every key is in config.example.toml)
+    --public-servers <path> public-servers.toml (default: next to the config file)
+    --log-level <level>     info | debug | trace (alpha default: debug)
+    --json                  JSON output for status, privacy check, cache
+    --help, --version
+
+CORE:
     --core-rpc <url>        http://host:port (use an SSH/VPN tunnel for WAN)
+    --core-datadir <path>   Core datadir (cookie is read from there)
+    --cookie-file <path>    explicit Core cookie
     --rpc-user <user>       explicit Core RPC user (remote Core)
     --rpc-password <pass>   explicit Core RPC password (remote Core)
-    --core-datadir <path>   Core datadir (cookie is read from there)
-    --blocks-dir <path>     Core blocks directory (default <datadir>/blocks)
-    --block-source <src>    auto | rpc | files (default auto)
-    --readers <n>           parallel fetch workers (0 = auto)
-    --cookie-file <path>    explicit Core cookie
     --manage <mode>         external | auto | managed (default auto)
     --prune-mib <n>         Core prune mode: 1 manual (default), 0 full, >=550 auto (needs opt-in)
-    --min-free-gib <n>      pause Core downloads below this free space
+    --core-arg <arg>        extra bitcoind argument (repeatable, adds to [core] extra_args)
+
+LISTENERS:
     --listen <addr>         Electrum plain listen (default 127.0.0.1:<network port>;
                             an explicit address also moves TLS to that host)
-    --plain-lan             offer the plain listener on 0.0.0.0 (TLS already is)
-    --tls / --no-tls        enable (default) or disable Electrum TLS
     --tls-listen <addr>     Electrum TLS listen (default <listen host>:<network TLS port>)
-    --tls-cert <path>       PEM certificate chain (default: generated self-signed)
-    --tls-key <path>        PEM private key (default: generated with the certificate)
+    --no-tls                disable Electrum TLS
+    --plain-lan             offer the plain listener on 0.0.0.0 (TLS already is)
     --metrics <addr>        status/metrics listen (default 127.0.0.1:<network port>)
-    --batch <n>             blocks per atomic commit (default 256)
-    --reorg-window <n>      undo window in blocks (default 288)
-    --allow-mainnet         required for mainnet
-    --allow-clearnet        allow external rawtx over clearnet (privacy risk)
+
+PRIVACY:
+    --no-tor                no managed Tor and no onion service
     --no-rawtx-tor          fetch wallet data directly, no Tor (exposes your IP)
-    --rawtx-tor             fetch wallet data through Tor (default)
-    --no-rawtx              disable external rawtx sources
+    --allow-clearnet        allow external rawtx over clearnet (privacy risk)
+
+PROCESS:
+    --no-supervise          run/serve/index as one process, without the
+                            automatic restart after a fatal error
     --no-follow             stop when caught up (only for `index`)
-    --json                  JSON output for status
+    --no-log-file           disable the application log
+
+EXPLICIT PERMISSIONS:
+    --allow-mainnet         required for mainnet
+    --allow-auto-prune      opt in to prune_mib >= 550 (automatic pruning)
+    --allow-low-memory      skip the minimum-RAM check (unsupported)
+    --yes, -y               onion reset, cache clear, import-identity: do not ask
+    --dry-run               cache clear: report what would be removed and stop
+    --purge                 onion reset: delete keys instead of keeping onion.prev
+
+SNAPSHOTS AND IDENTITY:
     --output <path>         file written by export-snapshot / export-identity
     --input <path>          file read by import-snapshot / import-identity
     --with-core             export-snapshot: bundle the network's Core datadir
@@ -439,86 +517,10 @@ OPTIONS:
     --verify [basic|full]   import-snapshot: hash check, or Core verifychain
     --expect-digest <hex>   import-snapshot: refuse unless the recomputed index
                             digest equals this value (from your export output)
-    --set <key=value>       override any TOML field, e.g. index.profile=ssd
-                            (values: true, 42, ["a","b"], or a bare string)
 
-TUNING (all networks):
-    --profile <name>        auto | hdd | ssd | nvme | manual
-    --adaptive              enable the controller (default)
-    --no-adaptive           freeze the configured/derived values
-    --cache-mib <n>         RocksDB block cache (0 = profile/RAM)
-    --write-buffer-mib <n>  total RocksDB memtable budget (0 = effective RAM/16, 512..2048)
-    --memory-reserve-mib <n> RAM left for OS/Core/page cache (0 = effective RAM/8, 2048..4096)
-    --memory-fraction <f>   e-lite ceiling as a share of total RAM (0 = 0.75)
-    --allow-low-memory      skip the minimum-RAM check (unsupported)
-    --background-jobs <n>   RocksDB jobs (0 = profile, capped by CPUs)
-    --commit-interval-ms <n> commit/fsync interval (0 = profile; 500..30000)
-    --commit-sync <mode>    auto | always | txids (bulk durability tradeoff)
-    --prefetch-blocks <n>   prepared-block window cap (0 = auto; >0 caps)
-    --prefetch-deadline-ms <n> stop prefetching a block after n ms (0 = off)
-    --max-open-files <n>        RocksDB fds for table readers (0 = 8192)
-    --adaptive-memtables    let the controller resize memtables at runtime
-    --no-adaptive-memtables keep the startup memtable budget (default)
-    --milestone-blocks <n>  progress report every N blocks (0 = off)
-    --milestone-seconds <n> progress report every N seconds (0 = off)
-
-PRUNING AND CORE:
-    --max-core-lag-blocks <n>   auto-prune download limit (0 = off)
-    --max-bulk-lag-blocks <n>   legacy block growth limit (used if GiB is 0)
-    --max-bulk-lag-gib <n>      pause Core above this unindexed backlog (0 = off)
-    --pause-core-during-bulk    pause Core during a long catch-up (default)
-    --no-pause-core-during-bulk disable the full bulk pause
-    --core-resume-ahead-blocks <n> legacy resume margin in blocks
-    --core-resume-ahead-gib <n> resume Core below this backlog (default 7)
-    --scheduler <mode>          overlap (default) | alternate (opt-in test)
-    --prune-defer-free-gib <n>  skip normal prune above this free space (default 20)
-    --min-gain-blocks <n>       minimum safe-height gain between prunes (default 5000)
-    --prune-interval-seconds <n> minimum time between prunes
-    --poll-seconds <n>          supervisor poll interval
-    --repair-max-gap-blocks <n> largest external prune-gap repair
-    --critical-free-gib <n>     pause indexing below this free space
-    --allow-auto-prune          opt in to prune_mib >= 550 (automatic pruning)
-    --core-arg <arg>            extra bitcoind argument (repeatable)
-    --core-io-priority <0-7>    best-effort ionice for managed Core (opt-in)
-    --core-cgroup-io-weight <n> best-effort cgroup v2 io.weight (opt-in)
-    --stop-on-exit / --no-stop-on-exit
-    --restart / --no-restart
-
-RAWTX, SERVER AND TLS:
-    --max-clients <n>       Electrum client limit
-    --banner-file <path>    wallet banner template (created if missing)
-    --p2p-peers <a,b>       comma-separated P2P peers for rawtx/repair
-    --no-p2p                disable the P2P rawtx/repair source
-    --no-esplora            disable the Esplora rawtx/repair source
-    --decoys <n>            decoy wallets per wallet load (0 disables)
-    --rawtx-cache-mib <n>   validated rawtx cache size (0 = disabled)
-    --tor-socks <addr>      SOCKS5h proxy for rawtx (see --no-rawtx-tor for direct)
-
-TOR / ONION:
-    --tor-mode <mode>       managed | off (default managed)
-    --no-tor                same as --tor-mode off
-    --tor-plain / --no-tor-plain    publish the plain Electrum port on the onion
-    --tor-tls / --no-tor-tls        publish the TLS Electrum port on the onion
-    --tor-auto-cert / --no-tor-auto-cert
-                            self-signed TLS certificate when none is configured
-    --tor-onion-port <n>    onion virtual port for plain (0 = same as listen)
-    --tor-onion-tls-port <n> onion virtual port for TLS (0 = same as tls-listen)
-    --tor-socks-port <n>    managed Tor SOCKS port (0 = auto)
-    --tor-binary <path>     Tor binary (empty = installer bundle, then PATH)
-    --tor-target-plain <addr> loopback target for the plain onion port
-    --tor-target-tls <addr> loopback target for the TLS onion port
-    --purge                 onion reset: delete keys instead of keeping onion.prev
-    --yes, -y               onion reset and cache clear: do not ask for confirmation
-    --dry-run               cache clear: report what would be removed and stop
-
-LOGGING:
-    --log-file <path>       application log (default <data-dir>/e-lite.log)
-    --log-max-mib <n>       rotate to e-lite.log.1 above N MiB (0 = never)
-    --log-level <level>     info | debug | trace (alpha default: debug;
-                            extra diagnostic lines are gated by this level)
-    --no-log-file           disable the application log
-    --no-supervise          run/serve/index as one process, without the
-                            automatic restart of e-lite after a fatal error
+Everything else (tuning, pruning, rawtx, Tor ports, logging) is a config key:
+put it in config.toml, or pass --set for one run. Older flags such as
+--readers still work for now and print their replacement (docs/CLI.md).
 "#
     )
 }

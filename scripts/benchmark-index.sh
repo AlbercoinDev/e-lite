@@ -9,7 +9,7 @@
 # Example:
 #   scripts/benchmark-index.sh mainnet "$DATA" "$CORE" 600 -- \
 #     --core-rpc http://127.0.0.1:8332 --manage managed --prune-mib 1 \
-#     --allow-mainnet --profile ssd --no-adaptive
+#     --allow-mainnet --set index.profile=ssd --set index.adaptive=false
 set -euo pipefail
 
 if [ "$#" -lt 3 ]; then
@@ -33,7 +33,7 @@ echo "== e-lite benchmark =="
 echo "network: $NETWORK  data: $DATA  core: $CORE  seconds: $SECONDS_TO_RUN"
 echo "log: $LOG"
 "$BIN" run --network "$NETWORK" --data-dir "$DATA" --core-datadir "$CORE" \
-  --min-free-gib 1 "${EXTRA[@]}" >"$LOG" 2>&1 &
+  --set pruning.min_free_gib=1 "${EXTRA[@]}" >"$LOG" 2>&1 &
 PID=$!
 sleep "$SECONDS_TO_RUN"
 kill -TERM "$PID" 2>/dev/null || true

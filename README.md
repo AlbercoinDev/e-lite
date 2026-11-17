@@ -67,7 +67,7 @@ INDEXING/READY banner; customize it with `[server] banner_file`.
 All tuning is available without a config file:
 
 ```bash
-e-lite run --network mainnet --allow-mainnet --profile nvme
+e-lite run --network mainnet --allow-mainnet --set index.profile=nvme
 e-lite run --set index.profile=ssd --set index.cache_mib=2048
 ```
 

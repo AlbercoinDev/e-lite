@@ -321,6 +321,10 @@ fn run() -> R<()> {
             eprintln!("[e-lite] WARNING: {e}; continuing without a log file");
         }
     }
+    // Printed by the node (into its log), not by the watching parent.
+    for line in &args.deprecations {
+        eprintln!("{line}");
+    }
     if let Some(note) = supervisor::restart_note() {
         eprintln!("{note}");
     }

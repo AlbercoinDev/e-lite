@@ -1,7 +1,7 @@
 # e-lite configuration (v0.2)
 # Every value shown is the default unless stated otherwise.
 # Any field can be overridden without this file: see `e-lite --help` and
-# docs/CLI.md (`--profile`, `--cache-mib`, `--set section.key=value`, ...).
+# docs/CLI.md (`--network`, `--data-dir`, `--set section.key=value`, ...).
 
 [network]
 name = "auto"                       # auto | mainnet | testnet4 | signet | regtest

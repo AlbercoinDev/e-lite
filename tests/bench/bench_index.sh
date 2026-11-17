@@ -73,9 +73,9 @@ for spec in "${specs[@]}"; do
   IFS=: read -r name readers batch <<<"$spec"
   data="$RUN/index-$name"
   args=(index --network regtest --core-datadir "$CORE" --core-rpc "http://127.0.0.1:$RPC"
-        --data-dir "$data" --manage external --min-free-gib 1 --no-tls --no-follow --no-rawtx)
-  [ -n "${readers:-}" ] && args+=(--readers "$readers")
-  [ -n "${batch:-}" ] && args+=(--batch "$batch")
+        --data-dir "$data" --manage external --set pruning.min_free_gib=1 --no-tls --no-follow --set rawtx.enabled=false)
+  [ -n "${readers:-}" ] && args+=(--set "index.readers=$readers")
+  [ -n "${batch:-}" ] && args+=(--set "index.batch_blocks=$batch")
   timeout "${RUN_TIMEOUT:-900}" python3 "$SCRIPT_DIR/bench_run.py" \
     "$RUN/$name.log" "$RUN/$name.meta" -- "$BIN" "${args[@]}"
   read -r secs rss <"$RUN/$name.meta"
