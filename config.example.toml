@@ -207,10 +207,11 @@ max_parallel_fetches = 16           # external block downloads in flight (the pr
 #   tx    = loose transaction first, whole block as fallback
 #   block = whole blocks only; no txid leaves the node
 path = "auto"
-wallet_deadline_seconds = 35       # total per wallet request (queue + network);
+wallet_deadline_seconds = 45       # total per wallet request (queue + network):
 txid_attempt_seconds = 3           # replace a provider that misses this;
                                    # in auto the txid gets 1.5 s before the block starts
-txid_race = true                   # auto: short head start for an in-flight block
+txid_race = false                  # true: in auto, the txid path only gets a
+                                   # 2.5 s head start before the block starts
 decoy_sessions = "same_round"      # or "background" (one decoy wallet while real wait)
 sessions_total = 16                # concurrent per-txid sessions (1-32)
 jitter_ms = 50                     # random delay before a session (0-250)

@@ -1,8 +1,8 @@
 # Session handoff
 
 **Updated:** 2026-11-17 (alpha.29.24.0: txid-first cold loads, 35 s wallet deadline)
-**Latest published release:** `0.1.0-alpha.29.24.1`
-**Release:** https://github.com/AlbercoinDev/e-lite/releases/tag/v0.1.0-alpha.29.24.1
+**Latest published release:** `0.1.0-alpha.29.25.0`
+**Release:** https://github.com/AlbercoinDev/e-lite/releases/tag/v0.1.0-alpha.29.25.0
 
 This is the short “where we are”. The invariants live in
 [`AGENTS.md`](../AGENTS.md); the
@@ -88,7 +88,14 @@ no repitas contexto ni rehagas decisiones ya documentadas.
   `docs/ROADMAP.md` is future work only, and `docs/AUDIT.md` holds the open
   findings (`docs/audit/FIXED.md` is the fixed history).
 
-## Last change (alpha.29.24.1): subscribe retry and lock recovery
+## Last change (alpha.29.25.0): the cheap path first
+
+- `auto` runs two per-txid session attempts (6 s) before any block; the block
+  gets 20 s of network and retries for transient failures inside the 45 s
+  wallet deadline. `txid_race` (false by default) shortens the txid budget to
+  2.5 s for an earlier block start.
+
+## Previous change (alpha.29.24.1): subscribe retry and lock recovery
 
 - `blockchain.scripthash.subscribe` retries once after 50 ms on a transient
   error instead of returning -32000 (Sparrow stores a null transaction).

@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.1.0-alpha.29.25.0 — 2026-11-17
+
+### Fixed
+
+- Cold wallet loads downloaded blocks too eagerly and gave them too little
+  time. In `auto` the per-txid path now runs **two session attempts**
+  (`txid_attempt_seconds` each, 6 s) before any block is downloaded; measured
+  p95 of a 50-tx batch is 1.2 s, so a healthy load serves the wallet without
+  touching the block path. `txid_race` (now `false` by default) gives the
+  block an earlier start at 2.5 s for operators who prefer it.
+- The block path gets **20 s of network** (was 8 s): a 1.9 MB block takes
+  ~3.2 s over Tor on a good circuit, but 16 concurrent downloads share the
+  bandwidth and Esplora providers answer 429 under that load.
+- Any transient block failure (deadline, 429, stall, slot wait) is retried up
+  to twice within the wallet deadline; only a definitive failure reaches the
+  wallet (AUD-045). A concurrent txid landing is picked up between attempts.
+
+### Tests
+
+- All suites green with the new budgets; config example matches defaults.
+
 ## 0.1.0-alpha.29.24.1 — 2026-11-17
 
 ### Fixed

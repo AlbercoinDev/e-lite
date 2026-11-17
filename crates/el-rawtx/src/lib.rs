@@ -230,7 +230,7 @@ pub const WALLET_BLOCK_BUDGET: Duration = Duration::from_secs(20);
 /// Network part of a wallet block request, once it holds a download slot.
 /// Eight seconds covers a 1.9 MB block on a slow circuit and leaves the race
 /// engine room to retry a recovering endpoint (MIN_ATTEMPT * 3).
-pub const WALLET_BLOCK_NET: Duration = Duration::from_secs(8);
+pub const WALLET_BLOCK_NET: Duration = Duration::from_secs(20);
 /// Head start given to a block download already in flight before the per-txid
 /// path starts: both run concurrently and the first verified answer wins.
 pub const RACE_HEAD_START: Duration = Duration::from_millis(250);
@@ -238,7 +238,7 @@ pub const RACE_HEAD_START: Duration = Duration::from_millis(250);
 /// started. Measured p95 of a 50-tx Electrum batch is 1.2 s, so a healthy
 /// txid path wins and no block is downloaded; a stalled one starts the block
 /// early enough to keep the wallet load fast.
-pub const TXID_HEAD_START: Duration = Duration::from_millis(1500);
+pub const TXID_HEAD_START: Duration = Duration::from_millis(2500);
 /// Extra time a follower waits beyond the leader's deadline.
 pub const FOLLOWER_GRACE: Duration = Duration::from_secs(5);
 /// A block whose download just failed is answered from that failure for this
@@ -620,9 +620,9 @@ impl RawtxConfig {
             privacy: PrivacyParams::default(),
             electrum_servers: Vec::new(),
             path: ExternalPath::Auto,
-            wallet_deadline_seconds: 35,
+            wallet_deadline_seconds: 45,
             txid_attempt_seconds: 3,
-            txid_race: true,
+            txid_race: false,
             decoy_sessions: DecoySessions::SameRound,
             sessions_total: 16,
             jitter_ms: 50,
@@ -1334,7 +1334,8 @@ impl Resolver {
         let mut block = self.local_block(&rec).map(|(block, _)| block);
         if block.is_none() {
             // One deadline for the whole wallet request
-            // (rawtx.wallet_deadline_seconds): queue and both paths share it.
+            // (rawtx.wallet_deadline_seconds, 45 s by default): queue and
+            // both paths share it.
             let request_deadline = Instant::now() + self.wallet_deadline;
             let pruned_below = self.prune_height.load(Ordering::Relaxed);
             let pruned = pruned_below > 0 && height < pruned_below;
@@ -1357,19 +1358,33 @@ impl Resolver {
                     if let Some(tm) = &self.tx_mode {
                         if let Some(pos) = self.position_of(txid, height) {
                             let t = TxRef { txid, height, pos };
-                            // The cheap path first: a short head start in
-                            // `auto` (the block is only downloaded if the txid
-                            // does not arrive), a full attempt in `tx`.
-                            let now = Instant::now();
-                            let first = if self.path == ExternalPath::Auto && self.txid_race {
+                            // The cheap path first, with a real budget: two
+                            // session attempts of `txid_attempt_seconds` each
+                            // (3 s; a provider that misses it is replaced).
+                            // No block is downloaded while this budget lasts,
+                            // so a healthy txid path serves the wallet without
+                            // touching the block path. Only `txid_race` gives
+                            // the block an earlier start (opt-in).
+                            let early_block = self.path == ExternalPath::Auto && self.txid_race;
+                            let head_start = if early_block {
                                 TXID_HEAD_START
                             } else {
                                 self.txid_attempt
                             };
-                            let first_deadline = (now + first).min(request_deadline);
-                            if first_deadline > now {
+                            for round in 0..2 {
+                                if early_block && round == 1 {
+                                    // The block path below takes over; the
+                                    // txid request stays queued in the
+                                    // batcher and is cached when it lands.
+                                    break;
+                                }
+                                let now = Instant::now();
+                                let attempt = (now + head_start).min(request_deadline);
+                                if attempt <= now {
+                                    break;
+                                }
                                 txid_tried = true;
-                                if let Ok(hex) = tm.fetch(ctx, t, first_deadline) {
+                                if let Ok(hex) = tm.fetch(ctx, t, attempt) {
                                     self.stats.txid_wins.fetch_add(1, Ordering::Relaxed);
                                     if joined_block {
                                         self.stats.race_wins_txid.fetch_add(1, Ordering::Relaxed);
@@ -1378,60 +1393,62 @@ impl Resolver {
                                 }
                                 self.stats.txid_stalls.fetch_add(1, Ordering::Relaxed);
                             }
-                            // `tx`: one more attempt, still much cheaper than
-                            // a block, before the fallback.
-                            if self.path == ExternalPath::Tx {
-                                let now = Instant::now();
-                                let second = (now + self.txid_attempt).min(request_deadline);
-                                if second > now {
-                                    if let Ok(hex) = tm.fetch(ctx, t, second) {
-                                        self.stats.txid_wins.fetch_add(1, Ordering::Relaxed);
-                                        return Ok(hex);
-                                    }
-                                }
-                            }
                         }
                     }
                 }
             }
             if block.is_none() {
                 // 4) Whole block from external sources. The queue gets the
-                // rest of the request budget (27 s by default) so a cold
-                // burst waits for a slot instead of failing a confirmed tx.
+                // rest of the request budget (~25 s of queue + 20 s of
+                // network) so a cold burst waits for a slot instead of
+                // failing a confirmed tx. Any transient failure (deadline,
+                // 429, stall, slot) is retried while budget remains; only a
+                // definitive failure reaches the wallet (AUD-045).
                 let joining = self.block_inflight(&rec.hash);
-                let fetched = match self.external_block(
-                    &rec,
-                    priority,
-                    Some(request_deadline.max(Instant::now() + MIN_ATTEMPT)),
-                ) {
-                    Ok((block, _)) => block,
-                    Err(first) => {
-                        // Only a slot-starvation failure is retried: a real
-                        // provider failure keeps the failure memory (AUD-158)
-                        // and a missing source keeps its explicit error. With
-                        // the 27 s queue this path is rare, and it is what
-                        // stops a cold burst from failing a confirmed tx.
-                        let starved = first.to_string().contains("download slot stayed busy");
-                        if !starved
-                            || request_deadline.saturating_duration_since(Instant::now())
-                                < Duration::from_secs(2)
-                        {
-                            return Err(first);
+                let mut last_error: Option<RawtxError> = None;
+                for attempt in 0..3 {
+                    if let Some(hex) = self.cached_tx(&rec, txid) {
+                        // A concurrent txid attempt landed while we waited.
+                        self.stats.cache_hits.fetch_add(1, Ordering::Relaxed);
+                        return Ok(hex);
+                    }
+                    let remaining = request_deadline.saturating_duration_since(Instant::now());
+                    if remaining < MIN_ATTEMPT {
+                        break;
+                    }
+                    match self.external_block(
+                        &rec,
+                        priority,
+                        Some(request_deadline.max(Instant::now() + MIN_ATTEMPT)),
+                    ) {
+                        Ok((fetched, _)) => {
+                            if joining {
+                                self.stats.block_joins.fetch_add(1, Ordering::Relaxed);
+                            }
+                            if joined_block || txid_tried {
+                                self.stats.race_wins_block.fetch_add(1, Ordering::Relaxed);
+                            }
+                            block = Some(fetched);
+                            break;
                         }
-                        std::thread::sleep(Duration::from_millis(300));
-                        match self.fetch_external_block(&rec, priority, Some(request_deadline)) {
-                            Ok((block, _)) => block,
-                            Err(second) => return Err(second),
+                        Err(error) => {
+                            last_error = Some(error);
+                            let retry = attempt < 2
+                                && last_error
+                                    .as_ref()
+                                    .is_some_and(Self::is_transient_block_failure);
+                            if !retry {
+                                break;
+                            }
+                            std::thread::sleep(Duration::from_millis(400));
                         }
                     }
-                };
-                if joining {
-                    self.stats.block_joins.fetch_add(1, Ordering::Relaxed);
                 }
-                if joined_block || txid_tried {
-                    self.stats.race_wins_block.fetch_add(1, Ordering::Relaxed);
+                if block.is_none() {
+                    return Err(last_error.unwrap_or_else(|| {
+                        RawtxError::Unavailable("wallet deadline reached".into())
+                    }));
                 }
-                block = Some(fetched);
             }
         }
         let block = block.expect("a block was fetched or joined");
@@ -1440,6 +1457,27 @@ impl Resolver {
             .pop()
             .ok_or_else(|| RawtxError::Verify("transaction is not in the block".into()))?;
         Ok(hex)
+    }
+
+    /// Transient failures a confirmed transaction may wait for or retry: a
+    /// missing source, a verify error or a provider's hard failure are not.
+    fn is_transient_block_failure(error: &RawtxError) -> bool {
+        let text = error.to_string();
+        [
+            "download slot stayed busy",
+            "external fetch deadline reached",
+            "deadline reached",
+            "Too Many Requests",
+            "429",
+            "timed out",
+            "stalled",
+            "inflight block download timed out",
+            "inflight result lost",
+            "every attempt slot stayed busy",
+            "no session slot",
+        ]
+        .iter()
+        .any(|needle| text.contains(needle))
     }
 
     /// The in-flight download of this block, when another caller started it.

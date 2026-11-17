@@ -677,9 +677,10 @@ pub struct RawtxCfg {
     /// when it misses it.
     #[serde(default = "d_txid_attempt")]
     pub txid_attempt_seconds: u64,
-    /// In `auto`, give an in-flight block a short head start and race it
-    /// against the per-txid path.
-    #[serde(default = "d_true")]
+    /// In `auto`, start the block after a 2.5 s txid head start instead of
+    /// waiting for the full two txid attempts. Off by default: the txid path
+    /// is faster and cheaper, and a block is only downloaded when it fails.
+    #[serde(default)]
     pub txid_race: bool,
     /// `same_round` (default) sends the decoy wallets in the same dispatch as
     /// the real one; `background` keeps only one while real requests wait.
@@ -770,7 +771,7 @@ impl Default for RawtxCfg {
             path: d_rawtx_path(),
             wallet_deadline_seconds: d_wallet_deadline(),
             txid_attempt_seconds: d_txid_attempt(),
-            txid_race: true,
+            txid_race: false,
             decoy_sessions: d_decoy_sessions(),
             sessions_total: d_sessions_total(),
             jitter_ms: d_jitter_ms(),
@@ -873,7 +874,7 @@ fn d_rawtx_path() -> String {
     "auto".to_string()
 }
 fn d_wallet_deadline() -> u64 {
-    35
+    45
 }
 fn d_txid_attempt() -> u64 {
     3
@@ -1523,9 +1524,9 @@ mod tests {
     fn wallet_rawtx_defaults_and_validation() {
         let cfg = Config::default();
         assert_eq!(cfg.rawtx.path, "auto");
-        assert_eq!(cfg.rawtx.wallet_deadline_seconds, 35);
+        assert_eq!(cfg.rawtx.wallet_deadline_seconds, 45);
         assert_eq!(cfg.rawtx.txid_attempt_seconds, 3);
-        assert!(cfg.rawtx.txid_race);
+        assert!(!cfg.rawtx.txid_race);
         assert_eq!(cfg.rawtx.decoy_sessions, "same_round");
         assert_eq!(cfg.rawtx.sessions_total, 16);
         assert_eq!(cfg.rawtx.jitter_ms, 50);
@@ -1573,7 +1574,7 @@ mod tests {
                 "rawtx.path=block".to_string(),
                 "rawtx.wallet_deadline_seconds=20".to_string(),
                 "rawtx.txid_attempt_seconds=4".to_string(),
-                "rawtx.txid_race=false".to_string(),
+                "rawtx.txid_race=true".to_string(),
                 "rawtx.decoy_sessions=background".to_string(),
                 "rawtx.sessions_total=24".to_string(),
                 "rawtx.jitter_ms=0".to_string(),
@@ -1586,7 +1587,7 @@ mod tests {
         assert_eq!(cfg.rawtx.path, "block");
         assert_eq!(cfg.rawtx.wallet_deadline_seconds, 20);
         assert_eq!(cfg.rawtx.txid_attempt_seconds, 4);
-        assert!(!cfg.rawtx.txid_race);
+        assert!(cfg.rawtx.txid_race);
         assert_eq!(cfg.rawtx.decoy_sessions, "background");
         assert_eq!(cfg.rawtx.sessions_total, 24);
         assert_eq!(cfg.rawtx.jitter_ms, 0);

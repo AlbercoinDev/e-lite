@@ -241,9 +241,9 @@ e-lite run --network mainnet --allow-mainnet \
 | `--set rawtx.provider_cooldown_seconds=<n>` | cool down a failed provider (Tor or direct) | `300` |
 | `--set rawtx.max_parallel_fetches=<n>` | concurrent external block downloads | `16` |
 | `--set rawtx.path=auto\|tx\|block` | how a pruned transaction is resolved: race the block (auto), txid first (tx) or block only | `auto` |
-| `--set rawtx.wallet_deadline_seconds=<n>` | total per wallet request (queue + network) | `35` |
+| `--set rawtx.wallet_deadline_seconds=<n>` | total per wallet request (queue + network) | `45` |
 | `--set rawtx.txid_attempt_seconds=<n>` | replace a per-txid provider that misses this | `3` |
-| `--set rawtx.txid_race=<bool>` | in `auto`, give the per-txid path 1.5 s before the block starts | `true` |
+| `--set rawtx.txid_race=<bool>` | in `auto`, give the per-txid path only 2.5 s before the block starts | `false` |
 | `--set rawtx.decoy_sessions=same_round\|background` | decoy wallets in the same round or one in the background | `same_round` |
 | `--set rawtx.sessions_total=<n>` | concurrent per-txid sessions | `16` |
 | `--set rawtx.jitter_ms=<n>` | random delay before a session (0-250) | `50` |
@@ -266,13 +266,13 @@ e-lite run --network mainnet --allow-mainnet \
 ### Wallet request budgets (alpha.29.20.0)
 
 - A per-txid session gets **3 s**; a provider that misses it is replaced.
-- The txid path gets **8 s** per transaction. A pruned `transaction.get` starts
-  the block download on demand, and any later request of the same block joins
-  the download in flight instead of spending the txid budget.
-- A wallet request gets **35 s** total: the per-txid path a 1.5 s head start
-  in `auto` (3 s per session attempt), the block a queue of ~27 s and 8 s of
-  network once it has a slot. A 1.9 MB block takes ~3.2 s over Tor at
-  581 KiB/s.
+- The per-txid path gets **6 s** per transaction (two session attempts). A
+  pruned `transaction.get` joins a block download already in flight instead of
+  spending the txid budget; no block is downloaded while the txid budget lasts.
+- A wallet request gets **45 s** total: the per-txid path two 3 s session
+  attempts (6 s) in `auto` and `tx`, and the block a queue of ~25 s plus 20 s
+  of network once it has a slot. A 1.9 MB block takes ~3.2 s over Tor at
+  581 KiB/s; under 16 concurrent downloads it needs more, hence 20 s.
 - The batch size per server is **adaptive**: 50 by default and halved (down to
   2) when a provider closes the connection. Measured:
   `electrum.blockstream.info` accepts 20 txids and closes above that.
