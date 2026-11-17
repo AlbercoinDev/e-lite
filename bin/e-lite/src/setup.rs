@@ -1434,3 +1434,192 @@ pub(crate) fn ensure_identity_blocking(
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn disk_resume_is_adaptive() {
+        let mut cfg = Config::default();
+        cfg.pruning.min_free_gib = 2;
+        assert_eq!(disk_low_bytes(&cfg), 2 * GIB);
+        assert_eq!(disk_resume_bytes(&cfg), 3 * GIB);
+        cfg.pruning.min_free_gib = 10;
+        assert_eq!(disk_resume_bytes(&cfg), 15 * GIB);
+    }
+
+    #[test]
+    fn auto_detects_chain_from_existing_database() {
+        let dir = std::env::temp_dir().join(format!(
+            "e-lite-auto-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        {
+            let store = Store::open(&dir).unwrap();
+            store
+                .init_identity(&NetworkIdentity::new(
+                    Chain::Regtest,
+                    Chain::Regtest.known_genesis().unwrap(),
+                ))
+                .unwrap();
+        }
+        let mut cfg = Config::default();
+        cfg.network.name = "auto".to_string();
+        cfg.network.data_dir = Some(dir.display().to_string());
+        assert_eq!(detect_chain_from_db(&cfg).unwrap(), Some(Chain::Regtest));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rate_limit_defaults_are_uniform_and_generous() {
+        let mut cfg = Config::default();
+        assert_eq!(effective_rate_limit(&cfg), (200, 5000), "loopback");
+
+        cfg.server.listen = "0.0.0.0:50001".to_string();
+        assert_eq!(effective_rate_limit(&cfg), (200, 5000), "exposed");
+
+        cfg.server.rate_limit = Some(0);
+        assert_eq!(effective_rate_limit(&cfg), (0, 5000), "explicit 0 disables");
+
+        cfg.server.rate_limit = Some(10);
+        cfg.server.rate_burst = Some(5);
+        assert_eq!(effective_rate_limit(&cfg), (10, 5));
+
+        let mut cfg = Config::default();
+        cfg.server.tls_listen = "0.0.0.0:50002".to_string();
+        assert_eq!(effective_rate_limit(&cfg), (200, 5000), "exposed TLS");
+    }
+
+    #[test]
+    fn provider_readiness_is_required_only_for_networked_wallets() {
+        let mut cfg = Config::default();
+        assert!(!requires_ready_provider(&cfg, Chain::Regtest, true));
+        assert!(requires_ready_provider(&cfg, Chain::Signet, true));
+        // No Esplora endpoint to probe: the gate cannot succeed, so it is
+        // skipped even with `require_ready` (AUD-167).
+        assert!(!requires_ready_provider(&cfg, Chain::Signet, false));
+        cfg.public_servers.require_ready = false;
+        assert!(!requires_ready_provider(&cfg, Chain::Signet, true));
+        cfg.public_servers.require_ready = true;
+        cfg.rawtx.enabled = false;
+        assert!(!requires_ready_provider(&cfg, Chain::Signet, true));
+        cfg.rawtx.enabled = true;
+        cfg.rawtx.use_esplora = false;
+        assert!(!requires_ready_provider(&cfg, Chain::Signet, true));
+    }
+
+    #[test]
+    fn p2p_peers_refresh_soon_when_empty_and_honour_pinned_peers() {
+        assert_eq!(p2p_refresh_interval(0), Duration::from_secs(60));
+        assert_eq!(p2p_refresh_interval(5), Duration::from_secs(600));
+        let mut cfg = Config::default();
+        assert!(p2p_discovery_enabled(&cfg));
+        cfg.rawtx.p2p_peers = vec!["192.0.2.1:8333".into()];
+        assert!(
+            !p2p_discovery_enabled(&cfg),
+            "pinned peers are never replaced"
+        );
+        cfg.rawtx.p2p_peers.clear();
+        cfg.rawtx.use_p2p = false;
+        assert!(!p2p_discovery_enabled(&cfg));
+    }
+
+    #[test]
+    fn external_fetches_are_private_by_default() {
+        // AUD-128: no clearnet fallback unless the operator opts in.
+        // AUD-159: the prefetch is on, with decoys (see el-rawtx tests).
+        let cfg = Config::default();
+        assert!(!cfg.rawtx.tor_fallback_clearnet);
+        assert!(!cfg.rawtx.allow_clearnet);
+        assert!(cfg.rawtx.prefetch);
+        assert!(cfg.rawtx.decoys >= 1);
+        let parsed: Config = toml::from_str("[rawtx]\nenabled = true\n").unwrap();
+        assert!(!parsed.rawtx.tor_fallback_clearnet);
+        assert!(parsed.rawtx.prefetch);
+        // AUD-155: a whole block over a fresh circuit gets an inactivity
+        // timeout and a long absolute limit, not a short total one.
+        assert!(cfg.rawtx.tor_request_timeout_seconds >= 60);
+        assert!(cfg.rawtx.tor_stall_timeout_seconds < cfg.rawtx.tor_request_timeout_seconds);
+        assert!(cfg.rawtx.p2p_tor_timeout_seconds > cfg.rawtx.p2p_timeout_seconds);
+    }
+
+    #[test]
+    fn p2p_peers_from_core_are_outbound_full_witness_and_onion_first() {
+        // AUD-154: inbound peers (ephemeral ports), I2P/CJDNS and peers that
+        // cannot serve old witness blocks are never used.
+        let peers: Vec<el_rpc::PeerInfo> = serde_json::from_str(
+            r#"[
+              {"addr":"198.51.100.1:51234","inbound":true,"services":1033,"network":"ipv4"},
+              {"addr":"198.51.100.2:8333","inbound":false,"services":1033,"network":"ipv4","transport_protocol_type":"v1"},
+              {"addr":"198.51.100.3:8333","inbound":false,"services":1032,"network":"ipv4"},
+              {"addr":"198.51.100.4:8333","inbound":false,"services":1,"network":"ipv4"},
+              {"addr":"abc.b32.i2p:0","inbound":false,"services":1033,"network":"i2p"},
+              {"addr":"exampleonionaddress.onion:8333","inbound":false,"services":1033,"network":"onion","transport_protocol_type":"v2"}
+            ]"#,
+        )
+        .unwrap();
+        let addrman: Vec<el_rpc::NodeAddress> = serde_json::from_str(
+            r#"[
+              {"address":"2001:db8::1","port":8333,"services":1033,"network":"ipv6"},
+              {"address":"fc00::1","port":8333,"services":1033,"network":"cjdns"},
+              {"address":"198.51.100.2","port":8333,"services":1033,"network":"ipv4"}
+            ]"#,
+        )
+        .unwrap();
+        let (list, connected) = select_p2p_peers(&peers, &addrman);
+        let addrs: Vec<&str> = list.iter().map(|p| p.addr.as_str()).collect();
+        assert_eq!(
+            addrs,
+            vec![
+                "exampleonionaddress.onion:8333",
+                "198.51.100.2:8333",
+                "[2001:db8::1]:8333"
+            ]
+        );
+        assert_eq!(connected, 2);
+        assert_eq!(list[0].v2, Some(true));
+        assert_eq!(list[1].v2, Some(false));
+        assert_eq!(list[2].v2, None);
+    }
+
+    #[test]
+    fn provider_gate_skips_unpruned_core_and_expires() {
+        let cfg = Config::default();
+        // An unpruned Core serves every raw transaction: no gate.
+        assert!(!provider_gate_required(
+            &cfg,
+            Chain::Signet,
+            Some(false),
+            true
+        ));
+        // Pruned, or Core did not answer: the gate holds the listeners.
+        assert!(provider_gate_required(
+            &cfg,
+            Chain::Signet,
+            Some(true),
+            true
+        ));
+        assert!(provider_gate_required(&cfg, Chain::Signet, None, true));
+        // Regtest never gates, whatever Core reports.
+        assert!(!provider_gate_required(
+            &cfg,
+            Chain::Regtest,
+            Some(true),
+            true
+        ));
+        // Fail-closed by default (AUD-045): the gate never expires ...
+        assert!(!provider_gate_expired(&cfg, Duration::from_secs(86_400)));
+        // ... unless the operator opts in, and then only after the timeout.
+        let mut open = Config::default();
+        open.public_servers.open_without_provider = true;
+        open.public_servers.ready_timeout_seconds = 60;
+        assert!(!provider_gate_expired(&open, Duration::from_secs(59)));
+        assert!(provider_gate_expired(&open, Duration::from_secs(60)));
+    }
+}

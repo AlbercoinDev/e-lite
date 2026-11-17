@@ -1699,4 +1699,37 @@ mod tests {
         assert!(!cfg.rawtx.use_tor);
         assert!(cfg.rawtx.effective_allow_clearnet());
     }
+
+    /// A configuration that still has a removed key starts (with a warning);
+    /// any other unknown key is still an error.
+    #[test]
+    fn retired_config_keys_are_ignored_and_unknown_keys_still_fail() {
+        let dir = std::env::temp_dir().join(format!("e-lite-retired-keys-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        let mut text = String::new();
+        for (key, _) in RETIRED_KEYS {
+            let (section, field) = key.split_once('.').unwrap();
+            text.push_str(&format!("[{section}]\n{field} = 1\n"));
+        }
+        // Several retired keys can share a section: write each section once.
+        let mut by_section: std::collections::BTreeMap<&str, Vec<&str>> = Default::default();
+        for (key, _) in RETIRED_KEYS {
+            let (section, field) = key.split_once('.').unwrap();
+            by_section.entry(section).or_default().push(field);
+        }
+        text.clear();
+        for (section, fields) in &by_section {
+            text.push_str(&format!("[{section}]\n"));
+            for field in fields {
+                text.push_str(&format!("{field} = 1\n"));
+            }
+        }
+        std::fs::write(&path, &text).unwrap();
+        let cfg = Config::load(Some(path.to_str().unwrap())).expect("retired keys must not fail");
+        assert_eq!(cfg, Config::default());
+        std::fs::write(&path, "[index]\nnot_a_real_key = 1\n").unwrap();
+        assert!(Config::load(Some(path.to_str().unwrap())).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

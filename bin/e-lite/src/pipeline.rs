@@ -2975,3 +2975,163 @@ pub(crate) fn check_pruned(
     }
     Ok(())
 }
+
+#[cfg(test)]
+pub(crate) mod tests {
+    use super::*;
+
+    /// A Core `getblockchaininfo` answer for the prune checks (also used by
+    /// the error-classification test in main.rs).
+    pub(crate) fn info(pruned: bool, pruneheight: u64) -> BlockchainInfo {
+        BlockchainInfo {
+            chain: "signet".to_string(),
+            blocks: 1000,
+            headers: 1000,
+            pruned,
+            pruneheight,
+            prune_target_size: 0,
+            size_on_disk: 0,
+            initialblockdownload: false,
+            signet_challenge: None,
+            verificationprogress: 1.0,
+        }
+    }
+
+    pub(crate) fn tip(height: u32) -> IndexedTip {
+        IndexedTip {
+            height,
+            block_hash: Hash32::ZERO,
+            schema_version: el_model::codec::SCHEMA_VERSION,
+            txnum: 0,
+        }
+    }
+
+    #[test]
+    fn full_node_allows_any_tip() {
+        assert!(check_pruned(&info(false, 0), None, None).is_ok());
+    }
+
+    #[test]
+    fn pruned_with_empty_index_is_rejected() {
+        assert!(check_pruned(&info(true, 100), None, None).is_err());
+    }
+
+    #[test]
+    fn pruned_gap_is_rejected() {
+        // Index stops at 50, Core only has blocks from 100 onwards.
+        assert!(check_pruned(&info(true, 100), Some(&tip(50)), None).is_err());
+        assert!(check_pruned(&info(true, 100), Some(&tip(98)), None).is_err());
+        // The same gap is allowed when a verified repair source is available.
+        assert!(check_pruned(&info(true, 100), Some(&tip(98)), Some(2)).is_ok());
+    }
+
+    #[test]
+    fn pruned_with_covered_tip_is_allowed() {
+        assert!(check_pruned(&info(true, 100), Some(&tip(99)), None).is_ok());
+        assert!(check_pruned(&info(true, 100), Some(&tip(150)), None).is_ok());
+    }
+
+    #[test]
+    fn milestone_triggers_by_blocks_or_time() {
+        let hour = Duration::from_secs(3600);
+        assert!(milestone_due(10_000, 20_000, Duration::ZERO, 10_000, 0));
+        assert!(!milestone_due(10_000, 19_999, Duration::ZERO, 10_000, 0));
+        assert!(milestone_due(10_000, 10_001, hour, 0, 3600));
+        assert!(!milestone_due(10_000, 10_001, hour, 0, 0));
+        // Both disabled means never.
+        assert!(!milestone_due(0, 1_000_000, hour, 0, 0));
+    }
+
+    #[test]
+    fn commit_sync_auto_relaxes_only_in_bulk() {
+        assert!(!commit_sync_policy("auto", true, 100_000, 200_000));
+        assert!(!commit_sync_policy("auto", false, 100_000, 200_000));
+        assert!(commit_sync_policy("auto", false, 200_000, 200_000));
+        assert!(commit_sync_policy("always", true, 100_000, 200_000));
+        assert!(!commit_sync_policy("txids", false, 200_000, 200_000));
+    }
+
+    #[test]
+    fn undo_window_is_measured_from_the_real_commit_tip() {
+        // AUD-131: only the window of the tip actually committed is written.
+        let dir = std::env::temp_dir().join(format!(
+            "e-lite-undo-window-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let store = Store::open(&dir).unwrap();
+        let window = 288u32;
+        let records: Vec<el_model::UndoRecord> = (600..=1_200u32)
+            .map(|height| el_model::UndoRecord {
+                height,
+                ..Default::default()
+            })
+            .collect();
+        // A group that commits early at 1159 (time limit) still writes undo
+        // for 1158 down to 1159 - 288, and nothing above the committed tip.
+        let mut batch = WriteBatch::default();
+        let written = write_window_undo(&store, &mut batch, &records, 1_159, window).unwrap();
+        assert_eq!(written, window as usize + 1);
+        // A tip below the window keeps everything up to the tip.
+        let low: Vec<el_model::UndoRecord> = (0..=100u32)
+            .map(|height| el_model::UndoRecord {
+                height,
+                ..Default::default()
+            })
+            .collect();
+        let mut batch = WriteBatch::default();
+        assert_eq!(
+            write_window_undo(&store, &mut batch, &low, 100, window).unwrap(),
+            101
+        );
+        drop(store);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn byte_backlog_is_height_independent() {
+        // 20 GiB is ~41k early blocks (0.5 MB) but only ~13.6k at 818k
+        // (1.5 MB). The byte watermark is the one that bounds the disk.
+        let gib = 1024 * 1024 * 1024u64;
+        let high = 20 * gib;
+        // Same 20 GiB backlog is ~41k blocks at 512 KiB but only ~14.3k at
+        // 1.5 MB: a block-count watermark cannot bound the disk.
+        assert!(backlog_bytes(41_000, 512 * 1024) >= high);
+        assert!(backlog_bytes(40_000, 512 * 1024) < high);
+        assert!(backlog_bytes(14_317, 1_500_000) >= high);
+        assert!(backlog_bytes(14_316, 1_500_000) < high);
+    }
+
+    #[test]
+    fn byte_window_pauses_at_high_and_resumes_at_low() {
+        let gib = 1024 * 1024 * 1024u64;
+        let high = 30 * gib;
+        let low = 7 * gib;
+        assert_eq!(byte_window(29 * gib, high, low, false), (false, false));
+        assert_eq!(byte_window(30 * gib, high, low, false), (true, false));
+        assert_eq!(byte_window(7 * gib, high, low, false), (false, true));
+        assert_eq!(byte_window(6 * gib, high, low, false), (false, true));
+        // A reader at the prune height forces a pause even below the low mark.
+        assert_eq!(byte_window(6 * gib, high, low, true), (true, false));
+    }
+
+    #[test]
+    fn directory_usage_counts_regular_files() {
+        let dir = std::env::temp_dir().join(format!(
+            "e-lite-dir-usage-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        std::fs::write(dir.join("a"), vec![0u8; 100]).unwrap();
+        std::fs::write(dir.join("sub/b"), vec![0u8; 50]).unwrap();
+        assert_eq!(dir_usage_bytes(&dir), 150);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}

@@ -521,3 +521,167 @@ put it in config.toml, or pass --set for one run. Older flags such as
 pub(crate) fn print_help() {
     print!("{}", help_text());
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn help_flags_are_documented() {
+        let help = help_text();
+        let docs = include_str!("../../../docs/CLI.md");
+        for word in help.split_whitespace() {
+            if !word.starts_with("--") {
+                continue;
+            }
+            let flag = word.trim_end_matches([',', ':', ';']);
+            assert!(
+                docs.contains(flag),
+                "{flag} is in `help` but not in docs/CLI.md"
+            );
+        }
+    }
+
+    /// A sample value for a retired flag, different from the default.
+    fn retired_sample(kind: Retired) -> Option<&'static str> {
+        match kind {
+            Retired::Str => Some("sample-value"),
+            Retired::Int | Retired::IntMin1 => Some("3"),
+            Retired::Float => Some("0.42"),
+            Retired::List => Some("10.0.0.1:8333, 10.0.0.2:8333"),
+            Retired::Const(_) => None,
+        }
+    }
+
+    fn argv(items: &[&str]) -> Vec<String> {
+        items.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// Every retired flag gives exactly the configuration of its `--set`, and
+    /// the key exists with the right type (sections refuse unknown fields).
+    #[test]
+    fn every_retired_flag_equals_its_set() {
+        for (flag, key, kind) in DEPRECATED_FLAGS {
+            let mut old = vec!["run".to_string(), flag.to_string()];
+            old.extend(retired_sample(*kind).map(str::to_string));
+            let parsed = parse_args_from(old).unwrap_or_else(|e| panic!("{flag}: {e}"));
+            assert_eq!(parsed.set.len(), 1, "{flag}");
+            assert!(
+                parsed.set[0].starts_with(&format!("{key}=")),
+                "{flag}: {}",
+                parsed.set[0]
+            );
+            assert_eq!(parsed.deprecations.len(), 1, "{flag}");
+            assert!(parsed.deprecations[0].contains(&parsed.set[0]), "{flag}");
+            let via_flag = Config::load_with_overrides(None, &parsed.set)
+                .unwrap_or_else(|e| panic!("{flag} -> {}: {e}", parsed.set[0]));
+            let explicit = parse_args_from(argv(&["run", "--set", &parsed.set[0]])).unwrap();
+            let via_set = Config::load_with_overrides(None, &explicit.set).unwrap();
+            assert_eq!(via_flag, via_set, "{flag}");
+            let key_retired = config::RETIRED_KEYS.iter().any(|(k, _)| k == key);
+            if key_retired {
+                // The setting itself is gone: the flag is accepted and ignored.
+                assert_eq!(via_flag, Config::default(), "{flag}");
+            } else if retired_sample(*kind).is_some() {
+                assert_ne!(via_flag, Config::default(), "{flag} changed nothing");
+            }
+        }
+    }
+
+    #[test]
+    fn retired_flags_keep_their_old_value_rules() {
+        let cfg = |items: &[&str]| {
+            let args = parse_args_from(argv(items)).unwrap();
+            Config::load_with_overrides(None, &args.set).unwrap()
+        };
+        // Clamped to 1 as the flags did.
+        assert_eq!(cfg(&["run", "--batch", "0"]).index.batch_blocks, 1);
+        assert_eq!(cfg(&["run", "--min-free-gib", "0"]).pruning.min_free_gib, 1);
+        // Inline values and lists.
+        assert_eq!(cfg(&["run", "--readers=3"]).index.readers, 3);
+        assert_eq!(
+            cfg(&["run", "--p2p-peers", "a:1,,b:2 "]).rawtx.p2p_peers,
+            vec!["a:1".to_string(), "b:2".to_string()]
+        );
+        // A string that looks like a number stays a string.
+        assert_eq!(cfg(&["run", "--profile", "123"]).index.profile, "123");
+        // Each pair of switches gives opposite values.
+        assert!(!cfg(&["run", "--no-adaptive"]).index.adaptive);
+        assert!(cfg(&["run", "--no-adaptive", "--adaptive"]).index.adaptive);
+        // A bad number is still an error naming the flag.
+        let err = parse_args_from(argv(&["run", "--readers", "many"]))
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(err.contains("--readers"), "{err}");
+    }
+
+    /// A retired flag is a `--set` in its position: the later one wins.
+    #[test]
+    fn a_later_set_overrides_a_retired_flag_and_the_other_way_round() {
+        let readers = |items: &[&str]| {
+            let args = parse_args_from(argv(items)).unwrap();
+            Config::load_with_overrides(None, &args.set)
+                .unwrap()
+                .index
+                .readers
+        };
+        assert_eq!(
+            readers(&["run", "--readers", "5", "--set", "index.readers=6"]),
+            6
+        );
+        assert_eq!(
+            readers(&["run", "--set", "index.readers=6", "--readers", "5"]),
+            5
+        );
+    }
+
+    /// The flags that stay are not in the retired table.
+    #[test]
+    fn kept_flags_are_not_retired() {
+        for flag in [
+            "--config",
+            "--network",
+            "--data-dir",
+            "--set",
+            "--log-level",
+            "--core-rpc",
+            "--core-datadir",
+            "--cookie-file",
+            "--rpc-user",
+            "--rpc-password",
+            "--manage",
+            "--prune-mib",
+            "--listen",
+            "--tls-listen",
+            "--no-tls",
+            "--plain-lan",
+            "--metrics",
+            "--no-tor",
+            "--no-rawtx-tor",
+            "--allow-clearnet",
+            "--no-supervise",
+            "--no-follow",
+            "--allow-mainnet",
+            "--allow-low-memory",
+            "--allow-auto-prune",
+            "--yes",
+            "--dry-run",
+            "--output",
+            "--input",
+            "--with-core",
+            "--verify",
+            "--expect-digest",
+            "--compress-level",
+            "--hash-files",
+            "--no-hash-files",
+            "--purge",
+            "--public-servers",
+            "--core-arg",
+            "--no-log-file",
+            "--json",
+        ] {
+            assert!(retired_flag(flag).is_none(), "{flag}");
+        }
+    }
+}
