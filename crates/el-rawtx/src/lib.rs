@@ -232,9 +232,13 @@ pub const WALLET_BLOCK_BUDGET: Duration = Duration::from_secs(20);
 /// engine room to retry a recovering endpoint (MIN_ATTEMPT * 3).
 pub const WALLET_BLOCK_NET: Duration = Duration::from_secs(8);
 /// Head start given to a block download already in flight before the per-txid
-/// path starts (`rawtx.txid_race`): both run concurrently and the first
-/// verified answer wins.
+/// path starts: both run concurrently and the first verified answer wins.
 pub const RACE_HEAD_START: Duration = Duration::from_millis(250);
+/// In `auto`, the per-txid path gets this long before the block download is
+/// started. Measured p95 of a 50-tx Electrum batch is 1.2 s, so a healthy
+/// txid path wins and no block is downloaded; a stalled one starts the block
+/// early enough to keep the wallet load fast.
+pub const TXID_HEAD_START: Duration = Duration::from_millis(1500);
 /// Extra time a follower waits beyond the leader's deadline.
 pub const FOLLOWER_GRACE: Duration = Duration::from_secs(5);
 /// A block whose download just failed is answered from that failure for this
@@ -516,6 +520,10 @@ pub struct RawtxStats {
     /// per-txid attempt) and by the txid path while a block was in flight.
     pub race_wins_block: AtomicU64,
     pub race_wins_txid: AtomicU64,
+    /// Per-txid path in `auto`: requests served by the txid path and requests
+    /// that missed the head start and fell to the block.
+    pub txid_wins: AtomicU64,
+    pub txid_stalls: AtomicU64,
 }
 
 #[derive(Clone, Debug)]
@@ -612,7 +620,7 @@ impl RawtxConfig {
             privacy: PrivacyParams::default(),
             electrum_servers: Vec::new(),
             path: ExternalPath::Auto,
-            wallet_deadline_seconds: 12,
+            wallet_deadline_seconds: 35,
             txid_attempt_seconds: 3,
             txid_race: true,
             decoy_sessions: DecoySessions::SameRound,
@@ -1333,37 +1341,53 @@ impl Resolver {
             // `block`: whole block only. No tx_mode (block privacy mode or no
             // per-txid sources) also means the block path.
             let block_only = self.path == ExternalPath::Block || self.tx_mode.is_none();
-            let mut raced = false;
+            let mut joined_block = false;
+            let mut txid_tried = false;
             if pruned && !block_only {
-                // A prefetch or another tx.get already started this block: in
-                // `auto` it gets a short head start and the per-txid path runs
-                // concurrently; the first verified answer wins.
-                if self.txid_race && self.path == ExternalPath::Auto {
-                    if let Some(entry) = self.inflight_entry(&rec.hash) {
-                        raced = true;
-                        if let Some(Ok(joined)) =
-                            entry.wait_outcome(RACE_HEAD_START.min(self.txid_attempt))
-                        {
-                            self.stats.block_joins.fetch_add(1, Ordering::Relaxed);
-                            block = Some(joined);
-                        }
+                // Another wallet request already started this block: join it
+                // before spending the txid budget.
+                if let Some(entry) = self.inflight_entry(&rec.hash) {
+                    joined_block = true;
+                    if let Some(Ok(joined)) = entry.wait_outcome(RACE_HEAD_START) {
+                        self.stats.block_joins.fetch_add(1, Ordering::Relaxed);
+                        block = Some(joined);
                     }
                 }
                 if block.is_none() {
-                    // 3) Per-txid mode (AUD-163): the loose transaction,
-                    //    verified against the index, with its own short budget
-                    //    (rawtx.txid_attempt_seconds); the block keeps the rest.
                     if let Some(tm) = &self.tx_mode {
                         if let Some(pos) = self.position_of(txid, height) {
                             let t = TxRef { txid, height, pos };
+                            // The cheap path first: a short head start in
+                            // `auto` (the block is only downloaded if the txid
+                            // does not arrive), a full attempt in `tx`.
                             let now = Instant::now();
-                            let attempt = (now + self.txid_attempt).min(request_deadline);
-                            if attempt > now {
-                                if let Ok(hex) = tm.fetch(ctx, t, attempt) {
-                                    if raced {
+                            let first = if self.path == ExternalPath::Auto && self.txid_race {
+                                TXID_HEAD_START
+                            } else {
+                                self.txid_attempt
+                            };
+                            let first_deadline = (now + first).min(request_deadline);
+                            if first_deadline > now {
+                                txid_tried = true;
+                                if let Ok(hex) = tm.fetch(ctx, t, first_deadline) {
+                                    self.stats.txid_wins.fetch_add(1, Ordering::Relaxed);
+                                    if joined_block {
                                         self.stats.race_wins_txid.fetch_add(1, Ordering::Relaxed);
                                     }
                                     return Ok(hex);
+                                }
+                                self.stats.txid_stalls.fetch_add(1, Ordering::Relaxed);
+                            }
+                            // `tx`: one more attempt, still much cheaper than
+                            // a block, before the fallback.
+                            if self.path == ExternalPath::Tx {
+                                let now = Instant::now();
+                                let second = (now + self.txid_attempt).min(request_deadline);
+                                if second > now {
+                                    if let Ok(hex) = tm.fetch(ctx, t, second) {
+                                        self.stats.txid_wins.fetch_add(1, Ordering::Relaxed);
+                                        return Ok(hex);
+                                    }
                                 }
                             }
                         }
@@ -1371,17 +1395,40 @@ impl Resolver {
                 }
             }
             if block.is_none() {
-                // 4) Whole block from external sources, with what is left.
+                // 4) Whole block from external sources. The queue gets the
+                // rest of the request budget (27 s by default) so a cold
+                // burst waits for a slot instead of failing a confirmed tx.
                 let joining = self.block_inflight(&rec.hash);
-                let (fetched, _) = self.external_block(
+                let fetched = match self.external_block(
                     &rec,
                     priority,
                     Some(request_deadline.max(Instant::now() + MIN_ATTEMPT)),
-                )?;
+                ) {
+                    Ok((block, _)) => block,
+                    Err(first) => {
+                        // Only a slot-starvation failure is retried: a real
+                        // provider failure keeps the failure memory (AUD-158)
+                        // and a missing source keeps its explicit error. With
+                        // the 27 s queue this path is rare, and it is what
+                        // stops a cold burst from failing a confirmed tx.
+                        let starved = first.to_string().contains("download slot stayed busy");
+                        if !starved
+                            || request_deadline.saturating_duration_since(Instant::now())
+                                < Duration::from_secs(2)
+                        {
+                            return Err(first);
+                        }
+                        std::thread::sleep(Duration::from_millis(300));
+                        match self.fetch_external_block(&rec, priority, Some(request_deadline)) {
+                            Ok((block, _)) => block,
+                            Err(second) => return Err(second),
+                        }
+                    }
+                };
                 if joining {
                     self.stats.block_joins.fetch_add(1, Ordering::Relaxed);
                 }
-                if raced {
+                if joined_block || txid_tried {
                     self.stats.race_wins_block.fetch_add(1, Ordering::Relaxed);
                 }
                 block = Some(fetched);

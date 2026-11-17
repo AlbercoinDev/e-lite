@@ -461,6 +461,8 @@ impl Shared {
                     "verified": rawtx.tx_verified.load(Ordering::Relaxed),
                     "rejected": rawtx.tx_verify_failed.load(Ordering::Relaxed),
                     "block_fallback": rawtx.tx_fallback.load(Ordering::Relaxed),
+                    "txid_wins": rawtx.txid_wins.load(Ordering::Relaxed),
+                    "txid_stalls": rawtx.txid_stalls.load(Ordering::Relaxed),
                 },
                 "block_joins": rawtx.block_joins.load(Ordering::Relaxed),
                 "race": {

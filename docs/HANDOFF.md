@@ -1,8 +1,8 @@
 # Session handoff
 
-**Updated:** 2026-11-17 (alpha.29.23.0: P2P per-peer budget and provider quota)
-**Latest published release:** `0.1.0-alpha.29.23.0`
-**Release:** https://github.com/AlbercoinDev/e-lite/releases/tag/v0.1.0-alpha.29.23.0
+**Updated:** 2026-11-17 (alpha.29.24.0: txid-first cold loads, 35 s wallet deadline)
+**Latest published release:** `0.1.0-alpha.29.24.0`
+**Release:** https://github.com/AlbercoinDev/e-lite/releases/tag/v0.1.0-alpha.29.24.0
 
 This is the short “where we are”. The invariants live in
 [`AGENTS.md`](../AGENTS.md); the
@@ -88,7 +88,15 @@ no repitas contexto ni rehagas decisiones ya documentadas.
   `docs/ROADMAP.md` is future work only, and `docs/AUDIT.md` holds the open
   findings (`docs/audit/FIXED.md` is the fixed history).
 
-## Last change (alpha.29.23.0): P2P budget and provider quota
+## Last change (alpha.29.24.0): cold wallet loads
+
+- `auto` gives the per-txid path 1.5 s before starting the block; healthy
+  loads download no blocks.
+- `wallet_deadline_seconds` defaults to 35 s (queue ~27 s + 8 s network);
+  a cold burst waits for a slot instead of failing a confirmed tx (AUD-045).
+- One retry bypassing the failure memory before an error is returned.
+
+## Previous change (alpha.29.23.0): P2P budget and provider quota
 
 - `rawtx.p2p_blocks_per_peer` (1..4, default 3): per-peer in-flight budget.
 - `rawtx.provider_quota` (0 or 1.0..4.0, default 1.5): long-term per-operator

@@ -1,5 +1,32 @@
 # Changelog
 
+## 0.1.0-alpha.29.24.0 — 2026-11-17
+
+### Fixed
+
+- **Cold wallet loads no longer fail confirmed transactions.** A 239-tx wallet
+  on a pruned Core filled the 16 download slots with eager block downloads and
+  the 4 s queue returned `every download slot stayed busy until the deadline`
+  as `-32000`; Sparrow stored the transaction as null and crashed with a
+  NullPointerException (AUD-045).
+- The eager block warm on every `transaction.get` is gone. In `auto` the
+  per-txid path now gets a **1.5 s head start** (measured p95 1.2 s for a
+  50-tx batch); the block is downloaded only when the txid does not arrive, so
+  a healthy load downloads no blocks at all.
+- The wallet block queue is no longer 4 s: `wallet_deadline_seconds` defaults
+  to **35 s** (queue ~27 s + 8 s of network). A cold burst waits for a slot
+  instead of failing; the 3 s provider switch is unchanged.
+- A transient block failure is retried once, bypassing the failure memory, so
+  a confirmed transaction does not inherit a prefetch's remembered error.
+- `path = tx` gets two attempts (6 s) before the block instead of one 3 s
+  attempt that included the session queue.
+
+### Changed
+
+- `/status.rawtx.race.wins_txid` counts txid wins while a block was in flight;
+  `wins_block` counts the block path after a txid attempt or join; `block_joins`
+  counts requests served by an in-flight block.
+
 ## 0.1.0-alpha.29.23.0 — 2026-11-17
 
 ### Added

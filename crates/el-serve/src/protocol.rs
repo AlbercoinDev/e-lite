@@ -1232,34 +1232,23 @@ pub(crate) fn transaction_get(shared: &Shared, params: &Value) -> RpcResult<Valu
         .map(|v| v.as_bool().unwrap_or(false))
         .unwrap_or(false);
     let txid_hash = Hash32::from_hex(txid).map_err(RpcError::invalid)?;
-    let (occ, blockhash, warm) = {
+    let (occ, blockhash) = {
         let _g = read_guard(shared)?;
         let occ = shared
             .store
             .occurrences(txid_hash)
             .map_err(|e| RpcError::server(e.to_string()))?;
-        let mut blockhash = None;
-        let mut warm = None;
-        if let Some((height, _)) = occ.first() {
-            if let Ok(Some(rec)) = shared.store.get_block(*height) {
-                blockhash = Some(rec.hash.to_hex());
-                // A pruned block is needed: start its download now, in
-                // parallel with the per-txid path. On demand only (no
-                // speculative history prefetch in tx mode).
-                if u64::from(*height) < shared.stats.core_pruneheight.load(Ordering::Relaxed)
-                    && !shared.prefetch.wants(&rec.hash)
-                {
-                    if let Ok(txids) = shared.store.block_txids(&rec) {
-                        warm = Some((rec.hash, *height, txids));
-                    }
-                }
-            }
-        }
-        (occ, blockhash, warm)
+        let blockhash = match occ.first() {
+            Some((height, _)) => shared
+                .store
+                .get_block(*height)
+                .ok()
+                .flatten()
+                .map(|r| r.hash.to_hex()),
+            None => None,
+        };
+        (occ, blockhash)
     };
-    if let Some((hash, height, txids)) = warm {
-        shared.prefetch.enqueue(hash, height, txids);
-    }
 
     if verbose {
         // For a confirmed transaction use the verified resolver and decode the

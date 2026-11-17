@@ -873,7 +873,7 @@ fn d_rawtx_path() -> String {
     "auto".to_string()
 }
 fn d_wallet_deadline() -> u64 {
-    12
+    35
 }
 fn d_txid_attempt() -> u64 {
     3
@@ -1523,7 +1523,7 @@ mod tests {
     fn wallet_rawtx_defaults_and_validation() {
         let cfg = Config::default();
         assert_eq!(cfg.rawtx.path, "auto");
-        assert_eq!(cfg.rawtx.wallet_deadline_seconds, 12);
+        assert_eq!(cfg.rawtx.wallet_deadline_seconds, 35);
         assert_eq!(cfg.rawtx.txid_attempt_seconds, 3);
         assert!(cfg.rawtx.txid_race);
         assert_eq!(cfg.rawtx.decoy_sessions, "same_round");
