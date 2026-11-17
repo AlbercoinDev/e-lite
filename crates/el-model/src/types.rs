@@ -105,45 +105,6 @@ pub struct UtxoValue {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub struct BlockPosition {
-    pub height: u32,
-    pub tx_pos: u32,
-}
-
-/// Occurrence id. Encodes `(height, tx_pos)` so it is derivable and never
-/// allocated separately. 40 bits of height + 24 bits of position.
-pub const TX_POS_BITS: u32 = 24;
-pub const TX_POS_MASK: u64 = (1u64 << TX_POS_BITS) - 1;
-
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash, PartialOrd, Ord)]
-pub struct TxRef(u64);
-
-impl TxRef {
-    pub fn try_new(height: u32, tx_pos: u32) -> Result<Self, String> {
-        if (tx_pos as u64) > TX_POS_MASK {
-            return Err(format!("tx_pos {tx_pos} does not fit in 24 bits"));
-        }
-        Ok(TxRef(((height as u64) << TX_POS_BITS) | tx_pos as u64))
-    }
-
-    pub fn from_parts_unchecked(height: u32, tx_pos: u32) -> Self {
-        TxRef(((height as u64) << TX_POS_BITS) | (tx_pos as u64 & TX_POS_MASK))
-    }
-
-    pub fn height(self) -> u32 {
-        (self.0 >> TX_POS_BITS) as u32
-    }
-
-    pub fn tx_pos(self) -> u32 {
-        (self.0 & TX_POS_MASK) as u32
-    }
-
-    pub fn raw(self) -> u64 {
-        self.0
-    }
-}
-
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct IndexedTip {
     pub height: u32,
     pub block_hash: Hash32,
@@ -258,15 +219,6 @@ impl Chain {
         }
     }
 
-    pub fn default_p2p_port(self) -> u16 {
-        match self {
-            Chain::Mainnet => 8333,
-            Chain::Testnet4 => 48333,
-            Chain::Signet => 38333,
-            Chain::Regtest => 18444,
-        }
-    }
-
     /// P2P network magic bytes.
     pub fn magic(self) -> [u8; 4] {
         match self {
@@ -360,21 +312,6 @@ pub struct UndoRecord {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn txref_roundtrip() {
-        for (h, p) in [
-            (0u32, 0u32),
-            (1, 1),
-            (917_000, 4242),
-            (0x00ff_ffff, 0x00ff_ffff),
-        ] {
-            let r = TxRef::try_new(h, p).unwrap();
-            assert_eq!(r.height(), h);
-            assert_eq!(r.tx_pos(), p);
-        }
-        assert!(TxRef::try_new(1, 1 << 24).is_err());
-    }
 
     #[test]
     fn network_ports_and_socks_are_distinct() {

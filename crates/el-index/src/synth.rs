@@ -343,14 +343,6 @@ impl Oracle {
         self.tip = Some((height, block.block_hash().to_string()));
     }
 
-    pub fn txnum(&self) -> u64 {
-        self.txnum
-    }
-
-    pub fn tip(&self) -> Option<(u32, String)> {
-        self.tip.clone()
-    }
-
     pub fn assert_matches(&self, store: &Store) -> Result<(), String> {
         let tip = store
             .committed_tip()

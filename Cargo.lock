@@ -391,7 +391,6 @@ dependencies = [
  "bitcoin",
  "el-model",
  "el-store",
- "hex",
  "rocksdb",
 ]
 
@@ -404,7 +403,6 @@ dependencies = [
  "el-rpc",
  "el-store",
  "hex",
- "sha2",
 ]
 
 [[package]]
@@ -457,7 +455,6 @@ dependencies = [
  "filetime",
  "hex",
  "rustls",
- "serde",
  "serde_json",
  "sha2",
 ]

@@ -47,10 +47,6 @@ pub fn u32be(v: u32) -> [u8; 4] {
     v.to_be_bytes()
 }
 
-pub fn u64be(v: u64) -> [u8; 8] {
-    v.to_be_bytes()
-}
-
 fn get_u32(buf: &[u8], off: usize) -> Result<u32> {
     if off + 4 > buf.len() {
         return err("truncated u32");
@@ -164,16 +160,6 @@ pub fn utxo_key(op: &Outpoint) -> [u8; 36] {
     out[0..32].copy_from_slice(op.txid.as_bytes());
     out[32..36].copy_from_slice(&op.vout.to_be_bytes());
     out
-}
-
-pub fn parse_outpoint(buf: &[u8]) -> Result<Outpoint> {
-    if buf.len() != 36 {
-        return err("outpoint must be 36 bytes");
-    }
-    Ok(Outpoint {
-        txid: get_hash(buf, 0)?,
-        vout: get_u32(buf, 32)?,
-    })
 }
 
 /// value(8) + script(32) + creation_height(4) + coinbase(1)

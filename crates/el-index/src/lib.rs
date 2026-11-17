@@ -1,6 +1,7 @@
 //! Block application, undo records and reorg rewind.
 
-pub mod synth;
+#[cfg(test)]
+mod synth;
 
 use el_model::codec::SCHEMA_VERSION;
 use el_model::{
@@ -217,6 +218,7 @@ pub fn prefetch_prevouts(store: &Store, prepared: &PreparedBlock) -> Result<Pref
     Ok(store.get_utxos(&needed)?)
 }
 
+#[cfg(test)]
 fn compute_out_script_hashes(block: &bitcoin::Block) -> Vec<Vec<ScriptHash>> {
     block
         .txdata
@@ -295,6 +297,7 @@ impl PreparedBlock {
 /// This compatibility wrapper prepares the block in the caller's thread; the
 /// indexer uses `prepare_block_bytes` in its reader threads and
 /// `apply_prepared_deferred_undo`.
+#[cfg(test)]
 pub fn apply_block(
     store: &Store,
     height: u32,
@@ -324,21 +327,8 @@ pub fn apply_block(
     )
 }
 
-pub fn apply_prepared(
-    store: &Store,
-    height: u32,
-    prepared: &PreparedBlock,
-    prev_tip: Option<IndexedTip>,
-    overlay: &mut GroupOverlay,
-    batch: &mut WriteBatch,
-    store_undo: bool,
-) -> Result<ApplyOutcome> {
-    apply_prepared_with_prefetch(
-        store, height, prepared, prev_tip, overlay, batch, store_undo, None,
-    )
-}
-
 /// Apply a prepared block using prevouts already fetched in a reader thread.
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub fn apply_prepared_with_prefetch(
     store: &Store,
@@ -722,15 +712,6 @@ pub fn prune_undo(
     // of stale records and made the canonical digest depend on commit timing.
     store.delete_undo_below(cutoff, batch)?;
     Ok(())
-}
-
-/// Aggregate a script's confirmed balance from its UTXO set.
-pub fn confirmed_balance(store: &Store, script: ScriptHash) -> Result<u64> {
-    let mut total = 0u64;
-    for (_, value, _, _) in store.utxos_for_script(script)? {
-        total = total.saturating_add(value);
-    }
-    Ok(total)
 }
 
 #[cfg(test)]

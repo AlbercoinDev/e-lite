@@ -603,13 +603,6 @@ impl Store {
         }
     }
 
-    pub fn last_block(&self) -> Result<Option<BlockRecord>> {
-        match self.committed_tip()? {
-            Some(tip) => self.get_block(tip.height),
-            None => Ok(None),
-        }
-    }
-
     // -------------------------------------------------------- occurrences
 
     pub fn put_occurrence(
@@ -1212,11 +1205,6 @@ impl Store {
             get.max(),
         ))
     }
-    /// Live memtables as accounted by the shared WriteBufferManager.
-    pub fn memtable_budget_usage(&self) -> usize {
-        self.write_buffer_manager.get_usage()
-    }
-
     pub fn fd_plan(&self) -> FdPlan {
         self.fd_plan
     }

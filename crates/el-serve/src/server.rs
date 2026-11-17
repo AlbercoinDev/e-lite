@@ -2,11 +2,6 @@
 
 use super::*;
 
-pub fn start_server(shared: Arc<Shared>) -> std::io::Result<std::thread::JoinHandle<()>> {
-    let listener = bind_listener(&shared.listen, "Electrum", None)?;
-    Ok(start_listener_on(listener, shared, None))
-}
-
 /// How long `bind_listener` waits for a port held by an outgoing connection.
 /// A closed connection keeps its source port for 60 s (TIME_WAIT).
 pub const BIND_RETRY: Duration = Duration::from_secs(75);

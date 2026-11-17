@@ -284,18 +284,6 @@ impl Supervisor {
         actions
     }
 
-    /// Force the supervisor into the paused state when the indexer detected a
-    /// low disk first. Returns `PauseDownloads` once, so the caller can pause
-    /// Core even if `disk_tick` would not emit it again.
-    pub fn force_disk_pause(&mut self) -> Vec<Action> {
-        if !self.cfg.disk_enabled || self.paused {
-            return Vec::new();
-        }
-        self.paused = true;
-        self.state = State::PauseDownload;
-        vec![Action::PauseDownloads]
-    }
-
     pub fn tick(&mut self, input: &TickInput) -> Vec<Action> {
         let mut actions = self.disk_tick(input.free_bytes);
         if !actions.is_empty() {
@@ -459,16 +447,6 @@ mod tests {
         assert_eq!(s.disk_tick(Some(50)), vec![Action::PauseDownloads]);
         assert!(s.paused());
         assert_eq!(s.disk_tick(Some(150)), Vec::new());
-        assert_eq!(s.disk_tick(Some(250)), vec![Action::ResumeDownloads]);
-        assert!(!s.paused());
-    }
-
-    #[test]
-    fn force_disk_pause_emits_once() {
-        let mut s = Supervisor::new(cfg());
-        assert_eq!(s.force_disk_pause(), vec![Action::PauseDownloads]);
-        assert!(s.paused());
-        assert!(s.force_disk_pause().is_empty());
         assert_eq!(s.disk_tick(Some(250)), vec![Action::ResumeDownloads]);
         assert!(!s.paused());
     }

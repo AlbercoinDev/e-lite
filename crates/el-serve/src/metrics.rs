@@ -2,15 +2,6 @@
 
 use super::*;
 
-/// Local /status and /metrics endpoint. Loopback only by default.
-pub fn start_metrics(
-    shared: Arc<Shared>,
-    addr: String,
-) -> std::io::Result<std::thread::JoinHandle<()>> {
-    let listener = bind_listener(&addr, "metrics", None)?;
-    Ok(start_metrics_on(shared, listener))
-}
-
 /// Serve `/status`, `/metrics` and `/healthz` on an already-bound listener.
 pub fn start_metrics_on(shared: Arc<Shared>, listener: TcpListener) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {

@@ -384,13 +384,6 @@ impl CoreClient {
         self.call("getblock", serde_json::json!([hash, 0]))
     }
 
-    pub fn raw_transaction_hex(&self, txid: &str, blockhash: &str) -> Result<String> {
-        self.call(
-            "getrawtransaction",
-            serde_json::json!([txid, false, blockhash]),
-        )
-    }
-
     /// Raw transaction without requiring a block hash (works for mempool txs).
     pub fn raw_transaction_hex_opt(&self, txid: &str, blockhash: Option<&str>) -> Result<String> {
         let params = match blockhash {
@@ -442,10 +435,6 @@ impl CoreClient {
     /// Test mempool acceptance without broadcasting.
     pub fn test_mempool_accept(&self, raw_txs: &[String]) -> Result<serde_json::Value> {
         self.call("testmempoolaccept", serde_json::json!([raw_txs]))
-    }
-
-    pub fn raw_mempool_verbose(&self) -> Result<std::collections::HashMap<String, MempoolEntry>> {
-        self.call("getrawmempool", serde_json::json!([true]))
     }
 
     pub fn mempool_info(&self) -> Result<MempoolInfo> {

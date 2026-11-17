@@ -1185,11 +1185,6 @@ impl Resolver {
         self.raw_tx_inner(ctx, txid, height, Priority::Wallet)
     }
 
-    /// Background prefetch path: same lookup and decoys, lower priority.
-    pub fn raw_tx_prefetch(&self, txid: Hash32, height: u32) -> Result<String> {
-        self.raw_tx_inner(0, txid, height, Priority::Prefetch)
-    }
-
     /// Prefetch every listed transaction of one block with a single block
     /// fetch, caching each one. An external download owes decoys like a
     /// wallet request (AUD-159) and never takes the last free download
