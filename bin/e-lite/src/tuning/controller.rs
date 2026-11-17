@@ -1,5 +1,5 @@
-//! The adaptive controller: readers, batch, cache and ZFS ARC; memtables only
-//! shrink, as a safety valve, when memory is critical.
+//! The adaptive controller: readers, batch and cache; memtables only shrink,
+//! as a safety valve, when memory is critical.
 
 use super::*;
 
@@ -442,10 +442,6 @@ impl Tunables {
     /// RAM the cache controller shrinks on a false signal. Warn with the
     /// recommended cap, rate-limited to once per hour.
     fn maybe_warn_uncapped_arc(&self, mem: &MemoryInfo) {
-        // The dynamic manager owns the cap once it wrote it: no warning.
-        if self.arc_managed.load(Ordering::Relaxed) {
-            return;
-        }
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
@@ -456,117 +452,6 @@ impl Tunables {
         }
         if warn_uncapped_arc(mem, "[e-lite] WARNING:") {
             self.arc_warn_at.store(now.max(1), Ordering::Relaxed);
-        }
-    }
-
-    /// Dynamic ZFS ARC manager. While Core downloads or the index drains, a
-    /// big ARC makes pool reads nearly free (97-98 % hit rate); once the
-    /// index is fully synced the working set is tiny and the RAM is better
-    /// left visible to the memory plan. Writes
-    /// `/sys/module/zfs/parameters/zfs_arc_max` only when e-lite can (root or
-    /// a writable parameter); without permission it keeps the warn-only mode.
-    /// Runs on the 5 s `el-tune` tick, with a 5 min dwell per change.
-    pub fn arc_tick(&self, lag: u64) {
-        if !self.zfs_arc_dynamic.load(Ordering::Relaxed) {
-            return;
-        }
-        if zfs_arc_mib().is_none() {
-            return; // no ZFS ARC on this host
-        }
-        let mut state = match self.arc_state.lock() {
-            Ok(state) => state,
-            Err(_) => return,
-        };
-        let Some(current_mib) = std::fs::read_to_string(ARC_PARAM_PATH)
-            .ok()
-            .and_then(|text| text.trim().parse::<u64>().ok())
-            .map(|bytes| bytes / (1024 * 1024))
-        else {
-            return;
-        };
-        if state.writable.is_none() || state.writable == Some(false) {
-            // Probe by writing the current value back: it changes nothing on
-            // success and fails with EACCES/EPERM without permission. A
-            // negative result is retried every 10 minutes, so granting the
-            // permissions (see `e-lite arc-setup`) enables the manager
-            // without restarting.
-            if let Some(at) = state.last_probe {
-                if at.elapsed() < Duration::from_secs(600) {
-                    return;
-                }
-            }
-            state.last_probe = Some(Instant::now());
-            let previous = state.writable;
-            match std::fs::write(ARC_PARAM_PATH, (current_mib * 1024 * 1024).to_string()) {
-                Ok(()) => {
-                    state.writable = Some(true);
-                    if previous == Some(false) {
-                        eprintln!(
-                            "[e-lite] arc: dynamic management enabled (zfs_arc_max is \
-                             writable now)"
-                        );
-                    }
-                }
-                Err(e) => {
-                    let was = previous;
-                    state.writable = Some(false);
-                    if was.is_none() {
-                        eprintln!(
-                            "[e-lite] arc: dynamic management unavailable (cannot write \
-                             zfs_arc_max: {e}); run `e-lite arc-setup` or keep the manual cap \
-                             from the startup warning"
-                        );
-                    }
-                    return;
-                }
-            }
-        }
-        if state.writable != Some(true) {
-            return;
-        }
-        let ibd_like = self.core_ibd() || lag > 1000;
-        let mem = memory_info();
-        let target = if ibd_like {
-            let configured = self.zfs_arc_max_mib.load(Ordering::Relaxed);
-            let auto = mem.total_mib.unwrap_or(0) / 2;
-            if configured > 0 {
-                configured
-            } else {
-                auto
-            }
-        } else {
-            self.zfs_arc_min_mib.load(Ordering::Relaxed)
-        }
-        .max(512);
-        // Hysteresis: a phase flip that lasts one block must not flap the cap.
-        if state.last_written_mib == Some(target)
-            || current_mib == target
-            || state
-                .last_change
-                .map(|at| at.elapsed() < Duration::from_secs(300))
-                .unwrap_or(false)
-        {
-            return;
-        }
-        match std::fs::write(ARC_PARAM_PATH, (target * 1024 * 1024).to_string()) {
-            Ok(()) => {
-                self.arc_managed.store(true, Ordering::Relaxed);
-                state.last_written_mib = Some(target);
-                state.last_change = Some(Instant::now());
-                eprintln!(
-                    "[e-lite] arc: cap {current_mib} -> {target} MiB ({phase}; ZFS ARC \
-                     managed dynamically)",
-                    phase = if ibd_like {
-                        "Core IBD or drain"
-                    } else {
-                        "fully synced"
-                    }
-                );
-            }
-            Err(e) => {
-                state.writable = Some(false);
-                eprintln!("[e-lite] arc: cannot write zfs_arc_max anymore: {e}; warn-only");
-            }
         }
     }
 

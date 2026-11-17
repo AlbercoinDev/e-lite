@@ -293,11 +293,6 @@ fn run() -> R<()> {
         println!("e-lite {VERSION}");
         return Ok(());
     }
-    if cmd == Command::ArcSetup {
-        // Host setup only: it needs neither a network nor a reachable Core
-        // (resolving `network = auto` fails on a machine without both).
-        return cmd_arc_setup(args.apply);
-    }
 
     let (cfg, chain) = if matches!(
         cmd,
@@ -386,7 +381,7 @@ fn run() -> R<()> {
             args.yes,
             args.data_dir.as_deref(),
         ),
-        Command::Help | Command::Version | Command::ArcSetup => unreachable!(),
+        Command::Help | Command::Version => unreachable!(),
     }
 }
 

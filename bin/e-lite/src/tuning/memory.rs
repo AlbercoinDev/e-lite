@@ -116,25 +116,6 @@ fn parse_zfs_arc_mib(text: &str) -> Option<u64> {
     zfs_arc_field(text, "size").map(|bytes| bytes / 1024 / 1024)
 }
 
-/// Where the dynamic ARC manager stands for this run.
-#[derive(Debug, Default)]
-pub(super) struct ArcManagerState {
-    /// None = not probed yet. The probe writes the *current* value back, so
-    /// it changes nothing when it succeeds.
-    pub(super) writable: Option<bool>,
-    /// Cap actually written by this run, so unchanged targets are skipped.
-    pub(super) last_written_mib: Option<u64>,
-    pub(super) last_change: Option<Instant>,
-    /// Last permission probe (a negative result is retried, so the operator
-    /// can fix the sysfs permissions without restarting e-lite).
-    pub(super) last_probe: Option<Instant>,
-}
-
-pub(super) const ARC_PARAM_PATH: &str = "/sys/module/zfs/parameters/zfs_arc_max";
-
-/// Public path of the ZFS ARC cap parameter (used by `e-lite arc-setup`).
-pub const ARC_CAP_PATH: &str = ARC_PARAM_PATH;
-
 /// Read one numeric field from `/proc/spl/kstat/zfs/arcstats` content.
 fn zfs_arc_field(text: &str, field: &str) -> Option<u64> {
     for line in text.lines() {
@@ -160,8 +141,7 @@ fn parse_zfs_arc_counters(text: &str) -> Option<(u64, u64)> {
 
 /// Warn about an apparently uncapped ZFS ARC (more than a quarter of RAM).
 /// Returns true when it printed, so callers can rate-limit. `prefix` is the
-/// log prefix. The advice points at `e-lite arc-setup`, which is the only way
-/// the dynamic manager can raise/lower the cap; a fixed cap stays valid.
+/// log prefix. e-lite only reads the ARC; the cap is the administrator's.
 pub fn warn_uncapped_arc(mem: &MemoryInfo, prefix: &str) -> bool {
     let (Some(arc), Some(total)) = (mem.arc_mib, mem.total_mib) else {
         return false;
@@ -170,13 +150,14 @@ pub fn warn_uncapped_arc(mem: &MemoryInfo, prefix: &str) -> bool {
         return false;
     }
     let pct = arc * 100 / total;
+    let suggested_mib = (total / 4).min(8192);
     eprintln!(
         "{prefix} ZFS ARC is using {arc} MiB ({pct}% of RAM) and no cap was found; it is \
-         invisible to MemAvailable and squeezes the cache plan. Let e-lite manage it: \
-         `e-lite arc-setup` (as root) makes zfs_arc_max writable and installs \
-         e-lite-arc-cap.service, so the cap follows half of RAM while Core downloads or the \
-         index drains and zfs_arc_min_mib (1024) once fully synced. A fixed cap also works: \
-         zfs_arc_max=<bytes> in /etc/modprobe.d",
+         invisible to MemAvailable and squeezes the cache plan. Set a fixed cap as root, for \
+         a dedicated machine about {suggested_mib} MiB: `options zfs zfs_arc_max={}` in \
+         /etc/modprobe.d/zfs.conf (now: echo {} > /sys/module/zfs/parameters/zfs_arc_max)",
+        suggested_mib * 1024 * 1024,
+        suggested_mib * 1024 * 1024,
     );
     true
 }

@@ -12,7 +12,6 @@ available**.
 | Core `external`, `auto`, `managed` | experimental | only owned Core can be paused/pruned/stopped |
 | Local Core, LAN Core, WAN via SSH/VPN | experimental | RPC-only for LAN/WAN; no remote block files |
 | Core P2P networks | experimental | `[core] network = auto` (clearnet + onion via the managed Tor, + I2P/CJDNS when available), `private` (only those networks, fail-closed) or `clearnet`; opt-in `private_broadcast` (`-privatebroadcast`, needs Core 30+) |
-| ZFS ARC management without root | experimental | `e-lite arc-setup` prints (or applies with `--apply` as root) the group-writable `zfs_arc_max` + systemd oneshot; the installer adds it on ZFS hosts; a failed permission probe is retried every 10 min |
 | Core RPC exposure guard | experimental | warns on non-loopback; `require_loopback_rpc` makes it fatal; no native TLS |
 | Block source `files`, `rpc`, `auto` | experimental | files reads `blk*.dat`, XOR aware, read-only |
 | From-zero pruned IBD with `prune_mib=1` | experimental | manual prune gate; default 5k safe-block gain |
@@ -26,7 +25,6 @@ available**.
 | Disk guard with download/index split | experimental | cgroup/LXC aware |
 | Adaptive profiles and hot reload | experimental | `auto/hdd/ssd/nvme/manual`, `SIGUSR1` |
 | Machine plan | experimental | physical cores + cgroup quota + disk class: readers and RocksDB jobs = physical cores clamped to 2..cap per disk (jobs: SSD/NVMe 8, ZFS/virtual 4, HDD 2) |
-| Dynamic ZFS ARC cap | experimental | grows during IBD/drain, shrinks to `zfs_arc_min_mib` when synced; needs write access to `zfs_arc_max` (`e-lite arc-setup`) |
 | Log levels and diagnostics | experimental | `info < debug < trace` (alpha default `debug`), hot-reloadable; height line with `recent` rate and `eta`; one startup line with the served banner, cache inventory and provider limits; per-connection `client "<name>" protocol <v>`, `first batch N items`, session/window summary with batches, cache hits/puts/fetch and `tx.get` failure causes (counts and latencies only, never hashes); one `rawtx summary` line at shutdown |
 | Global RocksDB memory budget | experimental | effective `MemAvailable` budget; memtables `effective/16`; opt-in adaptive memtables; adaptive cache; CPU-capped jobs |
 | Reorg recovery within undo window | experimental | deeper reorg fails clearly |

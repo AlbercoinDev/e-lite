@@ -181,21 +181,12 @@ zfs_arc_max` for 8 GiB on a 32 GiB host, persisted in `/etc/modprobe.d/`).
 `/status` and the `debug:` lines report the ARC hit rate, so you can check
 what the cap costs in read warmth.
 
-**Dynamic ARC (default on when e-lite can write it).** `zfs_arc_dynamic`
-lets e-lite manage the cap per phase instead: while Core downloads or the
-index drains, the cap grows to `zfs_arc_max_mib` (0 = half of total RAM —
-the block reads are nearly free at a 97-98 % hit rate); once fully synced
-the cap drops to `zfs_arc_min_mib` (default 1024 MiB) and the RAM becomes
-visible to `MemAvailable` again, so the memory plan and the cache recover.
-Writes go to `/sys/module/zfs/parameters/zfs_arc_max` (bytes) on the 5 s
-`el-tune` tick with a 5 min dwell, logged as `arc: cap X -> Y MiB (phase)`.
-It needs write access: run `e-lite arc-setup` (prints the `chgrp`/`chmod`
-and the `e-lite-arc-cap.service` unit) or `sudo e-lite arc-setup --apply`;
-`install.sh` installs the unit automatically when ZFS is present. A failed
-permission probe is retried every 10 minutes, so granting the permissions
-enables the manager without a restart. Setting `zfs_arc_dynamic = false`
-freezes whatever cap is in place — remember to raise it again before a long
-IBD.
+e-lite only reads the ARC; it never writes `zfs_arc_max`. A dynamic manager
+that raised the cap during IBD and lowered it once synced (`zfs_arc_dynamic`,
+`e-lite arc-setup`) was removed in 0.1.0-alpha.29.19.0. If an older release
+lowered the cap to 1024 MiB, it stays until the next reboot or until you write
+another value (`echo 0 > /sys/module/zfs/parameters/zfs_arc_max` restores
+the ZFS default).
 
 ## Controller cadence
 

@@ -38,8 +38,10 @@ the handoff is stale, update it in the change that makes it stale.
 ## Owner decisions
 
 - **No dependency on systemd or any init system.** e-lite restarts itself
-  (`bin/e-lite/src/supervisor.rs`). The only systemd piece is the optional
-  ZFS `e-lite-arc-cap.service` oneshot.
+  (`bin/e-lite/src/supervisor.rs`); nothing in e-lite or its installer creates
+  a unit.
+- **e-lite never writes the ZFS ARC cap**; it reads the ARC and warns when it
+  is uncapped.
 - **No online snapshot export**: a backup is taken with the service stopped.
 - **Version negotiation stays lenient (AUD-041)**: `client_min` is not
   enforced. Do not make it strict.

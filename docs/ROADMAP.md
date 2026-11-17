@@ -37,7 +37,7 @@ older notes still match. New findings of that review are AUD-173..181 in
 |---|---|---|
 | P2 | HDD sequential mode/readahead | fewer readers in file order, `fadvise`/readahead; A/B on HDD. |
 | P2 | Adaptive controller v2 | partial: dedicated 5 s/30 s thread, fitted memory plan, real `commit/blk`, starvation readers, p95 signals, opt-in hot memtables. Still missing: compaction-driven control and per-profile benchmark tables. |
-| P2 | Compaction/job tuning | partial: per-disk `jobs`, per-family L0/statistics and dynamic ZFS ARC. Still missing: pause/batch when `pending_compaction` grows. |
+| P2 | Compaction/job tuning | partial: per-disk `jobs` and per-family L0/statistics. Still missing: pause/batch when `pending_compaction` grows. |
 | P3 | Commit-group batching | interval/batch extend to 30 s/4096 in bulk; make the durability tradeoff explicit and tested per workload. |
 | P3 | UTXO/prefetch pipeline experiments | measure before changing the hot path. |
 

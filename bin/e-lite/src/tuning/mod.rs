@@ -190,16 +190,6 @@ pub struct Tunables {
     arc_prev: Mutex<Option<(u64, u64)>>,
     /// Unix seconds of the last uncapped-ARC warning (rate-limited to 1/h).
     arc_warn_at: AtomicU64,
-    /// Let e-lite grow/shrink the ZFS ARC cap with the phase (IBD vs live).
-    zfs_arc_dynamic: AtomicBool,
-    /// ARC cap in MiB during IBD/drain. 0 = half of total RAM.
-    zfs_arc_max_mib: AtomicU64,
-    /// ARC cap in MiB once fully synced.
-    zfs_arc_min_mib: AtomicU64,
-    /// True once the dynamic manager wrote the cap successfully; the
-    /// uncapped-ARC warning yields to the manager from then on.
-    arc_managed: AtomicBool,
-    arc_state: Mutex<ArcManagerState>,
     /// Opt-in routine memtable resize. The target must persist for 10 min.
     resume_shrunk: AtomicBool,
 
@@ -483,11 +473,6 @@ impl Tunables {
             last_cache_change: Mutex::new(None),
             arc_prev: Mutex::new(None),
             arc_warn_at: AtomicU64::new(0),
-            zfs_arc_dynamic: AtomicBool::new(cfg.index.zfs_arc_dynamic),
-            zfs_arc_max_mib: AtomicU64::new(cfg.index.zfs_arc_max_mib),
-            zfs_arc_min_mib: AtomicU64::new(cfg.index.zfs_arc_min_mib),
-            arc_managed: AtomicBool::new(false),
-            arc_state: Mutex::new(ArcManagerState::default()),
             reader_streak: Mutex::new((0, 0)),
             resume_shrunk: AtomicBool::new(false),
             read_ms: AtomicU64::new(0),
@@ -890,21 +875,6 @@ impl Tunables {
                 self.background_jobs.store(v, Ordering::Relaxed);
                 changed.push("background_jobs");
             }
-        }
-        if self.zfs_arc_dynamic.load(Ordering::Relaxed) != cfg.index.zfs_arc_dynamic {
-            self.zfs_arc_dynamic
-                .store(cfg.index.zfs_arc_dynamic, Ordering::Relaxed);
-            changed.push("zfs_arc_dynamic");
-        }
-        if self.zfs_arc_max_mib.load(Ordering::Relaxed) != cfg.index.zfs_arc_max_mib {
-            self.zfs_arc_max_mib
-                .store(cfg.index.zfs_arc_max_mib, Ordering::Relaxed);
-            changed.push("zfs_arc_max_mib");
-        }
-        if self.zfs_arc_min_mib.load(Ordering::Relaxed) != cfg.index.zfs_arc_min_mib {
-            self.zfs_arc_min_mib
-                .store(cfg.index.zfs_arc_min_mib, Ordering::Relaxed);
-            changed.push("zfs_arc_min_mib");
         }
         if cfg.index.readers > 0 {
             let v = cfg

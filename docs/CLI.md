@@ -45,9 +45,6 @@ import-snapshot  restore --input into an empty target (atomic: staged, then rena
                  (--verify checks per-file hashes; --verify=full opens the
                  restored Core and runs a bounded verifychain;
                  --expect-digest <hex> refuses an archive that is not yours)
-arc-setup        print the steps that let e-lite manage the ZFS ARC cap
-                 without root (group-writable zfs_arc_max + the
-                 e-lite-arc-cap.service oneshot); --apply runs them (root)
 version          print version
 ```
 
@@ -107,9 +104,6 @@ version          print version
 | `--set index.reorg_window=<n>` | `index.reorg_window` | `288` |
 | `--set index.milestone_blocks=<n>` | `index.milestone_blocks` | `10000` |
 | `--set index.milestone_seconds=<n>` | `index.milestone_seconds` | `21600` |
-| `--set index.zfs_arc_dynamic=false` | dynamic ZFS ARC cap (grow during IBD/drain, shrink when synced; see `arc-setup`) | `true` |
-| `--set index.zfs_arc_max_mib=<n>` | ARC cap during IBD/drain (0 = half of RAM) | `0` |
-| `--set index.zfs_arc_min_mib=<n>` | ARC cap once fully synced (floor 512) | `1024` |
 
 `auto` uses the disk `rotational` hint. Virtual disks and some RAID/USB devices
 report it incorrectly; set `--set index.profile=ssd` or `--set index.profile=nvme` when you know the

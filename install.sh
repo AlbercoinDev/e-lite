@@ -305,42 +305,27 @@ install_tor() {
 }
 install_tor
 
-# ----------------------------------------------------- ZFS ARC (best effort)
-# Let e-lite manage the ZFS ARC cap (grow while Core downloads, shrink to the
-# minimum once fully synced) without running as root: the sysfs parameter is
-# made group-writable and a systemd oneshot restores it after every boot.
-configure_arc() {
-  arc="/sys/module/zfs/parameters/zfs_arc_max"
-  [ -e "$arc" ] || return 0
-  command -v systemctl >/dev/null 2>&1 || return 0
-  # USER may be unset (cron, minimal shells); with `set -u` that would abort.
-  owner="${SUDO_USER:-${USER:-$(id -un 2>/dev/null || true)}}"
-  group="$(id -gn "$owner" 2>/dev/null || true)"
-  [ -n "$group" ] || return 0
+# ---------------------------------------------- ZFS ARC unit (old releases)
+# Releases up to 0.1.0-alpha.29.18.0 installed e-lite-arc-cap.service so
+# e-lite could write the ZFS ARC cap. e-lite no longer does; remove the unit
+# (it made zfs_arc_max group-writable at every boot). Best effort, never fatal.
+remove_arc_unit() {
   unit=/etc/systemd/system/e-lite-arc-cap.service
-  if [ -w "$(dirname "$unit")" ] || [ "$(id -u)" = 0 ]; then
-    cat > "$unit" <<EOF
-[Unit]
-Description=e-lite: allow the ZFS ARC cap to be managed by group $group
-After=zfs-load-module.service systemd-modules-load.service
-ConditionPathExists=$arc
-
-[Service]
-Type=oneshot
-ExecStart=/bin/chgrp $group $arc
-ExecStart=/bin/chmod 0664 $arc
-
-[Install]
-WantedBy=multi-user.target
-EOF
-    systemctl daemon-reload >/dev/null 2>&1 || true
-    systemctl enable --now e-lite-arc-cap.service >/dev/null 2>&1 || true
-    log "ZFS ARC: e-lite-arc-cap.service installed (group $group); e-lite can manage the cap"
+  [ -e "$unit" ] || return 0
+  if [ "$(id -u)" = 0 ]; then
+    run() { "$@"; }
+  elif command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; then
+    run() { sudo "$@"; }
   else
-    log "ZFS ARC: run 'sudo e-lite arc-setup --apply' to let e-lite manage the ARC cap"
+    log "ZFS ARC: $unit is no longer used; remove it as root: systemctl disable --now e-lite-arc-cap.service && rm $unit"
+    return 0
   fi
+  run systemctl disable --now e-lite-arc-cap.service >/dev/null 2>&1 || true
+  run rm -f "$unit" || true
+  run systemctl daemon-reload >/dev/null 2>&1 || true
+  log "ZFS ARC: removed the old e-lite-arc-cap.service (e-lite no longer writes the ARC cap)"
 }
-configure_arc
+remove_arc_unit
 
 # ---------------------------------------------------------------------- done
 log ""

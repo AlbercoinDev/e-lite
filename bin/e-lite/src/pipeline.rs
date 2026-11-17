@@ -2411,9 +2411,6 @@ pub(crate) fn spawn_controller(
             {
                 tunables.apply_store(&store);
             }
-            // The dynamic ZFS ARC cap runs on its own cadence, independent of
-            // the adaptive tuning gate.
-            tunables.arc_tick(lag);
         })
         .unwrap_or_else(|e| {
             eprintln!("[e-lite] cannot start the tuning thread: {e}");

@@ -20,7 +20,6 @@ pub(crate) enum Command {
     Onion,
     Cache,
     Privacy,
-    ArcSetup,
 }
 
 #[derive(Default)]
@@ -58,8 +57,6 @@ pub(crate) struct Args {
     pub(crate) expect_digest: Option<String>,
     pub(crate) set: Vec<String>,
     pub(crate) allow_low_memory: bool,
-    /// `arc-setup --apply`: run the setup as root (writes the systemd unit).
-    pub(crate) apply: bool,
     pub(crate) core_args: Vec<String>,
     pub(crate) no_tor: bool,
     pub(crate) purge: bool,
@@ -356,7 +353,6 @@ pub(crate) fn parse_args_from(argv: impl IntoIterator<Item = String>) -> R<Args>
             "--expect-digest" => args.expect_digest = Some(value("--expect-digest")?),
             "--set" => args.set.push(value("--set")?),
             "--allow-low-memory" => args.allow_low_memory = true,
-            "--apply" => args.apply = true,
             "--core-arg" => args.core_args.push(value("--core-arg")?),
             "--no-tor" => args.no_tor = true,
             "--purge" => args.purge = true,
@@ -409,7 +405,6 @@ pub(crate) fn parse_args_from(argv: impl IntoIterator<Item = String>) -> R<Args>
                     "import-snapshot" => Command::ImportSnapshot,
                     "export-identity" => Command::ExportIdentity,
                     "import-identity" => Command::ImportIdentity,
-                    "arc-setup" => Command::ArcSetup,
                     "version" => Command::Version,
                     "help" => Command::Help,
                     _ => return fail(format!("unknown command: {other}")),
@@ -453,7 +448,6 @@ COMMANDS:
                      configuration files to --output (private keys, not
                      encrypted; stop e-lite first)
     import-identity  restore them from --input (--yes replaces files that differ)
-    arc-setup        let e-lite manage the ZFS ARC cap without root
                      (prints the chgrp/chmod + systemd unit; --apply as root)
     version          print version
 

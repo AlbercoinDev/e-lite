@@ -193,8 +193,6 @@ Full detail: `CHANGELOG.md`.
   size and row counts on the owner's node before writing code.
 - AUD-129 cold-scan latency on HDD/SATA (prefix filters landed; mainnet
   latency not measured).
-- ZFS ARC dynamic manager on the owner's box: warn-only until
-  `e-lite arc-setup --apply` (root) grants write access to `zfs_arc_max`.
 
 ## Decisions that still bind
 
