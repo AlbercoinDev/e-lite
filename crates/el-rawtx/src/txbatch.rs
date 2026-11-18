@@ -15,20 +15,22 @@
 //! falls back to the whole-block path.
 
 use crate::decoy_wallets::{DecoyBook, DecoyPicker, TxRef};
-use crate::governor::{Lane, TorGovernor};
+use crate::governor::{Availability, GovernorPermit, Lane, TorGovernor};
 use crate::privacy::PrivacyParams;
 use crate::txcache::{CachedTx, TxCache};
 use crate::txsource::TxSource;
 use crate::DecoySessions;
-use crate::{AttemptCtl, RawtxError, RawtxStats, Result, Semaphore};
+use crate::{
+    AttemptCtl, Permit, RawtxError, RawtxStats, Result, Semaphore, MAX_HISTORY_TXID_PREFETCH,
+};
 use el_model::sync::Mutex;
 use el_model::{Hash32, ScriptHash};
 use el_store::Store;
 use rand::seq::SliceRandom;
 use rand::thread_rng;
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Condvar};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 /// Servers a real transaction is tried on before the block fallback.
@@ -38,13 +40,12 @@ const MAX_TX_ATTEMPTS: u32 = 3;
 /// firm switch threshold: a provider that misses it is replaced instead of
 /// holding the wallet's transactions.
 const SESSION_BUDGET: Duration = Duration::from_secs(3);
-/// Longest a session waits here for its slots and its Tor stream, all
-/// together. Past it the session's transactions go back to the batcher
-/// (29.25.2: it used to be `EXTERNAL_QUEUE_MAX`, 120 s per wait).
-const SESSION_QUEUE: Duration = Duration::from_secs(3);
-/// Times a transaction may go back to the batcher for local congestion
-/// before that counts as one of its `MAX_TX_ATTEMPTS` (~1 min at 3 s each).
-const MAX_LOCAL_REQUEUES: u32 = 20;
+const MAX_JOBS: usize = 4096;
+const MAX_PENDING_HISTORIES: usize = 128;
+const PREFETCH_TTL: Duration = Duration::from_secs(45);
+/// Only for a source returning an unstarted attempt after admission. The
+/// scheduler itself waits for resource events rather than retrying on a timer.
+const SOURCE_BUSY_BACKOFF: Duration = Duration::from_millis(50);
 /// Smallest batch tried after a provider rejects larger ones. Measured:
 /// `electrum.blockstream.info` accepts 20 txids and closes the connection
 /// above that. The cap halves per failure down to this value.
@@ -62,35 +63,127 @@ const LATENCY_ALPHA: f64 = 0.3;
 struct Req {
     ctx: u64,
     t: TxRef,
+    block: Hash32,
+    wait: Arc<Wait>,
     attempts: u32,
     tried: Vec<String>,
-    /// Sessions that could not run here (local congestion) since the last
-    /// real attempt.
-    local: u32,
+    ready: Instant,
+    cover_needed: bool,
 }
 
 #[derive(Clone)]
 enum Item {
     Real(Req),
-    Decoy {
-        ctx: u64,
-        wallet: usize,
-        txid: Hash32,
-    },
+    Decoy { ctx: u64, wallet: usize, t: TxRef },
 }
 
 impl Item {
     fn txid(&self) -> Hash32 {
         match self {
             Item::Real(r) => r.t.txid,
-            Item::Decoy { txid, .. } => *txid,
+            Item::Decoy { t, .. } => t.txid,
         }
     }
 }
 
+#[derive(Default)]
+struct Interest {
+    active: usize,
+    prefetch: Option<Instant>,
+}
+
+#[derive(Default)]
+struct Progress {
+    done: Option<Result<String>>,
+    owners: HashMap<u64, Interest>,
+}
+
 struct Wait {
-    done: Mutex<Option<std::result::Result<String, RawtxError>>>,
-    cv: Condvar,
+    state: Mutex<Progress>,
+}
+
+impl Wait {
+    fn still_relevant_to(&self, ctx: u64, now: Instant) -> bool {
+        self.state
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .owners
+            .get(&ctx)
+            .is_some_and(|i| i.active > 0 || i.prefetch.is_some_and(|until| until > now))
+    }
+
+    fn interest(&self, now: Instant) -> Option<(u64, Lane)> {
+        let mut st = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        if st.done.is_some() {
+            return None;
+        }
+        st.owners
+            .retain(|_, i| i.active > 0 || i.prefetch.is_some_and(|end| end > now));
+        st.owners
+            .iter()
+            .min_by_key(|(ctx, i)| (i.active == 0, **ctx))
+            .map(|(ctx, i)| {
+                (
+                    *ctx,
+                    if i.active > 0 {
+                        Lane::Wallet
+                    } else {
+                        Lane::Prefetch
+                    },
+                )
+            })
+    }
+
+    fn result(&self) -> Option<Result<String>> {
+        self.state
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .done
+            .clone()
+    }
+}
+
+/// One wallet's interest in shared work, kept across the block fallback.
+pub(crate) struct Ticket {
+    wait: Arc<Wait>,
+    event: Arc<Availability>,
+    ctx: u64,
+}
+
+impl Ticket {
+    pub(crate) fn result(&self) -> Option<Result<String>> {
+        self.wait.result()
+    }
+}
+
+impl Drop for Ticket {
+    fn drop(&mut self) {
+        let mut st = self.wait.state.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(interest) = st.owners.get_mut(&self.ctx) {
+            interest.active -= 1;
+            if interest.active == 0 {
+                // Do not keep speculative work for a request the wallet has
+                // completed or abandoned.
+                st.owners.remove(&self.ctx);
+            }
+        }
+        drop(st);
+        self.event.notify();
+    }
+}
+
+#[derive(Default)]
+struct Incoming {
+    reqs: Vec<Req>,
+    histories: VecDeque<(u64, ScriptHash, Vec<TxRef>)>,
+    unsent: Vec<Session>,
+}
+
+#[derive(Default)]
+struct Books {
+    open: HashMap<u64, Arc<Mutex<DecoyBook>>>,
+    order: VecDeque<u64>,
+    closed: VecDeque<u64>,
 }
 
 struct Shared {
@@ -99,10 +192,11 @@ struct Shared {
     sources: Vec<Arc<dyn TxSource>>,
     params: PrivacyParams,
     picker: DecoyPicker,
-    books: Mutex<(HashMap<u64, DecoyBook>, VecDeque<u64>)>,
-    queue: Mutex<Vec<Req>>,
-    queue_cv: Condvar,
-    waiters: Mutex<HashMap<Hash32, Arc<Wait>>>,
+    books: Mutex<Books>,
+    queue: Mutex<Incoming>,
+    event: Arc<Availability>,
+    waiters: Mutex<HashMap<(TxRef, Hash32), Arc<Wait>>>,
+    prune_height: Arc<AtomicU32>,
     sessions: Arc<Semaphore>,
     /// Sessions open to a server (at most `MAX_SESSIONS_PER_SERVER`).
     per_server: Mutex<HashMap<String, Arc<Semaphore>>>,
@@ -134,6 +228,7 @@ struct Shared {
     /// Batches being dispatched and sessions running right now (tests).
     active: std::sync::atomic::AtomicUsize,
     sessions_active: std::sync::atomic::AtomicUsize,
+    pending: std::sync::atomic::AtomicUsize,
 }
 
 /// The per-txid fetch mode of a resolver.
@@ -148,7 +243,7 @@ pub(crate) struct TxMode {
 impl Drop for TxMode {
     fn drop(&mut self) {
         self.shared.closed.store(true, Ordering::Relaxed);
-        self.shared.queue_cv.notify_all();
+        self.shared.event.notify();
         if let Some(worker) = self.worker.take() {
             let _ = worker.join();
         }
@@ -169,17 +264,26 @@ impl TxMode {
         jitter_ms: u64,
         provider_quota: f64,
         governor: Arc<TorGovernor>,
+        prune_height: Arc<AtomicU32>,
+        event: Arc<Availability>,
     ) -> Option<Self> {
         if sources.is_empty() {
             return None;
         }
         let shared = Arc::new(Shared {
-            picker: DecoyPicker::new(Arc::clone(&store), secret, params.clone()),
+            picker: DecoyPicker::new(
+                Arc::clone(&store),
+                secret,
+                params.clone(),
+                Arc::clone(&prune_height),
+            ),
             store,
             txcache,
             sources,
-            sessions: Semaphore::new(sessions_total.max(1)),
-            decoy_sessions: Semaphore::new((sessions_total / 4).max(1)),
+            sessions: Semaphore::new(sessions_total.min(params.parallel_sessions).max(1)),
+            decoy_sessions: Semaphore::new(
+                (sessions_total.min(params.parallel_sessions) / 4).max(1),
+            ),
             decoy_mode,
             jitter_ms: jitter_ms.min(250),
             provider_quota: if provider_quota <= 0.0 {
@@ -192,10 +296,11 @@ impl TxMode {
             governor,
             batch_caps: Mutex::new(HashMap::new()),
             params,
-            books: Mutex::new((HashMap::new(), VecDeque::new())),
-            queue: Mutex::new(Vec::new()),
-            queue_cv: Condvar::new(),
+            books: Mutex::new(Books::default()),
+            queue: Mutex::new(Incoming::default()),
+            event,
             waiters: Mutex::new(HashMap::new()),
+            prune_height,
             per_server: Mutex::new(HashMap::new()),
             latency: Mutex::new(HashMap::new()),
             spread: Mutex::new(HashMap::new()),
@@ -203,6 +308,7 @@ impl TxMode {
             closed: AtomicBool::new(false),
             active: std::sync::atomic::AtomicUsize::new(0),
             sessions_active: std::sync::atomic::AtomicUsize::new(0),
+            pending: std::sync::atomic::AtomicUsize::new(0),
         });
         let worker = Arc::clone(&shared);
         let handle = match std::thread::Builder::new()
@@ -226,48 +332,48 @@ impl TxMode {
         self.shared.sources.iter().map(|s| s.servers().len()).sum()
     }
 
+    pub(crate) fn wake(&self) {
+        self.shared.event.notify();
+    }
+
     /// The index served the history of `script` to connection `ctx`: queue
     /// every transaction not cached yet, and give the connection's decoy
     /// wallets a look-alike of the address. Returns how many were queued.
-    pub(crate) fn want_history(&self, ctx: u64, script: ScriptHash, hist: Vec<TxRef>) -> usize {
-        let missing: Vec<TxRef> = hist
-            .iter()
-            .copied()
-            .filter(|t| !self.shared.cached(t.txid))
-            .collect();
-        if missing.is_empty() {
+    pub(crate) fn want_history(&self, ctx: u64, script: ScriptHash, hist: &[TxRef]) -> usize {
+        let mut q = self.shared.queue.lock().unwrap_or_else(|p| p.into_inner());
+        if hist.is_empty()
+            || hist.len() > MAX_HISTORY_TXID_PREFETCH
+            || q.histories.len() >= MAX_PENDING_HISTORIES
+        {
             return 0;
         }
-        self.shared
-            .with_book(ctx, |book, picker| book.add_real(picker, script, &hist));
-        let n = missing.len();
-        for t in missing {
-            self.shared.submit(ctx, t, false);
-        }
+        let n = hist.len();
+        q.histories.push_back((ctx, script, hist.to_vec()));
+        drop(q);
+        self.shared.event.notify();
         n
     }
 
-    /// Fetch one transaction (waiting up to `deadline`). `Err` means the
-    /// caller should use the whole-block path.
-    pub(crate) fn fetch(&self, ctx: u64, t: TxRef, deadline: Instant) -> Result<String> {
-        let wait = self.shared.submit(ctx, t, true);
-        let mut done = wait
-            .done
+    pub(crate) fn request(&self, ctx: u64, t: TxRef, block: Hash32) -> Option<Ticket> {
+        let wait = self.shared.submit(ctx, t, block, true)?;
+        Some(Ticket {
+            wait,
+            event: Arc::clone(&self.shared.event),
+            ctx,
+        })
+    }
+
+    pub(crate) fn publish(&self, t: TxRef, block: Hash32, raw: &str) {
+        let key = (t, block);
+        let wait = self
+            .shared
+            .waiters
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        loop {
-            if let Some(result) = done.as_ref() {
-                return result.clone();
-            }
-            let left = deadline.saturating_duration_since(Instant::now());
-            if left.is_zero() {
-                return Err(RawtxError::Unavailable("tx mode: deadline reached".into()));
-            }
-            done = wait
-                .cv
-                .wait_timeout(done, left.min(Duration::from_secs(1)))
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .0;
+            .unwrap_or_else(|p| p.into_inner())
+            .get(&key)
+            .cloned();
+        if let Some(wait) = wait {
+            self.shared.finish(key, &wait, Ok(raw.to_owned()));
         }
     }
 
@@ -278,7 +384,7 @@ impl TxMode {
             .shared
             .queue
             .lock()
-            .map(|q| q.is_empty())
+            .map(|q| q.reqs.is_empty() && q.histories.is_empty() && q.unsent.is_empty())
             .unwrap_or(false);
         let waiters_empty = self
             .shared
@@ -290,85 +396,206 @@ impl TxMode {
             && waiters_empty
             && self.shared.active.load(Ordering::SeqCst) == 0
             && self.shared.sessions_active.load(Ordering::SeqCst) == 0
+            && self.shared.pending.load(Ordering::SeqCst) == 0
     }
 
     /// The connection closed: forget its decoy wallets.
     pub(crate) fn forget(&self, ctx: u64) {
-        if let Ok(mut books) = self.shared.books.lock() {
-            books.0.remove(&ctx);
-            books.1.retain(|c| *c != ctx);
+        self.shared
+            .queue
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .histories
+            .retain(|(id, _, _)| *id != ctx);
+        let waiters = self
+            .shared
+            .waiters
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        {
+            let mut books = self.shared.books.lock().unwrap_or_else(|p| p.into_inner());
+            books.open.remove(&ctx);
+            books.order.retain(|c| *c != ctx);
+            books.closed.push_back(ctx);
+            if books.closed.len() > MAX_BOOKS + MAX_PENDING_HISTORIES {
+                books.closed.pop_front();
+            }
         }
+        for wait in waiters.values() {
+            wait.state
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .owners
+                .remove(&ctx);
+        }
+        drop(waiters);
         if let Ok(mut spread) = self.shared.spread.lock() {
             spread.retain(|(c, _), _| *c != ctx);
         }
+        self.shared.event.notify();
     }
 }
 
 impl Shared {
-    fn cached(&self, txid: Hash32) -> bool {
-        self.txcache
-            .as_ref()
-            .is_some_and(|c| c.get(&txid).is_some())
+    fn cached(&self, t: TxRef, expected: Option<Hash32>) -> Option<String> {
+        let entry = self.txcache.as_ref()?.get(&t.txid)?;
+        let rec = self.store.get_block(t.height).ok()??;
+        if expected.is_some_and(|hash| hash != rec.hash) {
+            return None;
+        }
+        crate::verify_cached_tx(&entry, &rec, t.txid).ok()?;
+        Some(hex::encode(entry.raw))
     }
 
-    fn with_book<T>(&self, ctx: u64, f: impl FnOnce(&mut DecoyBook, &DecoyPicker) -> T) -> T {
-        let mut books = self.books.lock().unwrap_or_else(|p| p.into_inner());
-        if !books.0.contains_key(&ctx) {
-            if books.1.len() >= MAX_BOOKS {
-                if let Some(old) = books.1.pop_front() {
-                    books.0.remove(&old);
-                    if let Ok(mut spread) = self.spread.lock() {
-                        spread.retain(|(c, _), _| *c != old);
+    fn has_book(&self, ctx: u64) -> bool {
+        self.books
+            .lock()
+            .is_ok_and(|books| books.open.contains_key(&ctx))
+    }
+
+    fn defer_decoys(&self, source: usize, key: &str, queued: Instant, items: Vec<Item>) {
+        if items.is_empty() || queued.elapsed() >= PREFETCH_TTL {
+            return;
+        }
+        let mut incoming = self.queue.lock().unwrap_or_else(|p| p.into_inner());
+        incoming.unsent.push(Session {
+            source,
+            key: key.to_owned(),
+            items,
+            queued,
+            ready: Instant::now() + SOURCE_BUSY_BACKOFF,
+        });
+        drop(incoming);
+        self.event.notify();
+    }
+
+    fn with_book<T>(
+        &self,
+        ctx: u64,
+        f: impl FnOnce(&mut DecoyBook, &DecoyPicker) -> T,
+    ) -> Option<T> {
+        let book = {
+            let mut books = self.books.lock().unwrap_or_else(|p| p.into_inner());
+            if books.closed.contains(&ctx) {
+                return None;
+            }
+            if let Some(book) = books.open.get(&ctx) {
+                Arc::clone(book)
+            } else {
+                if books.order.len() >= MAX_BOOKS {
+                    if let Some(old) = books.order.pop_front() {
+                        books.open.remove(&old);
+                        if let Ok(mut spread) = self.spread.lock() {
+                            spread.retain(|(c, _), _| *c != old);
+                        }
                     }
                 }
+                let book = Arc::new(Mutex::new(DecoyBook::new(self.params.decoy_wallets)));
+                books.open.insert(ctx, Arc::clone(&book));
+                books.order.push_back(ctx);
+                book
             }
-            books
-                .0
-                .insert(ctx, DecoyBook::new(self.params.decoy_wallets));
-            books.1.push_back(ctx);
-        }
-        let book = books.0.get_mut(&ctx).expect("inserted above");
-        f(book, &self.picker)
+        };
+        let mut book = book.lock().unwrap_or_else(|p| p.into_inner());
+        Some(f(&mut book, &self.picker))
     }
 
     /// Queue `t` once (a second request shares the first one's wait).
-    fn submit(&self, ctx: u64, t: TxRef, from_tx_get: bool) -> Arc<Wait> {
+    fn submit(&self, ctx: u64, t: TxRef, block: Hash32, from_tx_get: bool) -> Option<Arc<Wait>> {
+        let now = Instant::now();
+        if t.height >= self.prune_height.load(Ordering::Relaxed) {
+            return None;
+        }
         let mut waiters = self.waiters.lock().unwrap_or_else(|p| p.into_inner());
-        if let Some(w) = waiters.get(&t.txid) {
-            return Arc::clone(w);
+        if self
+            .books
+            .lock()
+            .is_ok_and(|books| books.closed.contains(&ctx))
+        {
+            return None;
         }
-        let wait = Arc::new(Wait {
-            done: Mutex::new(None),
-            cv: Condvar::new(),
-        });
-        waiters.insert(t.txid, Arc::clone(&wait));
+        let key = (t, block);
+        let (wait, new) = if let Some(wait) = waiters.get(&key) {
+            (Arc::clone(wait), false)
+        } else {
+            let max = if from_tx_get {
+                MAX_JOBS
+            } else {
+                MAX_JOBS - MAX_HISTORY_TXID_PREFETCH
+            };
+            if waiters.len() >= max {
+                return None;
+            }
+            let wait = Arc::new(Wait {
+                state: Mutex::new(Progress::default()),
+            });
+            waiters.insert(key, Arc::clone(&wait));
+            (wait, true)
+        };
+        {
+            let mut st = wait.state.lock().unwrap_or_else(|p| p.into_inner());
+            let interest = st.owners.entry(ctx).or_default();
+            if from_tx_get {
+                interest.active += 1;
+            } else {
+                interest.prefetch = Some(now + PREFETCH_TTL);
+            }
+        }
         drop(waiters);
-        if from_tx_get {
-            // A bare transaction.get: no address known, decoys of its shape.
-            self.with_book(ctx, |book, picker| book.add_unknown(picker, &t));
+        if new {
+            self.requeue(Req {
+                ctx,
+                t,
+                block,
+                wait: Arc::clone(&wait),
+                attempts: 0,
+                tried: Vec::new(),
+                ready: now,
+                cover_needed: from_tx_get,
+            });
+        } else {
+            self.event.notify();
         }
-        let mut q = self.queue.lock().unwrap_or_else(|p| p.into_inner());
-        q.push(Req {
-            ctx,
-            t,
-            attempts: 0,
-            tried: Vec::new(),
-            local: 0,
-        });
-        self.queue_cv.notify_all();
-        wait
+        Some(wait)
     }
 
-    fn finish(&self, txid: Hash32, result: std::result::Result<String, RawtxError>) {
-        let wait = self
-            .waiters
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .remove(&txid);
-        if let Some(w) = wait {
-            *w.done.lock().unwrap_or_else(|p| p.into_inner()) = Some(result);
-            w.cv.notify_all();
+    fn finish(&self, key: (TxRef, Hash32), wait: &Arc<Wait>, result: Result<String>) {
+        let mut map = self.waiters.lock().unwrap_or_else(|p| p.into_inner());
+        if map.get(&key).is_some_and(|w| Arc::ptr_eq(w, wait)) {
+            wait.state.lock().unwrap_or_else(|p| p.into_inner()).done = Some(result);
+            map.remove(&key);
+            drop(map);
+            self.event.notify();
         }
+    }
+
+    fn wanted(&self, req: &Req, now: Instant) -> Option<(u64, Lane)> {
+        if let Some(i) = req.wait.interest(now) {
+            if req.t.height < self.prune_height.load(Ordering::Relaxed) {
+                return Some(i);
+            }
+        }
+        // Recheck interest under the map lock: a new wallet might have joined
+        // since the first check.
+        let mut map = self.waiters.lock().unwrap_or_else(|p| p.into_inner());
+        let key = (req.t, req.block);
+        if map.get(&key).is_some_and(|w| Arc::ptr_eq(w, &req.wait)) {
+            if req.t.height < self.prune_height.load(Ordering::Relaxed) {
+                if let Some(i) = req.wait.interest(now) {
+                    return Some(i);
+                }
+            }
+            req.wait
+                .state
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .done = Some(Err(RawtxError::Unavailable(
+                "transaction work no longer needed".into(),
+            )));
+            map.remove(&key);
+            self.event.notify();
+        }
+        None
     }
 
     fn server_slot(&self, key: &str) -> Arc<Semaphore> {
@@ -421,12 +648,13 @@ impl Shared {
 
     fn requeue(&self, req: Req) {
         let mut q = self.queue.lock().unwrap_or_else(|p| p.into_inner());
-        q.push(req);
-        self.queue_cv.notify_all();
+        q.reqs.push(req);
+        drop(q);
+        self.event.notify();
     }
 
     /// Check a loose transaction against the index and cache it (AUD-163).
-    fn verify(&self, t: &TxRef, raw: &[u8]) -> Result<String> {
+    fn validate(&self, t: &TxRef, expected: Option<Hash32>, raw: &[u8]) -> Result<Vec<Hash32>> {
         let tx: bitcoin::Transaction = bitcoin::consensus::deserialize(raw)
             .map_err(|e| RawtxError::Verify(format!("cannot decode: {e}")))?;
         let computed = Hash32::from_hex(&tx.compute_txid().to_string())
@@ -437,10 +665,13 @@ impl Shared {
         let rec = self
             .store
             .get_block(t.height)?
-            .ok_or_else(|| RawtxError::Verify("block not indexed".into()))?;
+            .ok_or_else(|| RawtxError::Unavailable("indexed location changed".into()))?;
+        if expected.is_some_and(|hash| rec.hash != hash) {
+            return Err(RawtxError::Unavailable("indexed location changed".into()));
+        }
         let txids = self.store.block_txids(&rec)?;
         if txids.get(t.pos as usize) != Some(&t.txid) {
-            return Err(RawtxError::Verify(
+            return Err(RawtxError::Unavailable(
                 "position does not match the index".into(),
             ));
         }
@@ -450,8 +681,13 @@ impl Shared {
             .map_err(|e| RawtxError::Verify(format!("bad indexed header: {e}")))?;
         let root = el_model::merkle_root_from_branch(t.txid, &branch, t.pos as usize);
         if root.to_hex() != header.merkle_root.to_string() {
-            return Err(RawtxError::Verify("merkle branch mismatch".into()));
+            return Err(RawtxError::Unavailable("index Merkle root changed".into()));
         }
+        Ok(branch)
+    }
+
+    fn verify(&self, t: &TxRef, block: Hash32, raw: &[u8]) -> Result<String> {
+        let branch = self.validate(t, Some(block), raw)?;
         if let Some(cache) = &self.txcache {
             let entry = CachedTx {
                 height: t.height,
@@ -467,33 +703,186 @@ impl Shared {
     }
 }
 
+struct Session {
+    source: usize,
+    key: String,
+    items: Vec<Item>,
+    queued: Instant,
+    ready: Instant,
+}
+
+impl Session {
+    fn lane(&self, now: Instant) -> Lane {
+        self.items
+            .iter()
+            .filter_map(|item| match item {
+                Item::Real(r) => r.wait.interest(now).map(|(_, lane)| lane),
+                Item::Decoy { .. } => None,
+            })
+            .min()
+            .unwrap_or(Lane::Decoy)
+    }
+}
+
 fn batch_loop(shared: Arc<Shared>) {
-    loop {
-        let reqs = {
-            let mut q = shared.queue.lock().unwrap_or_else(|p| p.into_inner());
-            while q.is_empty() {
-                if shared.closed.load(Ordering::Relaxed) {
-                    return;
-                }
-                q = shared
-                    .queue_cv
-                    .wait_timeout(q, Duration::from_secs(1))
-                    .unwrap_or_else(|p| p.into_inner())
-                    .0;
-            }
-            drop(q);
-            // Gather what arrives within the window, then take it all.
-            std::thread::sleep(Duration::from_millis(shared.params.batch_window_ms));
-            std::mem::take(&mut *shared.queue.lock().unwrap_or_else(|p| p.into_inner()))
-        };
+    let mut staged = VecDeque::<Session>::new();
+    let mut preparing = Vec::<Req>::new();
+    let mut workers = Vec::<std::thread::JoinHandle<()>>::new();
+    let mut gather_until = None;
+    while !shared.closed.load(Ordering::Relaxed) {
+        let seq = shared.event.sequence();
         shared.active.fetch_add(1, Ordering::SeqCst);
-        dispatch(&shared, reqs);
+        let (requests, unsent, history, more_history) = {
+            let mut incoming = shared.queue.lock().unwrap_or_else(|p| p.into_inner());
+            (
+                std::mem::take(&mut incoming.reqs),
+                std::mem::take(&mut incoming.unsent),
+                incoming.histories.pop_front(),
+                !incoming.histories.is_empty(),
+            )
+        };
+        staged.extend(unsent);
+        if let Some((ctx, script, hist)) = history {
+            let missing: Vec<_> = hist
+                .iter()
+                .copied()
+                .filter(|&t| shared.cached(t, None).is_none())
+                .collect();
+            if !missing.is_empty() {
+                shared.with_book(ctx, |book, picker| book.add_real(picker, script, &hist));
+                for t in missing {
+                    if let Ok(Some(rec)) = shared.store.get_block(t.height) {
+                        shared.submit(ctx, t, rec.hash, false);
+                    }
+                }
+            }
+        }
+        preparing.extend(requests);
+        let now = Instant::now();
+        let mut next = None;
+        if !preparing.is_empty() && staged.len() < MAX_JOBS {
+            let gather = *gather_until
+                .get_or_insert(now + Duration::from_millis(shared.params.batch_window_ms));
+            if now >= gather {
+                let mut ready = Vec::new();
+                preparing.retain_mut(|r| {
+                    if shared.wanted(r, now).is_none() {
+                        return false;
+                    }
+                    if r.ready > now {
+                        next = Some(next.map_or(r.ready, |until: Instant| until.min(r.ready)));
+                        return true;
+                    }
+                    if let Some(raw) = shared.cached(r.t, Some(r.block)) {
+                        shared.finish((r.t, r.block), &r.wait, Ok(raw));
+                    } else {
+                        ready.push(r.clone());
+                    }
+                    false
+                });
+                if !ready.is_empty() {
+                    dispatch(&shared, ready, &mut staged);
+                }
+                if preparing.is_empty() {
+                    gather_until = None;
+                }
+            } else {
+                next = Some(gather);
+            }
+        }
+        // Recompute lane when a wallet joins its history prefetch. Never
+        // create a worker to wait for a server, another session or Tor.
+        staged.make_contiguous().sort_by_cached_key(|s| s.lane(now));
+        let n = staged.len();
+        for _ in 0..n {
+            let Some(mut session) = staged.pop_front() else {
+                break;
+            };
+            if shared.closed.load(Ordering::Relaxed) {
+                break;
+            }
+            session.items.retain(|item| match item {
+                Item::Real(r) => shared.wanted(r, now).is_some(),
+                Item::Decoy { ctx, .. } => {
+                    shared.has_book(*ctx) && now < session.queued + PREFETCH_TTL
+                }
+            });
+            if session.items.is_empty() {
+                continue;
+            }
+            if session.ready > now {
+                next = Some(next.map_or(session.ready, |until| until.min(session.ready)));
+                staged.push_back(session);
+                continue;
+            }
+            let lane = session.lane(now);
+            match admit(&shared, &session, lane) {
+                Some(permits) => {
+                    let scheduler = Arc::clone(&shared);
+                    let backup = session.items.clone();
+                    let guard = SessionGuard::new(&shared);
+                    match std::thread::Builder::new()
+                        .name(el_model::sync::THREAD_FETCH.into())
+                        .spawn(move || {
+                            let _guard = guard;
+                            run_session(&scheduler, session, lane, permits);
+                        }) {
+                        Ok(worker) => workers.push(worker),
+                        Err(e) => {
+                            eprintln!("[e-lite] tx session did not start: {e}");
+                            for item in backup {
+                                if let Item::Real(r) = item {
+                                    shared.finish(
+                                        (r.t, r.block),
+                                        &r.wait,
+                                        Err(RawtxError::Unavailable(
+                                            "could not start transaction session".into(),
+                                        )),
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+                None => staged.push_back(session),
+            }
+        }
+        let mut i = 0;
+        while i < workers.len() {
+            if workers[i].is_finished() {
+                let _ = workers.swap_remove(i).join();
+            } else {
+                i += 1;
+            }
+        }
+        if !staged.is_empty() {
+            if let Some(until) = shared.governor.paused_until() {
+                next = Some(next.map_or(until, |other| other.min(until)));
+            }
+            if let Some(until) = staged
+                .iter()
+                .map(|s| s.queued + PREFETCH_TTL)
+                .filter(|&t| t > now)
+                .min()
+            {
+                next = Some(next.map_or(until, |other| other.min(until)));
+            }
+        }
+        shared
+            .pending
+            .store(staged.len() + preparing.len(), Ordering::SeqCst);
         shared.active.fetch_sub(1, Ordering::SeqCst);
+        if !more_history {
+            shared.event.wait(seq, next);
+        }
+    }
+    for worker in workers {
+        let _ = worker.join();
     }
 }
 
 /// Mix, spread and launch the sessions for one gathered batch.
-fn dispatch(shared: &Arc<Shared>, reqs: Vec<Req>) {
+fn dispatch(shared: &Shared, reqs: Vec<Req>, staged: &mut VecDeque<Session>) {
     // Usable servers over every source: (source index, key, onion).
     let mut servers: Vec<(usize, String, bool)> = Vec::new();
     for (i, src) in shared.sources.iter().enumerate() {
@@ -514,7 +903,8 @@ fn dispatch(shared: &Arc<Shared>, reqs: Vec<Req>) {
     if servers.is_empty() {
         for r in reqs {
             shared.finish(
-                r.t.txid,
+                (r.t, r.block),
+                &r.wait,
                 Err(RawtxError::Unavailable("tx mode: no server".into())),
             );
         }
@@ -527,7 +917,15 @@ fn dispatch(shared: &Arc<Shared>, reqs: Vec<Req>) {
 
     // Groups: per connection, the real requests and each decoy wallet.
     let mut by_ctx: HashMap<u64, Vec<Req>> = HashMap::new();
-    for r in reqs {
+    for mut r in reqs {
+        let Some((ctx, _)) = shared.wanted(&r, Instant::now()) else {
+            continue;
+        };
+        if r.cover_needed || r.ctx != ctx {
+            shared.with_book(ctx, |book, picker| book.add_unknown(picker, &r.t));
+            r.cover_needed = false;
+            r.ctx = ctx;
+        }
         by_ctx.entry(r.ctx).or_default().push(r);
     }
     // Groups keyed by (connection, 0 = real / 1 + decoy wallet).
@@ -538,19 +936,20 @@ fn dispatch(shared: &Arc<Shared>, reqs: Vec<Req>) {
         // are waiting; the same round (default) keeps all of them, which is
         // what hides the real group among look-alikes.
         let background = matches!(shared.decoy_mode, DecoySessions::Background);
-        let decoys = shared.with_book(ctx, |book, _| {
-            let mut taken = book.take(n);
-            if background {
-                taken.retain(|(wallet, _)| *wallet == 0);
-            }
-            taken
-        });
-        let k = shared.with_book(ctx, |book, _| book.wallets());
+        let (decoys, k) = shared
+            .with_book(ctx, |book, _| {
+                let mut taken = book.take(n);
+                if background {
+                    taken.retain(|(wallet, _)| *wallet == 0);
+                }
+                (taken, book.wallets())
+            })
+            .unwrap_or_default();
         groups.push(((ctx, 0), real.into_iter().map(Item::Real).collect()));
         let mut per_wallet: Vec<Vec<Item>> = (0..k).map(|_| Vec::new()).collect();
-        for (wallet, txid) in decoys {
+        for (wallet, t) in decoys {
             if let Some(g) = per_wallet.get_mut(wallet) {
-                g.push(Item::Decoy { ctx, wallet, txid });
+                g.push(Item::Decoy { ctx, wallet, t });
             }
         }
         groups.extend(
@@ -568,11 +967,22 @@ fn dispatch(shared: &Arc<Shared>, reqs: Vec<Req>) {
     let mut rng = thread_rng();
     // Faster servers first, with jitter so the choice is not deterministic;
     // the spread above still puts every group on several servers.
+    let burst = groups
+        .iter()
+        .filter(|((_, wallet), _)| *wallet == 0)
+        .map(|(_, items)| items.len())
+        .sum::<usize>()
+        >= 8;
     let rank: Vec<f64> = servers
         .iter()
-        .map(|(_, key, onion)| {
+        .map(|(source, key, onion)| {
             let jitter = 0.7 + rand::random::<f64>() * 0.6;
-            shared.expected_ms(key) * jitter * if *onion { 0.8 } else { 1.0 }
+            let singles = if shared.sources[*source].max_batch_size() == 1 && burst {
+                2.0
+            } else {
+                1.0
+            };
+            shared.expected_ms(key) * jitter * singles * if *onion { 0.8 } else { 1.0 }
         })
         .collect();
     // Candidates: the faster half of the servers, never fewer than `spread`.
@@ -645,11 +1055,6 @@ fn dispatch(shared: &Arc<Shared>, reqs: Vec<Req>) {
                 .unwrap_or(candidates[0]);
             *counts.entry(servers[pick].1.clone()).or_insert(0) += 1;
             per_server.entry(pick).or_default().push(item);
-            let operator = server_operator(&servers[pick].1);
-            if let Ok(mut totals) = shared.provider_counts.lock() {
-                *totals.entry(operator).or_insert(0) += 1;
-            }
-            shared.provider_total.fetch_add(1, Ordering::Relaxed);
         }
     }
     drop(spread_counts);
@@ -661,91 +1066,136 @@ fn dispatch(shared: &Arc<Shared>, reqs: Vec<Req>) {
     for (idx, mut items) in pending {
         items.shuffle(&mut rng);
         let (src_idx, key, _) = servers[idx].clone();
-        let cap = shared.batch_cap(&key, p.session_size.max(1));
+        let cap = shared
+            .batch_cap(&key, p.session_size.max(1))
+            .min(shared.sources[src_idx].max_batch_size().max(1));
         for chunk in items.chunks(cap) {
-            let src = Arc::clone(&shared.sources[src_idx]);
-            let chunk = chunk.to_vec();
-            let shared = Arc::clone(shared);
-            let key = key.clone();
-            let spawned = std::thread::Builder::new()
-                .name("el-txsession".into())
-                .spawn(move || run_session(&shared, src, &key, chunk));
-            if let Err(e) = spawned {
-                eprintln!("[e-lite] tx session did not start: {e}");
-            }
+            let now = Instant::now();
+            let jitter = if shared.jitter_ms == 0 {
+                0
+            } else {
+                rand::random::<u64>() % shared.jitter_ms
+            };
+            staged.push_back(Session {
+                source: src_idx,
+                key: key.clone(),
+                items: chunk.to_vec(),
+                queued: now,
+                ready: now + Duration::from_millis(jitter),
+            });
         }
     }
 }
 
 /// Decrements the session counter when `run_session` returns or unwinds.
-struct SessionGuard<'a>(&'a std::sync::atomic::AtomicUsize);
+struct SessionGuard(Arc<Shared>);
 
-impl Drop for SessionGuard<'_> {
-    fn drop(&mut self) {
-        self.0.fetch_sub(1, Ordering::SeqCst);
+impl SessionGuard {
+    fn new(shared: &Arc<Shared>) -> Self {
+        shared.sessions_active.fetch_add(1, Ordering::SeqCst);
+        Self(Arc::clone(shared))
     }
 }
 
-fn run_session(shared: &Arc<Shared>, src: Arc<dyn TxSource>, key: &str, items: Vec<Item>) {
-    shared.sessions_active.fetch_add(1, Ordering::SeqCst);
-    let _guard = SessionGuard(&shared.sessions_active);
-    let has_real = items.iter().any(|item| matches!(item, Item::Real(_)));
-    let lane = if has_real { Lane::Wallet } else { Lane::Decoy };
-    let queued = Instant::now();
-    if has_real && shared.jitter_ms > 0 {
-        // Small random delay: it breaks the timing correlation between the
-        // wallet's connection and its first provider request at a negligible
-        // cost (at most `jitter_ms`).
-        let delay = rand::random::<u64>() % shared.jitter_ms.max(1);
-        std::thread::sleep(Duration::from_millis(delay));
+impl Drop for SessionGuard {
+    fn drop(&mut self) {
+        self.0.sessions_active.fetch_sub(1, Ordering::SeqCst);
+        self.0.event.notify();
     }
-    // Every local wait of a session shares one short limit (29.25.2): no
-    // queue holds a transaction for minutes. What does not get its turn goes
-    // back to the batcher without spending one of its servers.
-    let queue_deadline = Instant::now() + SESSION_QUEUE;
-    // Decoy sessions use a small separate pool so three decoy wallets never
-    // take the session slots a real transaction is waiting for. Dropping a
-    // decoy when the pool is full is harmless: it is background noise.
-    let _decoy_permit = if has_real {
-        None
+}
+
+struct Admission {
+    _session: Permit,
+    _server: Permit,
+    _decoy: Option<Permit>,
+    stream: Option<GovernorPermit>,
+}
+
+fn admit(shared: &Shared, session: &Session, lane: Lane) -> Option<Admission> {
+    let server = shared.server_slot(&session.key).try_acquire(0)?;
+    let slot = shared
+        .sessions
+        .try_acquire(usize::from(lane == Lane::Decoy))?;
+    let decoy = if lane == Lane::Decoy {
+        Some(shared.decoy_sessions.try_acquire(0)?)
     } else {
-        match shared.decoy_sessions.acquire_until(queue_deadline, 0) {
-            Some(permit) => Some(permit),
-            None => return,
-        }
+        None
     };
-    // The server's slot first, then a global session slot, and the Tor
-    // stream last: a session waiting for a busy server or a session slot
-    // must not hold a stream every other download needs (29.25.2).
-    let slot = shared.server_slot(key);
-    let Some(_server_permit) = slot.acquire_until(queue_deadline, 0) else {
-        local_requeue(shared, items, key, "server busy", queued);
-        return;
+    let stream = if shared.sources[session.source].via_tor(&session.key) {
+        Some(shared.governor.try_acquire(lane)?)
+    } else {
+        None
     };
-    let Some(_permit) = shared.sessions.acquire_until(queue_deadline, 0) else {
-        local_requeue(shared, items, key, "no session slot", queued);
-        return;
-    };
-    let first = if src.via_tor(key) {
-        match shared.governor.acquire(lane, queue_deadline) {
-            Some(stream) => Some(stream),
-            None => {
-                local_requeue(shared, items, key, "no tor stream", queued);
-                return;
+    Some(Admission {
+        _session: slot,
+        _server: server,
+        _decoy: decoy,
+        stream,
+    })
+}
+
+fn run_session(shared: &Shared, session: Session, lane: Lane, mut permits: Admission) {
+    let Session {
+        source,
+        key,
+        mut items,
+        queued,
+        ..
+    } = session;
+    let key = key.as_str();
+    let src = &shared.sources[source];
+    items.retain(|item| match item {
+        Item::Real(r) => {
+            if shared.wanted(r, Instant::now()).is_none() {
+                false
+            } else if let Some(raw) = shared.cached(r.t, Some(r.block)) {
+                shared.finish((r.t, r.block), &r.wait, Ok(raw));
+                false
+            } else if shared
+                .store
+                .get_block(r.t.height)
+                .ok()
+                .flatten()
+                .is_none_or(|rec| rec.hash != r.block)
+            {
+                shared.finish(
+                    (r.t, r.block),
+                    &r.wait,
+                    Err(RawtxError::Unavailable("indexed location changed".into())),
+                );
+                false
+            } else {
+                true
             }
         }
-    } else {
-        None
-    };
+        Item::Decoy { ctx, t, .. } => {
+            shared.has_book(*ctx) && t.height < shared.prune_height.load(Ordering::Relaxed)
+        }
+    });
+    if items.is_empty() {
+        return;
+    }
+    // The original connection can leave while a second one is waiting for
+    // the same transaction. Replan before sending if the original cover is
+    // no longer associated with a live interest.
+    items.retain(|item| match item {
+        Item::Real(r) if !r.wait.still_relevant_to(r.ctx, Instant::now()) => {
+            let mut r = r.clone();
+            r.cover_needed = true;
+            shared.requeue(r);
+            false
+        }
+        _ => true,
+    });
+    if items.is_empty() {
+        return;
+    }
     let txids: Vec<Hash32> = items.iter().map(Item::txid).collect();
     let real = items.iter().filter(|i| matches!(i, Item::Real(_))).count() as u64;
     shared.stats.tx_sessions.fetch_add(1, Ordering::Relaxed);
-    shared.stats.tx_real.fetch_add(real, Ordering::Relaxed);
-    shared
-        .stats
-        .tx_decoys
-        .fetch_add(txids.len() as u64 - real, Ordering::Relaxed);
-    let ctl = AttemptCtl::new().with_streams(Arc::clone(&shared.governor), lane, first);
+    let ctl = AttemptCtl::new()
+        .with_streams(Arc::clone(&shared.governor), lane, permits.stream.take())
+        .with_health(lane == Lane::Wallet);
     let waited = queued.elapsed();
     // The session's budget starts once it holds everything it waited for.
     let started = Instant::now();
@@ -770,13 +1220,20 @@ fn run_session(shared: &Arc<Shared>, src: Arc<dyn TxSource>, key: &str, items: V
     }
     if local {
         // Nothing was sent: not the server's failure, not a slow server.
-        local_requeue(shared, items, key, crate::LOCAL_BUSY, queued);
+        let mut decoys = Vec::new();
+        for item in items {
+            match item {
+                Item::Real(r) => local_requeue(shared, r),
+                cover => decoys.push(cover),
+            }
+        }
+        shared.defer_decoys(source, key, queued, decoys);
         return;
     }
-    if result.is_ok() {
+    if result.is_ok() && lane == Lane::Wallet && src.via_tor(key) {
         shared.governor.healthy();
     }
-    if result.is_err() && ctl.connected() {
+    if result.is_err() && ctl.connected() && lane != Lane::Decoy {
         // A provider that closes above its batch limit is remembered with a
         // smaller batch, so the next session succeeds instead of failing. A
         // session that never connected says nothing about the batch size
@@ -785,87 +1242,96 @@ fn run_session(shared: &Arc<Shared>, src: Arc<dyn TxSource>, key: &str, items: V
     }
     // Real time, success or failure: a fast rejection must not look like a
     // 40 s stall (the old code used the whole session budget on failure).
-    shared.note_latency(key, ms);
+    if lane == Lane::Wallet {
+        shared.note_latency(key, ms);
+    }
     let batch = result.unwrap_or_default();
     let mut bad = false;
+    let mut unsent = Vec::new();
+    let mut sent = 0;
     for item in items {
+        if !skipped.contains(&item.txid()) || batch.contains_key(&item.txid()) {
+            sent += 1;
+            let count = if matches!(item, Item::Real(_)) {
+                &shared.stats.tx_real
+            } else {
+                &shared.stats.tx_decoys
+            };
+            count.fetch_add(1, Ordering::Relaxed);
+        }
         match item {
             Item::Real(r) if skipped.contains(&r.t.txid) && !batch.contains_key(&r.t.txid) => {
-                local_requeue_one(shared, r, key, "not sent");
+                local_requeue(shared, r);
             }
-            Item::Real(r) => match batch.get(&r.t.txid) {
-                Some(raw) => match shared.verify(&r.t, raw) {
-                    Ok(hex) => {
-                        shared.stats.tx_verified.fetch_add(1, Ordering::Relaxed);
-                        shared.finish(r.t.txid, Ok(hex));
-                    }
-                    Err(e) => {
-                        bad = true;
+            Item::Real(r) if shared.wanted(&r, Instant::now()).is_some() => {
+                match batch.get(&r.t.txid) {
+                    Some(raw) => match shared.verify(&r.t, r.block, raw) {
+                        Ok(hex) => {
+                            shared.stats.tx_verified.fetch_add(1, Ordering::Relaxed);
+                            shared.finish((r.t, r.block), &r.wait, Ok(hex));
+                        }
+                        Err(e) if matches!(e, RawtxError::Verify(_)) => {
+                            bad = true;
+                            shared
+                                .stats
+                                .tx_verify_failed
+                                .fetch_add(1, Ordering::Relaxed);
+                            shared.stats.verify_failures.fetch_add(1, Ordering::Relaxed);
+                            retry_or_fail(shared, r, key, e.kind());
+                        }
+                        Err(e) => shared.finish((r.t, r.block), &r.wait, Err(e)),
+                    },
+                    None => retry_or_fail(shared, r, key, "not returned"),
+                }
+            }
+            Item::Real(_) => {}
+            Item::Decoy { ctx, wallet, t } => {
+                if let Some(raw) = batch.get(&t.txid) {
+                    if shared.params.decoy_growth
+                        && shared.has_book(ctx)
+                        && shared.validate(&t, None, raw).is_ok()
+                    {
                         shared
-                            .stats
-                            .tx_verify_failed
-                            .fetch_add(1, Ordering::Relaxed);
-                        shared.stats.verify_failures.fetch_add(1, Ordering::Relaxed);
-                        retry_or_fail(shared, r, key, e.kind());
+                            .with_book(ctx, |book, picker| book.grow(picker, wallet, t.txid, raw));
                     }
-                },
-                None => retry_or_fail(shared, r, key, "not returned"),
-            },
-            Item::Decoy { ctx, wallet, txid } => {
-                if let Some(raw) = batch.get(&txid) {
-                    if shared.params.decoy_growth {
-                        shared.with_book(ctx, |book, picker| book.grow(picker, wallet, txid, raw));
-                    }
+                } else if skipped.contains(&t.txid) {
+                    unsent.push(Item::Decoy { ctx, wallet, t });
                 }
             }
         }
     }
-    if bad {
+    if sent > 0 {
+        let operator = server_operator(key);
+        if let Ok(mut totals) = shared.provider_counts.lock() {
+            *totals.entry(operator).or_insert(0) += sent;
+        }
+        shared.provider_total.fetch_add(sent, Ordering::Relaxed);
+    }
+    shared.defer_decoys(source, key, queued, unsent);
+    if bad && lane == Lane::Wallet {
         src.penalize(key);
     }
 }
 
-/// Requeue the real items of a session that could not run here (no slot,
-/// no Tor stream): the server was never asked, so it is not added to the
-/// item's tried servers and no attempt is spent. Decoys are dropped.
-fn local_requeue(shared: &Arc<Shared>, items: Vec<Item>, key: &str, why: &str, since: Instant) {
-    let mut n = 0usize;
-    for item in items {
-        if let Item::Real(r) = item {
-            n += 1;
-            local_requeue_one(shared, r, key, why);
-        }
-    }
+/// A request which never went on the wire spends no provider attempt.
+fn local_requeue(shared: &Shared, mut r: Req) {
     shared
         .stats
         .tx_local_requeues
-        .fetch_add(n as u64, Ordering::Relaxed);
-    if crate::debug_logs() && n > 0 {
-        eprintln!(
-            "[e-lite] debug: session to {key} did not run ({why}) after {} ms: {n} real requeued",
-            since.elapsed().as_millis()
-        );
-    }
-}
-
-fn local_requeue_one(shared: &Arc<Shared>, mut r: Req, key: &str, why: &str) {
-    r.local += 1;
-    if r.local > MAX_LOCAL_REQUEUES {
-        // Local congestion for this long: count it as a failed attempt so
-        // the transaction moves on to the block path.
-        r.local = 0;
-        retry_or_fail(shared, r, key, why);
-    } else if shared.closed.load(Ordering::Relaxed) {
+        .fetch_add(1, Ordering::Relaxed);
+    if shared.closed.load(Ordering::Relaxed) {
         shared.finish(
-            r.t.txid,
+            (r.t, r.block),
+            &r.wait,
             Err(RawtxError::Unavailable("tx mode: closed".into())),
         );
     } else {
+        r.ready = Instant::now() + SOURCE_BUSY_BACKOFF;
         shared.requeue(r);
     }
 }
 
-fn retry_or_fail(shared: &Arc<Shared>, mut r: Req, key: &str, why: &str) {
+fn retry_or_fail(shared: &Shared, mut r: Req, key: &str, why: &str) {
     r.attempts += 1;
     r.tried.push(key.to_string());
     if r.attempts < MAX_TX_ATTEMPTS && !shared.closed.load(Ordering::Relaxed) {
@@ -873,7 +1339,8 @@ fn retry_or_fail(shared: &Arc<Shared>, mut r: Req, key: &str, why: &str) {
     } else {
         shared.stats.tx_fallback.fetch_add(1, Ordering::Relaxed);
         shared.finish(
-            r.t.txid,
+            (r.t, r.block),
+            &r.wait,
             Err(RawtxError::Unavailable(format!(
                 "tx mode: {MAX_TX_ATTEMPTS} servers failed ({why})"
             ))),

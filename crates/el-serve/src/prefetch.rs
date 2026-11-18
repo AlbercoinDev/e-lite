@@ -103,6 +103,10 @@ impl Prefetcher {
         self.per_history
     }
 
+    pub(crate) fn enabled(&self) -> bool {
+        self.tx.is_some()
+    }
+
     /// Enqueue one block with the history transactions it contains.
     /// Duplicates and a full queue are dropped silently: prefetch is an
     /// optimisation, never a correctness path.

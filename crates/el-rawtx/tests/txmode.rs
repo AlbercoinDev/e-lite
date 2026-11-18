@@ -77,6 +77,10 @@ struct Chain {
 /// 1..=5); addresses 100.. each have 3-8 transactions spread over the other
 /// blocks, so decoys of a similar size exist.
 fn chain(name: &str) -> Chain {
+    chain_with_real_count(name, 5)
+}
+
+fn chain_with_real_count(name: &str, real_count: u32) -> Chain {
     let dir = tmp(name);
     let store = Arc::new(Store::open(&dir).unwrap());
     let mut batch = Store::batch();
@@ -86,10 +90,10 @@ fn chain(name: &str) -> Chain {
     let mut txnum = 0u64;
     let mut prev = BlockHash::all_zeros();
     let mut tag = 0u32;
-    for height in 0..40u32 {
+    for height in 0..(real_count + 35) {
         let mut txs = vec![tx(1_000_000 + height, &[999_999])]; // coinbase-like
         let mut owners: Vec<Vec<u32>> = vec![vec![]];
-        if (1..=5).contains(&height) {
+        if (1..=real_count).contains(&height) {
             tag += 1;
             txs.push(tx(tag, &[1, 1_000 + height]));
             owners.push(vec![1, 1_000 + height]);
@@ -157,7 +161,7 @@ fn chain(name: &str) -> Chain {
             }
         }
         txnum += block.txdata.len() as u64;
-        if height == 39 {
+        if height == real_count + 34 {
             store
                 .commit(
                     std::mem::replace(&mut batch, Store::batch()),
@@ -193,6 +197,7 @@ struct FakeSource {
     /// Sessions answered "local stream budget busy" before any is served
     /// (nothing sent: local congestion, not the server).
     busy: Mutex<u64>,
+    delay: Duration,
 }
 
 impl FakeSource {
@@ -204,6 +209,7 @@ impl FakeSource {
             limit: None,
             calls: Mutex::new(Vec::new()),
             busy: Mutex::new(0),
+            delay: Duration::ZERO,
         })
     }
 
@@ -215,6 +221,7 @@ impl FakeSource {
             limit: Some(limit),
             calls: Mutex::new(Vec::new()),
             busy: Mutex::new(0),
+            delay: self.delay,
         })
     }
 
@@ -265,6 +272,9 @@ impl TxSource for FakeSource {
             .lock()
             .unwrap()
             .push((server.to_string(), txids.to_vec()));
+        if !self.delay.is_zero() {
+            std::thread::sleep(self.delay);
+        }
         if let Some(limit) = self.limit {
             if txids.len() > limit {
                 return Err(RawtxError::Unavailable(format!(
@@ -773,4 +783,155 @@ fn local_congestion_does_not_spend_the_servers_of_a_transaction() {
             >= 1
     );
     settle(&r);
+}
+
+#[test]
+fn a_cold_239_transaction_load_shares_work_while_streams_are_busy() {
+    use std::sync::atomic::AtomicUsize;
+    let c = chain_with_real_count("wallet239", 239);
+    let mut src = FakeSource::new(&c.raw, 4, None);
+    Arc::get_mut(&mut src).unwrap().delay = Duration::from_millis(40);
+    let mut p = PrivacyParams::balanced();
+    p.decoy_wallets = 0; // assert exact real sends independently of cover traffic
+    p.session_size = 12;
+    let mut cfg = config(p);
+    cfg.tor_streams = 2;
+    cfg.jitter_ms = 0;
+    let r = Resolver::new(Arc::clone(&c.store), &cfg)
+        .unwrap()
+        .with_tx_sources(vec![Arc::clone(&src) as Arc<dyn TxSource>], [9; 32]);
+    r.set_prune_height(u32::MAX);
+    assert_eq!(r.want_history(1, c.real.0, &c.real.1), 239);
+    assert_eq!(r.want_history(2, c.real.0, &c.real.1), 239);
+    let next = AtomicUsize::new(0);
+    let load = || {
+        std::thread::scope(|scope| {
+            for _ in 0..32 {
+                scope.spawn(|| {
+                    while let Some(t) = c.real.1.get(next.fetch_add(1, Ordering::Relaxed) / 2) {
+                        let want = hex::encode(&c.raw[&t.txid]);
+                        assert_eq!(r.raw_tx_for(1, t.txid, t.height).unwrap(), want);
+                        assert_eq!(r.raw_tx_for(2, t.txid, t.height).unwrap(), want);
+                    }
+                });
+            }
+        })
+    };
+    let cold = Instant::now();
+    load();
+    let cold = cold.elapsed();
+    settle(&r);
+    assert!(r.tx_idle());
+    let snapshot = r.governor_snapshot();
+    assert_eq!(snapshot.peak, 2);
+    assert_eq!(snapshot.in_use, 0);
+    assert_eq!(r.stats().tx_local_requeues.load(Ordering::Relaxed), 0);
+    assert_eq!(
+        src.sent().len(),
+        239,
+        "one external send per cold transaction"
+    );
+    next.store(0, Ordering::Relaxed);
+    let warm = Instant::now();
+    load();
+    eprintln!(
+        "239 confirmations, two clients, two simulated Tor streams: cold {} ms, warm {} ms, {} external txids total",
+        cold.as_millis(),
+        warm.elapsed().as_millis(),
+        src.sent().len(),
+    );
+    assert_eq!(
+        src.sent().len(),
+        239,
+        "warm load must make no external requests"
+    );
+}
+
+#[test]
+fn block_path_override_disables_even_history_prefetch() {
+    let c = chain("override-block");
+    let src = FakeSource::new(&c.raw, 4, None);
+    let mut cfg = config(PrivacyParams::balanced());
+    cfg.path = el_rawtx::ExternalPath::Block;
+    let r = Resolver::new(Arc::clone(&c.store), &cfg)
+        .unwrap()
+        .with_tx_sources(vec![Arc::clone(&src) as Arc<dyn TxSource>], [9; 32]);
+    r.set_prune_height(u32::MAX);
+    assert_eq!(r.want_history(1, c.real.0, &c.real.1), 0);
+    let t = c.real.1[0];
+    assert!(matches!(
+        r.raw_tx(t.txid, t.height),
+        Err(RawtxError::NoSource(_))
+    ));
+    assert!(src.sent().is_empty());
+}
+
+#[test]
+fn a_txid_result_wakes_wallets_while_their_block_is_still_downloading() {
+    use el_rawtx::{BlockSource, Endpoint, FetchMode};
+    use std::sync::atomic::AtomicBool;
+
+    #[derive(Default)]
+    struct HangingBlock {
+        opened: AtomicBool,
+        canceled: AtomicBool,
+    }
+    impl BlockSource for HangingBlock {
+        fn name(&self) -> &str {
+            "hanging"
+        }
+        fn fetch_block(&self, _: &Hash32) -> Result<Vec<u8>> {
+            unreachable!("wallet block races use fetch_endpoint")
+        }
+        fn fetch_endpoint(
+            &self,
+            _: &Endpoint,
+            _: &Hash32,
+            deadline: Instant,
+            _: FetchMode,
+            ctl: &AttemptCtl,
+        ) -> Result<Vec<u8>> {
+            self.opened.store(true, Ordering::Release);
+            while Instant::now() < deadline && !ctl.aborted() {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            self.canceled.store(ctl.aborted(), Ordering::Release);
+            Err(RawtxError::Unavailable("block never answered".into()))
+        }
+    }
+
+    let c = chain("wallet-race");
+    let mut src = FakeSource::new(&c.raw, 1, None);
+    Arc::get_mut(&mut src).unwrap().delay = Duration::from_millis(1450);
+    let block = Arc::new(HangingBlock::default());
+    let p = PrivacyParams {
+        decoy_wallets: 0,
+        batch_window_ms: 0,
+        ..PrivacyParams::balanced()
+    };
+    let cfg = RawtxConfig {
+        wallet_deadline_seconds: 3,
+        txid_attempt_seconds: 1,
+        jitter_ms: 0,
+        ..config(p)
+    };
+    let r = Resolver::new(Arc::clone(&c.store), &cfg)
+        .unwrap()
+        .with_tx_sources(vec![src as Arc<dyn TxSource>], [2; 32])
+        .with_external(block.clone());
+    r.set_prune_height(u32::MAX);
+    let t = c.real.1[0];
+    let start = Instant::now();
+    assert_eq!(
+        r.raw_tx(t.txid, t.height).unwrap(),
+        hex::encode(&c.raw[&t.txid])
+    );
+    assert!(block.opened.load(Ordering::Acquire));
+    assert_eq!(r.stats().race_wins_txid.load(Ordering::Relaxed), 1);
+    assert!(start.elapsed() < Duration::from_secs(3));
+    let end = Instant::now() + Duration::from_secs(1);
+    while !block.canceled.load(Ordering::Acquire) && Instant::now() < end {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(block.canceled.load(Ordering::Acquire));
 }

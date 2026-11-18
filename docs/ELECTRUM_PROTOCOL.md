@@ -125,6 +125,13 @@ opt-in error until a BIP352 indexer is wired; it is not advertised as available.
 
 ## Performance and safety notes
 
+- A confirmed `transaction.get` that exhausts its deadline with only
+  temporary download failures triggers a reconnect, not a per-item negative
+  result. A batch with such an item is not sent partially. This avoids the
+  missing-transaction placeholder used by Sparrow for per-item RPC errors.
+  A real not-found or a permanent configuration error still has an explicit
+  RPC response.
+
 - A pruned transaction is fetched by txid (default) or as a whole block by
   hash, and verified against the index either way. P2P requests `MSG_WITNESS_BLOCK`
   (BIP144), requires `NODE_WITNESS`, and validates hash, merkle root and the

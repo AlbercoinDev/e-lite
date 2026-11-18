@@ -6,13 +6,10 @@
 //! branch up to the indexed header) before caching or serving it. Decoy
 //! transactions are only parsed for their outputs.
 
-use crate::esplora::isolated_tor_client_with;
 use crate::health::{Blame, HealthMap, TRANSIENT_BASE, TRANSIENT_CAP};
 use crate::{AttemptCtl, RawtxError, Result};
 use el_model::Hash32;
 use std::collections::HashMap;
-use std::io::Read;
-use std::sync::mpsc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -28,6 +25,11 @@ pub trait TxSource: Send + Sync {
     fn all_servers(&self) -> Vec<String>;
     /// Whether the server is reached through Tor.
     fn via_tor(&self, server: &str) -> bool;
+    /// Electrum batches many txids on one stream. Esplora needs one isolated
+    /// connection per transaction and is scheduled accordingly.
+    fn max_batch_size(&self) -> usize {
+        usize::MAX
+    }
     /// Ask one server for `txids` in one session (or one burst of requests).
     /// May return only some of them. Updates the server's health itself.
     fn fetch_from(
@@ -41,9 +43,6 @@ pub trait TxSource: Send + Sync {
     fn penalize(&self, server: &str);
 }
 
-/// Most transactions one Esplora-tx call fetches at once (each request is its
-/// own Tor circuit).
-const ESPLORA_TX_PARALLEL: usize = 8;
 /// Largest raw transaction accepted (a standard transaction is < 400 kWU).
 pub(crate) const MAX_TX_BYTES: u64 = 4 * 1024 * 1024;
 
@@ -52,7 +51,7 @@ pub(crate) const MAX_TX_BYTES: u64 = 4 * 1024 * 1024;
 pub struct EsploraTxSource {
     bases: Vec<String>,
     tor_proxy: Option<String>,
-    direct: Option<reqwest::blocking::Client>,
+    allow_clearnet: bool,
     connect: Duration,
     stall: Duration,
     cooldown: Duration,
@@ -72,22 +71,12 @@ impl EsploraTxSource {
         cooldown: Duration,
         conns: Arc<crate::Semaphore>,
     ) -> Option<Self> {
-        let direct = (allow_clearnet && tor_proxy.is_none())
-            .then(|| {
-                reqwest::blocking::Client::builder()
-                    .connect_timeout(connect)
-                    .timeout(stall)
-                    .user_agent(crate::HTTP_USER_AGENT)
-                    .build()
-                    .ok()
-            })
-            .flatten();
         let bases: Vec<String> = bases
             .into_iter()
             .map(|b| b.trim_end_matches('/').to_string())
             .filter(|b| {
                 let onion = b.to_ascii_lowercase().contains(".onion");
-                (tor_proxy.is_some() || (direct.is_some() && !onion))
+                (tor_proxy.is_some() || (allow_clearnet && !onion))
                     && (b.starts_with("https://") || (onion && b.starts_with("http://")))
             })
             .collect();
@@ -97,7 +86,7 @@ impl EsploraTxSource {
         Some(EsploraTxSource {
             bases,
             tor_proxy,
-            direct,
+            allow_clearnet,
             connect,
             stall,
             cooldown,
@@ -106,31 +95,43 @@ impl EsploraTxSource {
         })
     }
 
-    fn client(&self, base: &str) -> Option<reqwest::blocking::Client> {
+    fn client(&self, base: &str) -> Option<reqwest::Client> {
+        let factor = if base.contains(".onion") { 2 } else { 1 };
+        let builder = reqwest::Client::builder()
+            .connect_timeout((self.connect * factor).min(self.stall * factor))
+            .read_timeout(self.stall * factor)
+            .user_agent(crate::HTTP_USER_AGENT)
+            .pool_max_idle_per_host(0)
+            .redirect(reqwest::redirect::Policy::none())
+            .no_proxy();
         match &self.tor_proxy {
             Some(socks) => {
-                let factor = if base.contains(".onion") { 2 } else { 1 };
-                isolated_tor_client_with(socks, self.connect * factor, self.stall * factor)
+                let user = format!("el{:016x}", rand::random::<u64>());
+                builder
+                    .proxy(reqwest::Proxy::all(format!("socks5h://{user}:x@{socks}")).ok()?)
+                    .build()
+                    .ok()
             }
-            None => self.direct.clone(),
+            None if self.allow_clearnet => builder.build().ok(),
+            None => None,
         }
     }
 
-    fn fetch_one(
-        client: &reqwest::blocking::Client,
+    async fn fetch_one(
+        client: reqwest::Client,
         base: &str,
         txid: &Hash32,
-        deadline: Instant,
         ctl: &AttemptCtl,
     ) -> std::result::Result<Vec<u8>, Blame> {
         let url = format!("{base}/tx/{}/raw", txid.to_hex());
-        let mut resp = client.get(&url).send().map_err(|e| {
+        let mut resp = client.get(&url).send().await.map_err(|e| {
             if e.is_connect() || e.is_timeout() {
                 Blame::Unreachable
             } else {
                 Blame::Transient
             }
         })?;
+        ctl.mark_connected();
         let status = resp.status();
         if status == reqwest::StatusCode::TOO_MANY_REQUESTS
             || status == reqwest::StatusCode::SERVICE_UNAVAILABLE
@@ -144,23 +145,15 @@ impl EsploraTxSource {
             return Err(Blame::Hard);
         }
         let mut bytes = Vec::new();
-        let mut buf = [0u8; 16 * 1024];
-        loop {
-            if ctl.aborted() || Instant::now() >= deadline {
+        while let Some(chunk) = resp.chunk().await.map_err(|_| Blame::Transient)? {
+            if ctl.aborted() {
                 return Err(Blame::Transient);
             }
-            match resp.read(&mut buf) {
-                Ok(0) => break,
-                Ok(n) => {
-                    ctl.add_bytes(n);
-                    bytes.extend_from_slice(&buf[..n]);
-                    if bytes.len() as u64 > MAX_TX_BYTES {
-                        return Err(Blame::Hard);
-                    }
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
-                Err(_) => return Err(Blame::Transient),
+            if bytes.len().saturating_add(chunk.len()) as u64 > MAX_TX_BYTES {
+                return Err(Blame::Hard);
             }
+            ctl.add_bytes(chunk.len());
+            bytes.extend_from_slice(&chunk);
         }
         Ok(bytes)
     }
@@ -187,6 +180,10 @@ impl TxSource for EsploraTxSource {
         self.tor_proxy.is_some()
     }
 
+    fn max_batch_size(&self) -> usize {
+        1
+    }
+
     fn fetch_from(
         &self,
         server: &str,
@@ -194,105 +191,56 @@ impl TxSource for EsploraTxSource {
         deadline: Instant,
         ctl: &AttemptCtl,
     ) -> Result<TxBatch> {
-        let (tx, rx) = mpsc::channel();
-        let mut next = 0usize;
-        let mut running = 0usize;
-        let mut out = TxBatch::new();
-        let mut worst: Option<Blame> = None;
-        let mut starved = false;
-        while next < txids.len() || running > 0 {
-            while running < ESPLORA_TX_PARALLEL && next < txids.len() {
-                let Some(client) = self.client(server) else {
-                    return Err(RawtxError::Unavailable(format!("{server}: no client")));
-                };
-                let txid = txids[next];
-                let base = server.to_string();
-                let tx = tx.clone();
-                let ctl = ctl.clone();
-                // Each request is its own circuit, so its own Tor stream
-                // (29.25.2): the first waits for one, the fan-out only takes
-                // free ones and otherwise waits for its own requests.
-                let stream = if self.tor_proxy.is_some() {
-                    match ctl.take_stream((running == 0).then_some(deadline)) {
-                        Ok(stream) => stream,
-                        Err(crate::NoStream) if running == 0 => {
-                            starved = true;
-                            break;
-                        }
-                        Err(crate::NoStream) => break,
-                    }
-                } else {
-                    None
-                };
-                // One connection per request, from the shared pool: Tor must
-                // not be asked for 8 sessions x 8 circuits (AUD-167).
-                let Some(permit) = self.conns.acquire_until(deadline, 0) else {
-                    // No slot before the deadline: leave the rest for the next
-                    // attempt instead of blaming the server.
-                    if running == 0 {
-                        starved = true;
-                    }
-                    break;
-                };
-                std::thread::spawn(move || {
-                    let _permit = permit;
-                    let r = Self::fetch_one(&client, &base, &txid, deadline, &ctl);
-                    // The client owns the connection: close it, then give the
-                    // Tor stream back.
-                    drop(client);
-                    drop(stream);
-                    let _ = tx.send((txid, r));
-                });
-                next += 1;
-                running += 1;
-            }
-            if starved {
-                break;
-            }
-            let wait = deadline.saturating_duration_since(Instant::now());
-            match rx.recv_timeout(wait.max(Duration::from_millis(1))) {
-                Ok((txid, Ok(bytes))) => {
-                    running -= 1;
-                    out.insert(txid, bytes);
-                }
-                Ok((_, Err(blame))) => {
-                    running -= 1;
-                    // Over Tor a 429 is one exit (AUD-160); several pause it.
-                    let pause = match blame {
-                        Blame::RateLimited(_) => self.health.circuit_limited(server),
-                        _ => true,
-                    };
-                    if pause && worst.is_none() {
-                        worst = Some(blame);
-                    }
-                }
-                Err(_) => break,
-            }
+        let Some((txid, rest)) = txids.split_first() else {
+            return Ok(TxBatch::new());
+        };
+        for txid in rest {
+            ctl.skip(*txid);
         }
-        if !ctl.aborted() {
-            match (out.is_empty(), worst) {
-                (false, _) => self.health.succeed(server),
-                (true, Some(blame)) => {
+        let busy = || RawtxError::Unavailable(format!("{server}: {}", crate::LOCAL_BUSY));
+        let (_stream, _conn) = if self.via_tor(server) {
+            (ctl.take_stream(None).map_err(|_| busy())?, None)
+        } else {
+            (None, Some(self.conns.try_acquire(0).ok_or_else(busy)?))
+        };
+        let result = {
+            // No detached worker: on deadline the HTTP future is dropped,
+            // then its runtime closes the socket before the permit is freed.
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|_| busy())?;
+            runtime.block_on(async {
+                let client = self.client(server).ok_or(Blame::Hard)?;
+                tokio::time::timeout_at(deadline.into(), Self::fetch_one(client, server, txid, ctl))
+                    .await
+                    .unwrap_or(Err(Blame::Transient))
+            })
+        };
+        match result {
+            Ok(bytes) => {
+                if ctl.updates_health() {
+                    self.health.succeed(server);
+                }
+                Ok(TxBatch::from([(*txid, bytes)]))
+            }
+            Err(blame) => {
+                if ctl.updates_health()
+                    && (!matches!(blame, Blame::RateLimited(_))
+                        || self.health.circuit_limited(server))
+                {
                     self.health
                         .fail(server, blame, TRANSIENT_BASE, TRANSIENT_CAP, self.cooldown);
                 }
-                (true, None) => {}
+                let why = match blame {
+                    Blame::Hard => "HTTP request rejected",
+                    Blame::Unreachable => "HTTP connection failed",
+                    Blame::RateLimited(_) => "HTTP rate limited",
+                    Blame::Transient => "HTTP attempt timed out or stalled",
+                };
+                Err(RawtxError::Unavailable(format!("{server}: {why}")))
             }
         }
-        // What was never sent is not the server's: the caller requeues it.
-        for txid in &txids[next.min(txids.len())..] {
-            ctl.skip(*txid);
-        }
-        if out.is_empty() {
-            if next == 0 {
-                return Err(RawtxError::Unavailable(format!(
-                    "{server}: {}",
-                    crate::LOCAL_BUSY
-                )));
-            }
-            return Err(RawtxError::Unavailable(format!("{server}: no transaction")));
-        }
-        Ok(out)
     }
 
     fn penalize(&self, server: &str) {
@@ -303,5 +251,84 @@ impl TxSource for EsploraTxSource {
             TRANSIENT_CAP,
             self.cooldown,
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::governor::{Lane, TorGovernor};
+    use std::io::{BufRead, BufReader, Read, Write};
+    use std::net::TcpListener;
+
+    #[test]
+    fn esplora_deadline_closes_the_tor_socket_and_releases_the_permit() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let proxy = listener.local_addr().unwrap().to_string();
+        let remote = std::thread::spawn(move || {
+            let (mut sock, _) = listener.accept().unwrap();
+            sock.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+            let mut h = [0; 2];
+            sock.read_exact(&mut h).unwrap();
+            let mut bytes = vec![0; h[1] as usize];
+            sock.read_exact(&mut bytes).unwrap();
+            assert!(
+                bytes.contains(&2),
+                "Tor connection must use isolated credentials"
+            );
+            sock.write_all(&[5, 2]).unwrap();
+            sock.read_exact(&mut h).unwrap();
+            bytes.resize(h[1] as usize, 0);
+            sock.read_exact(&mut bytes).unwrap();
+            let mut n = [0];
+            sock.read_exact(&mut n).unwrap();
+            bytes.resize(n[0] as usize, 0);
+            sock.read_exact(&mut bytes).unwrap();
+            sock.write_all(&[1, 0]).unwrap();
+            let mut req = [0; 5];
+            sock.read_exact(&mut req).unwrap();
+            assert_eq!(req[3], 3);
+            bytes.resize(req[4] as usize + 2, 0);
+            sock.read_exact(&mut bytes).unwrap();
+            sock.write_all(&[5, 0, 0, 1, 0, 0, 0, 0, 0, 0]).unwrap();
+            let mut r = BufReader::new(sock);
+            let mut line = String::new();
+            r.read_line(&mut line).unwrap();
+            assert!(line.starts_with("GET /tx/"));
+            while {
+                line.clear();
+                r.read_line(&mut line).unwrap() != 0 && line != "\r\n"
+            } {}
+            // Never send the HTTP response; the client must cancel the
+            // stalled request and actively close instead of detaching it.
+            assert_eq!(r.read(&mut [0]).unwrap(), 0);
+        });
+        let endpoint = "http://example.onion";
+        let src = EsploraTxSource::new(
+            vec![endpoint.into()],
+            Some(proxy),
+            false,
+            Duration::from_secs(5),
+            Duration::from_secs(5),
+            Duration::from_secs(30),
+            crate::Semaphore::new(1),
+        )
+        .unwrap();
+        let governor = TorGovernor::new(1);
+        let stream = governor.try_acquire(Lane::Wallet).unwrap();
+        let ctl = AttemptCtl::new().with_streams(Arc::clone(&governor), Lane::Wallet, Some(stream));
+        let start = Instant::now();
+        let err = src
+            .fetch_from(
+                endpoint,
+                &[Hash32([0x31; 32])],
+                start + Duration::from_millis(500),
+                &ctl,
+            )
+            .unwrap_err();
+        assert!(err.to_string().contains("timed out"));
+        assert!(start.elapsed() < Duration::from_secs(2));
+        assert_eq!(governor.in_use(), 0);
+        remote.join().unwrap();
     }
 }

@@ -373,6 +373,8 @@ fn silent_payments_are_gated_with_an_explicit_error() {
 struct SlowSource {
     block: Vec<u8>,
     delay: Duration,
+    only_first: bool,
+    calls: std::sync::atomic::AtomicUsize,
 }
 
 impl BlockSource for SlowSource {
@@ -381,7 +383,10 @@ impl BlockSource for SlowSource {
     }
 
     fn fetch_block(&self, _hash: &Hash32) -> std::result::Result<Vec<u8>, RawtxError> {
-        std::thread::sleep(self.delay);
+        let count = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if count == 0 || !self.only_first {
+            std::thread::sleep(self.delay);
+        }
         Ok(self.block.clone())
     }
 }
@@ -389,6 +394,14 @@ impl BlockSource for SlowSource {
 /// A served index with one transaction whose block only a slow external
 /// source has.
 fn slow_fixture(delay: Duration) -> (Arc<Shared>, Hash32, std::path::PathBuf) {
+    slow_fixture_with_deadline(delay, 45, false)
+}
+
+fn slow_fixture_with_deadline(
+    delay: Duration,
+    deadline: u64,
+    only_first: bool,
+) -> (Arc<Shared>, Hash32, std::path::PathBuf) {
     let dir = std::env::temp_dir().join(format!(
         "e-lite-slow-{}-{}",
         std::process::id(),
@@ -474,7 +487,7 @@ fn slow_fixture(delay: Duration) -> (Arc<Shared>, Hash32, std::path::PathBuf) {
                 privacy: el_rawtx::PrivacyParams::default(),
                 electrum_servers: Vec::new(),
                 path: el_rawtx::ExternalPath::Auto,
-                wallet_deadline_seconds: 45,
+                wallet_deadline_seconds: deadline,
                 txid_attempt_seconds: 3,
                 txid_race: true,
                 decoy_sessions: el_rawtx::DecoySessions::SameRound,
@@ -490,10 +503,48 @@ fn slow_fixture(delay: Duration) -> (Arc<Shared>, Hash32, std::path::PathBuf) {
         .with_external(Arc::new(SlowSource {
             block: bitcoin::consensus::serialize(&block),
             delay,
+            only_first,
+            calls: std::sync::atomic::AtomicUsize::new(0),
         })),
     );
     let shared = shared_for(store, core, resolver, identity, &dir);
     (shared, txid, dir)
+}
+
+#[test]
+fn a_temporary_transaction_failure_does_not_send_sparrow_a_missing_item() {
+    use std::io::{BufRead, BufReader, Write};
+    use std::net::{TcpListener, TcpStream};
+    let (shared, txid, _dir) = slow_fixture_with_deadline(Duration::from_secs(4), 3, true);
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    el_serve::start_listener_on(listener, shared, None);
+    let send_batch = |items: Value| {
+        let mut sock = TcpStream::connect(addr).unwrap();
+        sock.set_read_timeout(Some(Duration::from_secs(8))).unwrap();
+        writeln!(sock, "{items}").unwrap();
+        let mut line = String::new();
+        BufReader::new(sock).read_line(&mut line).unwrap();
+        line
+    };
+    let get = |id| json!({"jsonrpc":"2.0","id":id,"method":"blockchain.transaction.get","params":[txid.to_hex()]});
+    let first = send_batch(json!([
+        get(1),
+        {"jsonrpc":"2.0","id":2,"method":"server.ping","params":[]}
+    ]));
+    assert!(
+        first.is_empty(),
+        "no batch or -32000 must reach the wallet: {first}"
+    );
+
+    let next: Value = serde_json::from_str(&send_batch(json!([
+        get(3),
+        {"jsonrpc":"2.0","id":4,"method":"blockchain.scripthash.subscribe","params":["00".repeat(32)]}
+    ]))).unwrap();
+    assert_eq!(next[0]["id"], 3);
+    assert!(next[0]["result"].as_str().unwrap().len() > 100);
+    assert_eq!(next[1]["id"], 4);
+    assert_eq!(next[1]["result"], Value::Null);
 }
 
 #[test]

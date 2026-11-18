@@ -1,5 +1,28 @@
 # Changelog
 
+## Unreleased
+
+### Wallet recovery
+
+- Transaction requests now observe shared jobs for an indexed transaction and
+  its block. A real answer can win while the alternate path is queued or
+  downloading. Each waiter has its own deadline, and cancellation does not
+  remove interest from another connection. A temporary failure of a confirmed
+  transaction at the deadline closes the Electrum connection without a
+  per-item RPC error that Sparrow could remember as a missing transaction.
+- The per-txid scheduler batches and admits work only when capacity is
+  available. Tor stream release, queueing and pause state are synchronized;
+  work waiting locally does not spend a provider attempt. Esplora-tx uses one
+  isolated request per admission, with its socket closed on deadline before
+  reuse of the slot. Electrum retains batched requests and keeps partial
+  pipelined results. There is no change to the default Tor stream limit.
+- History replies no longer wait for decoy selection. Background history
+  work is bounded and promoted when a wallet requests it. A known pruned
+  height skips the unsuccessful Core read. Warm mempool reads use the
+  published local view. `rawtx.path = "block"` disables txid requests even
+  from history prefetch. `rawtx.prefetch = false` disables both speculative
+  paths without disabling on-demand recovery.
+
 ## 0.1.0-alpha.29.25.2 — 2026-11-18
 
 ### Fixed

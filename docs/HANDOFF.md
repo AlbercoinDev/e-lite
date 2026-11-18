@@ -90,6 +90,11 @@ no repitas contexto ni rehagas decisiones ya documentadas.
 
 ## Last change (alpha.29.25.2): real stream budget
 
+The unreleased wallet recovery revision replaces the timed session requeue
+loop and the serial wallet-side fallback. See the Unreleased section in
+[`CHANGELOG.md`](../CHANGELOG.md) and AUD-199/200. Cold mainnet validation
+with Sparrow and Tor remains a separate acceptance step.
+
 - One governor permit per open Tor stream (race attempt, Electrum session,
   Esplora-tx request), held until the connection ends; hedges never wait for
   a stream. Per-txid sessions wait at most 3 s in all and take the stream

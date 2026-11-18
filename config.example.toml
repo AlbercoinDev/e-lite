@@ -203,20 +203,21 @@ max_parallel_fetches = 16           # external block downloads in flight (the pr
                                     # flight (hedges included) are capped at twice
                                     # this, at most 24 (Tor allows 32 pending circuits)
 # How a pruned transaction is resolved:
-#   auto  = the on-demand block download races the per-txid path (default)
-#   tx    = loose transaction first, whole block as fallback
-#   block = whole blocks only; no txid leaves the node
+#   auto  = loose transaction first, then start/join the whole-block fallback (default)
+#   tx    = same txid-first path without the optional earlier race
+#   block = whole blocks only, including history prefetch; no txid leaves the node
 path = "auto"
-wallet_deadline_seconds = 45       # total per wallet request (queue + network), 3-300:
-txid_attempt_seconds = 3           # replace a provider that misses this;
-                                   # in auto the txid gets 1.5 s before the block starts
+wallet_deadline_seconds = 45       # external request deadline, 3-300; transient expiry
+                                   # reconnects the wallet, not "transaction not found"
+txid_attempt_seconds = 3           # up to twice this head start before block fallback;
+                                   # an in-flight block can be joined immediately
 txid_race = false                  # true: in auto, the txid path only gets a
                                    # 2.5 s head start before the block starts
 decoy_sessions = "same_round"      # or "background" (one decoy wallet while real wait)
-sessions_total = 16                # concurrent per-txid sessions (1-32)
+sessions_total = 16                # cap (1-32), also limited by privacy.sessions.parallel
 jitter_ms = 50                     # random delay before a session (0-250)
 prefetch_history_blocks = 0        # blocks queued per history response; 0 = auto:
-                                   # block mode prefetches, per-txid mode on demand only
+                                   # block mode prefetches; txid mode only prefetches txids
 p2p_blocks_per_peer = 3            # blocks in flight with one P2P peer (1-4)
 tor_streams = 8                    # open Tor streams at once (2-32): every race
                                    # attempt, Electrum session and Esplora-tx request

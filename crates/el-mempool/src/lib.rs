@@ -127,6 +127,13 @@ impl Mempool {
         self.txs.get(txid)
     }
 
+    /// The raw transaction in the published mempool view. Do not use a raw
+    /// entry that has not made it into the coherent derived view yet.
+    pub fn raw_tx(&self, txid: &Hash32) -> Option<&bitcoin::Transaction> {
+        self.txs.get(txid)?;
+        self.raw.get(txid)
+    }
+
     /// The last `limit` transactions to enter the mempool, newest first.
     pub fn recent(&self, limit: usize) -> Vec<(Hash32, u64, u64)> {
         let mut out: Vec<(Hash32, u64, u64, u64)> = self
@@ -166,7 +173,13 @@ impl Mempool {
     /// Net unconfirmed balance change for `script` (received - spent).
     pub fn balance_delta(&self, script: ScriptHash) -> i64 {
         let mut delta = 0i64;
-        for tx in self.txs.values() {
+        for tx in self
+            .by_script
+            .get(&script)
+            .into_iter()
+            .flatten()
+            .filter_map(|id| self.txs.get(id))
+        {
             if let Some((recv, spent)) = tx.effects.get(&script) {
                 delta += *recv as i64 - *spent as i64;
             }
@@ -177,7 +190,13 @@ impl Mempool {
     /// Mempool outputs for `script` that are not spent by another mempool tx.
     pub fn utxos(&self, script: ScriptHash) -> Vec<(Outpoint, u64)> {
         let mut out = Vec::new();
-        for tx in self.txs.values() {
+        for tx in self
+            .by_script
+            .get(&script)
+            .into_iter()
+            .flatten()
+            .filter_map(|id| self.txs.get(id))
+        {
             for (op, sh, value) in &tx.outputs {
                 if *sh == script && !self.spending.contains(op) {
                     out.push((*op, *value));
