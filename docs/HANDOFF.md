@@ -1,8 +1,8 @@
 # Session handoff
 
-**Updated:** 2026-11-18 (alpha.29.25.2: real Tor stream budget, no transient errors to wallets)
-**Latest published release:** `0.1.0-alpha.29.25.2`
-**Release:** https://github.com/AlbercoinDev/e-lite/releases/tag/v0.1.0-alpha.29.25.2
+**Updated:** 2026-11-18 (alpha.29.26.0: wallet recovery from zero)
+**Latest published release:** `0.1.0-alpha.29.26.0`
+**Release:** https://github.com/AlbercoinDev/e-lite/releases/tag/v0.1.0-alpha.29.26.0
 
 This is the short “where we are”. The invariants live in
 [`AGENTS.md`](../AGENTS.md); the
@@ -88,12 +88,25 @@ no repitas contexto ni rehagas decisiones ya documentadas.
   `docs/ROADMAP.md` is future work only, and `docs/AUDIT.md` holds the open
   findings (`docs/audit/FIXED.md` is the fixed history).
 
-## Last change (alpha.29.25.2): real stream budget
+## Last change (alpha.29.26.0): wallet recovery from zero
 
-The unreleased wallet recovery revision replaces the timed session requeue
-loop and the serial wallet-side fallback. See the Unreleased section in
-[`CHANGELOG.md`](../CHANGELOG.md) and AUD-199/200. Cold mainnet validation
-with Sparrow and Tor remains a separate acceptance step.
+`crates/el-rawtx/src/wallet.rs` observes one shared transaction job and one
+shared block job per indexed transaction, each waiter with its own deadline;
+the first verified answer wins. The per-txid scheduler admits work only when a
+server, session and stream are all available and wakes on events instead of
+requeueing every 3 s. The governor's release and wait predicates share one
+lock (AUD-200). Esplora-tx cancels its request and closes the socket before
+returning the stream. A temporary expiry of a confirmed transaction closes the
+Electrum connection instead of answering a per-item `-32000` (AUD-045). Short
+live reorg/catch-up reads wait for the next state notification. `preset = "max"`
+and `rawtx.path = "block"` now disable txid requests in prefetch too; AUD-199
+records that standalone txid proofs do not authenticate SegWit witnesses.
+
+Pending: a real mainnet load (Sparrow, cold, new wallet, Tor) with this
+release, the `doctor history <hash>` output of the 1.3M-row script (AUD-198),
+and a decision on AUD-199.
+
+## Previous change (alpha.29.25.2): real stream budget
 
 - One governor permit per open Tor stream (race attempt, Electrum session,
   Esplora-tx request), held until the connection ends; hedges never wait for

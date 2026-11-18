@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.1.0-alpha.29.26.0 — 2026-11-18
 
 ### Wallet recovery
 
@@ -25,6 +25,17 @@
 - A wallet reading during a short live catch-up or reorg waits for the next
   readiness notification instead of receiving a premature history error.
   This does not change the readiness gate during initial sync.
+
+### Upgrade notes
+
+- No reindex and no cache wipe: the on-disk index and `rawtx-cache` keep their
+  format. Restart replaces the running binary; configuration, databases and
+  Core's datadir are untouched.
+- The per-txid path still authenticates inclusion (txid, position and Merkle
+  branch), not a standalone SegWit witness (AUD-199). `preset = "max"` or
+  `rawtx.path = "block"` keep every historical fetch on whole verified blocks;
+  changing the mode does not purge entries cached by an earlier standalone
+  fetch.
 
 ## 0.1.0-alpha.29.25.2 — 2026-11-18
 
