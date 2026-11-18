@@ -11,10 +11,17 @@
 //! The fast path has no cost: with a free slot and no pause the permit is
 //! granted at once, a request ends the moment its result arrives (condvar,
 //! not polling), and any success lifts the pause immediately.
+//!
+//! A permit is one **stream**, not one request (29.25.2): a block race takes
+//! one per attempt over Tor and holds it in the attempt's thread until the
+//! connection is really gone; a per-txid session takes one per connection.
+//! Only a refusal by the local Tor itself pauses the governor: a provider's
+//! 429 or a circuit that is slow to build is that endpoint's problem and is
+//! handled by its health (`health.rs`).
 
 use el_model::sync::Mutex;
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar};
 use std::time::{Duration, Instant};
 
@@ -27,6 +34,13 @@ pub enum Lane {
 }
 
 const LEVELS: usize = 3;
+const LANE_NAMES: [&str; LEVELS] = ["wallet", "prefetch", "decoy"];
+
+impl Lane {
+    pub fn name(self) -> &'static str {
+        LANE_NAMES[self as usize]
+    }
+}
 const WAIT_SLICE: Duration = Duration::from_millis(25);
 const BASE_BACKOFF: Duration = Duration::from_millis(500);
 const MAX_BACKOFF: Duration = Duration::from_secs(4);
@@ -63,6 +77,41 @@ pub struct TorGovernor {
     pause_until: Mutex<Option<Instant>>,
     backoff: Mutex<Duration>,
     pauses: AtomicUsize,
+    peak: AtomicUsize,
+    lanes: [LaneStats; LEVELS],
+    /// Last periodic `debug:` summary and the counters it printed.
+    summary: Mutex<(Instant, GovernorSnapshot)>,
+}
+
+/// How often the governor writes its `debug:` summary while it is in use.
+const SUMMARY_EVERY: Duration = Duration::from_secs(10);
+
+/// Counters of one lane, for `/status` and the periodic debug summary.
+#[derive(Default)]
+struct LaneStats {
+    granted: AtomicU64,
+    /// Grants that had to wait (no free slot or a pause).
+    waited: AtomicU64,
+    wait_ms: AtomicU64,
+    max_wait_ms: AtomicU64,
+    timeouts: AtomicU64,
+}
+
+/// Point-in-time view of the governor.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct GovernorSnapshot {
+    pub total: usize,
+    pub in_use: usize,
+    pub peak: usize,
+    pub pauses: usize,
+    pub paused: bool,
+    /// Waiting now, per lane (wallet, prefetch, decoy).
+    pub queued: [usize; LEVELS],
+    pub granted: [u64; LEVELS],
+    pub waited: [u64; LEVELS],
+    pub wait_ms: [u64; LEVELS],
+    pub max_wait_ms: [u64; LEVELS],
+    pub timeouts: [u64; LEVELS],
 }
 
 impl TorGovernor {
@@ -74,19 +123,33 @@ impl TorGovernor {
             pause_until: Mutex::new(None),
             backoff: Mutex::new(BASE_BACKOFF),
             pauses: AtomicUsize::new(0),
+            peak: AtomicUsize::new(0),
+            lanes: Default::default(),
+            summary: Mutex::new((Instant::now(), GovernorSnapshot::default())),
         })
     }
 
-    /// Tor or a provider refused a stream (EAGAIN, 429, proxy unavailable):
-    /// hold every new stream for a moment instead of hammering. The backoff
-    /// doubles per pause up to `MAX_BACKOFF` and is reset by any success.
-    pub fn pause(&self) {
+    /// The local Tor refused a stream (its SOCKS listener did not accept or
+    /// answer the greeting): hold every new stream for a moment instead of
+    /// hammering. The backoff doubles per pause up to `MAX_BACKOFF` and is
+    /// reset by any success. `reason` goes to the debug log only.
+    pub fn pause(&self, reason: &str) {
         let mut backoff = self.backoff.lock().unwrap_or_else(|p| p.into_inner());
         *backoff = (*backoff * 2).min(MAX_BACKOFF);
+        let hold = *backoff;
+        drop(backoff);
         if let Ok(mut until) = self.pause_until.lock() {
-            *until = Some(Instant::now() + *backoff);
+            *until = Some(Instant::now() + hold);
         }
-        self.pauses.fetch_add(1, Ordering::Relaxed);
+        let n = self.pauses.fetch_add(1, Ordering::Relaxed) + 1;
+        if crate::debug_logs() {
+            eprintln!(
+                "[e-lite] debug: tor governor: pause {} ms ({reason}); streams {}/{}, pause #{n}",
+                hold.as_millis(),
+                self.in_use(),
+                self.total
+            );
+        }
     }
 
     /// A stream succeeded: Tor is healthy again. Lift the pause at once and
@@ -95,8 +158,20 @@ impl TorGovernor {
         if let Ok(mut backoff) = self.backoff.lock() {
             *backoff = BASE_BACKOFF;
         }
-        if let Ok(mut until) = self.pause_until.lock() {
-            *until = None;
+        let lifted = match self.pause_until.lock() {
+            Ok(mut until) => {
+                let was = until.is_some_and(|t| t > Instant::now());
+                *until = None;
+                was
+            }
+            Err(_) => false,
+        };
+        if lifted && crate::debug_logs() {
+            eprintln!(
+                "[e-lite] debug: tor governor: pause lifted by a success; streams {}/{}",
+                self.in_use(),
+                self.total
+            );
         }
         if let Ok(queues) = self.queues.lock() {
             for lane in queues.iter() {
@@ -150,73 +225,203 @@ impl TorGovernor {
     /// Hold one Tor stream until `deadline`. The highest-priority waiter gets
     /// the next freed slot; a wallet stream never queues behind a decoy.
     pub fn acquire(self: &Arc<Self>, lane: Lane, deadline: Instant) -> Option<GovernorPermit> {
-        loop {
-            if !self.pause_wait(deadline) {
-                return None;
-            }
-            {
-                let mut in_use = self.in_use.lock().unwrap_or_else(|p| p.into_inner());
-                if *in_use < self.total {
-                    *in_use += 1;
-                    return Some(GovernorPermit {
-                        governor: Arc::clone(self),
-                    });
+        let started = Instant::now();
+        let permit = self.acquire_inner(lane, deadline);
+        let stats = &self.lanes[lane as usize];
+        match &permit {
+            Some(_) => {
+                stats.granted.fetch_add(1, Ordering::Relaxed);
+                let waited = started.elapsed().as_millis() as u64;
+                if waited > 0 {
+                    stats.waited.fetch_add(1, Ordering::Relaxed);
+                    stats.wait_ms.fetch_add(waited, Ordering::Relaxed);
+                    stats.max_wait_ms.fetch_max(waited, Ordering::Relaxed);
                 }
+                self.peak.fetch_max(self.in_use(), Ordering::Relaxed);
             }
-            let waiter = Arc::new(Waiter::new());
-            {
-                let mut queues = self.queues.lock().unwrap_or_else(|p| p.into_inner());
-                queues[lane as usize].push_back(Arc::clone(&waiter));
-            }
-            loop {
-                // The queues lock guards the served flag: a release that pops
-                // this waiter marks it done while holding that lock, so a
-                // timing-out waiter either sees done or is still queued.
-                let mut queues = self.queues.lock().unwrap_or_else(|p| p.into_inner());
-                if *waiter.done.lock().unwrap_or_else(|p| p.into_inner()) {
-                    return Some(GovernorPermit {
-                        governor: Arc::clone(self),
-                    });
-                }
-                let now = Instant::now();
-                if now >= deadline {
-                    if let Some(position) = queues[lane as usize]
-                        .iter()
-                        .position(|w| Arc::ptr_eq(w, &waiter))
-                    {
-                        queues[lane as usize].remove(position);
-                        return None;
-                    }
-                    // Not queued any more: the slot was handed to us.
-                    return Some(GovernorPermit {
-                        governor: Arc::clone(self),
-                    });
-                }
-                let left = (deadline - now).min(WAIT_SLICE);
-                let (guard, _) = waiter
-                    .cv
-                    .wait_timeout(queues, left)
-                    .unwrap_or_else(|p| p.into_inner());
-                drop(guard);
+            None => {
+                stats.timeouts.fetch_add(1, Ordering::Relaxed);
             }
         }
+        permit
+    }
+
+    /// A stream now if one is free and Tor is not paused; never waits (a
+    /// hedge must not queue: the attempt it hedges is still running).
+    pub fn try_acquire(self: &Arc<Self>, lane: Lane) -> Option<GovernorPermit> {
+        if self.paused() {
+            return None;
+        }
+        let mut in_use = self.in_use.lock().unwrap_or_else(|p| p.into_inner());
+        if *in_use >= self.total {
+            return None;
+        }
+        *in_use += 1;
+        let now = *in_use;
+        drop(in_use);
+        self.lanes[lane as usize]
+            .granted
+            .fetch_add(1, Ordering::Relaxed);
+        self.peak.fetch_max(now, Ordering::Relaxed);
+        Some(GovernorPermit {
+            governor: Arc::clone(self),
+        })
+    }
+
+    /// Counters and the state right now.
+    pub fn snapshot(&self) -> GovernorSnapshot {
+        let queued = self
+            .queues
+            .lock()
+            .map(|q| [q[0].len(), q[1].len(), q[2].len()])
+            .unwrap_or_default();
+        let read = |f: fn(&LaneStats) -> &AtomicU64| -> [u64; LEVELS] {
+            [0, 1, 2].map(|i| f(&self.lanes[i]).load(Ordering::Relaxed))
+        };
+        GovernorSnapshot {
+            total: self.total,
+            in_use: self.in_use(),
+            peak: self.peak.load(Ordering::Relaxed),
+            pauses: self.pauses(),
+            paused: self.paused(),
+            queued,
+            granted: read(|l| &l.granted),
+            waited: read(|l| &l.waited),
+            wait_ms: read(|l| &l.wait_ms),
+            max_wait_ms: read(|l| &l.max_wait_ms),
+            timeouts: read(|l| &l.timeouts),
+        }
+    }
+
+    fn acquire_inner(self: &Arc<Self>, lane: Lane, deadline: Instant) -> Option<GovernorPermit> {
+        if !self.pause_wait(deadline) {
+            return None;
+        }
+        // The free-slot check and the enqueue happen under the queues lock,
+        // which `release` takes first: a slot freed between "full" and
+        // "queued" is handed to this waiter instead of staying free while it
+        // waits out its deadline (29.25.2; the check used to be outside).
+        let waiter = {
+            let mut queues = self.queues.lock().unwrap_or_else(|p| p.into_inner());
+            let mut in_use = self.in_use.lock().unwrap_or_else(|p| p.into_inner());
+            if *in_use < self.total {
+                *in_use += 1;
+                return Some(GovernorPermit {
+                    governor: Arc::clone(self),
+                });
+            }
+            drop(in_use);
+            let waiter = Arc::new(Waiter::new());
+            queues[lane as usize].push_back(Arc::clone(&waiter));
+            waiter
+        };
+        loop {
+            // The queues lock guards the served flag: a release that pops
+            // this waiter marks it done while holding that lock, so a
+            // timing-out waiter either sees done or is still queued.
+            let mut queues = self.queues.lock().unwrap_or_else(|p| p.into_inner());
+            if *waiter.done.lock().unwrap_or_else(|p| p.into_inner()) {
+                return Some(GovernorPermit {
+                    governor: Arc::clone(self),
+                });
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                if let Some(position) = queues[lane as usize]
+                    .iter()
+                    .position(|w| Arc::ptr_eq(w, &waiter))
+                {
+                    queues[lane as usize].remove(position);
+                    return None;
+                }
+                // Not queued any more: the slot was handed to us.
+                return Some(GovernorPermit {
+                    governor: Arc::clone(self),
+                });
+            }
+            let left = (deadline - now).min(WAIT_SLICE);
+            let (guard, _) = waiter
+                .cv
+                .wait_timeout(queues, left)
+                .unwrap_or_else(|p| p.into_inner());
+            drop(guard);
+        }
+    }
+
+    /// At most every `SUMMARY_EVERY`, and only when streams were granted
+    /// since the last one, one `debug:` line with what happened in between:
+    /// enough to tell who held the streams during a slow load without a line
+    /// per stream. Called on release, so an idle governor writes nothing.
+    fn maybe_summary(&self) {
+        if !crate::debug_logs() {
+            return;
+        }
+        let Ok(mut last) = self.summary.try_lock() else {
+            return;
+        };
+        if last.0.elapsed() < SUMMARY_EVERY {
+            return;
+        }
+        let now = self.snapshot();
+        let before = &last.1;
+        let delta = |a: [u64; LEVELS], b: [u64; LEVELS]| [0, 1, 2].map(|i| a[i] - b[i].min(a[i]));
+        let granted = delta(now.granted, before.granted);
+        if granted.iter().sum::<u64>() == 0 {
+            *last = (Instant::now(), now);
+            return;
+        }
+        let waited = delta(now.waited, before.waited);
+        let wait_ms = delta(now.wait_ms, before.wait_ms);
+        let timeouts = delta(now.timeouts, before.timeouts);
+        let lanes: Vec<String> = (0..LEVELS)
+            .filter(|&i| granted[i] + timeouts[i] > 0 || now.queued[i] > 0)
+            .map(|i| {
+                format!(
+                    "{} {} granted ({} waited, avg {} ms), {} timed out, {} queued",
+                    LANE_NAMES[i],
+                    granted[i],
+                    waited[i],
+                    wait_ms[i].checked_div(waited[i]).unwrap_or(0),
+                    timeouts[i],
+                    now.queued[i]
+                )
+            })
+            .collect();
+        eprintln!(
+            "[e-lite] debug: tor governor {}s: streams {}/{} (peak {}), pauses {}{}; {}",
+            last.0.elapsed().as_secs(),
+            now.in_use,
+            now.total,
+            now.peak,
+            now.pauses - before.pauses.min(now.pauses),
+            if now.paused { ", paused now" } else { "" },
+            lanes.join("; ")
+        );
+        *last = (Instant::now(), now);
     }
 
     fn release(&self) {
         let mut queues = self.queues.lock().unwrap_or_else(|p| p.into_inner());
+        // The slot goes straight to the highest-priority waiter, if any.
+        let mut handed = false;
         for lane in queues.iter_mut() {
             if let Some(waiter) = lane.pop_front() {
                 if let Ok(mut done) = waiter.done.lock() {
                     *done = true;
                 }
                 waiter.cv.notify_all();
-                return;
+                handed = true;
+                break;
             }
         }
         drop(queues);
-        if let Ok(mut in_use) = self.in_use.lock() {
-            *in_use = in_use.saturating_sub(1);
+        if !handed {
+            if let Ok(mut in_use) = self.in_use.lock() {
+                *in_use = in_use.saturating_sub(1);
+            }
         }
+        // Outside the queues lock: the summary reads them.
+        self.maybe_summary();
     }
 }
 
@@ -266,8 +471,8 @@ mod tests {
     #[test]
     fn a_success_lifts_the_pause_at_once() {
         let governor = TorGovernor::new(2);
-        governor.pause();
-        governor.pause();
+        governor.pause("test");
+        governor.pause("test");
         let started = Instant::now();
         governor.healthy();
         assert!(governor
@@ -283,7 +488,7 @@ mod tests {
     #[test]
     fn pause_blocks_new_streams_until_it_expires() {
         let governor = TorGovernor::new(2);
-        governor.pause();
+        governor.pause("test");
         let started = Instant::now();
         assert!(governor
             .acquire(Lane::Wallet, Instant::now() + ms(100))
@@ -305,5 +510,47 @@ mod tests {
             started.elapsed() < ms(50),
             "free capacity is granted at once"
         );
+    }
+
+    #[test]
+    fn try_acquire_never_waits_and_counts() {
+        let governor = TorGovernor::new(1);
+        let held = governor.try_acquire(Lane::Wallet).unwrap();
+        let started = Instant::now();
+        assert!(governor.try_acquire(Lane::Wallet).is_none());
+        assert!(started.elapsed() < ms(20), "a hedge never queues");
+        drop(held);
+        assert!(governor.try_acquire(Lane::Prefetch).is_some());
+        governor.pause("test");
+        assert!(governor.try_acquire(Lane::Wallet).is_none(), "paused");
+        let snap = governor.snapshot();
+        assert_eq!(snap.granted, [1, 1, 0]);
+        assert_eq!(snap.in_use, 0);
+        assert_eq!(snap.peak, 1);
+    }
+
+    #[test]
+    fn waits_and_timeouts_are_counted_per_lane() {
+        let governor = TorGovernor::new(1);
+        let held = governor
+            .acquire(Lane::Wallet, Instant::now() + ms(1000))
+            .unwrap();
+        assert!(governor
+            .acquire(Lane::Decoy, Instant::now() + ms(30))
+            .is_none());
+        let g = Arc::clone(&governor);
+        let waiter = std::thread::spawn(move || {
+            g.acquire(Lane::Prefetch, Instant::now() + ms(2000))
+                .is_some()
+        });
+        std::thread::sleep(ms(60));
+        assert_eq!(governor.snapshot().queued, [0, 1, 0]);
+        drop(held);
+        assert!(waiter.join().unwrap());
+        let snap = governor.snapshot();
+        assert_eq!(snap.timeouts, [0, 0, 1]);
+        assert_eq!(snap.waited[1], 1);
+        assert!(snap.max_wait_ms[1] >= 50);
+        assert_eq!(snap.in_use, 0, "the waiter's permit was released");
     }
 }

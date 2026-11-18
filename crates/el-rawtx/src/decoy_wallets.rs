@@ -22,6 +22,10 @@ use std::io::Write;
 use std::path::Path;
 use std::sync::Arc;
 
+/// Rows of a decoy script read from the index (the first ones, so the decoy
+/// stays the same across loads).
+const MAX_DECOY_HISTORY: usize = 10_000;
+
 pub const DECOY_KEY_FILE: &str = "decoy.key";
 
 /// HMAC-SHA256 (RFC 2104) without an extra dependency.
@@ -99,7 +103,13 @@ impl DecoyPicker {
 
     /// The transactions of `script` from the index.
     pub(crate) fn history(&self, script: ScriptHash) -> Vec<TxRef> {
-        let Ok(entries) = self.store.history_for_script(script) else {
+        // Bounded: a decoy that lands on a huge script (an exchange, a
+        // dice address) keeps its first rows, deterministically, instead of
+        // loading millions of them.
+        let Ok((entries, _)) = self
+            .store
+            .history_for_script_bounded(script, MAX_DECOY_HISTORY)
+        else {
             return Vec::new();
         };
         let mut out = Vec::with_capacity(entries.len());

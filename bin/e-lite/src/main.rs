@@ -352,7 +352,14 @@ fn run() -> R<()> {
     );
     match cmd {
         Command::Init => cmd_init(&cfg, chain),
-        Command::Doctor => cmd_doctor(&cfg, chain),
+        Command::Doctor => match args.subcommand.as_deref() {
+            None => cmd_doctor(&cfg, chain),
+            Some("history") => cmd_doctor_history(&cfg, chain, args.target.as_deref()),
+            Some("history-top") => cmd_doctor_history_top(&cfg, chain, args.target.as_deref()),
+            Some(other) => fail(format!(
+                "unknown doctor subcommand: {other} (history <scripthash>, history-top [N])"
+            )),
+        },
         Command::Index => cmd_index(&cfg, chain),
         Command::Serve => cmd_serve(&cfg, chain),
         Command::Run => cmd_run(&cfg, chain),

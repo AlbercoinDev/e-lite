@@ -719,7 +719,14 @@ fn a_block_that_just_failed_is_not_asked_for_again_at_once() {
     let src = Arc::new(FailingSource {
         calls: AtomicU64::new(0),
     });
-    let resolver = Resolver::new(Arc::clone(&store), &config(0, 1))
+    // A 3 s request deadline: no request outlives the failure memory, so
+    // the second one meets the remembered failure. (A longer request waits
+    // the memory out and asks again, at most once per FAILURE_MEMORY.)
+    let cfg = RawtxConfig {
+        wallet_deadline_seconds: 3,
+        ..config(0, 1)
+    };
+    let resolver = Resolver::new(Arc::clone(&store), &cfg)
         .unwrap()
         .with_external(src.clone());
     let first = resolver.raw_tx(txid, 0).unwrap_err();
@@ -1337,5 +1344,177 @@ fn a_hard_tor_failure_is_not_retried() {
         .with_external(src.clone());
     assert!(resolver.raw_tx(txid, 0).is_err());
     assert_eq!(src.calls.load(Ordering::SeqCst), 1);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Endpoints through Tor (so every attempt takes a governor stream). The
+/// first call never answers until aborted, then keeps its connection for
+/// `linger` more (a loser slow to notice the abort); later calls answer at
+/// once, or never when `all_mute`.
+struct TorStreamSource {
+    blocks: Vec<u8>,
+    endpoints: usize,
+    all_mute: bool,
+    linger: Duration,
+    calls: AtomicU64,
+    running: AtomicU64,
+    max_running: AtomicU64,
+}
+
+impl TorStreamSource {
+    fn new(blocks: Vec<u8>, endpoints: usize, all_mute: bool, linger: Duration) -> Arc<Self> {
+        Arc::new(TorStreamSource {
+            blocks,
+            endpoints,
+            all_mute,
+            linger,
+            calls: AtomicU64::new(0),
+            running: AtomicU64::new(0),
+            max_running: AtomicU64::new(0),
+        })
+    }
+}
+
+impl BlockSource for TorStreamSource {
+    fn name(&self) -> &str {
+        "tor-streams"
+    }
+    fn fetch_block(&self, _hash: &Hash32) -> Result<Vec<u8>> {
+        Err(RawtxError::Unavailable("use endpoints".into()))
+    }
+    fn endpoints(&self, _mode: FetchMode) -> Vec<Endpoint> {
+        (0..self.endpoints)
+            .map(|i| Endpoint {
+                key: format!("tor ep-{i}"),
+                tier: 0,
+                via_tor: true,
+            })
+            .collect()
+    }
+    fn fetch_endpoint(
+        &self,
+        _endpoint: &Endpoint,
+        _hash: &Hash32,
+        _deadline: Instant,
+        _mode: FetchMode,
+        ctl: &AttemptCtl,
+    ) -> Result<Vec<u8>> {
+        let call = self.calls.fetch_add(1, Ordering::SeqCst);
+        let now = self.running.fetch_add(1, Ordering::SeqCst) + 1;
+        self.max_running.fetch_max(now, Ordering::SeqCst);
+        let out = if call == 0 || self.all_mute {
+            let until = Instant::now() + Duration::from_secs(30);
+            while !ctl.aborted() && Instant::now() < until {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            std::thread::sleep(self.linger);
+            Err(RawtxError::Unavailable("aborted".into()))
+        } else {
+            ctl.add_bytes(self.blocks.len());
+            Ok(self.blocks.clone())
+        };
+        self.running.fetch_sub(1, Ordering::SeqCst);
+        out
+    }
+}
+
+#[test]
+fn a_hedge_waits_for_a_free_tor_stream() {
+    // 29.25.2: the governor counts streams, not blocks. With one Tor stream a
+    // silent attempt is not hedged: the hedge would be a second stream.
+    let dir = tmp("tor-stream-cap");
+    let (store, _hash, txid, bytes) = setup(&dir, 0);
+    let src = TorStreamSource::new(bytes, 3, true, Duration::ZERO);
+    let cfg = RawtxConfig {
+        tor_streams: 1,
+        ..config(0, 0)
+    };
+    let resolver = Arc::new(
+        Resolver::new(Arc::clone(&store), &cfg)
+            .unwrap()
+            .with_external(src.clone()),
+    );
+    let r = Arc::clone(&resolver);
+    std::thread::spawn(move || r.raw_tx(txid, 0));
+    // Past the Tor first-byte hedge: before 29.25.2 a second attempt started.
+    std::thread::sleep(el_rawtx::HEDGE_FIRST_BYTE_TOR + Duration::from_millis(1500));
+    assert_eq!(src.max_running.load(Ordering::SeqCst), 1);
+    assert!(resolver.governor_snapshot().in_use <= 1);
+}
+
+#[test]
+fn a_tor_stream_is_held_until_the_attempt_really_ends() {
+    // 29.25.2: the permit lives in the attempt's thread. A loser that takes a
+    // while to drop its connection still counts against the budget.
+    let dir = tmp("tor-stream-linger");
+    let (store, _hash, txid, bytes) = setup(&dir, 0);
+    let src = TorStreamSource::new(bytes, 2, false, Duration::from_millis(1500));
+    let cfg = RawtxConfig {
+        tor_streams: 2,
+        ..config(0, 0)
+    };
+    let resolver = Resolver::new(Arc::clone(&store), &cfg)
+        .unwrap()
+        .with_external(src.clone());
+    // The first attempt is silent; the hedge (second stream) wins.
+    assert!(resolver.raw_tx(txid, 0).is_ok());
+    assert_eq!(
+        resolver.governor_snapshot().in_use,
+        1,
+        "the aborted loser still holds its stream"
+    );
+    std::thread::sleep(Duration::from_millis(2000));
+    assert_eq!(
+        resolver.governor_snapshot().in_use,
+        0,
+        "released once it ends"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Fails the first download, answers the next ones.
+struct FlakyOnceSource {
+    blocks: Vec<u8>,
+    calls: AtomicU64,
+}
+
+impl BlockSource for FlakyOnceSource {
+    fn name(&self) -> &str {
+        "p2p"
+    }
+    fn fetch_block(&self, _hash: &Hash32) -> Result<Vec<u8>> {
+        if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+            // The message of the mainnet log (a circuit not built in time).
+            return Err(RawtxError::Unavailable(
+                "tor 203.0.113.7:8333: socks connect: Resource temporarily unavailable (os error 11)"
+                    .into(),
+            ));
+        }
+        Ok(self.blocks.clone())
+    }
+}
+
+#[test]
+fn a_transient_block_failure_does_not_reach_the_wallet_while_time_remains() {
+    // 29.25.2 / AUD-045: the SOCKS timeout was not in the transient list and
+    // the retry ran into the failure memory 400 ms later, so the wallet got
+    // an error with most of its deadline left (Sparrow's NPE).
+    let dir = tmp("transient-retry");
+    let (store, _hash, txid, bytes) = setup(&dir, 0);
+    let src = Arc::new(FlakyOnceSource {
+        blocks: bytes,
+        calls: AtomicU64::new(0),
+    });
+    let resolver = Resolver::new(Arc::clone(&store), &config(0, 1))
+        .unwrap()
+        .with_external(src.clone());
+    let started = Instant::now();
+    assert!(resolver.raw_tx(txid, 0).is_ok());
+    assert_eq!(src.calls.load(Ordering::SeqCst), 2);
+    assert!(
+        started.elapsed() < Duration::from_secs(45),
+        "{:?}",
+        started.elapsed()
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }

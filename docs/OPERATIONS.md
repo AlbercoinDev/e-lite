@@ -457,6 +457,59 @@ inventory plus the per-session `cache hits`/`fetch` tell a cold run (fetches,
 no hits) from a warm one. `first tx.get … after the first get_history` is the
 scan phase; server-side latencies are the `avg`/`max` figures.
 
+### Following one wallet load through the external path
+
+A pruned node resolves old transactions outside. Each step has its own
+`debug:` line. `obj=` is an opaque tag (6 hex digits of a keyed hash, with a
+new key every run): it ties together the lines of one transaction or block
+without printing its txid or hash (AUD-132).
+
+```text
+debug: tx.get obj=4be210 height 715428: txid, 812 ms
+debug: tx.get obj=09c7de height 607985: block (joined), 2410 ms
+debug: stream session src=electrum ep=electrum.example:50002:t lane=wallet items 50 (12 real), wait 4 ms, 640 ms, connected: ok, 50 returned, 0 not sent
+debug: stream block obj=a3f91c src=esplora ep=tor:https://blockstream.info/api lane=wallet first wait 0 ms, 3210 ms, 1874 KiB: ok
+debug: stream block obj=a3f91c src=p2p ep=tor:203.0.113.7:8333 lane=wallet hedge wait 0 ms, 3300 ms, 0 KiB: aborted (lost the race)
+debug: block obj=a3f91c lane=wallet queued 120 ms, race 3215 ms: ok, 1874 KiB
+debug: session to electrum.example:50002:t did not run (no tor stream) after 3001 ms: 12 real requeued
+debug: tx.get obj=77d0a2 block try 1 failed (unavailable), retry in 9600 ms
+debug: tor governor 10s: streams 8/8 (peak 8), pauses 0; wallet 41 granted (12 waited, avg 380 ms), 0 timed out, 3 queued; decoy 6 granted (6 waited, avg 1900 ms), 2 timed out, 0 queued
+debug: tor governor: pause 1000 ms (p2p: local tor socks proxy refused); streams 8/8, pause #3
+```
+
+How to read it:
+
+- **`tx.get`**: the path that answered, and the total time the wallet waited.
+  `cache` lines are what the background (`want_history`) already brought in.
+- **`stream`**: one line per Tor connection when it closes. `wait` is the
+  time spent waiting for a stream from the governor. An aborted loser still
+  counts against `tor_streams` until its line appears.
+- **`session … did not run`**: local congestion. Nothing was sent, and the
+  transactions go back to the batcher without using up a server.
+- **`tor governor` summary**: streams in use against `rawtx.tor_streams`. A
+  `waited` average close to 3 s, or `timed out` on the `wallet` lane, means
+  Tor is the bottleneck.
+- **`pause`**: only the local Tor refusing a connection pauses every stream.
+
+`/status.rawtx.tor_governor` carries the same counters (cumulative, with
+`peak` and per lane).
+
+### A script with too many history rows
+
+A wallet that subscribes a script with more than 100,000 index rows gets
+`-32000 history for script hash <hash> has more than 100000 entries`. Copy the
+hash from the wallet's error and run:
+
+```bash
+e-lite doctor history <hash> --network mainnet
+e-lite doctor history-top 20 --network mainnet   # full scan, minutes to an hour
+```
+
+Both open the index read-only and work while e-lite is running. Compare the
+row count with a public explorer for the same address. A script that is
+empty there but has rows here points at the index, not at the wallet
+(AUD-198).
+
 ### A cold run for measurements
 
 `get_history` has no cache (it is computed from the index every time); what can

@@ -1,6 +1,6 @@
 # Session handoff
 
-**Updated:** 2026-11-17 (alpha.29.24.0: txid-first cold loads, 35 s wallet deadline)
+**Updated:** 2026-11-18 (unreleased 29.25.2 work on branch `alpha.29.25.2-stream-budget`)
 **Latest published release:** `0.1.0-alpha.29.25.1`
 **Release:** https://github.com/AlbercoinDev/e-lite/releases/tag/v0.1.0-alpha.29.25.1
 
@@ -88,7 +88,24 @@ no repitas contexto ni rehagas decisiones ya documentadas.
   `docs/ROADMAP.md` is future work only, and `docs/AUDIT.md` holds the open
   findings (`docs/audit/FIXED.md` is the fixed history).
 
-## Last change (alpha.29.25.1): Tor stream governor
+## Unreleased (branch `alpha.29.25.2-stream-budget`): real stream budget
+
+- One governor permit per open Tor stream (race attempt, Electrum session,
+  Esplora-tx request), held until the connection ends; hedges never wait for
+  a stream. Per-txid sessions wait at most 3 s in all and take the stream
+  last; local congestion requeues without spending servers (AUD-193, 196).
+- Every `unavailable` failure of a confirmed transaction is retried inside
+  the wallet deadline and the retry waits out the failure memory (AUD-194).
+- Only the local Tor's refusal pauses the governor; 429 is per provider
+  (AUD-195). The SOCKS "os error 11" is a circuit timeout.
+- Bounded history reads, script hash in the `-32000` error, `e-lite doctor
+  history|history-top` (read-only) for the open 1.3M-row script (AUD-198).
+- Detailed `debug:` lines (per tx.get, stream, block, session; governor
+  summary every 10 s) with an opaque per-process tag instead of hashes.
+- Not done yet: the release (version bump, tag, app pin) and a real mainnet
+  load to confirm it; see `CHANGELOG.md` "Unreleased".
+
+## Previous change (alpha.29.25.1): Tor stream governor
 
 - `rawtx.tor_streams` (default 8) caps every external stream (blocks, txid
   sessions, decoys) with wallet > prefetch > decoy priority; a refused stream

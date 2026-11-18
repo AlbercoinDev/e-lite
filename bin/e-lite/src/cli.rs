@@ -26,6 +26,8 @@ pub(crate) enum Command {
 pub(crate) struct Args {
     pub(crate) command: Option<Command>,
     pub(crate) subcommand: Option<String>,
+    /// Argument after the subcommand (`doctor history <scripthash>`).
+    pub(crate) target: Option<String>,
     pub(crate) config: Option<String>,
     pub(crate) public_servers: Option<String>,
     pub(crate) network: Option<String>,
@@ -382,9 +384,17 @@ pub(crate) fn parse_args_from(argv: impl IntoIterator<Item = String>) -> R<Args>
                         | Some(Command::Onion)
                         | Some(Command::Cache)
                         | Some(Command::Privacy)
+                        | Some(Command::Doctor)
                 ) && args.subcommand.is_none()
                 {
                     args.subcommand = Some(other.to_string());
+                    continue;
+                }
+                if args.command == Some(Command::Doctor)
+                    && args.subcommand.is_some()
+                    && args.target.is_none()
+                {
+                    args.target = Some(other.to_string());
                     continue;
                 }
                 if args.command.is_some() {
@@ -425,6 +435,12 @@ USAGE:
 COMMANDS:
     init             validate network/genesis against Core and create the database
     doctor           check config, Core, disk, ports and database integrity
+    doctor history <scripthash>
+                     rows of one script in the index (read-only, works while
+                     e-lite runs; the hash is the one a wallet error shows)
+    doctor history-top [N]
+                     the N scripts with the most index rows (default 20; a
+                     full scan: minutes to an hour on mainnet)
     index            index the active chain (add --no-follow to stop at tip)
     serve            serve Electrum queries from an already indexed database
     run              index and serve in one process (recommended; waits for Core)

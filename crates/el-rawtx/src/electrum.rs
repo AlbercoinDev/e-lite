@@ -12,6 +12,7 @@
 use crate::health::{Blame, HealthMap, TRANSIENT_BASE, TRANSIENT_CAP};
 use crate::socks::{socks_connect, split_host_port};
 use crate::txsource::{TxBatch, TxSource, MAX_TX_BYTES};
+use crate::LOCAL_BUSY;
 use crate::{AttemptCtl, RawtxError, Result};
 use el_model::sync::Mutex;
 use el_model::Hash32;
@@ -175,10 +176,6 @@ impl ElectrumTxSource {
         deadline: Instant,
         ctl: &AttemptCtl,
     ) -> std::result::Result<TxBatch, Blame> {
-        // One connection per session, from the shared pool (AUD-167).
-        let Some(_permit) = self.conns.acquire_until(deadline, 0) else {
-            return Err(Blame::Transient);
-        };
         let tcp = self.connect_tcp(s)?;
         ctl.watch(&tcp);
         let stall = self.stall * if s.is_onion() { 2 } else { 1 };
@@ -336,6 +333,19 @@ impl TxSource for ElectrumTxSource {
         let s = self
             .server(server)
             .ok_or_else(|| RawtxError::Unavailable(format!("unknown electrum server {server}")))?;
+        // One Tor stream (the session's, under the governor) and one
+        // connection from the shared pool (AUD-167). Without either nothing
+        // is sent and the server is not blamed: it was never contacted.
+        let _stream = if self.tor_proxy.is_some() {
+            ctl.take_stream(Some(deadline)).map_err(|crate::NoStream| {
+                RawtxError::Unavailable(format!("{server}: {LOCAL_BUSY}"))
+            })?
+        } else {
+            None
+        };
+        let Some(_conn) = self.conns.acquire_until(deadline, 0) else {
+            return Err(RawtxError::Unavailable(format!("{server}: {LOCAL_BUSY}")));
+        };
         match self.session(s, txids, deadline, ctl) {
             Ok(batch) => {
                 if !batch.is_empty() {

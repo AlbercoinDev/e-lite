@@ -146,6 +146,38 @@ pub const CF_NAMES: [&str; 7] = [
 pub const PREFIX_CFS: [&str; 3] = ["tx_occurrences", "history", "utxo_by_script"];
 pub const PREFIX_LEN: usize = 32;
 
+/// History rows of one script: (height, tx position, effect).
+pub type HistoryRows = Vec<(u32, u32, HistoryEffect)>;
+
+/// Rows of one script in the history family.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct HistoryCount {
+    pub rows: u64,
+    pub first_height: u32,
+    pub last_height: u32,
+}
+
+impl HistoryCount {
+    fn add(&mut self, height: u32) {
+        if self.rows == 0 || height < self.first_height {
+            self.first_height = height;
+        }
+        self.last_height = self.last_height.max(height);
+        self.rows += 1;
+    }
+}
+
+/// Result of a full scan of the history family.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct HistoryTop {
+    pub rows: u64,
+    pub scripts: u64,
+    /// Keys that are not `script(32) + height(4) + tx_pos(4)`.
+    pub malformed: u64,
+    /// Scripts with the most rows, largest first.
+    pub top: Vec<(ScriptHash, HistoryCount)>,
+}
+
 /// Relative write pressure of each family. `utxo` and `history` dominate an
 /// IBD; giving them a larger memtable avoids frequent flushes and commit
 /// stalls. The total is still bounded by the shared WriteBufferManager.
@@ -275,6 +307,98 @@ pub fn per_cf_write_buffer_bytes(
     // The shared WriteBufferManager enforces the total; a per-CF cap here
     // would make the configured budget unreachable.
     ideal.max(1)
+}
+
+/// Rows of `script` in a history family (keys only).
+fn count_history(db: &DB, cf: &rocksdb::ColumnFamily, script: ScriptHash) -> Result<HistoryCount> {
+    let prefix = script.0.as_bytes();
+    let mut opts = ReadOptions::default();
+    opts.set_total_order_seek(true);
+    let mut count = HistoryCount::default();
+    for item in db.iterator_cf_opt(cf, opts, IteratorMode::From(prefix, Direction::Forward)) {
+        let (k, _) = item?;
+        if k.len() < PREFIX_LEN || &k[..PREFIX_LEN] != prefix {
+            break;
+        }
+        if k.len() != 40 {
+            continue;
+        }
+        let (_, height, _) = codec::parse_history_key(&k)?;
+        count.add(height);
+    }
+    Ok(count)
+}
+
+/// One pass over a history family. Keys are sorted by script, so each script
+/// is a run of consecutive keys and memory stays O(`top`).
+fn top_history(db: &DB, cf: &rocksdb::ColumnFamily, top: usize) -> Result<HistoryTop> {
+    let mut opts = ReadOptions::default();
+    opts.set_total_order_seek(true);
+    // A full scan must not evict the serving working set.
+    opts.fill_cache(false);
+    let mut out = HistoryTop::default();
+    let mut current: Option<(ScriptHash, HistoryCount)> = None;
+    let flush = |out: &mut HistoryTop, done: Option<(ScriptHash, HistoryCount)>| {
+        if let Some((script, count)) = done {
+            out.scripts += 1;
+            if top > 0
+                && (out.top.len() < top || out.top.last().is_some_and(|l| l.1.rows < count.rows))
+            {
+                out.top.push((script, count));
+                out.top.sort_by_key(|entry| std::cmp::Reverse(entry.1.rows));
+                out.top.truncate(top);
+            }
+        }
+    };
+    for item in db.iterator_cf_opt(cf, opts, IteratorMode::Start) {
+        let (k, _) = item?;
+        if k.len() != 40 {
+            out.malformed += 1;
+            continue;
+        }
+        let (script, height, _) = codec::parse_history_key(&k)?;
+        out.rows += 1;
+        match &mut current {
+            Some((s, count)) if *s == script => count.add(height),
+            _ => {
+                let mut count = HistoryCount::default();
+                count.add(height);
+                flush(&mut out, current.replace((script, count)));
+            }
+        }
+    }
+    flush(&mut out, current.take());
+    Ok(out)
+}
+
+/// Read-only view of the history family for `e-lite doctor history`. It
+/// opens only that family, takes no lock and writes nothing, so it works
+/// beside a running e-lite (it sees the data as of its opening).
+pub struct HistoryReader {
+    db: DB,
+}
+
+impl HistoryReader {
+    pub fn open(path: impl AsRef<Path>) -> Result<Self> {
+        let mut opts = Options::default();
+        opts.set_max_open_files(256);
+        let db = DB::open_cf_for_read_only(&opts, path.as_ref(), ["history"], false)?;
+        Ok(HistoryReader { db })
+    }
+
+    fn cf(&self) -> Result<&rocksdb::ColumnFamily> {
+        self.db
+            .cf_handle("history")
+            .ok_or_else(|| StoreError("missing column family history".to_string()))
+    }
+
+    pub fn count_for(&self, script: ScriptHash) -> Result<HistoryCount> {
+        count_history(&self.db, self.cf()?, script)
+    }
+
+    pub fn top_scripts(&self, top: usize) -> Result<HistoryTop> {
+        top_history(&self.db, self.cf()?, top)
+    }
 }
 
 impl Store {
@@ -688,6 +812,42 @@ impl Store {
             out.push((height, tx_pos, codec::parse_history_value(&v)?));
         }
         Ok(out)
+    }
+
+    /// `history_for_script`, reading at most `max + 1` rows: the second value
+    /// says the script has more than `max` (29.25.2). A wallet subscribing a
+    /// script past the limit no longer loads every row just to refuse it.
+    pub fn history_for_script_bounded(
+        &self,
+        script: ScriptHash,
+        max: usize,
+    ) -> Result<(HistoryRows, bool)> {
+        let prefix = script.0.as_bytes();
+        let mut out = Vec::new();
+        for item in self.prefix_iter("history", prefix)? {
+            let (k, v) = item?;
+            if k.len() != 40 || &k[..32] != prefix {
+                break;
+            }
+            if out.len() == max {
+                return Ok((out, true));
+            }
+            let (_, height, tx_pos) = codec::parse_history_key(&k)?;
+            out.push((height, tx_pos, codec::parse_history_value(&v)?));
+        }
+        Ok((out, false))
+    }
+
+    /// Rows of `script` in the history family, with the first and last
+    /// height: keys only, no value decoding (`e-lite doctor history`).
+    pub fn history_count_for(&self, script: ScriptHash) -> Result<HistoryCount> {
+        count_history(&self.db, self.cf("history")?, script)
+    }
+
+    /// One pass over the whole history family: total rows, scripts, and the
+    /// `top` scripts with the most rows (`e-lite doctor history-top`).
+    pub fn history_top_scripts(&self, top: usize) -> Result<HistoryTop> {
+        top_history(&self.db, self.cf("history")?, top)
     }
 
     /// The first script with history whose hash is at or after `key`,
@@ -1768,6 +1928,69 @@ mod tests {
         assert_eq!(s.history_for_script(a).unwrap().len(), 2);
         assert_eq!(s.history_for_script(b).unwrap().len(), 1);
         assert!(s.history_for_script(c).unwrap().is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn history_is_bounded_counted_and_ranked() {
+        // 29.25.2: a script past the wallet limit is refused after limit + 1
+        // rows; `doctor history` counts one script and `history-top` ranks
+        // every script in one pass, also through the read-only reader.
+        let _guard = serial();
+        let dir = tmp("history-diag");
+        let effect = HistoryEffect {
+            received_sat: 1,
+            spent_sat: 0,
+            flags: 0,
+        };
+        let big = ScriptHash(Hash32([0x10; 32]));
+        let mid = ScriptHash(Hash32([0x20; 32]));
+        let small = ScriptHash(Hash32([0x30; 32]));
+        let none = ScriptHash(Hash32([0x18; 32]));
+        {
+            let s = Store::open(&dir).unwrap();
+            let mut b = Store::batch();
+            for pos in 0..50u32 {
+                s.put_history(&mut b, big, 100 + pos / 10, pos, &effect)
+                    .unwrap();
+            }
+            for pos in 0..7u32 {
+                s.put_history(&mut b, mid, 200, pos, &effect).unwrap();
+            }
+            s.put_history(&mut b, small, 300, 0, &effect).unwrap();
+            s.write_batch(b, true).unwrap();
+
+            let (rows, over) = s.history_for_script_bounded(big, 20).unwrap();
+            assert_eq!(rows.len(), 20);
+            assert!(over);
+            let (rows, over) = s.history_for_script_bounded(mid, 7).unwrap();
+            assert_eq!(rows.len(), 7);
+            assert!(!over, "exactly the limit is within it");
+            let (rows, over) = s.history_for_script_bounded(none, 5).unwrap();
+            assert!(rows.is_empty() && !over);
+
+            let count = s.history_count_for(big).unwrap();
+            assert_eq!(
+                count,
+                HistoryCount {
+                    rows: 50,
+                    first_height: 100,
+                    last_height: 104
+                }
+            );
+            assert_eq!(s.history_count_for(none).unwrap().rows, 0);
+
+            let top = s.history_top_scripts(2).unwrap();
+            assert_eq!((top.rows, top.scripts, top.malformed), (58, 3, 0));
+            assert_eq!(top.top.len(), 2);
+            assert_eq!(top.top[0].0, big);
+            assert_eq!(top.top[1].0, mid);
+
+            // Read-only beside the open writer (a running e-lite).
+            let reader = HistoryReader::open(&dir).unwrap();
+            assert_eq!(reader.count_for(small).unwrap().rows, 1);
+            assert_eq!(reader.top_scripts(1).unwrap().top[0].1.rows, 50);
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

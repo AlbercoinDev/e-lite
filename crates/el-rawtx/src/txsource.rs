@@ -199,6 +199,7 @@ impl TxSource for EsploraTxSource {
         let mut running = 0usize;
         let mut out = TxBatch::new();
         let mut worst: Option<Blame> = None;
+        let mut starved = false;
         while next < txids.len() || running > 0 {
             while running < ESPLORA_TX_PARALLEL && next < txids.len() {
                 let Some(client) = self.client(server) else {
@@ -208,22 +209,45 @@ impl TxSource for EsploraTxSource {
                 let base = server.to_string();
                 let tx = tx.clone();
                 let ctl = ctl.clone();
+                // Each request is its own circuit, so its own Tor stream
+                // (29.25.2): the first waits for one, the fan-out only takes
+                // free ones and otherwise waits for its own requests.
+                let stream = if self.tor_proxy.is_some() {
+                    match ctl.take_stream((running == 0).then_some(deadline)) {
+                        Ok(stream) => stream,
+                        Err(crate::NoStream) if running == 0 => {
+                            starved = true;
+                            break;
+                        }
+                        Err(crate::NoStream) => break,
+                    }
+                } else {
+                    None
+                };
                 // One connection per request, from the shared pool: Tor must
                 // not be asked for 8 sessions x 8 circuits (AUD-167).
                 let Some(permit) = self.conns.acquire_until(deadline, 0) else {
                     // No slot before the deadline: leave the rest for the next
-                    // attempt instead of blaming the server. If nothing is
-                    // running either, the caller sees a stalled session and
-                    // the deadline ends it.
+                    // attempt instead of blaming the server.
+                    if running == 0 {
+                        starved = true;
+                    }
                     break;
                 };
                 std::thread::spawn(move || {
                     let _permit = permit;
                     let r = Self::fetch_one(&client, &base, &txid, deadline, &ctl);
+                    // The client owns the connection: close it, then give the
+                    // Tor stream back.
+                    drop(client);
+                    drop(stream);
                     let _ = tx.send((txid, r));
                 });
                 next += 1;
                 running += 1;
+            }
+            if starved {
+                break;
             }
             let wait = deadline.saturating_duration_since(Instant::now());
             match rx.recv_timeout(wait.max(Duration::from_millis(1))) {
@@ -255,7 +279,17 @@ impl TxSource for EsploraTxSource {
                 (true, None) => {}
             }
         }
+        // What was never sent is not the server's: the caller requeues it.
+        for txid in &txids[next.min(txids.len())..] {
+            ctl.skip(*txid);
+        }
         if out.is_empty() {
+            if next == 0 {
+                return Err(RawtxError::Unavailable(format!(
+                    "{server}: {}",
+                    crate::LOCAL_BUSY
+                )));
+            }
             return Err(RawtxError::Unavailable(format!("{server}: no transaction")));
         }
         Ok(out)

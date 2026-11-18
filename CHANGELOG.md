@@ -1,5 +1,79 @@
 # Changelog
 
+## Unreleased (planned 0.1.0-alpha.29.25.2)
+
+### Fixed
+
+- **The Tor stream budget counts streams, not requests (AUD-193).** In
+  29.25.1 a block took one governor permit and its race then opened up to
+  three attempts (each its own Tor stream); a per-txid session took its
+  permit *before* waiting up to 120 s for a server slot and a session slot,
+  so idle sessions held the streams the block downloads were waiting for
+  (`every download slot stayed busy until the deadline`); an Esplora-tx
+  session fanned out up to 8 requests under one permit; and an aborted
+  loser gave its permit back before its connection was gone. Now every Tor
+  connection holds one permit for exactly as long as it is open: each race
+  attempt (a hedge never waits for one: no free stream, no hedge), each
+  Electrum session and each Esplora-tx request. `tor_streams` is now a real
+  bound on open Tor streams. Decoy block downloads take a stream too (in
+  the lowest lane; they were outside the budget), and a waiter can no
+  longer miss a stream freed between "full" and "queued" (it then waited
+  out its deadline while later arrivals took the free stream).
+- **No long queues in the per-txid path.** A session waits at most 3 s, in
+  all, for its server slot, a session slot and its Tor stream (it was 120 s
+  per wait), and takes the stream last. A session that could not run here
+  sends its transactions back to the batcher without spending one of their
+  three servers (AUD-196); after ~1 min of local congestion that counts as an
+  attempt and the block path takes over.
+- **A transient block failure no longer reaches the wallet with time left
+  (AUD-194).** Every `unavailable` failure of a confirmed transaction is
+  retried inside `wallet_deadline_seconds` (the list of known messages missed
+  the SOCKS timeouts), and the retry waits out the 10 s failure memory of
+  that block instead of running into it 400 ms later and returning the
+  remembered error (the Sparrow NPE of the mainnet log).
+- **What pauses Tor (AUD-195).** Only a refusal of the local Tor itself
+  (its SOCKS listener) pauses every stream. A provider's 429 cools that
+  provider down and no longer stops P2P and the other providers; a clearnet
+  success no longer lifts a Tor pause.
+- **`socks connect: Resource temporarily unavailable (os error 11)`** was a
+  circuit not built within the connect limit (Linux reports an expired
+  socket timeout as EAGAIN), not Tor refusing the stream. It now reads
+  `socks connect: timed out waiting for the circuit`.
+- **Batch size and provider health (AUD-196).** The per-txid batch is halved
+  only when the session reached the server (a slow circuit used to halve it
+  for the whole process, down to 2), and an Electrum server is no longer
+  cooled down when the local connection pool, not the server, was busy.
+- **Large histories are refused without loading them (AUD-197).** A script
+  past the 100,000-row limit is detected after 100,001 rows (the 1.3M-row
+  script of the mainnet log was read whole on every subscribe), decoy
+  wallets read at most 10,000 rows of a script, and the `-32000` error now
+  names the script hash so the operator can diagnose it.
+
+### Added
+
+- `e-lite doctor history <scripthash>` (rows and height range of one script)
+  and `e-lite doctor history-top [N]` (the N scripts with the most rows, one
+  full scan). Both open the index read-only and work beside a running
+  e-lite.
+- Detailed `debug:` lines for wallet loads, with an opaque per-process tag
+  (`obj=3fa9c1`) instead of any txid or block hash: one line per
+  `transaction.get` with the path that answered (`cache`, `txid`, `block`,
+  `block (joined)`) and its time; one per Tor stream (source, endpoint,
+  lane, first/hedge/retry, wait for the stream, duration, KiB, result); one
+  per block download (queue and race time); one per per-txid session
+  (items, waits, connected or not, returned/not sent); requeues for local
+  congestion; and every 10 s while in use a governor summary (streams in use
+  and peak, pauses, per lane: granted, waited and average wait, timeouts,
+  queued).
+- `/status.rawtx.tor_governor`: `peak` and per-lane `wallet`/`prefetch`/
+  `decoy` counters (`queued`, `granted`, `waited`, `wait_ms`, `max_wait_ms`,
+  `timeouts`); `/status.rawtx` `tx_local_requeues`.
+
+### Changed
+
+- `rawtx.wallet_deadline_seconds` accepts 3..300 (was 3..60) for manual
+  experiments; the default stays 45 s.
+
 ## 0.1.0-alpha.29.25.1 — 2026-11-17
 
 ### Fixed

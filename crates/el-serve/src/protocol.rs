@@ -528,24 +528,36 @@ pub(crate) fn param_scripthash(params: &Value) -> RpcResult<ScriptHash> {
 
 pub(crate) type HistoryRow = (u32, u32, String, u64, u64);
 
+/// Error text for a script whose history is past `MAX_HISTORY_ENTRIES`.
+fn too_large_message(script: ScriptHash, what: &str) -> String {
+    format!(
+        "history for script hash {} has more than {} entries; {what} \
+         (diagnose with: e-lite doctor history {})",
+        script.to_electrum_hex(),
+        MAX_HISTORY_ENTRIES,
+        script.to_electrum_hex()
+    )
+}
+
 pub(crate) fn history_entries_with_code(
     shared: &Shared,
     script: ScriptHash,
     too_large_code: i64,
     prefetch: bool,
 ) -> RpcResult<Vec<HistoryRow>> {
-    let entries = shared
+    // At most limit + 1 rows are read: a script past the limit is refused
+    // without loading its whole history (29.25.2).
+    let (entries, over) = shared
         .store
-        .history_for_script(script)
+        .history_for_script_bounded(script, MAX_HISTORY_ENTRIES)
         .map_err(|e| RpcError::server(e.to_string()))?;
-    if entries.len() > MAX_HISTORY_ENTRIES {
+    if over {
+        // The wallet gets the script hash it asked about (its own data), so
+        // the operator can run `e-lite doctor history <scripthash>`. The log
+        // redacts it (AUD-132, `log_rpc_error`).
         return Err(RpcError::new(
             too_large_code,
-            format!(
-                "history for this script has {} entries (limit {}); use a script with fewer transactions",
-                entries.len(),
-                MAX_HISTORY_ENTRIES
-            ),
+            too_large_message(script, "use a script with fewer transactions"),
         ));
     }
     let mut blocks: HashMap<u32, el_model::BlockRecord> = HashMap::new();
@@ -1025,15 +1037,14 @@ pub(crate) fn outpoint_status(
 
     let candidates = {
         let _g = read_guard(shared)?;
-        let entries = shared
+        let (entries, over) = shared
             .store
-            .history_for_script(script)
+            .history_for_script_bounded(script, MAX_HISTORY_ENTRIES)
             .map_err(|e| RpcError::server(e.to_string()))?;
-        if entries.len() > MAX_HISTORY_ENTRIES {
-            return Err(RpcError::server(format!(
-                "history for this script has {} entries (limit {}); cannot resolve the spender",
-                entries.len(),
-                MAX_HISTORY_ENTRIES
+        if over {
+            return Err(RpcError::server(too_large_message(
+                script,
+                "cannot resolve the spender",
             )));
         }
         let mut candidates = Vec::new();

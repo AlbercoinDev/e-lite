@@ -190,6 +190,9 @@ struct FakeSource {
     /// a provider that closes the connection (measured with blockstream).
     limit: Option<usize>,
     calls: Mutex<Vec<(String, Vec<Hash32>)>>,
+    /// Sessions answered "local stream budget busy" before any is served
+    /// (nothing sent: local congestion, not the server).
+    busy: Mutex<u64>,
 }
 
 impl FakeSource {
@@ -200,6 +203,7 @@ impl FakeSource {
             liar: liar.map(str::to_string),
             limit: None,
             calls: Mutex::new(Vec::new()),
+            busy: Mutex::new(0),
         })
     }
 
@@ -210,6 +214,7 @@ impl FakeSource {
             liar: self.liar.clone(),
             limit: Some(limit),
             calls: Mutex::new(Vec::new()),
+            busy: Mutex::new(0),
         })
     }
 
@@ -240,8 +245,22 @@ impl TxSource for FakeSource {
         server: &str,
         txids: &[Hash32],
         _deadline: Instant,
-        _ctl: &AttemptCtl,
+        ctl: &AttemptCtl,
     ) -> Result<TxBatch> {
+        let refused = {
+            let mut left = self.busy.lock().unwrap();
+            let refuse = *left > 0;
+            *left = left.saturating_sub(1);
+            refuse
+        };
+        if refused {
+            return Err(RawtxError::Unavailable(format!(
+                "{server}: local stream budget busy"
+            )));
+        }
+        // The fake "connects" like a real server before it answers or
+        // closes the connection.
+        ctl.mark_connected();
         self.calls
             .lock()
             .unwrap()
@@ -722,4 +741,36 @@ fn live_tx_mode_mainnet() {
         st.tx_fallback.load(Ordering::Relaxed),
     );
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn local_congestion_does_not_spend_the_servers_of_a_transaction() {
+    // 29.25.2: a session that could not get a Tor stream or a slot here sent
+    // nothing. Its transactions go back to the batcher without counting one
+    // of their MAX_TX_ATTEMPTS servers: with one server and five local
+    // refusals the old code fell back to the block path (none here).
+    let c = chain("localbusy");
+    let src = FakeSource::new(&c.raw, 1, None);
+    *src.busy.lock().unwrap() = 5;
+    let privacy = PrivacyParams {
+        decoy_wallets: 0,
+        ..PrivacyParams::balanced()
+    };
+    let r = resolver(&c, privacy, Arc::clone(&src), [5; 32]);
+    let got = load(&r, &c, 1);
+    for (t, hex) in c.real.1.iter().zip(&got) {
+        assert_eq!(hex, &hex::encode(&c.raw[&t.txid]));
+    }
+    let stats = r.stats();
+    assert_eq!(
+        stats.tx_fallback.load(std::sync::atomic::Ordering::SeqCst),
+        0
+    );
+    assert!(
+        stats
+            .tx_local_requeues
+            .load(std::sync::atomic::Ordering::SeqCst)
+            >= 1
+    );
+    settle(&r);
 }

@@ -216,35 +216,22 @@ impl Resolver {
         // A wallet request may take the last free slot; the prefetch leaves
         // it free and steps aside while any wallet request waits for a slot.
         // A prefetch that a wallet joined becomes a wallet download (AUD-165).
-        let wallet = priority == Priority::Wallet || entry.wallet_waiting.load(Ordering::Relaxed);
+        let is_wallet =
+            || priority == Priority::Wallet || entry.wallet_waiting.load(Ordering::Relaxed);
+        let wallet = is_wallet();
         // The queue gets whatever the request budget leaves after the network
         // part (~25 s of queue and 20 s of network for a wallet request, 45 s
         // total); the full 120 s for a background prefetch. The governor caps
-        // every Tor stream (block downloads, per-txid sessions, decoys) with
-        // wallet > prefetch > decoy priority, so a cold burst waits for a
-        // slot instead of saturating Tor.
+        // every Tor **stream** (each race attempt, each per-txid connection)
+        // with wallet > prefetch > decoy priority, so a cold burst waits for
+        // a stream instead of saturating Tor (29.25.2: one permit per
+        // attempt, not per block).
         let budget = if wallet {
             WALLET_BLOCK_NET
         } else {
             EXTERNAL_BUDGET
         };
         let lane = if wallet { Lane::Wallet } else { Lane::Prefetch };
-        let queue_deadline = entry
-            .deadline()
-            .checked_sub(budget)
-            .unwrap_or_else(Instant::now);
-        let Some(_permit) = self
-            .governor
-            .acquire(lane, queue_deadline.max(Instant::now() + MIN_ATTEMPT))
-        else {
-            self.stats.unavailable.fetch_add(1, Ordering::Relaxed);
-            return Err(RawtxError::Unavailable(
-                "every download slot stayed busy until the deadline".into(),
-            ));
-        };
-        // The network budget starts now, not when the request queued.
-        let deadline = Instant::now() + budget;
-        entry.set_deadline(deadline);
         let mut plan: Vec<(Arc<dyn BlockSource>, Endpoint)> = Vec::new();
         for source in self.sources() {
             for endpoint in source.endpoints(FetchMode::Normal) {
@@ -260,14 +247,61 @@ impl Resolver {
                 "every external endpoint is cooling down".into(),
             ));
         }
-        let wallet = priority == Priority::Wallet || entry.wallet_waiting.load(Ordering::Relaxed);
+        // The first stream is the queue: it is waited for with what the
+        // request leaves after the network budget.
+        let queue_started = Instant::now();
+        let first = if plan[0].1.via_tor {
+            let queue_deadline = entry
+                .deadline()
+                .checked_sub(budget)
+                .unwrap_or_else(Instant::now);
+            let Some(permit) = self
+                .governor
+                .acquire(lane, queue_deadline.max(Instant::now() + MIN_ATTEMPT))
+            else {
+                self.stats.unavailable.fetch_add(1, Ordering::Relaxed);
+                if debug_logs() {
+                    eprintln!(
+                        "[e-lite] debug: block obj={} lane={} no tor stream after {} ms (streams {}/{})",
+                        log_tag(hash),
+                        lane.name(),
+                        queue_started.elapsed().as_millis(),
+                        self.governor.in_use(),
+                        self.governor.total()
+                    );
+                }
+                return Err(RawtxError::Unavailable(
+                    "every download slot stayed busy until the deadline".into(),
+                ));
+            };
+            Some(permit)
+        } else {
+            None
+        };
+        let queued_ms = queue_started.elapsed().as_millis();
+        // The network budget starts now, not when the request queued.
+        let deadline = Instant::now() + budget;
+        entry.set_deadline(deadline);
         let _wallet = wallet.then(|| Busy::new(&self.wallet_downloads));
-        let result = self.race(hash, deadline, plan, wallet);
+        let started = Instant::now();
+        let result = self.race(hash, deadline, plan, &is_wallet, first);
         if result.is_ok() {
             // A success means Tor is healthy: lift any pause at once.
             self.governor.healthy();
         } else {
             self.stats.unavailable.fetch_add(1, Ordering::Relaxed);
+        }
+        if debug_logs() {
+            eprintln!(
+                "[e-lite] debug: block obj={} lane={} queued {queued_ms} ms, race {} ms: {}",
+                log_tag(hash),
+                lane.name(),
+                started.elapsed().as_millis(),
+                match &result {
+                    Ok(bytes) => format!("ok, {} KiB", bytes.len() / 1024),
+                    Err(e) => format!("failed ({})", redact_hashes(&e.to_string())),
+                }
+            );
         }
         result
     }
@@ -277,8 +311,11 @@ impl Resolver {
         hash: &Hash32,
         deadline: Instant,
         plan: Vec<(Arc<dyn BlockSource>, Endpoint)>,
-        wallet: bool,
+        is_wallet: &dyn Fn() -> bool,
+        first: Option<GovernorPermit>,
     ) -> Result<Vec<u8>> {
+        // The stream the caller queued for, used by the first Tor attempt.
+        let mut first = first;
         struct Running {
             ctl: AttemptCtl,
             started: Instant,
@@ -330,45 +367,91 @@ impl Resolver {
                 let allowed = !fallback
                     || (running.is_empty() && plan[next..].iter().all(|(_, e)| e.tier > 0));
                 if allowed {
-                    // Waiting for an attempt permit must not outlive the
-                    // network budget: `queue_deadline` covers the download
-                    // slot only (AUD-167). A prefetch or decoy leaves one
-                    // permit free so a wallet never queues behind them.
-                    let keep_free = usize::from(!wallet);
-                    let wait_until = if running.is_empty() { deadline } else { now };
-                    if let Some(permit) =
-                        self.external_attempts.acquire_until(wait_until, keep_free)
-                    {
-                        self.stats.race_attempts.fetch_add(1, Ordering::Relaxed);
-                        if !running.is_empty() {
-                            self.stats.race_hedges.fetch_add(1, Ordering::Relaxed);
+                    let wallet = is_wallet();
+                    let lane = if wallet { Lane::Wallet } else { Lane::Prefetch };
+                    let role = if running.is_empty() {
+                        if attempts == 0 {
+                            "first"
+                        } else {
+                            "retry"
                         }
-                        let (source, endpoint) = plan[next].clone();
-                        *tried.entry(endpoint.key.clone()).or_insert(0) += 1;
-                        let ctl = AttemptCtl::new();
-                        running.insert(
-                            next,
-                            Running {
-                                ctl: ctl.clone(),
-                                started: Instant::now(),
-                                via_tor: endpoint.via_tor,
-                                _permit: permit,
-                            },
-                        );
-                        self.spawn_attempt(
-                            next,
-                            source,
-                            endpoint,
-                            *hash,
-                            deadline,
-                            ctl,
-                            tx.clone(),
-                        );
-                        next += 1;
-                        continue;
+                    } else {
+                        "hedge"
+                    };
+                    // One Tor stream per attempt (29.25.2). A hedge never
+                    // waits for one: the attempt it hedges is still running.
+                    // With nothing running, wait while an attempt still fits
+                    // in the network budget.
+                    let stream_wait = Instant::now();
+                    let stream = if !plan[next].1.via_tor {
+                        Ok(None)
+                    } else if let Some(permit) = first.take() {
+                        Ok(Some(permit))
                     } else if running.is_empty() {
-                        errors.push("every attempt slot stayed busy".to_string());
-                        break;
+                        let until = deadline.checked_sub(MIN_ATTEMPT).unwrap_or(now).max(now);
+                        self.governor.acquire(lane, until).map(Some).ok_or(())
+                    } else {
+                        self.governor.try_acquire(lane).map(Some).ok_or(())
+                    };
+                    let stream_wait = stream_wait.elapsed();
+                    match stream {
+                        Err(()) if running.is_empty() => {
+                            errors.push("every tor stream stayed busy".to_string());
+                            break;
+                        }
+                        // No free stream for a hedge now: the running
+                        // attempts go on and the hedge is looked at again on
+                        // the next tick.
+                        Err(()) => {}
+                        Ok(stream) => {
+                            // Waiting for an attempt permit must not outlive
+                            // the network budget: `queue_deadline` covers the
+                            // download slot only (AUD-167). A prefetch or
+                            // decoy leaves one permit free so a wallet never
+                            // queues behind them.
+                            let keep_free = usize::from(!wallet);
+                            let wait_until = if running.is_empty() { deadline } else { now };
+                            if let Some(permit) =
+                                self.external_attempts.acquire_until(wait_until, keep_free)
+                            {
+                                self.stats.race_attempts.fetch_add(1, Ordering::Relaxed);
+                                if !running.is_empty() {
+                                    self.stats.race_hedges.fetch_add(1, Ordering::Relaxed);
+                                }
+                                let (source, endpoint) = plan[next].clone();
+                                *tried.entry(endpoint.key.clone()).or_insert(0) += 1;
+                                let ctl = AttemptCtl::new();
+                                running.insert(
+                                    next,
+                                    Running {
+                                        ctl: ctl.clone(),
+                                        started: Instant::now(),
+                                        via_tor: endpoint.via_tor,
+                                        _permit: permit,
+                                    },
+                                );
+                                self.spawn_attempt(
+                                    next,
+                                    source,
+                                    endpoint,
+                                    *hash,
+                                    deadline,
+                                    ctl,
+                                    tx.clone(),
+                                    AttemptLog {
+                                        stream,
+                                        lane,
+                                        role,
+                                        stream_wait,
+                                    },
+                                );
+                                next += 1;
+                                continue;
+                            } else if running.is_empty() {
+                                errors.push("every attempt slot stayed busy".to_string());
+                                break;
+                            }
+                        }
                     }
                 }
             }
@@ -476,15 +559,44 @@ impl Resolver {
         deadline: Instant,
         ctl: AttemptCtl,
         tx: mpsc::Sender<(usize, Result<Vec<u8>>)>,
+        log: AttemptLog,
     ) {
         let stats = Arc::clone(&self.stats);
         let spawned = std::thread::Builder::new()
             .name(el_model::sync::THREAD_FETCH.to_string())
             .spawn(move || {
+                let AttemptLog {
+                    stream,
+                    lane,
+                    role,
+                    stream_wait,
+                } = log;
+                let started = Instant::now();
                 let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
                     source.fetch_endpoint(&endpoint, &hash, deadline, FetchMode::Normal, &ctl)
                 }))
                 .unwrap_or_else(|_| Err(RawtxError::Unavailable("attempt panicked".into())));
+                // The connection is gone once the source returns: only now is
+                // the Tor stream given back, also for an aborted loser that
+                // took a while to notice (29.25.2).
+                drop(stream);
+                if debug_logs() {
+                    eprintln!(
+                        "[e-lite] debug: stream block obj={} src={} ep={} lane={} {role} wait {} ms, {} ms, {} KiB: {}",
+                        log_tag(&hash),
+                        source.name(),
+                        endpoint_label(&endpoint),
+                        lane.name(),
+                        stream_wait.as_millis(),
+                        started.elapsed().as_millis(),
+                        ctl.bytes() / 1024,
+                        match &result {
+                            Ok(_) => "ok".to_string(),
+                            Err(_) if ctl.aborted() => "aborted (lost the race)".to_string(),
+                            Err(e) => redact_hashes(&e.to_string()),
+                        }
+                    );
+                }
                 let result = result.and_then(|bytes| {
                     match verify_block_by_hash(&bytes, &hash).and_then(|block| {
                         verify_witness_commitment(&block)?;
@@ -519,6 +631,15 @@ impl Resolver {
         failed.get(hash).map(|(_, e)| e.clone())
     }
 
+    /// When the remembered failure of `hash` expires, if there is one.
+    pub(super) fn failure_expiry(&self, hash: &Hash32) -> Option<Instant> {
+        let failed = self.failed.lock().ok()?;
+        failed
+            .get(hash)
+            .map(|(at, _)| *at + FAILURE_MEMORY)
+            .filter(|t| *t > Instant::now())
+    }
+
     /// Remember that every source failed for `hash`. "No source" is not
     /// remembered: it is a configuration state, not a download failure.
     fn remember_failure(&self, hash: &Hash32, e: &RawtxError) {
@@ -530,6 +651,28 @@ impl Resolver {
             failed.retain(|_, (at, _)| now.duration_since(*at) < FAILURE_MEMORY);
             failed.insert(*hash, (now, e.clone()));
         }
+    }
+}
+
+/// What one race attempt carries for the stream budget and its log line.
+struct AttemptLog {
+    /// The Tor stream (none for a direct attempt); released when the
+    /// attempt's thread is done with the connection.
+    stream: Option<GovernorPermit>,
+    lane: Lane,
+    /// `first`, `hedge` or `retry`.
+    role: &'static str,
+    /// Time spent waiting for the stream.
+    stream_wait: Duration,
+}
+
+/// Endpoint for a debug line: the transport and the provider or peer, never
+/// anything about the wallet.
+fn endpoint_label(endpoint: &Endpoint) -> String {
+    if endpoint.key.is_empty() {
+        "whole".to_string()
+    } else {
+        endpoint.key.replace(' ', ":")
     }
 }
 

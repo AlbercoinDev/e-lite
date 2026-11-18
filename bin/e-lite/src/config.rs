@@ -1224,8 +1224,8 @@ impl Config {
         if el_rawtx::ExternalPath::parse(&self.rawtx.path).is_none() {
             return Err("[rawtx] path must be auto, tx or block".to_string());
         }
-        if !(3..=60).contains(&self.rawtx.wallet_deadline_seconds) {
-            return Err("[rawtx] wallet_deadline_seconds must be 3..60".to_string());
+        if !(3..=300).contains(&self.rawtx.wallet_deadline_seconds) {
+            return Err("[rawtx] wallet_deadline_seconds must be 3..300".to_string());
         }
         if !(1..=30).contains(&self.rawtx.txid_attempt_seconds) {
             return Err("[rawtx] txid_attempt_seconds must be 1..30".to_string());
@@ -1553,6 +1553,13 @@ mod tests {
         bad.rawtx.path = "auto".into();
         bad.rawtx.wallet_deadline_seconds = 2;
         assert!(bad.validate().is_err());
+        // 29.25.2: the range reaches 300 s for manual experiments (the
+        // default stays 45 s); 301 is refused.
+        let mut wide = Config::default();
+        wide.rawtx.wallet_deadline_seconds = 300;
+        assert!(wide.validate().is_ok());
+        wide.rawtx.wallet_deadline_seconds = 301;
+        assert!(wide.validate().is_err());
         bad.rawtx.wallet_deadline_seconds = 12;
         bad.rawtx.txid_attempt_seconds = 13;
         assert!(bad.validate().is_err());

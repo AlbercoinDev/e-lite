@@ -209,12 +209,28 @@ impl Shared {
             .map(|v| v.clone())
             .unwrap_or_else(|_| json!({}));
         let tor_governor = {
-            let (total, in_use, pauses, paused) = self.resolver.governor_stats();
+            // One permit per live Tor stream (29.25.2): `in_use` is the
+            // number of connections open through Tor right now.
+            let g = self.resolver.governor_snapshot();
+            let lane = |i: usize| {
+                json!({
+                    "queued": g.queued[i],
+                    "granted": g.granted[i],
+                    "waited": g.waited[i],
+                    "wait_ms": g.wait_ms[i],
+                    "max_wait_ms": g.max_wait_ms[i],
+                    "timeouts": g.timeouts[i],
+                })
+            };
             json!({
-                "total": total,
-                "in_use": in_use,
-                "pauses": pauses,
-                "paused": paused,
+                "total": g.total,
+                "in_use": g.in_use,
+                "peak": g.peak,
+                "pauses": g.pauses,
+                "paused": g.paused,
+                "wallet": lane(0),
+                "prefetch": lane(1),
+                "decoy": lane(2),
             })
         };
         json!({

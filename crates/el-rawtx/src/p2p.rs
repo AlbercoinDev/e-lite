@@ -504,7 +504,7 @@ impl P2pSource {
         // instead of piling up more refusals.
         if let Some(governor) = &self.governor {
             if down {
-                governor.pause();
+                governor.pause("p2p: local tor socks proxy refused");
             } else {
                 governor.healthy();
             }

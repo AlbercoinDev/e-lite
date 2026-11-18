@@ -86,7 +86,7 @@ opt-in error until a BIP352 indexer is wired; it is not advertised as available.
 
 | Item | Value |
 |---|---|
-| Max history entries per script | 100,000 |
+| Max history entries per script | 100,000 (more is `-32000` naming the script hash; `e-lite doctor history <hash>` counts its rows) |
 | Max outpoint subscriptions per client | 1,000 |
 | Max headers per request | 2,016 |
 | Max clients | 32 (configurable) |

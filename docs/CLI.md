@@ -16,6 +16,12 @@ are just starting points.
 ```text
 init             validate network/genesis against Core and create the database
 doctor           check config, Core, disk, ports, database and memory
+doctor history <scripthash>
+                 index rows and height range of one script (Electrum hash, as
+                 a wallet error shows it); read-only, works while e-lite runs
+doctor history-top [N]
+                 the N scripts with the most index rows (default 20); one full
+                 read-only scan: minutes to an hour on mainnet
 index            index the active chain (--no-follow stops at tip)
 serve            serve Electrum from an already indexed database (works offline)
 run              index and serve in one process; waits for Core RPC
@@ -241,7 +247,7 @@ e-lite run --network mainnet --allow-mainnet \
 | `--set rawtx.provider_cooldown_seconds=<n>` | cool down a failed provider (Tor or direct) | `300` |
 | `--set rawtx.max_parallel_fetches=<n>` | concurrent external block downloads | `16` |
 | `--set rawtx.path=auto\|tx\|block` | how a pruned transaction is resolved: race the block (auto), txid first (tx) or block only | `auto` |
-| `--set rawtx.wallet_deadline_seconds=<n>` | total per wallet request (queue + network) | `45` |
+| `--set rawtx.wallet_deadline_seconds=<n>` | total per wallet request (queue + network), 3-300 | `45` |
 | `--set rawtx.txid_attempt_seconds=<n>` | replace a per-txid provider that misses this | `3` |
 | `--set rawtx.txid_race=<bool>` | in `auto`, give the per-txid path only 2.5 s before the block starts | `false` |
 | `--set rawtx.decoy_sessions=same_round\|background` | decoy wallets in the same round or one in the background | `same_round` |
@@ -250,7 +256,7 @@ e-lite run --network mainnet --allow-mainnet \
 | `--set rawtx.prefetch_history_blocks=<n>` | blocks queued per history response; 0 = auto (block mode prefetches, per-txid mode on demand) | `0` |
 | `--set rawtx.p2p_blocks_per_peer=<n>` | blocks in flight with one P2P peer | `3` |
 | `--set rawtx.provider_quota=<n>` | long-term per-provider quota as a multiple of the fair share; 0 disables rotation | `1.5` |
-| `--set rawtx.tor_streams=<n>` | global budget of concurrent Tor streams (blocks, txid sessions, decoys) | `8` |
+| `--set rawtx.tor_streams=<n>` | open Tor streams at once: each race attempt, Electrum session and Esplora-tx request holds one while connected | `8` |
 | `--set rawtx.privacy_file=<path>` | `privacy.toml` location (empty: next to config.toml) | empty |
 | `--set privacy.<section>.<key>=<v>` | override one `privacy.toml` value for this run (range-checked, see `docs/PRIVACY-TUNING.md`) | — |
 | `--set rawtx.p2p_timeout_seconds=<n>` | P2P connect/handshake/block timeout | `8` |

@@ -38,6 +38,13 @@ const MAX_TX_ATTEMPTS: u32 = 3;
 /// firm switch threshold: a provider that misses it is replaced instead of
 /// holding the wallet's transactions.
 const SESSION_BUDGET: Duration = Duration::from_secs(3);
+/// Longest a session waits here for its slots and its Tor stream, all
+/// together. Past it the session's transactions go back to the batcher
+/// (29.25.2: it used to be `EXTERNAL_QUEUE_MAX`, 120 s per wait).
+const SESSION_QUEUE: Duration = Duration::from_secs(3);
+/// Times a transaction may go back to the batcher for local congestion
+/// before that counts as one of its `MAX_TX_ATTEMPTS` (~1 min at 3 s each).
+const MAX_LOCAL_REQUEUES: u32 = 20;
 /// Smallest batch tried after a provider rejects larger ones. Measured:
 /// `electrum.blockstream.info` accepts 20 txids and closes the connection
 /// above that. The cap halves per failure down to this value.
@@ -57,6 +64,9 @@ struct Req {
     t: TxRef,
     attempts: u32,
     tried: Vec<String>,
+    /// Sessions that could not run here (local congestion) since the last
+    /// real attempt.
+    local: u32,
 }
 
 #[derive(Clone)]
@@ -146,6 +156,7 @@ impl Drop for TxMode {
 }
 
 impl TxMode {
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         store: Arc<Store>,
         txcache: Option<Arc<TxCache>>,
@@ -342,6 +353,7 @@ impl Shared {
             t,
             attempts: 0,
             tried: Vec::new(),
+            local: 0,
         });
         self.queue_cv.notify_all();
         wait
@@ -678,20 +690,8 @@ fn run_session(shared: &Arc<Shared>, src: Arc<dyn TxSource>, key: &str, items: V
     shared.sessions_active.fetch_add(1, Ordering::SeqCst);
     let _guard = SessionGuard(&shared.sessions_active);
     let has_real = items.iter().any(|item| matches!(item, Item::Real(_)));
-    // One Tor stream per session, under the global governor: a wallet
-    // session never queues behind a decoy session.
     let lane = if has_real { Lane::Wallet } else { Lane::Decoy };
-    let Some(_governor) = shared
-        .governor
-        .acquire(lane, Instant::now() + crate::EXTERNAL_QUEUE_MAX)
-    else {
-        for item in &items {
-            if let Item::Real(r) = item {
-                retry_or_fail(shared, r.clone(), key, "tor stream budget busy");
-            }
-        }
-        return;
-    };
+    let queued = Instant::now();
     if has_real && shared.jitter_ms > 0 {
         // Small random delay: it breaks the timing correlation between the
         // wallet's connection and its first provider request at a negligible
@@ -699,42 +699,43 @@ fn run_session(shared: &Arc<Shared>, src: Arc<dyn TxSource>, key: &str, items: V
         let delay = rand::random::<u64>() % shared.jitter_ms.max(1);
         std::thread::sleep(Duration::from_millis(delay));
     }
+    // Every local wait of a session shares one short limit (29.25.2): no
+    // queue holds a transaction for minutes. What does not get its turn goes
+    // back to the batcher without spending one of its servers.
+    let queue_deadline = Instant::now() + SESSION_QUEUE;
     // Decoy sessions use a small separate pool so three decoy wallets never
     // take the session slots a real transaction is waiting for. Dropping a
     // decoy when the pool is full is harmless: it is background noise.
     let _decoy_permit = if has_real {
         None
     } else {
-        match shared
-            .decoy_sessions
-            .acquire_until(Instant::now() + crate::EXTERNAL_QUEUE_MAX, 0)
-        {
+        match shared.decoy_sessions.acquire_until(queue_deadline, 0) {
             Some(permit) => Some(permit),
             None => return,
         }
     };
-    // The server's slot first: a session waiting for a busy server must not
-    // hold one of the global slots.
+    // The server's slot first, then a global session slot, and the Tor
+    // stream last: a session waiting for a busy server or a session slot
+    // must not hold a stream every other download needs (29.25.2).
     let slot = shared.server_slot(key);
-    let Some(_server_permit) = slot.acquire_until(Instant::now() + crate::EXTERNAL_QUEUE_MAX, 0)
-    else {
-        for item in items {
-            if let Item::Real(r) = item {
-                retry_or_fail(shared, r, key, "server busy");
-            }
-        }
+    let Some(_server_permit) = slot.acquire_until(queue_deadline, 0) else {
+        local_requeue(shared, items, key, "server busy", queued);
         return;
     };
-    let Some(_permit) = shared
-        .sessions
-        .acquire_until(Instant::now() + crate::EXTERNAL_QUEUE_MAX, 0)
-    else {
-        for item in items {
-            if let Item::Real(r) = item {
-                retry_or_fail(shared, r, key, "no session slot");
+    let Some(_permit) = shared.sessions.acquire_until(queue_deadline, 0) else {
+        local_requeue(shared, items, key, "no session slot", queued);
+        return;
+    };
+    let first = if src.via_tor(key) {
+        match shared.governor.acquire(lane, queue_deadline) {
+            Some(stream) => Some(stream),
+            None => {
+                local_requeue(shared, items, key, "no tor stream", queued);
+                return;
             }
         }
-        return;
+    } else {
+        None
     };
     let txids: Vec<Hash32> = items.iter().map(Item::txid).collect();
     let real = items.iter().filter(|i| matches!(i, Item::Real(_))).count() as u64;
@@ -744,25 +745,54 @@ fn run_session(shared: &Arc<Shared>, src: Arc<dyn TxSource>, key: &str, items: V
         .stats
         .tx_decoys
         .fetch_add(txids.len() as u64 - real, Ordering::Relaxed);
-    let ctl = AttemptCtl::new();
+    let ctl = AttemptCtl::new().with_streams(Arc::clone(&shared.governor), lane, first);
+    let waited = queued.elapsed();
+    // The session's budget starts once it holds everything it waited for.
     let started = Instant::now();
     let result = src.fetch_from(key, &txids, started + SESSION_BUDGET, &ctl);
+    let ms = started.elapsed().as_millis() as f64;
+    let skipped: HashSet<Hash32> = ctl.skipped().into_iter().collect();
+    let local = matches!(&result, Err(RawtxError::Unavailable(m)) if m.contains(crate::LOCAL_BUSY));
+    if crate::debug_logs() {
+        eprintln!(
+            "[e-lite] debug: stream session src={} ep={key} lane={} items {} ({real} real), wait {} ms, {} ms, {}: {}",
+            src.name(),
+            lane.name(),
+            txids.len(),
+            waited.as_millis(),
+            ms as u64,
+            if ctl.connected() { "connected" } else { "no connection" },
+            match &result {
+                Ok(batch) => format!("ok, {} returned, {} not sent", batch.len(), skipped.len()),
+                Err(e) => crate::redact_hashes(&e.to_string()),
+            }
+        );
+    }
+    if local {
+        // Nothing was sent: not the server's failure, not a slow server.
+        local_requeue(shared, items, key, crate::LOCAL_BUSY, queued);
+        return;
+    }
     if result.is_ok() {
         shared.governor.healthy();
     }
-    // Real time, success or failure: a fast rejection must not look like a
-    // 40 s stall (the old code used the whole session budget on failure).
-    let ms = started.elapsed().as_millis() as f64;
-    if result.is_err() {
+    if result.is_err() && ctl.connected() {
         // A provider that closes above its batch limit is remembered with a
-        // smaller batch, so the next session succeeds instead of failing.
+        // smaller batch, so the next session succeeds instead of failing. A
+        // session that never connected says nothing about the batch size
+        // (29.25.2: a slow circuit used to halve it for the whole process).
         shared.note_batch_failure(key, items.len());
     }
+    // Real time, success or failure: a fast rejection must not look like a
+    // 40 s stall (the old code used the whole session budget on failure).
     shared.note_latency(key, ms);
     let batch = result.unwrap_or_default();
     let mut bad = false;
     for item in items {
         match item {
+            Item::Real(r) if skipped.contains(&r.t.txid) && !batch.contains_key(&r.t.txid) => {
+                local_requeue_one(shared, r, key, "not sent");
+            }
             Item::Real(r) => match batch.get(&r.t.txid) {
                 Some(raw) => match shared.verify(&r.t, raw) {
                     Ok(hex) => {
@@ -792,6 +822,46 @@ fn run_session(shared: &Arc<Shared>, src: Arc<dyn TxSource>, key: &str, items: V
     }
     if bad {
         src.penalize(key);
+    }
+}
+
+/// Requeue the real items of a session that could not run here (no slot,
+/// no Tor stream): the server was never asked, so it is not added to the
+/// item's tried servers and no attempt is spent. Decoys are dropped.
+fn local_requeue(shared: &Arc<Shared>, items: Vec<Item>, key: &str, why: &str, since: Instant) {
+    let mut n = 0usize;
+    for item in items {
+        if let Item::Real(r) = item {
+            n += 1;
+            local_requeue_one(shared, r, key, why);
+        }
+    }
+    shared
+        .stats
+        .tx_local_requeues
+        .fetch_add(n as u64, Ordering::Relaxed);
+    if crate::debug_logs() && n > 0 {
+        eprintln!(
+            "[e-lite] debug: session to {key} did not run ({why}) after {} ms: {n} real requeued",
+            since.elapsed().as_millis()
+        );
+    }
+}
+
+fn local_requeue_one(shared: &Arc<Shared>, mut r: Req, key: &str, why: &str) {
+    r.local += 1;
+    if r.local > MAX_LOCAL_REQUEUES {
+        // Local congestion for this long: count it as a failed attempt so
+        // the transaction moves on to the block path.
+        r.local = 0;
+        retry_or_fail(shared, r, key, why);
+    } else if shared.closed.load(Ordering::Relaxed) {
+        shared.finish(
+            r.t.txid,
+            Err(RawtxError::Unavailable("tx mode: closed".into())),
+        );
+    } else {
+        shared.requeue(r);
     }
 }
 

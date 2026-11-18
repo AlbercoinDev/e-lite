@@ -182,7 +182,7 @@ fn socks_request(stream: &mut TcpStream, peer: &str) -> std::result::Result<(), 
     // From here on Tor is building a circuit to the peer: a timeout is the
     // circuit's (or the peer's), not the proxy's.
     let mut head = [0u8; 4];
-    stream.read_exact(&mut head).map_err(SocksError::Stream)?;
+    stream.read_exact(&mut head).map_err(circuit_error)?;
     if head[0] != 5 {
         return Err(SocksError::Proxy(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -197,7 +197,7 @@ fn socks_request(stream: &mut TcpStream, peer: &str) -> std::result::Result<(), 
         4 => 16,
         3 => {
             let mut len = [0u8; 1];
-            stream.read_exact(&mut len).map_err(SocksError::Stream)?;
+            stream.read_exact(&mut len).map_err(circuit_error)?;
             len[0] as usize
         }
         _ => {
@@ -209,8 +209,23 @@ fn socks_request(stream: &mut TcpStream, peer: &str) -> std::result::Result<(), 
     };
     // Bound address and port.
     let mut rest = vec![0u8; skip + 2];
-    stream.read_exact(&mut rest).map_err(SocksError::Stream)?;
+    stream.read_exact(&mut rest).map_err(circuit_error)?;
     Ok(())
+}
+
+/// A read of the CONNECT reply that hit the socket timeout. Linux reports an
+/// expired `SO_RCVTIMEO` as EAGAIN ("Resource temporarily unavailable", os
+/// error 11), which reads like Tor refusing the stream; it is a circuit that
+/// was not built in time. Say so, so the log and the transient-failure
+/// classifier read it right (29.25.2).
+fn circuit_error(e: io::Error) -> SocksError {
+    match e.kind() {
+        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut => SocksError::Stream(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "timed out waiting for the circuit",
+        )),
+        _ => SocksError::Stream(e),
+    }
 }
 
 #[cfg(test)]
@@ -237,6 +252,27 @@ mod tests {
             started.elapsed() < Duration::from_secs(2),
             "SOCKS handshake must not block past the timeout"
         );
+    }
+
+    #[test]
+    fn a_slow_circuit_is_a_timeout_not_eagain() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        std::thread::spawn(move || {
+            let (mut sock, _) = listener.accept().unwrap();
+            let mut greeting = [0u8; 4];
+            sock.read_exact(&mut greeting).unwrap();
+            sock.write_all(&[5, 0]).unwrap();
+            let mut request = [0u8; 10];
+            sock.read_exact(&mut request).unwrap();
+            // Never answer the CONNECT: the circuit is "being built".
+            std::thread::sleep(Duration::from_secs(2));
+        });
+        let err = socks_connect(&addr, "127.0.0.1:8333", Duration::from_millis(200)).unwrap_err();
+        let text = err.to_string();
+        assert!(matches!(err, SocksError::Stream(_)), "{text}");
+        assert!(text.contains("timed out"), "{text}");
+        assert!(!text.contains("os error 11"), "{text}");
     }
 
     #[test]

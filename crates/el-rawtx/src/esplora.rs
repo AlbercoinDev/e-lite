@@ -35,7 +35,7 @@ pub struct EsploraSource {
     fallback_clearnet: bool,
     allow_clearnet: bool,
     fallback_warned: AtomicBool,
-    /// Shared Tor stream governor; a 429 pauses every stream briefly.
+    /// Shared Tor stream governor; a Tor success lifts its pause.
     governor: Option<Arc<TorGovernor>>,
     /// Cooldown after a hard failure (wrong answer from the provider).
     cooldown: Duration,
@@ -228,7 +228,7 @@ impl EsploraSource {
 
     /// Set the Tor circuit/connect and stall timeouts (capped by the attempt
     /// limit).
-    /// The Tor stream governor (pause on rate limits).
+    /// The Tor stream governor (a Tor success lifts its pause).
     pub fn with_governor(mut self, governor: Arc<TorGovernor>) -> Self {
         self.governor = Some(governor);
         self
@@ -472,13 +472,11 @@ impl BlockSource for EsploraSource {
                     if !ctl.aborted() && matches!(blame, Blame::Transient) {
                         ctl.retry_on_new_circuit();
                     }
+                    // A 429 is this provider's (or this exit's) limit: its
+                    // health backs it off. It must not pause every other
+                    // stream through Tor (29.25.2).
                     if !quiet && !ctl.aborted() {
                         self.fail_tor(base, blame);
-                    }
-                    if matches!(blame, Blame::RateLimited(_)) {
-                        if let Some(governor) = &self.governor {
-                            governor.pause();
-                        }
                     }
                     Err(RawtxError::Unavailable(format!("tor {e}")))
                 }
@@ -492,10 +490,9 @@ impl BlockSource for EsploraSource {
             let via_fallback = self.fallback_clearnet && !self.allow_clearnet;
             return match Self::fetch_with(client, base, hash, attempt, ctl) {
                 Ok(bytes) => {
+                    // A clearnet success says nothing about Tor: it does not
+                    // lift a Tor pause.
                     self.direct_health.succeed(base);
-                    if let Some(governor) = &self.governor {
-                        governor.healthy();
-                    }
                     if via_fallback && !self.fallback_warned.swap(true, Ordering::Relaxed) {
                         eprintln!(
                             "[e-lite] WARNING: Tor request failed; using clearnet for {base} (operator IP exposed)"

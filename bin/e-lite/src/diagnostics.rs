@@ -41,6 +41,103 @@ pub(crate) fn cmd_init(cfg: &Config, chain: Chain) -> R<()> {
     Ok(())
 }
 
+/// `e-lite doctor history <scripthash>`: how many index rows one script has
+/// (29.25.2). The hash is the Electrum one (reversed hex) that a wallet error
+/// for a too-large history shows. Read-only: works beside a running e-lite.
+pub(crate) fn cmd_doctor_history(cfg: &Config, chain: Chain, target: Option<&str>) -> R<()> {
+    let Some(hex) = target else {
+        return fail(
+            "usage: e-lite doctor history <scripthash> (64 hex digits, as Electrum shows it)",
+        );
+    };
+    let script = el_model::ScriptHash::from_electrum_hex(hex.trim())
+        .map_err(|e| format!("not an Electrum script hash: {e}"))?;
+    let reader = open_history_reader(cfg, chain)?;
+    let started = std::time::Instant::now();
+    let count = reader.count_for(script)?;
+    // Stdout of a command the operator runs with a hash they already hold,
+    // not a log line (AUD-132 covers the logs).
+    let asked = script.to_electrum_hex();
+    println!("e-lite {} doctor history", VERSION);
+    println!("network: {}", chain.name());
+    println!("script hash: {asked}");
+    println!("index rows: {}", count.rows);
+    if count.rows > 0 {
+        println!("heights: {} .. {}", count.first_height, count.last_height);
+    }
+    println!(
+        "wallet limit: {} rows ({})",
+        el_serve::MAX_HISTORY_ENTRIES,
+        if count.rows as usize > el_serve::MAX_HISTORY_ENTRIES {
+            "over: a wallet subscribing it gets an error"
+        } else {
+            "within"
+        }
+    );
+    println!("scan: {} ms", started.elapsed().as_millis());
+    println!(
+        "Compare with a public explorer: a script with no history there and rows \
+         here points at the index, not at the wallet."
+    );
+    Ok(())
+}
+
+/// The index of this network, read-only, with a clear error when the data
+/// directory has no index (wrong `--network` or `--data-dir`).
+fn open_history_reader(cfg: &Config, chain: Chain) -> R<el_store::HistoryReader> {
+    let dir = cfg.data_dir(chain);
+    if !dir.join("CURRENT").exists() {
+        return fail(format!(
+            "no index at {} (check --network and --data-dir)",
+            dir.display()
+        ));
+    }
+    Ok(el_store::HistoryReader::open(&dir)?)
+}
+
+/// `e-lite doctor history-top [N]`: one full pass over the history family.
+pub(crate) fn cmd_doctor_history_top(cfg: &Config, chain: Chain, target: Option<&str>) -> R<()> {
+    let top: usize = match target {
+        Some(n) => n
+            .parse()
+            .map_err(|_| format!("history-top takes a number, not {n}"))?,
+        None => 20,
+    };
+    let reader = open_history_reader(cfg, chain)?;
+    eprintln!(
+        "[e-lite] scanning the whole history family (read-only; minutes to an hour on mainnet)..."
+    );
+    let started = std::time::Instant::now();
+    let result = reader.top_scripts(top.clamp(1, 1000))?;
+    println!("e-lite {} doctor history-top", VERSION);
+    println!("network: {}", chain.name());
+    println!(
+        "rows: {}  scripts: {}  malformed keys: {}  scan: {} s",
+        result.rows,
+        result.scripts,
+        result.malformed,
+        started.elapsed().as_secs()
+    );
+    // Stdout of an operator command over the whole index (no wallet asked
+    // for these scripts), not a log line.
+    for (i, (script, count)) in result.top.iter().enumerate() {
+        let shown = script.to_electrum_hex();
+        println!(
+            "{:>3}. {shown}  rows {}  heights {}..{}{}",
+            i + 1,
+            count.rows,
+            count.first_height,
+            count.last_height,
+            if count.rows as usize > el_serve::MAX_HISTORY_ENTRIES {
+                "  (over the wallet limit)"
+            } else {
+                ""
+            }
+        );
+    }
+    Ok(())
+}
+
 /// Publish the effective Tor SOCKS port (not the configured `0 = auto`) and
 /// the fact that e-lite never allocates a Tor control port.
 pub(crate) fn cmd_doctor(cfg: &Config, chain: Chain) -> R<()> {

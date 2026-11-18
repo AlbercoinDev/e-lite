@@ -48,6 +48,21 @@ fn debug_logs() -> bool {
     DEBUG_LOGS.load(Ordering::Relaxed)
 }
 
+/// Short opaque tag for a wallet object (txid, block hash) in `debug:` lines:
+/// the first 6 hex digits of SHA-256 over a random per-process key and the
+/// hash. It ties the lines of one object together inside a run without
+/// revealing the hash (AUD-132), and is not linkable across restarts.
+pub fn log_tag(hash: &Hash32) -> String {
+    use sha2::{Digest, Sha256};
+    static KEY: std::sync::OnceLock<[u8; 32]> = std::sync::OnceLock::new();
+    let key = KEY.get_or_init(rand::random::<[u8; 32]>);
+    let mut h = Sha256::new();
+    h.update(b"e-lite log tag v1");
+    h.update(key);
+    h.update(hash.as_bytes());
+    hex::encode(&h.finalize()[..3])
+}
+
 /// HTTP `User-Agent` for every external request. A generic value: the
 /// project name and version would put the operator in a tiny anonymity set
 /// for every provider (AUD-133).
@@ -311,7 +326,28 @@ struct CtlInner {
     bytes: AtomicU64,
     sockets: Mutex<Vec<TcpStream>>,
     retry: AtomicBool,
+    /// A connection to the far end was made (a socket was watched).
+    connected: AtomicBool,
+    /// Tor stream budget of a per-txid session: the governor, the lane and
+    /// the stream the session already queued for (29.25.2).
+    streams: Mutex<Option<StreamBudget>>,
+    /// Txids a session never asked for (no stream was free for them).
+    skipped: Mutex<Vec<Hash32>>,
 }
+
+struct StreamBudget {
+    governor: Arc<TorGovernor>,
+    lane: Lane,
+    first: Option<GovernorPermit>,
+}
+
+/// No Tor stream was free before the deadline (`AttemptCtl::take_stream`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NoStream;
+
+/// A per-txid session could not get a Tor stream or a connection slot here:
+/// nothing was sent and the server is not to blame (29.25.2).
+pub(crate) const LOCAL_BUSY: &str = "local stream budget busy";
 
 /// Shared by one attempt and the race that started it: progress (bytes
 /// received) flows up, an abort flows down. Aborting shuts down the
@@ -357,8 +393,77 @@ impl AttemptCtl {
         self.0.bytes.load(Ordering::Relaxed)
     }
 
+    /// Every Tor stream of this attempt goes through `governor` in `lane`;
+    /// `first` is the stream its caller already queued for.
+    pub fn with_streams(
+        self,
+        governor: Arc<TorGovernor>,
+        lane: Lane,
+        first: Option<GovernorPermit>,
+    ) -> Self {
+        if let Ok(mut streams) = self.0.streams.lock() {
+            *streams = Some(StreamBudget {
+                governor,
+                lane,
+                first,
+            });
+        }
+        self
+    }
+
+    /// One Tor stream for a connection of this attempt. `Ok(None)` without a
+    /// budget (tests, clearnet). The stream the caller queued for comes
+    /// first; then `wait_until` waits for one, and `None` only takes a free
+    /// one. `Err` means no stream: nothing may be sent.
+    pub fn take_stream(
+        &self,
+        wait_until: Option<Instant>,
+    ) -> std::result::Result<Option<GovernorPermit>, NoStream> {
+        let (governor, lane) = {
+            let Ok(mut streams) = self.0.streams.lock() else {
+                return Ok(None);
+            };
+            let Some(budget) = streams.as_mut() else {
+                return Ok(None);
+            };
+            if let Some(first) = budget.first.take() {
+                return Ok(Some(first));
+            }
+            (Arc::clone(&budget.governor), budget.lane)
+        };
+        match wait_until {
+            Some(until) => governor.acquire(lane, until),
+            None => governor.try_acquire(lane),
+        }
+        .map(Some)
+        .ok_or(NoStream)
+    }
+
+    /// The attempt reached the far end without a watched socket (a client
+    /// library that owns its connection, or a test source).
+    pub fn mark_connected(&self) {
+        self.0.connected.store(true, Ordering::Relaxed);
+    }
+
+    /// Whether a socket of this attempt reached the far end.
+    pub fn connected(&self) -> bool {
+        self.0.connected.load(Ordering::Relaxed)
+    }
+
+    /// The source did not ask for `txid` (no stream was free).
+    pub fn skip(&self, txid: Hash32) {
+        if let Ok(mut skipped) = self.0.skipped.lock() {
+            skipped.push(txid);
+        }
+    }
+
+    pub fn skipped(&self) -> Vec<Hash32> {
+        self.0.skipped.lock().map(|s| s.clone()).unwrap_or_default()
+    }
+
     /// Register a socket so an abort can shut it down.
     pub fn watch(&self, stream: &TcpStream) {
+        self.0.connected.store(true, Ordering::Relaxed);
         if let Ok(clone) = stream.try_clone() {
             if let Ok(mut sockets) = self.0.sockets.lock() {
                 sockets.push(clone);
@@ -515,6 +620,9 @@ pub struct RawtxStats {
     pub tx_verified: AtomicU64,
     pub tx_verify_failed: AtomicU64,
     pub tx_fallback: AtomicU64,
+    /// Real transactions sent back to the batcher by local congestion (no
+    /// slot or Tor stream here); no server was asked (29.25.2).
+    pub tx_local_requeues: AtomicU64,
     /// A wallet transaction was served from a block download already in
     /// flight instead of starting the per-txid path.
     pub block_joins: AtomicU64,
@@ -961,7 +1069,7 @@ impl Resolver {
             prune_height: std::sync::atomic::AtomicU32::new(0),
             privacy: cfg.privacy.clone(),
             path: cfg.path,
-            wallet_deadline: Duration::from_secs(cfg.wallet_deadline_seconds.clamp(3, 60)),
+            wallet_deadline: Duration::from_secs(cfg.wallet_deadline_seconds.clamp(3, 300)),
             txid_attempt: Duration::from_secs(cfg.txid_attempt_seconds.clamp(1, 30)),
             txid_race: cfg.txid_race,
             decoy_sessions: cfg.decoy_sessions,
@@ -1292,12 +1400,12 @@ impl Resolver {
 
     /// Resolve a confirmed transaction's raw hex at `height`.
     pub fn raw_tx(&self, txid: Hash32, height: u32) -> Result<String> {
-        self.raw_tx_inner(0, txid, height, Priority::Wallet)
+        self.raw_tx_logged(0, txid, height)
     }
 
     /// `raw_tx` for wallet connection `ctx` (its decoy wallets go along).
     pub fn raw_tx_for(&self, ctx: u64, txid: Hash32, height: u32) -> Result<String> {
-        self.raw_tx_inner(ctx, txid, height, Priority::Wallet)
+        self.raw_tx_logged(ctx, txid, height)
     }
 
     /// Prefetch every listed transaction of one block with a single block
@@ -1335,17 +1443,39 @@ impl Resolver {
             .ok_or_else(|| RawtxError::Unavailable(format!("block {height} not indexed")))
     }
 
+    /// A wallet's `transaction.get`, with one `debug:` line saying which path
+    /// answered and how long it took (never the txid: an opaque tag).
+    fn raw_tx_logged(&self, ctx: u64, txid: Hash32, height: u32) -> Result<String> {
+        let started = Instant::now();
+        let mut path = "local";
+        let result = self.raw_tx_inner(ctx, txid, height, Priority::Wallet, &mut path);
+        if debug_logs() {
+            eprintln!(
+                "[e-lite] debug: tx.get obj={} height {height}: {path}, {} ms{}",
+                log_tag(&txid),
+                started.elapsed().as_millis(),
+                match &result {
+                    Ok(_) => String::new(),
+                    Err(e) => format!(", failed ({})", redact_hashes(&e.to_string())),
+                }
+            );
+        }
+        result
+    }
+
     fn raw_tx_inner(
         &self,
         ctx: u64,
         txid: Hash32,
         height: u32,
         priority: Priority,
+        path: &mut &'static str,
     ) -> Result<String> {
         let rec = self.block_record(height)?;
         // 1) Transaction cache: one small file per transaction (AUD-139).
         if let Some(hex) = self.cached_tx(&rec, txid) {
             self.stats.cache_hits.fetch_add(1, Ordering::Relaxed);
+            *path = "cache";
             return Ok(hex);
         }
         // 2) The block without asking outside: memory, block cache, Core.
@@ -1355,6 +1485,8 @@ impl Resolver {
             // (rawtx.wallet_deadline_seconds, 45 s by default): queue and
             // both paths share it.
             let request_deadline = Instant::now() + self.wallet_deadline;
+            // Not in Core, the block cache or memory: what follows is outside.
+            *path = "external";
             let pruned_below = self.prune_height.load(Ordering::Relaxed);
             let pruned = pruned_below > 0 && height < pruned_below;
             // `block`: whole block only. No tx_mode (block privacy mode or no
@@ -1368,6 +1500,7 @@ impl Resolver {
                 if let Some(entry) = self.inflight_entry(&rec.hash) {
                     joined_block = true;
                     if let Some(Ok(joined)) = entry.wait_outcome(RACE_HEAD_START) {
+                        *path = "block (joined before txid)";
                         self.stats.block_joins.fetch_add(1, Ordering::Relaxed);
                         block = Some(joined);
                     }
@@ -1403,6 +1536,11 @@ impl Resolver {
                                 }
                                 txid_tried = true;
                                 if let Ok(hex) = tm.fetch(ctx, t, attempt) {
+                                    *path = if round == 0 {
+                                        "txid"
+                                    } else {
+                                        "txid (2nd round)"
+                                    };
                                     self.stats.txid_wins.fetch_add(1, Ordering::Relaxed);
                                     if joined_block {
                                         self.stats.race_wins_txid.fetch_add(1, Ordering::Relaxed);
@@ -1428,6 +1566,7 @@ impl Resolver {
                     if let Some(hex) = self.cached_tx(&rec, txid) {
                         // A concurrent txid attempt landed while we waited.
                         self.stats.cache_hits.fetch_add(1, Ordering::Relaxed);
+                        *path = "txid (landed during the block path)";
                         return Ok(hex);
                     }
                     let remaining = request_deadline.saturating_duration_since(Instant::now());
@@ -1440,6 +1579,7 @@ impl Resolver {
                         Some(request_deadline.max(Instant::now() + MIN_ATTEMPT)),
                     ) {
                         Ok((fetched, _)) => {
+                            *path = if joining { "block (joined)" } else { "block" };
                             if joining {
                                 self.stats.block_joins.fetch_add(1, Ordering::Relaxed);
                             }
@@ -1458,7 +1598,37 @@ impl Resolver {
                             if !retry {
                                 break;
                             }
-                            std::thread::sleep(Duration::from_millis(400));
+                            // Wait out the failure memory of this block
+                            // (AUD-158) instead of retrying into it: a retry
+                            // 400 ms later used to get the same remembered
+                            // error and hand it to the wallet with budget left
+                            // (29.25.2). The txid path may land meanwhile.
+                            let pause = self
+                                .failure_expiry(&rec.hash)
+                                .map(|t| t.saturating_duration_since(Instant::now()))
+                                .unwrap_or_default()
+                                .max(Duration::from_millis(400));
+                            let until = (Instant::now() + pause).min(
+                                request_deadline
+                                    .checked_sub(MIN_ATTEMPT)
+                                    .unwrap_or_else(Instant::now),
+                            );
+                            if debug_logs() {
+                                eprintln!(
+                                    "[e-lite] debug: tx.get obj={} block try {} failed ({}), retry in {} ms",
+                                    log_tag(&txid),
+                                    attempt + 1,
+                                    last_error.as_ref().map_or("?", RawtxError::kind),
+                                    until.saturating_duration_since(Instant::now()).as_millis()
+                                );
+                            }
+                            while Instant::now() < until && self.cached_tx(&rec, txid).is_none() {
+                                std::thread::sleep(
+                                    until
+                                        .saturating_duration_since(Instant::now())
+                                        .min(Duration::from_millis(250)),
+                                );
+                            }
                         }
                     }
                 }
@@ -1477,25 +1647,26 @@ impl Resolver {
         Ok(hex)
     }
 
-    /// Transient failures a confirmed transaction may wait for or retry: a
-    /// missing source, a verify error or a provider's hard failure are not.
+    /// Transient failures a confirmed transaction may wait for or retry
+    /// within its deadline. The transaction is in the index, so "every
+    /// source failed" is always worth another try while time remains: a
+    /// slow circuit (`socks connect: ... timed out` / os error 11), a busy
+    /// Tor stream budget, a 429, a stall. A missing source, a configuration
+    /// error and a verification failure are not (AUD-045; 29.25.2 replaced
+    /// the list of known messages, which missed the SOCKS timeouts).
     fn is_transient_block_failure(error: &RawtxError) -> bool {
-        let text = error.to_string();
-        [
-            "download slot stayed busy",
-            "external fetch deadline reached",
-            "deadline reached",
-            "Too Many Requests",
-            "429",
-            "timed out",
-            "stalled",
-            "inflight block download timed out",
-            "inflight result lost",
-            "every attempt slot stayed busy",
-            "no session slot",
-        ]
-        .iter()
-        .any(|needle| text.contains(needle))
+        match error {
+            RawtxError::Unavailable(m) => !m.contains("not indexed"),
+            RawtxError::NoSource(_)
+            | RawtxError::Verify(_)
+            | RawtxError::Config(_)
+            | RawtxError::Io(_) => false,
+        }
+    }
+
+    /// Counters and state of the Tor stream governor, for `/status`.
+    pub fn governor_snapshot(&self) -> governor::GovernorSnapshot {
+        self.governor.snapshot()
     }
 
     /// State of the Tor stream governor, for `/status`.
@@ -1802,6 +1973,7 @@ impl Resolver {
         let external = self.external.clone();
         let p2p = self.p2p.clone();
         let stats = Arc::clone(&self.stats);
+        let governor = Arc::clone(&self.governor);
         self.decoy_lane.started.call_once(move || {
             let spawned = std::thread::Builder::new()
                 .name("el-decoys".to_string())
@@ -1836,6 +2008,20 @@ impl Resolver {
                             }
                             continue;
                         }
+                        // The decoy's stream comes from the same budget, in
+                        // the lowest lane: it never takes a stream a wallet
+                        // or a prefetch is waiting for (29.25.2; it used to
+                        // be outside the governor).
+                        let stream = loop {
+                            if let Some(stream) = governor
+                                .acquire(Lane::Decoy, Instant::now() + Duration::from_secs(1))
+                            {
+                                break stream;
+                            }
+                            if !lane.pause(Duration::ZERO) {
+                                return;
+                            }
+                        };
                         sources.shuffle(&mut thread_rng());
                         let deadline = Instant::now() + EXTERNAL_BUDGET;
                         for source in &sources {
@@ -1847,6 +2033,7 @@ impl Resolver {
                                 break;
                             }
                         }
+                        drop(stream);
                         lane.done();
                     }
                 });
