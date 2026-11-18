@@ -89,3 +89,28 @@ cumulative `blocks/s` in the log. Compare the same phase at the same height:
 | commit | `commit_group`/reason do not collapse to tiny groups |
 
 If a variant is ambiguous, revert; defaults remain conservative.
+
+## Wallet recovery in Sparrow (29.26.1 versus 29.26.2)
+
+Use a disposable, fully synced mainnet instance. Keep Core, index, providers,
+Tor settings, privacy profile and client transport the same. Stop e-lite
+before changing the binary or `rawtx.cache_dir`; use a new cache directory
+per run and leave the production cache alone. Do not downgrade a live
+installation to run the baseline.
+
+Run each version at least three times, alternating order. Use a new Sparrow
+watch-only wallet on each run or otherwise confirm Sparrow actually asked
+for the transactions again. Keep the xpub and the wallet local. Take the
+first `Loading transactions`, first `Retrieving` and `Finished loading`
+timestamps from Sparrow, and note whether the same number of transactions
+loaded. A run immediately after startup and a run after the provider probes
+settle are different conditions: compare like for like.
+
+Capture `/status` before and after and the matching e-lite log window. Count
+failed `stream session` and `stream block` attempts separately from canceled
+losing hedges. In 29.26.2 also record probe overhead and
+`rawtx.tx_mode.items_by_operator`; in 29.26.1 derive the split from endpoint
+and item counts in the stream logs, grouping aliases of the same operator.
+Compare medians, worst runs and operator shares, not just the fastest run.
+The [offline provider benchmark](../../docs/benchmarks/provider-qualification.md)
+is a separate check and does not use Sparrow or live Tor.

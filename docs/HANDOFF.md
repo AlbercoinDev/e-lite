@@ -94,8 +94,11 @@ background worker. The txid scheduler and block race check the result
 again before opening a connection. Expired or paused routes cannot use
 wallet traffic to become eligible again. See
 [OPERATIONS](OPERATIONS.md#external-wallet-route-qualification) for the
-metrics to record on several clean-cache Sparrow runs. Mainnet A/B remains
-pending, as do AUD-198 and AUD-199; do not clear a live node's cache to test.
+metrics to record on several clean-cache Sparrow runs. The
+[offline A/B](benchmarks/provider-qualification.md) compares the published
+29.26.1 and 29.26.2 binaries with 239 synthetic transactions. Mainnet A/B
+remains pending, as do AUD-198 and AUD-199; do not clear a live node's cache
+to test.
 
 ## Previous change (alpha.29.26.1): stream admission in wallet recovery
 
