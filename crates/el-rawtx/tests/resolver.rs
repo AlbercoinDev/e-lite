@@ -1425,8 +1425,12 @@ fn a_hedge_waits_for_a_free_tor_stream() {
     let dir = tmp("tor-stream-cap");
     let (store, _hash, txid, bytes) = setup(&dir, 0);
     let src = TorStreamSource::new(bytes, 3, true, Duration::ZERO);
+    // A 3 s request: the download ends at its 20 s network budget, so the
+    // thread below can be joined (none may outlive the test inside the
+    // store).
     let cfg = RawtxConfig {
         tor_streams: 1,
+        wallet_deadline_seconds: 3,
         ..config(0, 0)
     };
     let resolver = Arc::new(
@@ -1435,11 +1439,15 @@ fn a_hedge_waits_for_a_free_tor_stream() {
             .with_external(src.clone()),
     );
     let r = Arc::clone(&resolver);
-    std::thread::spawn(move || r.raw_tx(txid, 0));
+    let load = std::thread::spawn(move || r.raw_tx(txid, 0));
     // Past the Tor first-byte hedge: before 29.25.2 a second attempt started.
     std::thread::sleep(el_rawtx::HEDGE_FIRST_BYTE_TOR + Duration::from_millis(1500));
     assert_eq!(src.max_running.load(Ordering::SeqCst), 1);
     assert!(resolver.governor_snapshot().in_use <= 1);
+    assert!(load.join().unwrap().is_err(), "every endpoint is silent");
+    assert_eq!(src.max_running.load(Ordering::SeqCst), 1);
+    drop(resolver);
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]

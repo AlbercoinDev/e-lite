@@ -34,7 +34,9 @@
 - **What pauses Tor (AUD-195).** Only a refusal of the local Tor itself
   (its SOCKS listener) pauses every stream. A provider's 429 cools that
   provider down and no longer stops P2P and the other providers; a clearnet
-  success no longer lifts a Tor pause.
+  success no longer lifts a Tor pause. A success now really lifts the pause
+  at once for every caller: one that had run into it slept out the whole
+  backoff (up to 4 s).
 - **`socks connect: Resource temporarily unavailable (os error 11)`** was a
   circuit not built within the connect limit (Linux reports an expired
   socket timeout as EAGAIN), not Tor refusing the stream. It now reads

@@ -214,8 +214,11 @@ impl TorGovernor {
                 return false;
             }
             match self.paused_until() {
+                // In short slices: a success (`healthy`) lifts the pause at
+                // once and this caller must see it, not sleep out the whole
+                // backoff (29.25.2; it slept up to 4 s).
                 Some(until) if until > now => {
-                    std::thread::sleep(until.min(deadline) - now);
+                    std::thread::sleep((until.min(deadline) - now).min(WAIT_SLICE));
                 }
                 _ => return true,
             }
@@ -552,5 +555,26 @@ mod tests {
         assert_eq!(snap.waited[1], 1);
         assert!(snap.max_wait_ms[1] >= 50);
         assert_eq!(snap.in_use, 0, "the waiter's permit was released");
+    }
+
+    #[test]
+    fn a_success_wakes_a_caller_already_waiting_out_a_pause() {
+        let governor = TorGovernor::new(2);
+        for _ in 0..4 {
+            governor.pause("test"); // backoff at its 4 s cap
+        }
+        let g = Arc::clone(&governor);
+        let started = Instant::now();
+        let waiter = std::thread::spawn(move || {
+            g.acquire(Lane::Wallet, Instant::now() + ms(5000)).is_some()
+        });
+        std::thread::sleep(ms(100));
+        governor.healthy();
+        assert!(waiter.join().unwrap());
+        assert!(
+            started.elapsed() < ms(600),
+            "woken by the success, not by the end of the pause: {:?}",
+            started.elapsed()
+        );
     }
 }
