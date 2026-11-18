@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased (planned 0.1.0-alpha.29.25.2)
+## 0.1.0-alpha.29.25.2 — 2026-11-18
 
 ### Fixed
 

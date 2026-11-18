@@ -1,8 +1,8 @@
 # Session handoff
 
-**Updated:** 2026-11-18 (unreleased 29.25.2 work on branch `alpha.29.25.2-stream-budget`)
-**Latest published release:** `0.1.0-alpha.29.25.1`
-**Release:** https://github.com/AlbercoinDev/e-lite/releases/tag/v0.1.0-alpha.29.25.1
+**Updated:** 2026-11-18 (alpha.29.25.2: real Tor stream budget, no transient errors to wallets)
+**Latest published release:** `0.1.0-alpha.29.25.2`
+**Release:** https://github.com/AlbercoinDev/e-lite/releases/tag/v0.1.0-alpha.29.25.2
 
 This is the short “where we are”. The invariants live in
 [`AGENTS.md`](../AGENTS.md); the
@@ -88,7 +88,7 @@ no repitas contexto ni rehagas decisiones ya documentadas.
   `docs/ROADMAP.md` is future work only, and `docs/AUDIT.md` holds the open
   findings (`docs/audit/FIXED.md` is the fixed history).
 
-## Unreleased (branch `alpha.29.25.2-stream-budget`): real stream budget
+## Last change (alpha.29.25.2): real stream budget
 
 - One governor permit per open Tor stream (race attempt, Electrum session,
   Esplora-tx request), held until the connection ends; hedges never wait for
@@ -102,8 +102,8 @@ no repitas contexto ni rehagas decisiones ya documentadas.
   history|history-top` (read-only) for the open 1.3M-row script (AUD-198).
 - Detailed `debug:` lines (per tx.get, stream, block, session; governor
   summary every 10 s) with an opaque per-process tag instead of hashes.
-- Not done yet: the release (version bump, tag, app pin) and a real mainnet
-  load to confirm it; see `CHANGELOG.md` "Unreleased".
+- Pending: a real mainnet load (Sparrow, cold, new wallet) to confirm it,
+  and the `doctor history <hash>` output of the 1.3M-row script (AUD-198).
 
 ## Previous change (alpha.29.25.1): Tor stream governor
 
