@@ -6,7 +6,7 @@
 
 This audit is not a claim of formal verification. It records static checks,
 manual review areas, concrete findings and residual risks. Fixed findings
-(AUD-001..200, except the ones listed below) are in [`audit/FIXED.md`](audit/FIXED.md). The 2026-11 review, in
+(AUD-001..201, except the ones listed below) are in [`audit/FIXED.md`](audit/FIXED.md). The 2026-11 review, in
 Spanish, is [`reviews/2026-11-analisis.md`](reviews/2026-11-analisis.md).
 
 ## Baseline

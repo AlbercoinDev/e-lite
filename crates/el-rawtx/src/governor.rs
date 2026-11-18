@@ -44,12 +44,69 @@ impl Lane {
 const BASE_BACKOFF: Duration = Duration::from_millis(500);
 const MAX_BACKOFF: Duration = Duration::from_secs(4);
 
+/// Who is asking for a wallet stream. A per-txid batch is a small request
+/// that is ready to go and answers the wallet directly; a block download is
+/// the shared fallback. They take turns at a freed stream, so a backlog of
+/// block downloads cannot starve the ready batches (and the fallback still
+/// makes progress instead of waiting for the whole load to finish).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Demand {
+    #[default]
+    Batch = 0,
+    Block = 1,
+}
+
+impl Demand {
+    fn other(self) -> Self {
+        match self {
+            Demand::Batch => Demand::Block,
+            Demand::Block => Demand::Batch,
+        }
+    }
+}
+
+/// Both wallet demands have their own FIFO, so a ticket queued by a block
+/// download is not a ticket queued by a batch.
+const DEMANDS: usize = 2;
+
 struct Capacity {
     in_use: usize,
-    queues: [VecDeque<u64>; LEVELS],
+    /// Waiting tickets per lane: `[batch, block]`.
+    queues: [[VecDeque<u64>; DEMANDS]; LEVELS],
     next: u64,
+    /// The wallet demand that takes the next freed stream.
+    turn: Demand,
     pause_until: Option<Instant>,
     backoff: Duration,
+}
+
+impl Capacity {
+    fn higher_lanes_empty(&self, lane: Lane) -> bool {
+        self.queues[..lane as usize]
+            .iter()
+            .flatten()
+            .all(VecDeque::is_empty)
+    }
+}
+
+/// Alternation between the two wallet demands. The demand whose turn it is
+/// goes first; when it has nobody waiting, the other one may use the stream
+/// at once, so a one-sided load never waits for a turn that nobody will take.
+fn turn_allows(state: &Capacity, lane: Lane, demand: Demand) -> bool {
+    lane != Lane::Wallet
+        || state.turn == demand
+        || state.queues[lane as usize][demand.other() as usize].is_empty()
+}
+
+fn advance_turn(state: &mut Capacity, lane: Lane, demand: Demand) {
+    if lane != Lane::Wallet {
+        return;
+    }
+    state.turn = if state.queues[lane as usize][demand.other() as usize].is_empty() {
+        demand
+    } else {
+        demand.other()
+    };
 }
 
 /// Event sequence shared with the transaction scheduler. Taking a snapshot
@@ -157,6 +214,7 @@ impl TorGovernor {
                 in_use: 0,
                 queues: Default::default(),
                 next: 0,
+                turn: Demand::Batch,
                 pause_until: None,
                 backoff: BASE_BACKOFF,
             }),
@@ -246,9 +304,10 @@ impl TorGovernor {
     }
 
     /// Hold one Tor stream until `deadline`. The highest-priority waiter gets
-    /// the next freed slot; a wallet stream never queues behind a decoy.
+    /// the next freed slot; a wallet stream never queues behind a decoy. The
+    /// two wallet demands alternate, so neither waits out the other.
     pub fn acquire(self: &Arc<Self>, lane: Lane, deadline: Instant) -> Option<GovernorPermit> {
-        self.acquire_while(lane, deadline, || true)
+        self.acquire_while(lane, Demand::Batch, deadline, || true)
     }
 
     pub(crate) fn wake_waiters(&self) {
@@ -261,11 +320,12 @@ impl TorGovernor {
     pub(crate) fn acquire_while(
         self: &Arc<Self>,
         lane: Lane,
+        demand: Demand,
         deadline: Instant,
         wanted: impl Fn() -> bool,
     ) -> Option<GovernorPermit> {
         let started = Instant::now();
-        let permit = self.acquire_inner(lane, deadline, &wanted);
+        let permit = self.acquire_inner(lane, demand, deadline, &wanted);
         let stats = &self.lanes[lane as usize];
         match &permit {
             Some(_) => {
@@ -286,31 +346,54 @@ impl TorGovernor {
     }
 
     /// A stream now if one is free and Tor is not paused; never waits (a
-    /// hedge must not queue: the attempt it hedges is still running).
+    /// hedge must not queue: the attempt it hedges is still running). A
+    /// queued waiter of either wallet demand goes first.
     pub fn try_acquire(self: &Arc<Self>, lane: Lane) -> Option<GovernorPermit> {
+        self.try_acquire_demand(lane, Demand::Batch)
+    }
+
+    /// The same probe for a block download's hedge.
+    pub(crate) fn try_acquire_block(self: &Arc<Self>, lane: Lane) -> Option<GovernorPermit> {
+        self.try_acquire_demand(lane, Demand::Block)
+    }
+
+    fn try_acquire_demand(self: &Arc<Self>, lane: Lane, demand: Demand) -> Option<GovernorPermit> {
         let mut state = self.capacity.lock().unwrap_or_else(|p| p.into_inner());
         if state.in_use >= self.capacity_for(lane)
             || state
                 .pause_until
                 .is_some_and(|until| until > Instant::now())
-            || state.queues[..=lane as usize].iter().any(|q| !q.is_empty())
+            || !state.higher_lanes_empty(lane)
+            || !state.queues[lane as usize][demand as usize].is_empty()
+            || !turn_allows(&state, lane, demand)
         {
             return None;
         }
-        state.in_use += 1;
-        self.peak.fetch_max(state.in_use, Ordering::Relaxed);
         self.lanes[lane as usize]
             .granted
             .fetch_add(1, Ordering::Relaxed);
-        Some(GovernorPermit {
+        let permit = self.take(&mut state, lane, demand);
+        drop(state);
+        self.notify();
+        Some(permit)
+    }
+
+    /// Count one used stream and give the next freed one to the other wallet
+    /// demand: a batch that is ready must not wait until the block queue
+    /// drains, and a block download must not wait for an endless batch stream.
+    fn take(self: &Arc<Self>, state: &mut Capacity, lane: Lane, demand: Demand) -> GovernorPermit {
+        state.in_use += 1;
+        self.peak.fetch_max(state.in_use, Ordering::Relaxed);
+        advance_turn(state, lane, demand);
+        GovernorPermit {
             governor: Arc::clone(self),
-        })
+        }
     }
 
     /// Counters and the state right now.
     pub fn snapshot(&self) -> GovernorSnapshot {
         let state = self.capacity.lock().unwrap_or_else(|p| p.into_inner());
-        let queued = std::array::from_fn(|i| state.queues[i].len());
+        let queued = std::array::from_fn(|i| state.queues[i].iter().map(VecDeque::len).sum());
         let read = |f: fn(&LaneStats) -> &AtomicU64| -> [u64; LEVELS] {
             [0, 1, 2].map(|i| f(&self.lanes[i]).load(Ordering::Relaxed))
         };
@@ -334,18 +417,20 @@ impl TorGovernor {
     fn acquire_inner(
         self: &Arc<Self>,
         lane: Lane,
+        demand: Demand,
         deadline: Instant,
         wanted: &dyn Fn() -> bool,
     ) -> Option<GovernorPermit> {
         let mut state = self.capacity.lock().unwrap_or_else(|p| p.into_inner());
         let limit = self.capacity_for(lane);
-        let lane = lane as usize;
+        let lane_index = lane as usize;
+        let demand_index = demand as usize;
         let mut ticket = None;
         loop {
             let now = Instant::now();
             if now >= deadline || !wanted() {
                 if let Some(id) = ticket {
-                    state.queues[lane].retain(|&other| other != id);
+                    state.queues[lane_index][demand_index].retain(|&other| other != id);
                     drop(state);
                     self.notify();
                 }
@@ -354,25 +439,22 @@ impl TorGovernor {
             let pause = state.pause_until.filter(|&until| until > now);
             if state.in_use < limit
                 && pause.is_none()
-                && state.queues[..lane].iter().all(VecDeque::is_empty)
-                && state.queues[lane].front().copied() == ticket
+                && state.higher_lanes_empty(lane)
+                && state.queues[lane_index][demand_index].front().copied() == ticket
+                && turn_allows(&state, lane, demand)
             {
                 if ticket.is_some() {
-                    state.queues[lane].pop_front();
+                    state.queues[lane_index][demand_index].pop_front();
                 }
-                state.in_use += 1;
-                self.peak.fetch_max(state.in_use, Ordering::Relaxed);
-                if state.in_use < self.total {
-                    self.changed.notify_all();
-                }
-                return Some(GovernorPermit {
-                    governor: Arc::clone(self),
-                });
+                let permit = self.take(&mut state, lane, demand);
+                drop(state);
+                self.notify();
+                return Some(permit);
             }
             if ticket.is_none() {
                 let id = state.next;
                 state.next = id.wrapping_add(1);
-                state.queues[lane].push_back(id);
+                state.queues[lane_index][demand_index].push_back(id);
                 ticket = Some(id);
             }
             let until = pause.map_or(deadline, |until| deadline.min(until));
@@ -503,6 +585,141 @@ mod tests {
             "a success lifts the pause: nobody waits it out"
         );
         assert!(!governor.paused());
+    }
+
+    #[test]
+    fn a_ready_txid_batch_takes_its_turn_instead_of_the_whole_block_queue() {
+        let g = TorGovernor::new(2);
+        // Two streams held by block downloads, as during a cold wallet load.
+        let first = g.try_acquire_block(Lane::Wallet).unwrap();
+        let second = g.try_acquire_block(Lane::Wallet).unwrap();
+        let order = Arc::new(Mutex::new(Vec::<&'static str>::new()));
+        let gov = &g;
+        std::thread::scope(|scope| {
+            let mut blocks = Vec::new();
+            for _ in 0..6 {
+                let order = Arc::clone(&order);
+                blocks.push(scope.spawn(move || {
+                    let permit = gov.acquire_while(
+                        Lane::Wallet,
+                        Demand::Block,
+                        Instant::now() + ms(3000),
+                        || true,
+                    );
+                    if let Some(permit) = permit {
+                        order.lock().unwrap().push("block");
+                        std::thread::sleep(ms(5));
+                        drop(permit);
+                    }
+                }));
+            }
+            let start = Instant::now();
+            while g.snapshot().queued[0] < 6 && start.elapsed() < ms(1000) {
+                std::thread::yield_now();
+            }
+            assert_eq!(g.snapshot().queued[0], 6, "six block downloads wait");
+            // A ready per-txid batch arrives behind every queued block.
+            let (done, granted) = std::sync::mpsc::channel();
+            let batch_order = Arc::clone(&order);
+            let batch = scope.spawn(move || {
+                let permit = gov.acquire(Lane::Wallet, Instant::now() + ms(3000));
+                batch_order.lock().unwrap().push("batch");
+                done.send(()).unwrap();
+                drop(permit);
+            });
+            // Both streams are held, so the batch must be queued before one
+            // frees: wait for it instead of racing the drop below.
+            let start = Instant::now();
+            while g.snapshot().queued[0] < 7 && start.elapsed() < ms(1000) {
+                std::thread::yield_now();
+            }
+            assert_eq!(g.snapshot().queued[0], 7, "the batch is queued too");
+            drop(first);
+            granted
+                .recv_timeout(ms(2000))
+                .expect("the ready batch must not wait for the block queue to drain");
+            let position = order
+                .lock()
+                .unwrap()
+                .iter()
+                .position(|who| *who == "batch")
+                .unwrap();
+            assert!(
+                position <= 2,
+                "the batch went at position {position}: {order:?}"
+            );
+            drop(second);
+            batch.join().unwrap();
+            for block in blocks {
+                block.join().unwrap();
+            }
+        });
+        assert_eq!(g.in_use(), 0);
+    }
+
+    #[test]
+    fn ready_batches_do_not_starve_the_block_fallback() {
+        let g = TorGovernor::new(1);
+        let held = g.try_acquire(Lane::Wallet).unwrap();
+        let order = Arc::new(Mutex::new(Vec::<&'static str>::new()));
+        let gov = &g;
+        std::thread::scope(|scope| {
+            let mut batches = Vec::new();
+            for _ in 0..4 {
+                let order = Arc::clone(&order);
+                batches.push(scope.spawn(move || {
+                    let permit = gov.acquire(Lane::Wallet, Instant::now() + ms(3000));
+                    if let Some(permit) = permit {
+                        order.lock().unwrap().push("batch");
+                        drop(permit);
+                    }
+                }));
+            }
+            let start = Instant::now();
+            while g.snapshot().queued[0] < 4 && start.elapsed() < ms(1000) {
+                std::thread::yield_now();
+            }
+            assert_eq!(g.snapshot().queued[0], 4, "four ready batches wait");
+            let (done, granted) = std::sync::mpsc::channel();
+            let block_order = Arc::clone(&order);
+            let block = scope.spawn(move || {
+                let permit = gov.acquire_while(
+                    Lane::Wallet,
+                    Demand::Block,
+                    Instant::now() + ms(3000),
+                    || true,
+                );
+                block_order.lock().unwrap().push("block");
+                done.send(()).unwrap();
+                drop(permit);
+            });
+            // The stream is held, so the block download must be queued before
+            // it frees: wait for it instead of racing the drop below.
+            let start = Instant::now();
+            while g.snapshot().queued[0] < 5 && start.elapsed() < ms(1000) {
+                std::thread::yield_now();
+            }
+            assert_eq!(g.snapshot().queued[0], 5, "the block download is queued");
+            drop(held);
+            granted
+                .recv_timeout(ms(2000))
+                .expect("the block fallback must not wait for every ready batch");
+            let position = order
+                .lock()
+                .unwrap()
+                .iter()
+                .position(|who| *who == "block")
+                .unwrap();
+            assert!(
+                position <= 2,
+                "the block went at position {position}: {order:?}"
+            );
+            block.join().unwrap();
+            for batch in batches {
+                batch.join().unwrap();
+            }
+        });
+        assert_eq!(g.in_use(), 0);
     }
 
     #[test]

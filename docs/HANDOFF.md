@@ -1,8 +1,8 @@
 # Session handoff
 
-**Updated:** 2026-11-18 (alpha.29.26.0: wallet recovery from zero)
-**Latest published release:** `0.1.0-alpha.29.26.0`
-**Release:** https://github.com/AlbercoinDev/e-lite/releases/tag/v0.1.0-alpha.29.26.0
+**Updated:** 2026-11-18 (alpha.29.26.1: wallet recovery admission fix)
+**Latest published release:** `0.1.0-alpha.29.26.1`
+**Release:** https://github.com/AlbercoinDev/e-lite/releases/tag/v0.1.0-alpha.29.26.1
 
 This is the short “where we are”. The invariants live in
 [`AGENTS.md`](../AGENTS.md); the
@@ -88,7 +88,23 @@ no repitas contexto ni rehagas decisiones ya documentadas.
   `docs/ROADMAP.md` is future work only, and `docs/AUDIT.md` holds the open
   findings (`docs/audit/FIXED.md` is the fixed history).
 
-## Last change (alpha.29.26.0): wallet recovery from zero
+## Last change (alpha.29.26.1): stream admission in wallet recovery
+
+`TorGovernor` now separates the two wallet demands: a ready per-txid batch and
+a block download. Each has its own queue and they alternate at every freed
+stream, so a backlog of block downloads can no longer starve the cheap path
+(AUD-201). `wallet.rs` retries a failed per-txid round while the request still
+has time, instead of leaving the transaction with no path until the block
+failure memory expires. The 239-transaction load keeps both paths running:
+`a_cold_load_keeps_the_txid_path_while_blocks_download`, and the admission
+property is pinned by `a_ready_txid_batch_takes_its_turn_instead_of_the_whole_block_queue`
+and `ready_batches_do_not_starve_the_block_fallback`.
+
+Pending: a real mainnet load (Sparrow, cold, new wallet, Tor) with this
+release, the `doctor history <hash>` output of the 1.3M-row script (AUD-198),
+and a decision on AUD-199.
+
+## Previous change (alpha.29.26.0): wallet recovery from zero
 
 `crates/el-rawtx/src/wallet.rs` observes one shared transaction job and one
 shared block job per indexed transaction, each waiter with its own deadline;

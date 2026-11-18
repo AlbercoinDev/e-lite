@@ -11,12 +11,13 @@ use bitcoin::{
 use el_model::codec::SCHEMA_VERSION;
 use el_model::{BlockRecord, Hash32, HistoryEffect, IndexedTip, ScriptHash};
 use el_rawtx::{
-    AttemptCtl, PrivacyParams, RawtxConfig, RawtxError, Resolver, Result, TxBatch, TxRef, TxSource,
+    AttemptCtl, BlockSource, PrivacyParams, RawtxConfig, RawtxError, Resolver, Result, TxBatch,
+    TxRef, TxSource,
 };
 use el_store::Store;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -69,6 +70,8 @@ struct Chain {
     store: Arc<Store>,
     dir: PathBuf,
     raw: HashMap<Hash32, Vec<u8>>,
+    /// Serialized blocks by hash, for a synthetic block source.
+    blocks: HashMap<Hash32, Vec<u8>>,
     /// The real wallet's address and its history.
     real: (ScriptHash, Vec<TxRef>),
 }
@@ -86,6 +89,7 @@ fn chain_with_real_count(name: &str, real_count: u32) -> Chain {
     let mut batch = Store::batch();
     let mut all_txids = Vec::new();
     let mut raw = HashMap::new();
+    let mut blocks = HashMap::new();
     let mut real_hist = Vec::new();
     let mut txnum = 0u64;
     let mut prev = BlockHash::all_zeros();
@@ -121,6 +125,7 @@ fn chain_with_real_count(name: &str, real_count: u32) -> Chain {
         let header: [u8; 80] = bitcoin::consensus::serialize(&block.header)
             .try_into()
             .unwrap();
+        blocks.insert(hash, bitcoin::consensus::serialize(&block));
         store
             .put_block(
                 &mut batch,
@@ -181,6 +186,7 @@ fn chain_with_real_count(name: &str, real_count: u32) -> Chain {
         store,
         dir,
         raw,
+        blocks,
         real: (real, real_hist),
     }
 }
@@ -845,6 +851,208 @@ fn a_cold_239_transaction_load_shares_work_while_streams_are_busy() {
         239,
         "warm load must make no external requests"
     );
+}
+
+/// A txid provider whose first rounds fail and then answers, and a block
+/// source that never can. This is the shape of the owner's load at 45 s: no
+/// working path for one transaction while the wallet waited.
+struct FlakyTx {
+    raw: HashMap<Hash32, Vec<u8>>,
+    servers: Vec<String>,
+    fail_first: AtomicU64,
+    calls: Mutex<Vec<Hash32>>,
+}
+
+impl TxSource for FlakyTx {
+    fn name(&self) -> &str {
+        "flaky"
+    }
+    fn servers(&self) -> Vec<String> {
+        self.servers.clone()
+    }
+    fn all_servers(&self) -> Vec<String> {
+        self.servers.clone()
+    }
+    fn via_tor(&self, _server: &str) -> bool {
+        true
+    }
+    fn fetch_from(
+        &self,
+        _server: &str,
+        txids: &[Hash32],
+        _deadline: Instant,
+        ctl: &AttemptCtl,
+    ) -> Result<TxBatch> {
+        ctl.mark_connected();
+        self.calls.lock().unwrap().extend_from_slice(txids);
+        let mut left = self.fail_first.load(Ordering::SeqCst);
+        while left > 0 {
+            match self.fail_first.compare_exchange_weak(
+                left,
+                left - 1,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ) {
+                Ok(_) => {
+                    return Err(RawtxError::Unavailable("simulated provider failure".into()));
+                }
+                Err(now) => left = now,
+            }
+        }
+        Ok(txids
+            .iter()
+            .filter_map(|t| self.raw.get(t).map(|b| (*t, b.clone())))
+            .collect())
+    }
+    fn penalize(&self, _server: &str) {}
+}
+
+/// A block source that cannot download anything.
+struct NoBlocks;
+
+impl BlockSource for NoBlocks {
+    fn name(&self) -> &str {
+        "no-blocks"
+    }
+    fn fetch_block(&self, _hash: &Hash32) -> Result<Vec<u8>> {
+        Err(RawtxError::Unavailable("simulated provider timeout".into()))
+    }
+}
+
+/// Slow but working whole blocks, to compete for the streams.
+struct SlowBlocks {
+    blocks: HashMap<Hash32, Vec<u8>>,
+    delay: Duration,
+    calls: AtomicU64,
+}
+
+impl BlockSource for SlowBlocks {
+    fn name(&self) -> &str {
+        "slow-blocks"
+    }
+    fn fetch_block(&self, hash: &Hash32) -> Result<Vec<u8>> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        std::thread::sleep(self.delay);
+        self.blocks
+            .get(hash)
+            .cloned()
+            .ok_or_else(|| RawtxError::Unavailable("unknown block".into()))
+    }
+}
+
+#[test]
+fn a_failed_txid_round_is_retried_while_the_block_path_has_no_download() {
+    let c = chain("straggler");
+    let t = c.real.1[0];
+    let src = Arc::new(FlakyTx {
+        raw: c.raw.clone(),
+        servers: vec!["s0".into(), "s1".into(), "s2".into()],
+        // The first round (three servers) fails; a second round answers.
+        fail_first: AtomicU64::new(3),
+        calls: Mutex::new(Vec::new()),
+    });
+    let mut cfg = config(PrivacyParams {
+        decoy_wallets: 0,
+        ..PrivacyParams::balanced()
+    });
+    cfg.txid_race = true;
+    cfg.tor_streams = 2;
+    cfg.max_parallel_fetches = 2;
+    cfg.wallet_deadline_seconds = 8;
+    let r = Resolver::new(Arc::clone(&c.store), &cfg)
+        .unwrap()
+        .with_tx_sources(vec![Arc::clone(&src) as Arc<dyn TxSource>], [11; 32])
+        .with_external(Arc::new(NoBlocks) as Arc<dyn BlockSource>);
+    r.set_prune_height(u32::MAX);
+    let started = Instant::now();
+    let hex = r
+        .raw_tx_for(1, t.txid, t.height)
+        .expect("a failed round must not leave the request with no path");
+    assert_eq!(hex, hex::encode(&c.raw[&t.txid]));
+    assert!(
+        src.calls.lock().unwrap().len() >= 4,
+        "the transaction must be asked again after the failed round: {:?}",
+        src.calls.lock().unwrap().len()
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(8),
+        "the retry must answer inside the wallet deadline: {:?}",
+        started.elapsed()
+    );
+    settle(&r);
+    let _ = std::fs::remove_dir_all(&c.dir);
+}
+
+#[test]
+fn a_cold_load_keeps_the_txid_path_while_blocks_download() {
+    let c = chain_with_real_count("contend", 24);
+    let mut src = FakeSource::new(&c.raw, 4, None);
+    Arc::get_mut(&mut src).unwrap().delay = Duration::from_millis(700);
+    let mut p = PrivacyParams::balanced();
+    p.decoy_wallets = 0;
+    p.session_size = 3;
+    let mut cfg = config(p);
+    cfg.txid_race = true;
+    // More block jobs than streams: a block queue that does not drain at once,
+    // like the 16 parallel downloads of the owner's load.
+    cfg.tor_streams = 2;
+    cfg.max_parallel_fetches = 8;
+    cfg.wallet_deadline_seconds = 20;
+    let blocks = Arc::new(SlowBlocks {
+        blocks: c.blocks.clone(),
+        delay: Duration::from_millis(400),
+        calls: AtomicU64::new(0),
+    });
+    let r = Resolver::new(Arc::clone(&c.store), &cfg)
+        .unwrap()
+        .with_tx_sources(vec![Arc::clone(&src) as Arc<dyn TxSource>], [13; 32])
+        .with_external(Arc::clone(&blocks) as Arc<dyn BlockSource>);
+    r.set_prune_height(u32::MAX);
+    r.want_history(1, c.real.0, &c.real.1);
+    let started = Instant::now();
+    let resolver = &r;
+    let got: Vec<String> = std::thread::scope(|scope| {
+        let calls: Vec<_> = c
+            .real
+            .1
+            .iter()
+            .map(|t| scope.spawn(move || resolver.raw_tx_for(1, t.txid, t.height)))
+            .collect();
+        calls
+            .into_iter()
+            .map(|call| {
+                call.join()
+                    .unwrap()
+                    .expect("every transaction must resolve")
+            })
+            .collect()
+    });
+    let elapsed = started.elapsed();
+    eprintln!(
+        "cold load with a competing block path: {} transactions in {} ms, {} external txid sends, {} block downloads, txid wins {}",
+        got.len(),
+        elapsed.as_millis(),
+        src.sent().len(),
+        blocks.calls.load(Ordering::SeqCst),
+        r.stats().txid_wins.load(Ordering::Relaxed),
+    );
+    for (t, hex) in c.real.1.iter().zip(&got) {
+        assert_eq!(hex, &hex::encode(&c.raw[&t.txid]));
+    }
+    assert!(
+        blocks.calls.load(Ordering::SeqCst) > 0,
+        "the block fallback must be competing for the streams"
+    );
+    assert!(
+        r.stats().txid_wins.load(Ordering::Relaxed) > 0,
+        "the per-txid path must be answering during the load"
+    );
+    assert!(
+        elapsed < Duration::from_secs(20),
+        "the load must not wait for the block queue: {elapsed:?}"
+    );
+    settle(&r);
+    let _ = std::fs::remove_dir_all(&c.dir);
 }
 
 #[test]

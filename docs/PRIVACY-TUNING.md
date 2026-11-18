@@ -127,6 +127,15 @@ Notes:
 - A session queued locally does not charge a provider attempt. Unsent cover
   can stay queued while capacity is unavailable, within its bounded lifetime;
   saturation or a disappearing provider can still reduce effective cover.
+- A ready batch and a queued whole-block download take turns at a freed Tor
+  stream (AUD-201): a block backlog cannot hold the cheap path, and a stream
+  of batches cannot hold the fallback. Both still fit in `rawtx.tor_streams`;
+  nothing is reserved for one of them.
+- When every server of a round fails, the transaction gets another round while
+  the wallet is still waiting (up to three in total, two seconds apart), so it
+  can be asked to up to nine servers instead of three. The request still
+  carries only its txid, over Tor, mixed with the same decoy wallets; the
+  block download keeps running beside it.
 - Servers are ranked by their measured session time (with jitter), so slow
   or failing servers get fewer sessions; the spread still applies.
 - Warnings (not errors): `decoys.wallets = 0` and `sessions.min_servers = 1`

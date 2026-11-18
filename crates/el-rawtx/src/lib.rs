@@ -140,7 +140,7 @@ pub use core_source::CoreBlockSource;
 pub use decoy_wallets::TxRef;
 pub use electrum::{ElectrumServer, ElectrumTxSource};
 pub use esplora::{isolated_tor_client, EsploraSource};
-pub use governor::{GovernorPermit, Lane, TorGovernor};
+pub use governor::{Demand, GovernorPermit, Lane, TorGovernor};
 pub use p2p::{P2pSource, PeerHint};
 pub use privacy::{ExternalMode, PrivacyParams};
 pub use txsource::{EsploraTxSource, TxBatch, TxSource};

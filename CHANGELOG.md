@@ -1,5 +1,34 @@
 # Changelog
 
+## 0.1.0-alpha.29.26.1 — 2026-11-18
+
+### Fixed
+
+- **A ready per-txid batch no longer waits behind block downloads (AUD-201).**
+  The per-txid sessions and the whole-block fallback shared one governor queue
+  in 29.26.0, so while any block download was queued a ready transaction batch
+  could not take a freed Tor stream. In the owner's 239-transaction load,
+  sessions waited 19-27 s for a stream and then answered in under 3 s, one
+  transaction reached the 45 s wallet deadline with no working path, and the
+  connection was closed. The two demands now take turns at each freed stream,
+  each with its own FIFO; a one-sided load still uses every stream.
+- **A failed per-txid round is retried while the request still has time.**
+  When three servers had failed and the block download for that transaction
+  had produced nothing, the request had no path at all until the block failure
+  memory expired. Up to three rounds now run, two seconds apart, with the
+  block path racing beside them.
+
+### Upgrade notes
+
+- No reindex and no cache wipe: the index, `rawtx-cache` and every
+  configuration file keep their format. Restart replaces the running binary.
+- A transaction whose per-txid round fails can be asked to more servers than
+  before (up to nine instead of three) while the wallet is still waiting. The
+  request still carries only a txid, over Tor, with the same decoy wallets;
+  `preset = "max"` still sends no txid at all.
+- AUD-199 is unchanged: the per-txid path authenticates inclusion, not a
+  standalone SegWit witness.
+
 ## 0.1.0-alpha.29.26.0 — 2026-11-18
 
 ### Wallet recovery

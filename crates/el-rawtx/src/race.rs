@@ -277,6 +277,7 @@ impl Resolver {
                 .unwrap_or_else(Instant::now);
             let Some(permit) = self.governor.acquire_while(
                 lane,
+                Demand::Block,
                 queue_deadline.max(Instant::now() + MIN_ATTEMPT),
                 || entry.wanted() && wallet == is_wallet(),
             ) else {
@@ -409,11 +410,11 @@ impl Resolver {
                     } else if running.is_empty() {
                         let until = deadline.checked_sub(MIN_ATTEMPT).unwrap_or(now).max(now);
                         self.governor
-                            .acquire_while(lane, until, || job.wanted())
+                            .acquire_while(lane, Demand::Block, until, || job.wanted())
                             .map(Some)
                             .ok_or(())
                     } else {
-                        self.governor.try_acquire(lane).map(Some).ok_or(())
+                        self.governor.try_acquire_block(lane).map(Some).ok_or(())
                     };
                     let stream_wait = stream_wait.elapsed();
                     match stream {

@@ -3,6 +3,12 @@
 
 use super::*;
 
+/// Rounds of `MAX_TX_ATTEMPTS` servers for one wallet request. The first is
+/// the normal attempt; later ones run while the request still has time and the
+/// block path has not answered, so a failing provider never leaves it without
+/// any path (not even while it waits out the block failure memory).
+const MAX_TXID_ROUNDS: u32 = 3;
+
 impl Resolver {
     pub(super) fn recover_wallet(
         &self,
@@ -56,6 +62,13 @@ impl Resolver {
         let mut block_terminal = false;
         let mut noted_stall = false;
         let mut block_started = block.is_some();
+        // A per-txid round is up to `MAX_TX_ATTEMPTS` servers. When it fails
+        // and the block path has not answered, another round is worth it: the
+        // alternative is waiting out a block download that may fail, or its
+        // failure memory, with no path at all. That is how a straggler reached
+        // the wallet deadline and closed the connection.
+        let mut tx_rounds = u32::from(tried_tx);
+        let mut tx_retry_at = None;
         loop {
             let seq = self.recovery_event.sequence();
             if !connected() {
@@ -76,6 +89,9 @@ impl Resolver {
                         tx_failure = Some(e);
                         if !noted_stall {
                             retry_at = Instant::now();
+                        }
+                        if pruned && tx_rounds < MAX_TXID_ROUNDS {
+                            tx_retry_at = Some(Instant::now() + MIN_ATTEMPT);
                         }
                     }
                 }
@@ -130,6 +146,28 @@ impl Resolver {
                 }));
             }
             let mut wake_at = deadline;
+            if tx.is_none() && pruned && tx_rounds < MAX_TXID_ROUNDS && tx_retry_at.is_some() {
+                match tx_retry_at {
+                    Some(at) if now >= at => {
+                        tx_rounds += 1;
+                        tx = self
+                            .tx_mode
+                            .as_ref()
+                            .zip(t)
+                            .and_then(|(mode, t)| mode.request(ctx, t, rec.hash));
+                        tx_retry_at = if tx.is_some() {
+                            None
+                        } else {
+                            Some(now + MIN_ATTEMPT)
+                        };
+                        if tx.is_some() {
+                            continue;
+                        }
+                    }
+                    Some(at) => wake_at = wake_at.min(at),
+                    None => {}
+                }
+            }
             if block.is_none() && !block_terminal {
                 if let Some(existing) = self.join_block(&rec.hash, Priority::Wallet) {
                     joined = true;

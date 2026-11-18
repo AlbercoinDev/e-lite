@@ -481,7 +481,10 @@ How to read it:
   `cache` lines are what the background (`want_history`) already brought in.
 - **`stream session`**: one line when an admitted session finishes. `wait`
   includes its time staged in the scheduler; a slot is held for the actual
-  network work, not that wait. `stream block` shows each block attempt.
+  network work, not that wait. `stream block` shows each block attempt. A
+  ready batch and a queued block download take turns at a freed stream
+  (AUD-201), so `queued` on the wallet lane can be non-zero while `txid`
+  answers still arrive: that is the fallback waiting, not Tor.
 - A temporary confirmed-transaction expiry closes the wallet connection
   without an individual RPC answer. Reconnect and retry rather than clearing
   the transaction cache or changing the index.
