@@ -209,6 +209,7 @@ max_parallel_fetches = 16           # external block downloads in flight (the pr
 path = "auto"
 wallet_deadline_seconds = 45       # external request deadline, 3-300; transient expiry
                                    # reconnects the wallet, not "transaction not found"
+                                   # short live reorg readiness has its own 3 s limit
 txid_attempt_seconds = 3           # up to twice this head start before block fallback;
                                    # an in-flight block can be joined immediately
 txid_race = false                  # true: in auto, the txid path only gets a

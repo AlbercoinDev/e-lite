@@ -120,11 +120,44 @@ impl Shared {
 
 impl Shared {
     pub fn set_state(&self, s: u8) {
-        self.state.store(s, Ordering::SeqCst);
+        let (lock, changed) = &self.stats.wallet_state;
+        let _state = lock.lock().unwrap_or_else(|p| p.into_inner());
+        if s == state::READY {
+            self.stats.wallet_ready_once.store(true, Ordering::Relaxed);
+        }
+        if self.state.swap(s, Ordering::SeqCst) != s {
+            changed.notify_all();
+        }
     }
 
     pub fn get_state(&self) -> u8 {
         self.state.load(Ordering::SeqCst)
+    }
+
+    /// A live wallet must not mistake a short active-chain transition for
+    /// absent history. Wait for the actual publish event, not after it.
+    /// Initial sync, substantial lag and integrity failures are not waited on.
+    pub(crate) fn wallet_transition(&self) -> bool {
+        self.stats.wallet_ready_once.load(Ordering::Relaxed)
+            && !self.stats.core_ibd.load(Ordering::Relaxed)
+            && self
+                .stats
+                .core_height
+                .load(Ordering::Relaxed)
+                .abs_diff(self.stats.indexed_height.load(Ordering::Relaxed))
+                <= 16
+            && matches!(self.get_state(), state::BUILDING | state::REORG)
+    }
+
+    pub(crate) fn wait_wallet_transition(&self) {
+        if !self.wallet_transition() {
+            return;
+        }
+        let (lock, changed) = &self.stats.wallet_state;
+        let state = lock.lock().unwrap_or_else(|p| p.into_inner());
+        let _ = changed.wait_timeout_while(state, Duration::from_secs(3), |_| {
+            self.wallet_transition() && !self.shutdown.load(Ordering::Relaxed)
+        });
     }
 
     pub fn identity(&self) -> NetworkIdentity {

@@ -131,6 +131,9 @@ opt-in error until a BIP352 indexer is wired; it is not advertised as available.
   missing-transaction placeholder used by Sparrow for per-item RPC errors.
   A real not-found or a permanent configuration error still has an explicit
   RPC response.
+- After the server has reached `READY`, a brief reorg or catch-up (at most
+  16 blocks behind/ahead, not Core IBD) waits for the new state, for at most
+  three seconds. Initial sync still reports that it is not ready.
 
 - A pruned transaction is fetched by txid (default) or as a whole block by
   hash, and verified against the index either way. P2P requests `MSG_WITNESS_BLOCK`

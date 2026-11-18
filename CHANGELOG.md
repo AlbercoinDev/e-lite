@@ -22,6 +22,9 @@
   published local view. `rawtx.path = "block"` disables txid requests even
   from history prefetch. `rawtx.prefetch = false` disables both speculative
   paths without disabling on-demand recovery.
+- A wallet reading during a short live catch-up or reorg waits for the next
+  readiness notification instead of receiving a premature history error.
+  This does not change the readiness gate during initial sync.
 
 ## 0.1.0-alpha.29.25.2 — 2026-11-18
 

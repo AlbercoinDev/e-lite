@@ -159,7 +159,13 @@ pub fn dispatch_for(
             // Everything else reads the index: enforce a consistent tip and a
             // non-misleading state. The read lock is taken per method and is
             // *never* held across Core or external network I/O.
-            check_ready(shared)?;
+            if client.is_some() {
+                shared.wait_wallet_transition();
+            }
+            check_ready(shared).map_err(|mut error| {
+                error.retry_transport = client.is_some() && shared.wallet_transition();
+                error
+            })?;
             // The per-txid path may only send txids of heights Core has
             // pruned (AUD-167). One relaxed store per request.
             shared
