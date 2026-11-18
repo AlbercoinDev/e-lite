@@ -20,6 +20,7 @@ use sha2::{Digest, Sha256};
 use std::collections::{HashSet, VecDeque};
 use std::io::Write;
 use std::path::Path;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 
 /// Rows of a decoy script read from the index (the first ones, so the decoy
@@ -90,14 +91,21 @@ pub(crate) struct DecoyPicker {
     store: Arc<Store>,
     secret: [u8; 32],
     params: PrivacyParams,
+    prune_height: Arc<AtomicU32>,
 }
 
 impl DecoyPicker {
-    pub(crate) fn new(store: Arc<Store>, secret: [u8; 32], params: PrivacyParams) -> Self {
+    pub(crate) fn new(
+        store: Arc<Store>,
+        secret: [u8; 32],
+        params: PrivacyParams,
+        prune_height: Arc<AtomicU32>,
+    ) -> Self {
         DecoyPicker {
             store,
             secret,
             params,
+            prune_height,
         }
     }
 
@@ -114,7 +122,11 @@ impl DecoyPicker {
         };
         let mut out = Vec::with_capacity(entries.len());
         let mut last: Option<(u32, el_model::BlockRecord)> = None;
+        let prune_height = self.prune_height.load(Ordering::Relaxed);
         for (height, pos, _) in entries {
+            if height >= prune_height {
+                break;
+            }
             let rec = match &last {
                 Some((h, r)) if *h == height => *r,
                 _ => match self.store.get_block(height) {
@@ -207,9 +219,9 @@ pub(crate) struct DecoyBook {
     picks: Vec<(usize, Pick)>,
     /// txid -> pick index, for growth.
     owner: std::collections::HashMap<Hash32, usize>,
-    pending: VecDeque<(usize, Hash32)>,
+    pending: VecDeque<(usize, TxRef)>,
     real_scripts: HashSet<ScriptHash>,
-    unknown_slots: u32,
+    covered: HashSet<Hash32>,
 }
 
 impl DecoyBook {
@@ -220,7 +232,7 @@ impl DecoyBook {
             owner: std::collections::HashMap::new(),
             pending: VecDeque::new(),
             real_scripts: HashSet::new(),
-            unknown_slots: 0,
+            covered: HashSet::new(),
         }
     }
 
@@ -231,6 +243,9 @@ impl DecoyBook {
     }
 
     fn add_pick(&mut self, wallet: usize, script: ScriptHash, hist: Vec<TxRef>, target: usize) {
+        if self.picks.len() >= 4096 {
+            return;
+        }
         let idx = self.picks.len();
         let mut pick = Pick {
             txs: Vec::new(),
@@ -249,7 +264,7 @@ impl DecoyBook {
                 pick.txs.push(t.txid);
                 pick.queue.push_back(t.txid);
                 self.owner.insert(t.txid, idx);
-                self.pending.push_back((wallet, t.txid));
+                self.pending.push_back((wallet, *t));
             }
         }
         self.picks.push((wallet, pick));
@@ -261,6 +276,7 @@ impl DecoyBook {
         if hist.is_empty() || !self.real_scripts.insert(script) {
             return;
         }
+        self.covered.extend(hist.iter().map(|t| t.txid));
         let era = Self::era_of(hist);
         let exclude = HashSet::from([script]);
         for slot in 0..self.k {
@@ -275,17 +291,14 @@ impl DecoyBook {
     /// A real transaction asked for without its address (a bare
     /// `transaction.get`): a one-transaction look-alike per decoy wallet.
     pub(crate) fn add_unknown(&mut self, picker: &DecoyPicker, t: &TxRef) {
-        let n = self.unknown_slots;
-        self.unknown_slots = self.unknown_slots.wrapping_add(1);
+        if !self.covered.insert(t.txid) {
+            return;
+        }
         let exclude = HashSet::new();
         for slot in 0..self.k {
-            if let Some((decoy, dh)) = picker.pick(
-                &t.txid.0,
-                n * 16 + slot as u32,
-                1,
-                (t.height, t.height),
-                &exclude,
-            ) {
+            if let Some((decoy, dh)) =
+                picker.pick(&t.txid.0, slot as u32, 1, (t.height, t.height), &exclude)
+            {
                 self.add_pick(slot, decoy, dh, 1);
             }
         }
@@ -297,18 +310,18 @@ impl DecoyBook {
     /// the wallet's history is missing from the cache (AUD-167); the rest
     /// waits for the next round. Selection is by txid order, so the same cache
     /// state sends the same decoys.
-    pub(crate) fn take(&mut self, real: usize) -> Vec<(usize, Hash32)> {
+    pub(crate) fn take(&mut self, real: usize) -> Vec<(usize, TxRef)> {
         let quota = real.max(1);
-        let queued: Vec<(usize, Hash32)> = self.pending.drain(..).collect();
-        let mut by_wallet: std::collections::BTreeMap<usize, Vec<Hash32>> =
+        let queued: Vec<(usize, TxRef)> = self.pending.drain(..).collect();
+        let mut by_wallet: std::collections::BTreeMap<usize, Vec<TxRef>> =
             std::collections::BTreeMap::new();
         for (wallet, txid) in queued {
             by_wallet.entry(wallet).or_default().push(txid);
         }
         let mut out = Vec::new();
         for (wallet, mut txs) in by_wallet {
-            txs.sort();
-            txs.dedup();
+            txs.sort_by_key(|t| (t.txid, t.height, t.pos));
+            txs.dedup_by_key(|t| t.txid);
             for (i, txid) in txs.into_iter().enumerate() {
                 if i < quota {
                     out.push((wallet, txid));
@@ -374,7 +387,7 @@ impl DecoyBook {
                         if pick.seen.insert(t.txid) {
                             pick.txs.push(t.txid);
                             pick.queue.push_back(t.txid);
-                            new_txs.push(t.txid);
+                            new_txs.push(t);
                         }
                     }
                 }
@@ -386,7 +399,7 @@ impl DecoyBook {
             }
         }
         for t in new_txs {
-            self.owner.entry(t).or_insert(idx);
+            self.owner.entry(t.txid).or_insert(idx);
             self.pending.push_back((wallet, t));
         }
     }
@@ -457,7 +470,7 @@ mod tests {
         assert_eq!(first.iter().filter(|(w, _)| *w == 1).count(), 3);
         let second = book.take(3);
         assert_eq!(second.len(), 6);
-        let mut all: Vec<Hash32> = first.iter().chain(&second).map(|(_, t)| *t).collect();
+        let mut all: Vec<Hash32> = first.iter().chain(&second).map(|(_, t)| t.txid).collect();
         all.sort();
         all.dedup();
         assert_eq!(all.len(), 12, "no decoy is sent twice");

@@ -238,6 +238,71 @@ fn concurrent_requests_share_one_block_download() {
 }
 
 #[test]
+fn a_disconnected_wallet_does_not_cancel_another_wallets_block() {
+    use std::sync::atomic::AtomicBool;
+    use std::sync::mpsc;
+
+    struct GatedBlock {
+        bytes: Vec<u8>,
+        calls: AtomicU64,
+        opened: mpsc::Sender<()>,
+        serve: std::sync::Mutex<mpsc::Receiver<()>>,
+    }
+    impl BlockSource for GatedBlock {
+        fn name(&self) -> &str {
+            "gated"
+        }
+        fn fetch_block(&self, _: &Hash32) -> Result<Vec<u8>> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.opened.send(()).unwrap();
+            self.serve
+                .lock()
+                .unwrap()
+                .recv_timeout(Duration::from_secs(3))
+                .unwrap();
+            Ok(self.bytes.clone())
+        }
+    }
+    let dir = tmp("block-two-wallets");
+    let (store, _, txid, bytes) = setup(&dir, 0);
+    let (opened, waiting) = mpsc::channel();
+    let (release, serve) = mpsc::channel();
+    let src = Arc::new(GatedBlock {
+        bytes,
+        calls: AtomicU64::new(0),
+        opened,
+        serve: std::sync::Mutex::new(serve),
+    });
+    let r = Resolver::new(store, &config(0, 0))
+        .unwrap()
+        .with_external(src.clone());
+    let connected = AtomicBool::new(true);
+    std::thread::scope(|scope| {
+        let first =
+            scope.spawn(|| r.raw_tx_while(1, txid, 0, || connected.load(Ordering::Acquire)));
+        waiting.recv_timeout(Duration::from_secs(1)).unwrap();
+        let (joined, ready) = mpsc::channel();
+        let announced = AtomicBool::new(false);
+        let resolver = &r;
+        let second = scope.spawn(move || {
+            resolver.raw_tx_while(2, txid, 0, || {
+                if !announced.swap(true, Ordering::AcqRel) {
+                    joined.send(()).unwrap();
+                }
+                true
+            })
+        });
+        ready.recv_timeout(Duration::from_secs(1)).unwrap();
+        connected.store(false, Ordering::Release);
+        r.wake_wallets();
+        assert!(first.join().unwrap().is_err());
+        release.send(()).unwrap();
+        assert!(second.join().unwrap().is_ok());
+    });
+    assert_eq!(src.calls.load(Ordering::SeqCst), 1);
+}
+
+#[test]
 fn fetches_verified_block_by_hash_for_prune_repair() {
     let dir = tmp("repair");
     let store = Arc::new(Store::open(&dir).unwrap());
@@ -712,8 +777,8 @@ impl BlockSource for FailingSource {
 
 #[test]
 fn a_block_that_just_failed_is_not_asked_for_again_at_once() {
-    // AUD-158: a wallet retrying the same transaction within seconds gets the
-    // recent failure, not another round over every source.
+    // AUD-158: a wallet retrying the same transaction within seconds waits
+    // out the same failure memory, not another round over every source.
     let dir = tmp("failure-memory");
     let (store, _hash, txid, _bytes) = setup(&dir, 0);
     let src = Arc::new(FailingSource {
@@ -729,9 +794,14 @@ fn a_block_that_just_failed_is_not_asked_for_again_at_once() {
     let resolver = Resolver::new(Arc::clone(&store), &cfg)
         .unwrap()
         .with_external(src.clone());
+    let start = Instant::now();
     let first = resolver.raw_tx(txid, 0).unwrap_err();
     let second = resolver.raw_tx(txid, 0).unwrap_err();
-    assert_eq!(first, second);
+    assert!(first.is_retryable_wallet() && second.is_retryable_wallet());
+    assert!(
+        start.elapsed() >= Duration::from_secs(6),
+        "no early per-item failure"
+    );
     assert_eq!(src.calls.load(Ordering::SeqCst), 1);
     let _ = std::fs::remove_dir_all(&dir);
 }

@@ -3,6 +3,8 @@
 //! endpoints with hedged attempts, and the memory of recent failures.
 
 use super::*;
+use crate::governor::Availability;
+use std::sync::atomic::AtomicUsize;
 
 /// When the leader of a block download gives up if it never gets a slot:
 /// the slot wait (`EXTERNAL_QUEUE_MAX`) plus the network budget, or the
@@ -20,183 +22,199 @@ fn block_path_deadline(now: Instant, request_deadline: Option<Instant>) -> Insta
 
 /// A block download shared by concurrent callers asking for the same height.
 pub(super) struct InflightBlock {
-    done: Mutex<bool>,
-    /// The leader's block, already verified against the indexed header:
-    /// followers reuse it instead of verifying their own copy.
     result: Mutex<Option<Result<Arc<bitcoin::Block>>>>,
-    cv: Condvar,
-    /// The leader's deadline: queue limit plus budget when it registers,
-    /// then exactly `EXTERNAL_BUDGET` from the moment it gets a download
-    /// slot. Followers wait until the current `deadline + FOLLOWER_GRACE`.
-    deadline: Mutex<Instant>,
-    /// A wallet request is waiting on this download: a prefetch leader
-    /// switches to wallet priority (AUD-165).
+    deadline: Instant,
+    interested: AtomicUsize,
     wallet_waiting: AtomicBool,
+    exhausted: AtomicBool,
 }
 
 impl InflightBlock {
     fn new(deadline: Instant, wallet: bool) -> Self {
         Self {
-            done: Mutex::new(false),
             result: Mutex::new(None),
-            cv: Condvar::new(),
-            deadline: Mutex::new(deadline),
+            deadline,
+            interested: AtomicUsize::new(1),
             wallet_waiting: AtomicBool::new(wallet),
+            exhausted: AtomicBool::new(false),
         }
     }
 
-    fn deadline(&self) -> Instant {
-        *self
-            .deadline
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    fn wanted(&self) -> bool {
+        self.interested.load(Ordering::Acquire) != 0
     }
 
-    fn set_deadline(&self, deadline: Instant) {
-        *self
-            .deadline
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = deadline;
-    }
-
-    /// Wait up to `timeout` for this download to finish. `None` when it is
-    /// still running; the caller then races the per-txid path against it.
-    pub(super) fn wait_outcome(&self, timeout: Duration) -> Option<Result<Arc<bitcoin::Block>>> {
-        let deadline = Instant::now() + timeout;
-        let mut done = self.done.lock().ok()?;
-        while !*done {
-            let left = deadline.saturating_duration_since(Instant::now());
-            if left.is_zero() {
-                return None;
+    fn join(&self) -> bool {
+        let mut n = self.interested.load(Ordering::Acquire);
+        while n != 0 {
+            match self.interested.compare_exchange_weak(
+                n,
+                n + 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return true,
+                Err(now) => n = now,
             }
-            let (guard, _) = self
-                .cv
-                .wait_timeout(done, left.min(Duration::from_millis(50)))
-                .ok()?;
-            done = guard;
         }
-        drop(done);
-        let result = self.result.lock().ok()?.clone();
-        Some(result.unwrap_or_else(|| Err(RawtxError::Unavailable("inflight result lost".into()))))
+        false
+    }
+}
+
+pub(super) struct BlockLease {
+    job: Arc<InflightBlock>,
+    event: Arc<Availability>,
+    governor: Arc<TorGovernor>,
+}
+
+impl BlockLease {
+    pub(super) fn result(&self) -> Option<Result<Arc<bitcoin::Block>>> {
+        self.job
+            .result
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
+    }
+}
+
+impl Drop for BlockLease {
+    fn drop(&mut self) {
+        if self.job.interested.fetch_sub(1, Ordering::AcqRel) == 1 {
+            self.governor.wake_waiters();
+            self.event.notify();
+        }
     }
 }
 
 impl Resolver {
-    /// Fetch one block from the external sources, deduplicating concurrent
-    /// requests for the same hash. The first caller downloads; the rest wait
-    /// for its result instead of hammering the same provider.
-    /// Returns the verified block and whether this caller led the download
-    /// (only the leader owes decoys for it).
-    pub(super) fn fetch_external_block(
+    /// Join first, otherwise start a job only when the block lane has
+    /// capacity. No request owns the job: any waiter may return early.
+    pub(super) fn join_block(&self, hash: &Hash32, priority: Priority) -> Option<BlockLease> {
+        let map = self.inflight.lock().unwrap_or_else(|p| p.into_inner());
+        let job = map.get(hash)?;
+        if !job.join() {
+            return None;
+        }
+        if priority == Priority::Wallet {
+            self.promote(job);
+        }
+        Some(self.block_lease(Arc::clone(job)))
+    }
+
+    fn block_lease(&self, job: Arc<InflightBlock>) -> BlockLease {
+        BlockLease {
+            job,
+            event: Arc::clone(&self.recovery_event),
+            governor: Arc::clone(&self.governor),
+        }
+    }
+
+    fn promote(&self, job: &InflightBlock) {
+        if !job.wallet_waiting.swap(true, Ordering::AcqRel) {
+            self.governor.wake_waiters();
+        }
+    }
+
+    pub(super) fn start_block(
         &self,
         rec: &el_model::BlockRecord,
         priority: Priority,
         request_deadline: Option<Instant>,
-    ) -> Result<(Arc<bitcoin::Block>, bool)> {
-        let hash = &rec.hash;
-        if let Some(cache) = &self.cache {
-            if let Some(bytes) = cache.get(hash) {
-                if let Some(block) = self.recent_block(hash) {
-                    return Ok((block, false));
+    ) -> Result<Option<BlockLease>> {
+        let mut map = self.inflight.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(job) = map.get(&rec.hash) {
+            if job.join() {
+                if priority == Priority::Wallet {
+                    self.promote(job);
                 }
-                return self
-                    .verify_external(&bytes, rec)
-                    .map(|block| (block, false));
+                return Ok(Some(self.block_lease(Arc::clone(job))));
             }
+            // The last waiter left. Let the canceled job drain and publish
+            // any genuine source exhaustion before starting another race.
+            return Ok(None);
         }
-        let (entry, leader) = {
-            let mut map = self
-                .inflight
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            match map.get(hash) {
-                Some(existing) => {
-                    if priority == Priority::Wallet {
-                        existing.wallet_waiting.store(true, Ordering::Relaxed);
-                    }
-                    (Arc::clone(existing), false)
-                }
-                None => {
-                    let entry = Arc::new(InflightBlock::new(
-                        block_path_deadline(Instant::now(), request_deadline),
-                        priority == Priority::Wallet,
-                    ));
-                    map.insert(*hash, Arc::clone(&entry));
-                    (entry, true)
-                }
-            }
+        if let Some(block) = self.recent_block(&rec.hash) {
+            let job = Arc::new(InflightBlock::new(Instant::now(), false));
+            *job.result.lock().unwrap_or_else(|p| p.into_inner()) = Some(Ok(block));
+            return Ok(Some(self.block_lease(job)));
+        }
+        if self.sources().is_empty() {
+            self.stats.unavailable.fetch_add(1, Ordering::Relaxed);
+            return Err(RawtxError::NoSource(
+                "no external source configured (or Tor is required and unavailable)".into(),
+            ));
+        }
+        if let Some(e) = self.recent_failure(&rec.hash) {
+            return Err(e);
+        }
+        let Some(permit) = self
+            .block_jobs
+            .try_acquire(usize::from(priority != Priority::Wallet))
+        else {
+            return Ok(None);
         };
-
-        if leader {
-            let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
-                self.fetch_from_external_sources(hash, &entry, priority)
-            }))
-            .unwrap_or_else(|_| {
-                Err(RawtxError::Unavailable(
-                    "external block fetch panicked".into(),
-                ))
-            });
-            // Only a wallet's failure is remembered (AUD-165): a prefetch
-            // that waited for a slot, or failed in the background, must not
-            // answer a later wallet request with its error (Sparrow stores
-            // it as an unfetchable transaction, AUD-045).
-            if let Err(e) = &result {
-                if entry.wallet_waiting.load(Ordering::Relaxed) && !is_queue_timeout(e) {
-                    self.remember_failure(hash, e);
-                }
-            }
-            // Verified before the followers wake up, so the block is
-            // checked once per download and not once per request.
-            let result = result.and_then(|bytes| self.verify_external(&bytes, rec));
-            *entry
-                .result
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(result.clone());
-            *entry
-                .done
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner()) = true;
-            entry.cv.notify_all();
-            self.inflight
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .remove(hash);
-            return result.map(|block| (block, true));
+        let job = Arc::new(InflightBlock::new(
+            block_path_deadline(Instant::now(), request_deadline),
+            priority == Priority::Wallet,
+        ));
+        let lease = self.block_lease(Arc::clone(&job));
+        let runner = self.worker_handle();
+        let rec = *rec;
+        map.insert(rec.hash, Arc::clone(&job));
+        let started = std::thread::Builder::new()
+            .name(el_model::sync::THREAD_FETCH.into())
+            .spawn(move || runner.run_block_job(rec, job, permit));
+        if started.is_err() {
+            map.remove(&rec.hash);
+            self.recovery_event.notify();
+            return Err(RawtxError::Unavailable("could not start block job".into()));
         }
+        Ok(Some(lease))
+    }
 
-        // The leader gives up at its own deadline; a follower waits a little
-        // longer so it always receives the leader's result (AUD-156). The
-        // deadline moves once the leader gets a slot, so it is re-read.
-        let mut done = entry
-            .done
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        while !*done {
-            let now = Instant::now();
-            let deadline = entry.deadline() + FOLLOWER_GRACE;
-            if now >= deadline {
-                return Err(RawtxError::Unavailable(
-                    "inflight block download timed out".into(),
-                ));
+    fn run_block_job(&self, rec: el_model::BlockRecord, job: Arc<InflightBlock>, permit: Permit) {
+        let work = std::panic::catch_unwind(AssertUnwindSafe(|| {
+            self.fetch_from_external_sources(&rec, &job)
+        }))
+        .unwrap_or_else(|_| {
+            Err(RawtxError::Unavailable(
+                "external block fetch panicked".into(),
+            ))
+        });
+        let result = work.map(|block| {
+            self.stats.verifications.fetch_add(1, Ordering::Relaxed);
+            let block = self.remember(rec.hash, block);
+            self.owe_decoys(rec.hash);
+            block
+        });
+        if let Err(e) = &result {
+            if (job.wanted() || job.exhausted.load(Ordering::Acquire))
+                && job.wallet_waiting.load(Ordering::Acquire)
+                && !is_queue_timeout(e)
+            {
+                self.remember_failure(&rec.hash, e);
             }
-            let wait = deadline
-                .saturating_duration_since(now)
-                .min(Duration::from_secs(1));
-            let (guard, _) = entry
-                .cv
-                .wait_timeout(done, wait)
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            done = guard;
+            if job.wanted() && job.wallet_waiting.load(Ordering::Acquire) {
+                let height = rec.height;
+                eprintln!(
+                    "[e-lite] rawtx at height {height} failed ({}); sources: {}",
+                    e.kind(),
+                    redact_hashes(&e.to_string())
+                );
+            }
         }
-        drop(done);
-        let result = entry
-            .result
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clone();
-        result
-            .unwrap_or_else(|| Err(RawtxError::Unavailable("inflight result lost".into())))
-            .map(|block| (block, false))
+        *job.result.lock().unwrap_or_else(|p| p.into_inner()) = Some(result);
+        {
+            let mut map = self.inflight.lock().unwrap_or_else(|p| p.into_inner());
+            if map
+                .get(&rec.hash)
+                .is_some_and(|other| Arc::ptr_eq(other, &job))
+            {
+                map.remove(&rec.hash);
+            }
+        }
+        drop(permit);
+        self.recovery_event.notify();
     }
 
     /// Race the endpoints of every external source for one block (AUD-160).
@@ -209,16 +227,14 @@ impl Resolver {
     /// clearnet fallback tier starts only when no primary attempt is left.
     fn fetch_from_external_sources(
         &self,
-        hash: &Hash32,
+        rec: &el_model::BlockRecord,
         entry: &InflightBlock,
-        priority: Priority,
-    ) -> Result<Vec<u8>> {
+    ) -> Result<bitcoin::Block> {
+        let hash = &rec.hash;
         // A wallet request may take the last free slot; the prefetch leaves
         // it free and steps aside while any wallet request waits for a slot.
         // A prefetch that a wallet joined becomes a wallet download (AUD-165).
-        let is_wallet =
-            || priority == Priority::Wallet || entry.wallet_waiting.load(Ordering::Relaxed);
-        let wallet = is_wallet();
+        let is_wallet = || entry.wallet_waiting.load(Ordering::Acquire);
         // The queue gets whatever the request budget leaves after the network
         // part (~25 s of queue and 20 s of network for a wallet request, 45 s
         // total); the full 120 s for a background prefetch. The governor caps
@@ -226,12 +242,6 @@ impl Resolver {
         // with wallet > prefetch > decoy priority, so a cold burst waits for
         // a stream instead of saturating Tor (29.25.2: one permit per
         // attempt, not per block).
-        let budget = if wallet {
-            WALLET_BLOCK_NET
-        } else {
-            EXTERNAL_BUDGET
-        };
-        let lane = if wallet { Lane::Wallet } else { Lane::Prefetch };
         let mut plan: Vec<(Arc<dyn BlockSource>, Endpoint)> = Vec::new();
         for source in self.sources() {
             for endpoint in source.endpoints(FetchMode::Normal) {
@@ -250,15 +260,29 @@ impl Resolver {
         // The first stream is the queue: it is waited for with what the
         // request leaves after the network budget.
         let queue_started = Instant::now();
-        let first = if plan[0].1.via_tor {
+        let (wallet, lane, budget, first) = loop {
+            let wallet = is_wallet();
+            let lane = if wallet { Lane::Wallet } else { Lane::Prefetch };
+            let budget = if wallet {
+                WALLET_BLOCK_NET
+            } else {
+                EXTERNAL_BUDGET
+            };
+            if !plan[0].1.via_tor {
+                break (wallet, lane, budget, None);
+            }
             let queue_deadline = entry
-                .deadline()
+                .deadline
                 .checked_sub(budget)
                 .unwrap_or_else(Instant::now);
-            let Some(permit) = self
-                .governor
-                .acquire(lane, queue_deadline.max(Instant::now() + MIN_ATTEMPT))
-            else {
+            let Some(permit) = self.governor.acquire_while(
+                lane,
+                queue_deadline.max(Instant::now() + MIN_ATTEMPT),
+                || entry.wanted() && wallet == is_wallet(),
+            ) else {
+                if entry.wanted() && wallet != is_wallet() {
+                    continue;
+                }
                 self.stats.unavailable.fetch_add(1, Ordering::Relaxed);
                 if debug_logs() {
                     eprintln!(
@@ -274,21 +298,15 @@ impl Resolver {
                     "every download slot stayed busy until the deadline".into(),
                 ));
             };
-            Some(permit)
-        } else {
-            None
+            break (wallet, lane, budget, Some(permit));
         };
         let queued_ms = queue_started.elapsed().as_millis();
         // The network budget starts now, not when the request queued.
         let deadline = Instant::now() + budget;
-        entry.set_deadline(deadline);
         let _wallet = wallet.then(|| Busy::new(&self.wallet_downloads));
         let started = Instant::now();
-        let result = self.race(hash, deadline, plan, &is_wallet, first);
-        if result.is_ok() {
-            // A success means Tor is healthy: lift any pause at once.
-            self.governor.healthy();
-        } else {
+        let result = self.race(rec, deadline, plan, entry, first);
+        if result.is_err() && entry.wanted() {
             self.stats.unavailable.fetch_add(1, Ordering::Relaxed);
         }
         if debug_logs() {
@@ -298,7 +316,7 @@ impl Resolver {
                 lane.name(),
                 started.elapsed().as_millis(),
                 match &result {
-                    Ok(bytes) => format!("ok, {} KiB", bytes.len() / 1024),
+                    Ok(_) => "ok (verified)".into(),
                     Err(e) => format!("failed ({})", redact_hashes(&e.to_string())),
                 }
             );
@@ -308,21 +326,20 @@ impl Resolver {
 
     fn race(
         &self,
-        hash: &Hash32,
+        rec: &el_model::BlockRecord,
         deadline: Instant,
         plan: Vec<(Arc<dyn BlockSource>, Endpoint)>,
-        is_wallet: &dyn Fn() -> bool,
+        job: &InflightBlock,
         first: Option<GovernorPermit>,
-    ) -> Result<Vec<u8>> {
+    ) -> Result<bitcoin::Block> {
         // The stream the caller queued for, used by the first Tor attempt.
         let mut first = first;
         struct Running {
             ctl: AttemptCtl,
             started: Instant,
             via_tor: bool,
-            _permit: Permit,
         }
-        let (tx, rx) = mpsc::channel::<(usize, Result<Vec<u8>>)>();
+        let (tx, rx) = mpsc::channel::<AttemptResult>();
         let race_started = Instant::now();
         let mut exhausted_since: Option<Instant> = None;
         // Attempts started per endpoint in this race.
@@ -342,8 +359,10 @@ impl Resolver {
 
         loop {
             let now = Instant::now();
-            if now + MIN_ATTEMPT.min(Duration::from_millis(500)) >= deadline {
-                errors.push("external fetch deadline reached".to_string());
+            if !job.wanted() || now >= deadline {
+                if !job.exhausted.load(Ordering::Acquire) || errors.is_empty() {
+                    errors.push("external fetch deadline reached".to_string());
+                }
                 finish(&mut running);
                 break;
             }
@@ -367,7 +386,7 @@ impl Resolver {
                 let allowed = !fallback
                     || (running.is_empty() && plan[next..].iter().all(|(_, e)| e.tier > 0));
                 if allowed {
-                    let wallet = is_wallet();
+                    let wallet = job.wallet_waiting.load(Ordering::Acquire);
                     let lane = if wallet { Lane::Wallet } else { Lane::Prefetch };
                     let role = if running.is_empty() {
                         if attempts == 0 {
@@ -389,7 +408,10 @@ impl Resolver {
                         Ok(Some(permit))
                     } else if running.is_empty() {
                         let until = deadline.checked_sub(MIN_ATTEMPT).unwrap_or(now).max(now);
-                        self.governor.acquire(lane, until).map(Some).ok_or(())
+                        self.governor
+                            .acquire_while(lane, until, || job.wanted())
+                            .map(Some)
+                            .ok_or(())
                     } else {
                         self.governor.try_acquire(lane).map(Some).ok_or(())
                     };
@@ -410,10 +432,7 @@ impl Resolver {
                             // decoy leaves one permit free so a wallet never
                             // queues behind them.
                             let keep_free = usize::from(!wallet);
-                            let wait_until = if running.is_empty() { deadline } else { now };
-                            if let Some(permit) =
-                                self.external_attempts.acquire_until(wait_until, keep_free)
-                            {
+                            if let Some(permit) = self.external_attempts.try_acquire(keep_free) {
                                 self.stats.race_attempts.fetch_add(1, Ordering::Relaxed);
                                 if !running.is_empty() {
                                     self.stats.race_hedges.fetch_add(1, Ordering::Relaxed);
@@ -427,14 +446,13 @@ impl Resolver {
                                         ctl: ctl.clone(),
                                         started: Instant::now(),
                                         via_tor: endpoint.via_tor,
-                                        _permit: permit,
                                     },
                                 );
                                 self.spawn_attempt(
                                     next,
                                     source,
                                     endpoint,
-                                    *hash,
+                                    *rec,
                                     deadline,
                                     ctl,
                                     tx.clone(),
@@ -443,19 +461,30 @@ impl Resolver {
                                         lane,
                                         role,
                                         stream_wait,
+                                        permit,
                                     },
                                 );
                                 next += 1;
                                 continue;
                             } else if running.is_empty() {
-                                errors.push("every attempt slot stayed busy".to_string());
-                                break;
+                                // Waiting for one resource must not hold the other.
+                                drop(stream);
+                                let seq = self.recovery_event.sequence();
+                                if self.external_attempts.can_acquire(keep_free) {
+                                    continue;
+                                }
+                                self.recovery_event
+                                    .wait(seq, Some(deadline.min(Instant::now() + RACE_TICK)));
+                                continue;
                             }
                         }
                     }
                 }
             }
             if running.is_empty() && next >= plan.len() {
+                if attempts > 0 {
+                    job.exhausted.store(true, Ordering::Release);
+                }
                 // Every endpoint failed or is cooling down. While budget
                 // remains, wait a little for one to come back instead of
                 // failing the wallet (whose client may store the error,
@@ -469,7 +498,13 @@ impl Resolver {
                 {
                     break;
                 }
-                std::thread::sleep(Duration::from_secs(1));
+                let until = deadline.min(Instant::now() + Duration::from_secs(1));
+                while job.wanted() && Instant::now() < until {
+                    let seq = self.recovery_event.sequence();
+                    if job.wanted() {
+                        self.recovery_event.wait(seq, Some(until));
+                    }
+                }
                 let mut fresh: Vec<(Arc<dyn BlockSource>, Endpoint)> = Vec::new();
                 for source in self.sources() {
                     for endpoint in source.endpoints(FetchMode::Quiet) {
@@ -483,6 +518,7 @@ impl Resolver {
                 }
                 if !fresh.is_empty() {
                     exhausted_since = None;
+                    job.exhausted.store(false, Ordering::Release);
                 }
                 fresh.shuffle(&mut thread_rng());
                 fresh.sort_by_key(|(_, endpoint)| endpoint.tier);
@@ -495,7 +531,7 @@ impl Resolver {
             }
             let wait = RACE_TICK.min(deadline.saturating_duration_since(Instant::now()));
             match rx.recv_timeout(wait) {
-                Ok((idx, Ok(bytes))) => {
+                Ok((idx, Ok((block, size)))) => {
                     running.remove(&idx);
                     finish(&mut running);
                     let wins = match plan[idx].0.name() {
@@ -508,10 +544,11 @@ impl Resolver {
                         .race_win_ms
                         .fetch_add(race_started.elapsed().as_millis() as u64, Ordering::Relaxed);
                     self.stats.fetches.fetch_add(1, Ordering::Relaxed);
-                    self.stats
-                        .bytes
-                        .fetch_add(bytes.len() as u64, Ordering::Relaxed);
-                    return Ok(bytes);
+                    self.stats.bytes.fetch_add(size as u64, Ordering::Relaxed);
+                    if plan[idx].1.via_tor && job.wallet_waiting.load(Ordering::Acquire) {
+                        self.governor.healthy();
+                    }
+                    return Ok(block);
                 }
                 Ok((idx, Err(e))) => {
                     if let Some(ended) = running.remove(&idx) {
@@ -555,13 +592,15 @@ impl Resolver {
         idx: usize,
         source: Arc<dyn BlockSource>,
         endpoint: Endpoint,
-        hash: Hash32,
+        rec: el_model::BlockRecord,
         deadline: Instant,
         ctl: AttemptCtl,
-        tx: mpsc::Sender<(usize, Result<Vec<u8>>)>,
+        tx: mpsc::Sender<AttemptResult>,
         log: AttemptLog,
     ) {
         let stats = Arc::clone(&self.stats);
+        let event = Arc::clone(&self.recovery_event);
+        let failed = tx.clone();
         let spawned = std::thread::Builder::new()
             .name(el_model::sync::THREAD_FETCH.to_string())
             .spawn(move || {
@@ -570,10 +609,13 @@ impl Resolver {
                     lane,
                     role,
                     stream_wait,
+                    permit,
                 } = log;
+                let hash = rec.hash;
                 let started = Instant::now();
                 let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
-                    source.fetch_endpoint(&endpoint, &hash, deadline, FetchMode::Normal, &ctl)
+                    let mode = if lane == Lane::Wallet { FetchMode::Normal } else { FetchMode::Quiet };
+                    source.fetch_endpoint(&endpoint, &hash, deadline, mode, &ctl)
                 }))
                 .unwrap_or_else(|_| Err(RawtxError::Unavailable("attempt panicked".into())));
                 // The connection is gone once the source returns: only now is
@@ -598,13 +640,8 @@ impl Resolver {
                     );
                 }
                 let result = result.and_then(|bytes| {
-                    match verify_block_by_hash(&bytes, &hash).and_then(|block| {
-                        verify_witness_commitment(&block)?;
-                        Ok(block)
-                    }) {
-                        // Not written to the block cache: the caller keeps the
-                        // transactions it needs (AUD-139).
-                        Ok(_) => Ok(bytes),
+                    match verify_full(&bytes, &rec) {
+                        Ok(block) => Ok((block, bytes.len())),
                         Err(e) => {
                             stats.verify_failures.fetch_add(1, Ordering::Relaxed);
                             eprintln!(
@@ -616,10 +653,18 @@ impl Resolver {
                         }
                     }
                 });
+                drop(permit);
+                event.notify();
                 let _ = tx.send((idx, result));
             });
         if let Err(e) = spawned {
             eprintln!("[e-lite] fetch thread did not start: {e}");
+            let _ = failed.send((
+                idx,
+                Err(RawtxError::Unavailable(
+                    "could not start external attempt".into(),
+                )),
+            ));
         }
     }
 
@@ -655,6 +700,8 @@ impl Resolver {
 }
 
 /// What one race attempt carries for the stream budget and its log line.
+type AttemptResult = (usize, Result<(bitcoin::Block, usize)>);
+
 struct AttemptLog {
     /// The Tor stream (none for a direct attempt); released when the
     /// attempt's thread is done with the connection.
@@ -664,6 +711,7 @@ struct AttemptLog {
     role: &'static str,
     /// Time spent waiting for the stream.
     stream_wait: Duration,
+    permit: Permit,
 }
 
 /// Endpoint for a debug line: the transport and the provider or peer, never

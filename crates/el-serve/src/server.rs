@@ -187,6 +187,7 @@ impl Drop for ClientSlot {
         self.client.alive.store(false, Ordering::SeqCst);
         self.shared.clients.unregister(self.client.id);
         self.shared.resolver.forget_client(self.client.id);
+        self.shared.resolver.wake_wallets();
         let counter = if self.client.detached.load(Ordering::SeqCst) {
             &self.shared.stats.detached_clients
         } else {
@@ -387,7 +388,7 @@ pub(crate) fn client_loop(shared: &Shared, client: &Arc<ClientState>) -> std::io
     let wait_below = |limit: usize| {
         let (count, cv) = &in_flight;
         let mut n = count.lock().unwrap_or_else(|p| p.into_inner());
-        while *n > limit.saturating_sub(1) {
+        while *n > limit.saturating_sub(1) && client.alive.load(Ordering::Relaxed) {
             let (guard, timeout) = cv
                 .wait_timeout(n, PLACE_WAIT_POLL)
                 .unwrap_or_else(|p| p.into_inner());
@@ -424,6 +425,8 @@ pub(crate) fn client_loop(shared: &Shared, client: &Arc<ClientState>) -> std::io
                 }
                 Err(_) => {
                     release_slot_early(shared, client);
+                    client.kill();
+                    shared.resolver.wake_wallets();
                     break;
                 }
             }
@@ -444,6 +447,9 @@ pub(crate) fn client_loop(shared: &Shared, client: &Arc<ClientState>) -> std::io
             };
             if may_wait_on_network(&request) {
                 let mut n = wait_below(PIPELINE_DEPTH);
+                if !client.alive.load(Ordering::Relaxed) {
+                    break;
+                }
                 *n += 1;
                 drop(n);
                 client.background.fetch_add(1, Ordering::Relaxed);
@@ -755,6 +761,12 @@ pub(crate) fn process_request(
     client: Option<&Arc<ClientState>>,
     request: &Value,
 ) -> LineOutcome {
+    if client.is_some_and(|c| !c.alive.load(Ordering::Relaxed)) {
+        return LineOutcome {
+            response: None,
+            close: true,
+        };
+    }
     let _scope = ClientScope::enter(client.map(|c| c.id).unwrap_or(0));
     shared.stats.requests_total.fetch_add(1, Ordering::Relaxed);
     let is_notification = request
@@ -814,6 +826,16 @@ pub(crate) fn process_request(
         Err(e) => {
             shared.stats.errors_total.fetch_add(1, Ordering::Relaxed);
             log_rpc_error(shared, method, &e);
+            if e.retry_transport {
+                if let Some(client) = client {
+                    client.kill();
+                    shared.resolver.wake_wallets();
+                    return LineOutcome {
+                        response: None,
+                        close: true,
+                    };
+                }
+            }
             LineOutcome {
                 response: if is_notification {
                     None

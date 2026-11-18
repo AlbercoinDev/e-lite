@@ -42,9 +42,13 @@ A server learns the txids it is asked for, never the wallet's scripts,
 addresses, xpub or IP; it sees `k + 1` plausible wallets loading at once
 (`decoys.wallets`, default 3). Every loose transaction is checked before use:
 its txid, its position in the indexed block and its merkle branch up to the
-indexed header. `preset = "max"` restores **whole blocks by block hash
-only**: no txid ever leaves the node, and a provider learns only block
-hashes. Every fetched block is verified before use:
+indexed header. That proof does **not** authenticate a standalone SegWit
+witness. To use only whole-block verification for historical external
+transactions, set `preset = "max"` or `rawtx.path = "block"`. This uses
+**whole blocks by block hash only**, including during prefetch: no txid
+leaves the node. Existing cached standalone entries predate that policy
+and are not automatically purged by changing modes; see `e-lite cache`
+for explicit cache maintenance. Every fetched block is verified before use:
 
 1. block hash equals the expected hash from Core's active chain;
 2. header/chain continuity;

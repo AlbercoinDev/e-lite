@@ -8,6 +8,9 @@ pub struct RpcError {
     pub message: String,
     /// Set when the connection must be closed after sending the error.
     pub close: bool,
+    /// Close without returning an individual RPC error. Some wallets treat
+    /// that error as a permanent missing transaction even when it is not.
+    pub(crate) retry_transport: bool,
     /// The method name is not one this server knows. Its name is client
     /// text and never reaches the log.
     pub unknown_method: bool,
@@ -19,6 +22,7 @@ impl RpcError {
             code,
             message: message.into(),
             close: false,
+            retry_transport: false,
             unknown_method: false,
         }
     }
@@ -125,7 +129,9 @@ pub(crate) fn note_tx_get_failure(shared: &Shared, cause: TxGetFailure, height: 
 
 pub(crate) fn rawtx_failure(shared: &Shared, height: u32, e: el_rawtx::RawtxError) -> RpcError {
     note_tx_get_failure(shared, TxGetFailure::of(&e), Some(height));
-    RpcError::server(e.to_string())
+    let mut rpc = RpcError::server(e.to_string());
+    rpc.retry_transport = e.is_retryable_wallet();
+    rpc
 }
 
 pub fn dispatch(shared: &Shared, method: &str, params: &Value) -> RpcResult<Value> {
@@ -231,7 +237,7 @@ pub fn dispatch_for(
                 "blockchain.silentpayments.subscribe" | "blockchain.silentpayments.unsubscribe" => {
                     silent_payments(shared, method)
                 }
-                "blockchain.transaction.get" => transaction_get(shared, params),
+                "blockchain.transaction.get" => transaction_get(shared, client, params),
                 "blockchain.transaction.get_merkle" => {
                     let _g = read_guard(shared)?;
                     transaction_merkle(shared, params)

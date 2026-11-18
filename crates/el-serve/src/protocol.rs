@@ -526,7 +526,7 @@ pub(crate) fn param_scripthash(params: &Value) -> RpcResult<ScriptHash> {
     ScriptHash::from_electrum_hex(s).map_err(|e| RpcError::invalid(e.to_string()))
 }
 
-pub(crate) type HistoryRow = (u32, u32, String, u64, u64);
+pub(crate) type HistoryRow = (u32, u32, Hash32, u64, u64);
 
 /// Error text for a script whose history is past `MAX_HISTORY_ENTRIES`.
 fn too_large_message(script: ScriptHash, what: &str) -> String {
@@ -564,6 +564,7 @@ pub(crate) fn history_entries_with_code(
     let mut out = Vec::with_capacity(entries.len());
     // Blocks in history order with their transactions, for the prefetcher.
     let mut prefetch_blocks: Vec<(Hash32, u32, Vec<Hash32>)> = Vec::new();
+    let block_prefetch = prefetch && shared.prefetch.per_history() > 0;
     for (height, tx_pos, effect) in entries {
         let rec = match blocks.get(&height) {
             Some(r) => *r,
@@ -582,34 +583,27 @@ pub(crate) fn history_entries_with_code(
             .store
             .txid_at(txnum)
             .map_err(|e| RpcError::server(e.to_string()))?;
-        if prefetch {
+        if block_prefetch {
             match prefetch_blocks.last_mut() {
                 Some((_, h, txids)) if *h == height => txids.push(txid),
                 _ => prefetch_blocks.push((rec.hash, height, vec![txid])),
             }
         }
-        out.push((
-            height,
-            tx_pos,
-            txid.to_hex(),
-            effect.received_sat,
-            effect.spent_sat,
-        ));
+        out.push((height, tx_pos, txid, effect.received_sat, effect.spent_sat));
     }
-    if prefetch && shared.resolver.tx_mode_servers().is_some() {
-        // Per-txid mode (AUD-163): every pruned transaction of the history,
-        // fetched now with the connection's decoy wallets. Heights Core
+    if prefetch && shared.prefetch.enabled() && shared.resolver.uses_txid_recovery() {
+        // Per-txid mode (AUD-163): bounded, background recovery of pruned
+        // transactions with the connection's decoy wallets. Heights Core
         // still has are served locally and never leave the node.
         let pruned_below = shared.stats.core_pruneheight.load(Ordering::Relaxed);
         let refs: Vec<el_rawtx::TxRef> = out
             .iter()
             .filter(|(height, ..)| (*height as u64) < pruned_below)
-            .filter_map(|(height, tx_pos, txid, ..)| {
-                Hash32::from_hex(txid).ok().map(|txid| el_rawtx::TxRef {
-                    txid,
-                    height: *height,
-                    pos: *tx_pos,
-                })
+            .take(el_rawtx::MAX_HISTORY_TXID_PREFETCH + 1)
+            .map(|(height, tx_pos, txid, ..)| el_rawtx::TxRef {
+                txid: *txid,
+                height: *height,
+                pos: *tx_pos,
             })
             .collect();
         if !refs.is_empty() {
@@ -642,14 +636,10 @@ pub(crate) fn history_value(
     too_large_code: i64,
 ) -> RpcResult<Value> {
     let entries = history_entries_with_code(shared, script, too_large_code, true)?;
-    let mem = shared
-        .mempool
-        .read()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let mem_entries = mem.history(script);
+    let mem_entries = history_mempool(shared, script, &entries);
     let mut arr = Vec::with_capacity(entries.len() + mem_entries.len());
     for (height, _, txid, _, _) in entries {
-        arr.push(json!({"tx_hash": txid, "height": height}));
+        arr.push(json!({"tx_hash": txid.to_hex(), "height": height}));
     }
     // Electrum history appends mempool entries after the confirmed ones.
     for (txid, fee, height) in mem_entries {
@@ -749,11 +739,7 @@ pub(crate) fn status_value(
     prefetch: bool,
 ) -> RpcResult<Option<String>> {
     let entries = history_entries_with_code(shared, script, too_large_code, prefetch)?;
-    let mem = shared
-        .mempool
-        .read()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let mem_entries = mem.history(script);
+    let mem_entries = history_mempool(shared, script, &entries);
     if entries.is_empty() && mem_entries.is_empty() {
         return Ok(None);
     }
@@ -765,6 +751,30 @@ pub(crate) fn status_value(
         hasher.update(format!("{txid}:{height}:").as_bytes());
     }
     Ok(Some(hex::encode(hasher.finalize())))
+}
+
+fn history_mempool(
+    shared: &Shared,
+    script: ScriptHash,
+    confirmed: &[HistoryRow],
+) -> Vec<(Hash32, u64, i32)> {
+    let mut entries = shared
+        .mempool
+        .read()
+        .unwrap_or_else(|p| p.into_inner())
+        .history(script);
+    if !entries.is_empty() && !confirmed.is_empty() {
+        // Core may have mined a transaction just before the next mempool
+        // poll. Never announce both heights for the same history entry.
+        let pending: HashSet<_> = entries.iter().map(|(id, _, _)| *id).collect();
+        let overlap: HashSet<_> = confirmed
+            .iter()
+            .filter(|(_, _, id, _, _)| pending.contains(id))
+            .map(|(_, _, id, _, _)| *id)
+            .collect();
+        entries.retain(|(id, _, _)| !overlap.contains(id));
+    }
+    entries
 }
 
 pub(crate) fn script_status(shared: &Shared, script: ScriptHash) -> RpcResult<Option<String>> {
@@ -819,15 +829,9 @@ pub(crate) fn scripthash_subscribe(
     let script = param_scripthash(params)?;
     // A subscribe is the wallet's first look at an address: start fetching
     // its transactions now (AUD-163), one round trip before get_history.
-    // A single retry covers a transient store/lock error; a deterministic
-    // one (history too large, missing block) is reported with its message.
-    let status = match status_value(shared, script, -32000, true) {
-        Ok(status) => status,
-        Err(first) => {
-            std::thread::sleep(std::time::Duration::from_millis(50));
-            status_value(shared, script, -32000, true).map_err(|_| first)?
-        }
-    };
+    // The index lock is already recovered by the dispatcher. A failed
+    // local read must not sleep and run a second scan under that guard.
+    let status = status_value(shared, script, -32000, true)?;
     if let Some(c) = client {
         if let Ok(mut subs) = c.subs.lock() {
             subs.insert(script, status.clone());
@@ -1223,23 +1227,36 @@ pub fn confirmed_tx_with_block(
     txid: Hash32,
     fetch: impl Fn(u32) -> RpcResult<String>,
 ) -> RpcResult<(String, BlockRecord, u32)> {
-    const ATTEMPTS: usize = 3;
-    for _ in 0..ATTEMPTS {
-        let Some((before, _)) = locate_confirmed(shared, txid)? else {
-            break;
-        };
-        let raw = fetch(before.height)?;
-        match locate_confirmed(shared, txid)? {
-            Some((after, tip)) if after.hash == before.hash => return Ok((raw, after, tip)),
-            _ => continue,
-        }
-    }
-    Err(RpcError::server(
-        "the transaction moved during a reorganisation; ask again",
-    ))
+    confirmed_tx_from(shared, txid, locate_confirmed(shared, txid)?, fetch)
 }
 
-pub(crate) fn transaction_get(shared: &Shared, params: &Value) -> RpcResult<Value> {
+fn confirmed_tx_from(
+    shared: &Shared,
+    txid: Hash32,
+    mut location: Option<(BlockRecord, u32)>,
+    fetch: impl Fn(u32) -> RpcResult<String>,
+) -> RpcResult<(String, BlockRecord, u32)> {
+    const ATTEMPTS: usize = 3;
+    for _ in 0..ATTEMPTS {
+        let Some((before, _)) = location else { break };
+        let raw = fetch(before.height);
+        location = locate_confirmed(shared, txid)?;
+        if let Some((after, tip)) = location {
+            if after.hash == before.hash {
+                return raw.map(|hex| (hex, after, tip));
+            }
+        }
+    }
+    let mut error = RpcError::server("the transaction moved during a reorganisation; ask again");
+    error.retry_transport = true;
+    Err(error)
+}
+
+pub(crate) fn transaction_get(
+    shared: &Shared,
+    client: Option<&Arc<ClientState>>,
+    params: &Value,
+) -> RpcResult<Value> {
     let txid = params
         .as_array()
         .and_then(|a| a.first())
@@ -1251,50 +1268,35 @@ pub(crate) fn transaction_get(shared: &Shared, params: &Value) -> RpcResult<Valu
         .map(|v| v.as_bool().unwrap_or(false))
         .unwrap_or(false);
     let txid_hash = Hash32::from_hex(txid).map_err(RpcError::invalid)?;
-    let (occ, blockhash) = {
-        let _g = read_guard(shared)?;
-        let occ = shared
-            .store
-            .occurrences(txid_hash)
-            .map_err(|e| RpcError::server(e.to_string()))?;
-        let blockhash = match occ.first() {
-            Some((height, _)) => shared
-                .store
-                .get_block(*height)
-                .ok()
-                .flatten()
-                .map(|r| r.hash.to_hex()),
-            None => None,
-        };
-        (occ, blockhash)
-    };
-
-    if verbose {
+    let location = locate_confirmed(shared, txid_hash)?;
+    if location.is_some() {
+        let (raw, block, tip) = confirmed_tx_from(shared, txid_hash, location, |height| {
+            let _guard = rawtx_reader_guard(shared, height);
+            shared
+                .resolver
+                .raw_tx_while(current_client(), txid_hash, height, || {
+                    client.is_none_or(|c| c.alive.load(Ordering::Relaxed))
+                })
+                .map_err(|e| rawtx_failure(shared, height, e))
+        })?;
+        if !verbose {
+            return Ok(json!(raw));
+        }
         // For a confirmed transaction use the verified resolver and decode the
         // raw bytes locally through Core. This works on a pruned node, where
         // getrawtransaction(txid, true, blockhash) would fail.
-        if !occ.is_empty() {
-            let (raw, block, tip) = confirmed_tx_with_block(shared, txid_hash, |height| {
-                let _guard = rawtx_reader_guard(shared, height);
-                shared
-                    .resolver
-                    .raw_tx_for(current_client(), txid_hash, height)
-                    .map_err(|e| rawtx_failure(shared, height, e))
-            })?;
-            let mut decoded = shared.core.decode_raw_transaction(&raw).map_err(|e| {
-                note_tx_get_failure(shared, TxGetFailure::Internal, Some(block.height));
-                RpcError::server(format!("rawtx decode: {e}"))
-            })?;
-            decorate_verbose_tx(&mut decoded, &raw, &block, tip)?;
-            return Ok(decoded);
-        }
-        let mut value = shared
-            .core
-            .raw_transaction_json(txid, blockhash.as_deref())
-            .map_err(|e| {
-                note_tx_get_failure(shared, TxGetFailure::NotFound, None);
-                RpcError::server(format!("rawtx unavailable: {e}"))
-            })?;
+        let mut decoded = shared.core.decode_raw_transaction(&raw).map_err(|e| {
+            note_tx_get_failure(shared, TxGetFailure::Internal, Some(block.height));
+            RpcError::server(format!("rawtx decode: {e}"))
+        })?;
+        decorate_verbose_tx(&mut decoded, &raw, &block, tip)?;
+        return Ok(decoded);
+    }
+    if verbose {
+        let mut value = shared.core.raw_transaction_json(txid, None).map_err(|e| {
+            note_tx_get_failure(shared, TxGetFailure::NotFound, None);
+            RpcError::server(format!("rawtx unavailable: {e}"))
+        })?;
         if let Some(obj) = value.as_object_mut() {
             if !obj.contains_key("confirmations") {
                 obj.insert("confirmations".to_string(), json!(0));
@@ -1303,26 +1305,23 @@ pub(crate) fn transaction_get(shared: &Shared, params: &Value) -> RpcResult<Valu
         return Ok(value);
     }
 
-    match occ.first().copied() {
-        Some((height, _)) => {
-            // Keep the prune gate away from this height only when Core can
-            // still serve it; external-only heights must not block pruning.
-            let _guard = rawtx_reader_guard(shared, height);
-            shared
-                .resolver
-                .raw_tx_for(current_client(), txid_hash, height)
-                .map(|raw| json!(raw))
-                .map_err(|e| rawtx_failure(shared, height, e))
-        }
-        None => shared
-            .core
-            .raw_transaction_hex_opt(txid, None)
-            .map(|raw| json!(raw))
-            .map_err(|e| {
-                note_tx_get_failure(shared, TxGetFailure::NotFound, None);
-                RpcError::server(format!("transaction not found: {e}"))
-            }),
+    let in_pool = shared
+        .mempool
+        .read()
+        .unwrap_or_else(|p| p.into_inner())
+        .raw_tx(&txid_hash)
+        .cloned();
+    if let Some(tx) = in_pool {
+        return Ok(json!(hex::encode(bitcoin::consensus::serialize(&tx))));
     }
+    shared
+        .core
+        .raw_transaction_hex_opt(txid, None)
+        .map(|raw| json!(raw))
+        .map_err(|e| {
+            note_tx_get_failure(shared, TxGetFailure::NotFound, None);
+            RpcError::server(format!("transaction not found: {e}"))
+        })
 }
 
 pub(crate) fn mempool_info(shared: &Shared) -> RpcResult<Value> {

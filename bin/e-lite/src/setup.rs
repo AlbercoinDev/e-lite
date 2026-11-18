@@ -1081,8 +1081,8 @@ pub(crate) fn build_shared(
         resolved.electrum.clone(),
     )?;
     let readers = el_chain::ReaderTracker::new();
-    // Opt-in (AUD-134). P2P may gain peers later, so the configured sources
-    // count, not the ones usable right now.
+    // Use the resolver's effective policy (including rawtx.path = "block").
+    // P2P may gain peers later, so don't use an instantaneous health probe.
     let prefetch = if cfg.rawtx.prefetch && cfg.rawtx.enabled {
         // 0 = auto: block mode prefetches the history, per-txid mode only on
         // demand (no block leaves before the wallet asks). An explicit value
@@ -1090,10 +1090,7 @@ pub(crate) fn build_shared(
         let per_history = if cfg.rawtx.prefetch_history_blocks > 0 {
             cfg.rawtx.prefetch_history_blocks
         } else {
-            let tx_mode = privacy::load(cfg, config_path().as_deref(), false)
-                .map(|loaded| loaded.params.mode == el_rawtx::ExternalMode::Tx)
-                .unwrap_or(true);
-            if tx_mode {
+            if resolver.uses_txid_recovery() {
                 0
             } else {
                 el_serve::PREFETCH_PER_HISTORY

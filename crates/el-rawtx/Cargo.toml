@@ -18,4 +18,4 @@ filetime.workspace = true
 bip324.workspace = true
 serde_json.workspace = true
 rustls.workspace = true
-
+tokio = { version = "1", features = ["rt", "time", "net"] }

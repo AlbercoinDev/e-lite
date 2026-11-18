@@ -4,7 +4,7 @@
 use std::fmt;
 use std::io::{self, Read, Write};
 use std::net::{IpAddr, TcpStream, ToSocketAddrs};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 pub(crate) fn split_host_port(peer: &str) -> io::Result<(&str, u16)> {
     if let Some(rest) = peer.strip_prefix('[') {
@@ -75,23 +75,40 @@ pub(crate) fn socks_connect(
     peer: &str,
     timeout: Duration,
 ) -> std::result::Result<TcpStream, SocksError> {
-    let mut stream = socks_greet(proxy, timeout).map_err(SocksError::Proxy)?;
+    let mut stream = proxy_socket(proxy, timeout, None).map_err(SocksError::Proxy)?;
+    socks_greet(&mut stream).map_err(SocksError::Proxy)?;
     socks_request(&mut stream, peer)?;
     Ok(stream)
 }
 
-/// Connect to the proxy and complete the method negotiation (with a random
-/// username: Tor isolates streams with different credentials).
-fn socks_greet(proxy: &str, timeout: Duration) -> io::Result<TcpStream> {
+pub(crate) fn socks_connect_until(
+    proxy: &str,
+    peer: &str,
+    timeout: Duration,
+    deadline: Instant,
+) -> std::result::Result<TcpStream, SocksError> {
+    let stream = proxy_socket(proxy, timeout, Some(deadline)).map_err(SocksError::Proxy)?;
+    let mut stream = DeadlineStream::new(stream, timeout, deadline);
+    socks_greet(&mut stream).map_err(SocksError::Proxy)?;
+    socks_request(&mut stream, peer)?;
+    Ok(stream.stream)
+}
+
+fn proxy_socket(
+    proxy: &str,
+    timeout: Duration,
+    deadline: Option<Instant>,
+) -> io::Result<TcpStream> {
     let proxy_addrs: Vec<_> = proxy.to_socket_addrs()?.collect();
     let mut stream = None;
     for addr in proxy_addrs {
-        if let Ok(sock) = TcpStream::connect_timeout(&addr, timeout) {
+        let limit = deadline.map_or(Ok(timeout), |d| remaining(d, timeout))?;
+        if let Ok(sock) = TcpStream::connect_timeout(&addr, limit) {
             stream = Some(sock);
             break;
         }
     }
-    let mut stream = stream.ok_or_else(|| {
+    let stream = stream.ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::TimedOut,
             format!("socks proxy {proxy} did not accept a connection"),
@@ -99,7 +116,11 @@ fn socks_greet(proxy: &str, timeout: Duration) -> io::Result<TcpStream> {
     })?;
     stream.set_read_timeout(Some(timeout))?;
     stream.set_write_timeout(Some(timeout))?;
+    Ok(stream)
+}
 
+/// SOCKS method negotiation with a random credential for circuit isolation.
+fn socks_greet(stream: &mut (impl Read + Write)) -> io::Result<()> {
     // Offer no-auth and username/password (Tor uses the username for circuit
     // isolation).
     stream.write_all(&[5, 2, 0, 2])?;
@@ -114,9 +135,9 @@ fn socks_greet(proxy: &str, timeout: Duration) -> io::Result<TcpStream> {
     match resp[1] {
         0 => {}
         2 => {
-            let user = format!("e-lite-{}", rand::random::<u64>());
+            let user = format!("el{:016x}", rand::random::<u64>());
             let user = user.as_bytes();
-            let pass = b"e-lite";
+            let pass = b"x";
             let mut auth = Vec::with_capacity(3 + user.len() + pass.len());
             auth.push(1);
             auth.push(user.len() as u8);
@@ -146,11 +167,14 @@ fn socks_greet(proxy: &str, timeout: Duration) -> io::Result<TcpStream> {
             ))
         }
     }
-    Ok(stream)
+    Ok(())
 }
 
 /// Send the CONNECT for `peer` and read the reply.
-fn socks_request(stream: &mut TcpStream, peer: &str) -> std::result::Result<(), SocksError> {
+fn socks_request(
+    stream: &mut (impl Read + Write),
+    peer: &str,
+) -> std::result::Result<(), SocksError> {
     let (host, port) = split_host_port(peer).map_err(SocksError::Stream)?;
     let mut request = vec![5, 1, 0];
     if let Ok(ip) = host.parse::<IpAddr>() {
@@ -211,6 +235,56 @@ fn socks_request(stream: &mut TcpStream, peer: &str) -> std::result::Result<(), 
     let mut rest = vec![0u8; skip + 2];
     stream.read_exact(&mut rest).map_err(circuit_error)?;
     Ok(())
+}
+
+fn remaining(deadline: Instant, idle: Duration) -> io::Result<Duration> {
+    let left = deadline.saturating_duration_since(Instant::now()).min(idle);
+    if left.is_zero() {
+        Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "session deadline reached",
+        ))
+    } else {
+        Ok(left)
+    }
+}
+
+/// Recompute the timeout for each socket operation (including TLS records).
+/// A slow trickle of bytes cannot restart the whole session budget.
+pub(crate) struct DeadlineStream {
+    stream: TcpStream,
+    idle: Duration,
+    deadline: Instant,
+}
+
+impl DeadlineStream {
+    pub(crate) fn new(stream: TcpStream, idle: Duration, deadline: Instant) -> Self {
+        Self {
+            stream,
+            idle,
+            deadline,
+        }
+    }
+}
+
+impl Read for DeadlineStream {
+    fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+        self.stream
+            .set_read_timeout(Some(remaining(self.deadline, self.idle)?))?;
+        self.stream.read(bytes)
+    }
+}
+
+impl Write for DeadlineStream {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.stream
+            .set_write_timeout(Some(remaining(self.deadline, self.idle)?))?;
+        self.stream.write(bytes)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.stream.flush()
+    }
 }
 
 /// A read of the CONNECT reply that hit the socket timeout. Linux reports an

@@ -10,7 +10,7 @@
 //! Tor exit, and every transaction is verified against the local index.
 
 use crate::health::{Blame, HealthMap, TRANSIENT_BASE, TRANSIENT_CAP};
-use crate::socks::{socks_connect, split_host_port};
+use crate::socks::{socks_connect_until, split_host_port, DeadlineStream};
 use crate::txsource::{TxBatch, TxSource, MAX_TX_BYTES};
 use crate::LOCAL_BUSY;
 use crate::{AttemptCtl, RawtxError, Result};
@@ -147,18 +147,30 @@ impl ElectrumTxSource {
         self.servers.iter().find(|s| s.key() == key)
     }
 
-    fn connect_tcp(&self, s: &ElectrumServer) -> std::result::Result<TcpStream, Blame> {
+    fn connect_tcp(
+        &self,
+        s: &ElectrumServer,
+        deadline: Instant,
+    ) -> std::result::Result<TcpStream, Blame> {
         let addr = format!("{}:{}", s.host, s.port);
         let factor = if s.is_onion() { 2 } else { 1 };
         let limit = self.connect * factor;
         match &self.tor_proxy {
-            Some(proxy) => socks_connect(proxy, &addr, limit).map_err(|_| Blame::Unreachable),
+            Some(proxy) => {
+                socks_connect_until(proxy, &addr, limit, deadline).map_err(|_| Blame::Unreachable)
+            }
             None if self.allow_clearnet => {
                 let addrs: Vec<_> = addr
                     .to_socket_addrs()
                     .map_err(|_| Blame::Unreachable)?
                     .collect();
                 for a in addrs {
+                    let limit = deadline
+                        .saturating_duration_since(Instant::now())
+                        .min(limit);
+                    if limit.is_zero() {
+                        break;
+                    }
                     if let Ok(t) = TcpStream::connect_timeout(&a, limit) {
                         return Ok(t);
                     }
@@ -176,16 +188,15 @@ impl ElectrumTxSource {
         deadline: Instant,
         ctl: &AttemptCtl,
     ) -> std::result::Result<TxBatch, Blame> {
-        let tcp = self.connect_tcp(s)?;
-        ctl.watch(&tcp);
+        let tcp = self.connect_tcp(s, deadline)?;
+        ctl.mark_connected();
         let stall = self.stall * if s.is_onion() { 2 } else { 1 };
         let left = deadline.saturating_duration_since(Instant::now());
         if left.is_zero() {
             return Err(Blame::Transient);
         }
-        let _ = tcp.set_read_timeout(Some(stall.min(left)));
-        let _ = tcp.set_write_timeout(Some(stall.min(left)));
         let _ = tcp.set_nodelay(true);
+        let tcp = DeadlineStream::new(tcp, stall, deadline);
         if s.tls {
             let name =
                 rustls::pki_types::ServerName::try_from(s.host.clone()).map_err(|_| Blame::Hard)?;
@@ -250,8 +261,11 @@ impl ElectrumTxSource {
             send(rw.get_mut(), &request(i, t))?;
         }
         for _ in 0..txids.len() {
-            let item = read_json(&mut rw, deadline, ctl)?;
-            collect(&item, txids, &mut out);
+            match read_json(&mut rw, deadline, ctl) {
+                Ok(item) => collect(&item, txids, &mut out),
+                Err(_) if !out.is_empty() => break,
+                Err(err) => return Err(err),
+            }
         }
         Ok(out)
     }
@@ -336,25 +350,21 @@ impl TxSource for ElectrumTxSource {
         // One Tor stream (the session's, under the governor) and one
         // connection from the shared pool (AUD-167). Without either nothing
         // is sent and the server is not blamed: it was never contacted.
-        let _stream = if self.tor_proxy.is_some() {
-            ctl.take_stream(Some(deadline)).map_err(|crate::NoStream| {
-                RawtxError::Unavailable(format!("{server}: {LOCAL_BUSY}"))
-            })?
+        let busy = || RawtxError::Unavailable(format!("{server}: {LOCAL_BUSY}"));
+        let (_stream, _conn) = if self.tor_proxy.is_some() {
+            (ctl.take_stream(None).map_err(|_| busy())?, None)
         } else {
-            None
-        };
-        let Some(_conn) = self.conns.acquire_until(deadline, 0) else {
-            return Err(RawtxError::Unavailable(format!("{server}: {LOCAL_BUSY}")));
+            (None, Some(self.conns.try_acquire(0).ok_or_else(busy)?))
         };
         match self.session(s, txids, deadline, ctl) {
             Ok(batch) => {
-                if !batch.is_empty() {
+                if ctl.updates_health() && !batch.is_empty() {
                     self.health.succeed(server);
                 }
                 Ok(batch)
             }
             Err(blame) => {
-                if !ctl.aborted() {
+                if ctl.updates_health() {
                     self.health
                         .fail(server, blame, TRANSIENT_BASE, TRANSIENT_CAP, self.cooldown);
                 }

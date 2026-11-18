@@ -18,8 +18,9 @@ Requests that do leave the node:
   e-lite: only a txid (`tx` mode) or a block hash (`block` mode);
 - are **verified against the local index** before anything is cached or
   served: the transaction's txid, its position in the indexed block and its
-  merkle branch up to the indexed header. A lying server can withhold data,
-  never forge it.
+  merkle branch up to the indexed header. This authenticates the data
+  committed by the txid, not the standalone SegWit witness. Whole-block
+  verification also checks the witness commitment.
 
 ## The two modes
 
@@ -120,6 +121,12 @@ Notes:
   32 parallel sessions over 11 servers lost 87 of 480 transactions to refused
   or dropped connections, 16 lost 2. That is why `sessions.parallel` defaults
   to 16 and stops at 32 (also the number of circuits Tor builds at once).
+- Effective session capacity is also capped by `rawtx.sessions_total`; all
+  actual Tor connections share `rawtx.tor_streams`. Esplora admits one
+  transaction per isolated request, whereas Electrum can batch them.
+- A session queued locally does not charge a provider attempt. Unsent cover
+  can stay queued while capacity is unavailable, within its bounded lifetime;
+  saturation or a disappearing provider can still reduce effective cover.
 - Servers are ranked by their measured session time (with jitter), so slow
   or failing servers get fewer sessions; the spread still applies.
 - Warnings (not errors): `decoys.wallets = 0` and `sessions.min_servers = 1`

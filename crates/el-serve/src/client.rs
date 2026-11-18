@@ -370,7 +370,7 @@ impl ClientState {
         }
     }
 
-    fn kill(&self) {
+    pub(crate) fn kill(&self) {
         self.alive.store(false, Ordering::SeqCst);
         if let Ok(writer) = self.writer.try_lock() {
             let _ = writer.socket().shutdown(std::net::Shutdown::Both);
@@ -390,6 +390,9 @@ impl ClientState {
             Ok(w) => w,
             Err(_) => return false,
         };
+        if !self.alive.load(Ordering::Relaxed) {
+            return false;
+        }
         if writer
             .write_all(&bytes)
             .and_then(|_| writer.flush())
