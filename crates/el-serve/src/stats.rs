@@ -133,6 +133,8 @@ impl CacheBaseline {
 }
 
 pub struct Stats {
+    pub(crate) wallet_state: (Mutex<()>, Condvar),
+    pub(crate) wallet_ready_once: AtomicBool,
     pub indexed_height: AtomicU64,
     pub core_height: AtomicU64,
     pub core_headers: AtomicU64,
@@ -279,6 +281,8 @@ pub struct Stats {
 impl Default for Stats {
     fn default() -> Self {
         Stats {
+            wallet_state: Default::default(),
+            wallet_ready_once: AtomicBool::new(false),
             indexed_height: AtomicU64::new(0),
             core_height: AtomicU64::new(0),
             core_headers: AtomicU64::new(0),

@@ -299,6 +299,43 @@ fn building_state_is_not_an_empty_answer() {
 }
 
 #[test]
+fn online_history_waits_only_for_the_live_ready_transition() {
+    use std::io::{BufRead, BufReader, Write};
+    use std::net::{TcpListener, TcpStream};
+    let (fx, script, _) = fixture();
+    fx.shared.set_state(state::READY);
+    fx.shared.set_state(state::BUILDING);
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    el_serve::start_listener_on(listener, Arc::clone(&fx.shared), None);
+    let mut socket = TcpStream::connect(addr).unwrap();
+    socket
+        .set_read_timeout(Some(Duration::from_millis(100)))
+        .unwrap();
+    let query = json!({
+        "jsonrpc":"2.0", "id":1, "method":"blockchain.scripthash.get_history",
+        "params":[script.to_electrum_hex()]
+    });
+    writeln!(socket, "{query}").unwrap();
+    let mut reader = BufReader::new(socket);
+    let mut response = String::new();
+    let err = reader.read_line(&mut response).unwrap_err();
+    assert!(matches!(
+        err.kind(),
+        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+    ));
+    assert!(response.is_empty(), "{response}");
+    reader
+        .get_ref()
+        .set_read_timeout(Some(Duration::from_secs(1)))
+        .unwrap();
+    fx.shared.set_state(state::READY);
+    reader.read_line(&mut response).unwrap();
+    let value: Value = serde_json::from_str(&response).unwrap();
+    assert!(value["result"].is_array(), "{response}");
+}
+
+#[test]
 fn malformed_json_and_bad_params() {
     let (fx, _, _) = fixture();
     let r = process_line(&fx.shared, "{not json");
