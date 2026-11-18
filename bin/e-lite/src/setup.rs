@@ -770,9 +770,8 @@ pub(crate) fn build_resolver(
         // Same peers, plus Core's view of their transport (v1/v2).
         resolver.refresh_p2p_peers(hints);
     }
-    Ok(Arc::new(
-        resolver.with_local(Arc::new(CoreBlockSource::new(core.clone()))),
-    ))
+    let resolver = resolver.with_local(Arc::new(CoreBlockSource::new(core.clone())));
+    Ok(Arc::new(resolver))
 }
 
 /// Peers are discovered from Core only when the operator did not pin
@@ -941,33 +940,6 @@ pub(crate) fn provider_gate_required(
 pub(crate) fn provider_gate_expired(cfg: &Config, waited: Duration) -> bool {
     cfg.public_servers.open_without_provider
         && waited >= Duration::from_secs(cfg.public_servers.ready_timeout_seconds)
-}
-
-/// Keep probing in the background after the listeners opened without a
-/// ready provider, so `/status.public_servers.provider_ready` and the log
-/// reflect a provider that comes back. Only constant, wallet-free requests
-/// are sent (`/block-height/0` and the genesis block).
-pub(crate) fn spawn_provider_reprobe(shared: Arc<Shared>, cfg: Config) {
-    if !cfg.rawtx.enabled || !cfg.rawtx.use_esplora || shared.public_servers.is_empty() {
-        return;
-    }
-    let spawned = std::thread::Builder::new()
-        .name("el-providers".to_string())
-        .spawn(move || {
-            while !shared.provider_ready.load(Ordering::Relaxed) {
-                for _ in 0..60 {
-                    if shared.shutdown.load(Ordering::Relaxed) {
-                        return;
-                    }
-                    std::thread::sleep(Duration::from_secs(1));
-                }
-                refresh_providers(&shared, &cfg, false);
-            }
-            eprintln!("[e-lite] a public provider answered; raw transactions of pruned blocks are available again");
-        });
-    if let Err(e) = spawned {
-        eprintln!("[e-lite] cannot start the provider re-probe thread: {e}");
-    }
 }
 
 pub(crate) fn effective_rate_limit(cfg: &Config) -> (u64, u64) {

@@ -31,6 +31,7 @@ impl Resolver {
         }
 
         *path = "external";
+        self.start_provider_probes();
         let t = self
             .position_of(txid, height)
             .map(|pos| TxRef { txid, height, pos });
@@ -49,7 +50,12 @@ impl Resolver {
         } else {
             self.txid_attempt * 2
         };
-        let fallback_at = if tried_tx {
+        let fallback_at = if tried_tx
+            && self
+                .tx_mode
+                .as_ref()
+                .is_some_and(txbatch::TxMode::routes_ready)
+        {
             (now + head_start).min(deadline.checked_sub(MIN_ATTEMPT).unwrap_or(now))
         } else {
             now

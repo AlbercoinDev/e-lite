@@ -17,6 +17,7 @@
 use crate::decoy_wallets::{DecoyBook, DecoyPicker, TxRef};
 use crate::governor::{Availability, GovernorPermit, Lane, TorGovernor};
 use crate::privacy::PrivacyParams;
+use crate::qualification::{Qualification, Route, Sample, TX_FAST};
 use crate::txcache::{CachedTx, TxCache};
 use crate::txsource::TxSource;
 use crate::DecoySessions;
@@ -190,6 +191,7 @@ struct Shared {
     store: Arc<Store>,
     txcache: Option<Arc<TxCache>>,
     sources: Vec<Arc<dyn TxSource>>,
+    qualification: Arc<Qualification>,
     params: PrivacyParams,
     picker: DecoyPicker,
     books: Mutex<Books>,
@@ -266,6 +268,7 @@ impl TxMode {
         governor: Arc<TorGovernor>,
         prune_height: Arc<AtomicU32>,
         event: Arc<Availability>,
+        qualification: Arc<Qualification>,
     ) -> Option<Self> {
         if sources.is_empty() {
             return None;
@@ -280,6 +283,7 @@ impl TxMode {
             store,
             txcache,
             sources,
+            qualification,
             sessions: Semaphore::new(sessions_total.min(params.parallel_sessions).max(1)),
             decoy_sessions: Semaphore::new(
                 (sessions_total.min(params.parallel_sessions) / 4).max(1),
@@ -330,6 +334,28 @@ impl TxMode {
     /// Servers usable now, over every source.
     pub(crate) fn servers(&self) -> usize {
         self.shared.sources.iter().map(|s| s.servers().len()).sum()
+    }
+
+    pub(crate) fn probe_sources(&self) -> Vec<Arc<dyn TxSource>> {
+        self.shared
+            .sources
+            .iter()
+            .filter(|s| s.requires_qualification())
+            .cloned()
+            .collect()
+    }
+
+    pub(crate) fn routes_ready(&self) -> bool {
+        self.shared
+            .sufficient_diversity(&self.shared.eligible_servers())
+    }
+
+    pub(crate) fn provider_counts(&self) -> HashMap<String, u64> {
+        self.shared
+            .provider_counts
+            .lock()
+            .map(|counts| counts.clone())
+            .unwrap_or_default()
     }
 
     pub(crate) fn wake(&self) {
@@ -638,11 +664,15 @@ impl Shared {
     }
 
     /// Expected session time of a server; unknown servers rank as average.
-    fn expected_ms(&self, key: &str) -> f64 {
+    fn expected_ms(&self, source: usize, key: &str) -> f64 {
         self.latency
             .lock()
             .ok()
             .and_then(|m| m.get(key).copied())
+            .or_else(|| {
+                self.qualification
+                    .probe_ms(&Route::tx(self.sources[source].as_ref(), key))
+            })
             .unwrap_or(5_000.0)
     }
 
@@ -729,6 +759,7 @@ fn batch_loop(shared: Arc<Shared>) {
     let mut preparing = Vec::<Req>::new();
     let mut workers = Vec::<std::thread::JoinHandle<()>>::new();
     let mut gather_until = None;
+    let mut reassign = Vec::new();
     while !shared.closed.load(Ordering::Relaxed) {
         let seq = shared.event.sequence();
         shared.active.fetch_add(1, Ordering::SeqCst);
@@ -760,7 +791,14 @@ fn batch_loop(shared: Arc<Shared>) {
         preparing.extend(requests);
         let now = Instant::now();
         let mut next = None;
-        if !preparing.is_empty() && staged.len() < MAX_JOBS {
+        for session in std::mem::take(&mut reassign) {
+            reassign_session(&shared, session, &mut staged);
+        }
+        let routes_ready = shared.sufficient_diversity(&shared.eligible_servers());
+        if !routes_ready && shared.sources.iter().any(|s| s.requires_qualification()) {
+            preparing.retain(|r| shared.wanted(r, now).is_some());
+            gather_until = None;
+        } else if !preparing.is_empty() && staged.len() < MAX_JOBS {
             let gather = *gather_until
                 .get_or_insert(now + Duration::from_millis(shared.params.batch_window_ms));
             if now >= gather {
@@ -813,6 +851,15 @@ fn batch_loop(shared: Arc<Shared>) {
             if session.ready > now {
                 next = Some(next.map_or(session.ready, |until| until.min(session.ready)));
                 staged.push_back(session);
+                continue;
+            }
+            if !routes_ready && shared.sources[session.source].requires_qualification() {
+                staged.push_back(session);
+                continue;
+            }
+            if shared.session_generation(&session).is_none() {
+                shared.qualification.skipped();
+                reassign.push(session);
                 continue;
             }
             let lane = session.lane(now);
@@ -868,11 +915,12 @@ fn batch_loop(shared: Arc<Shared>) {
                 next = Some(next.map_or(until, |other| other.min(until)));
             }
         }
-        shared
-            .pending
-            .store(staged.len() + preparing.len(), Ordering::SeqCst);
+        shared.pending.store(
+            staged.len() + preparing.len() + reassign.len(),
+            Ordering::SeqCst,
+        );
         shared.active.fetch_sub(1, Ordering::SeqCst);
-        if !more_history {
+        if !more_history && reassign.is_empty() {
             shared.event.wait(seq, next);
         }
     }
@@ -883,38 +931,19 @@ fn batch_loop(shared: Arc<Shared>) {
 
 /// Mix, spread and launch the sessions for one gathered batch.
 fn dispatch(shared: &Shared, reqs: Vec<Req>, staged: &mut VecDeque<Session>) {
-    // Usable servers over every source: (source index, key, onion).
-    let mut servers: Vec<(usize, String, bool)> = Vec::new();
-    for (i, src) in shared.sources.iter().enumerate() {
-        for key in src.servers() {
-            let onion = key.to_ascii_lowercase().contains(".onion");
-            servers.push((i, key, onion));
-        }
-    }
-    if servers.is_empty() {
-        // Everything is cooling down: use every server rather than failing.
-        for (i, src) in shared.sources.iter().enumerate() {
-            for key in src.all_servers() {
-                let onion = key.to_ascii_lowercase().contains(".onion");
-                servers.push((i, key, onion));
-            }
-        }
-    }
-    if servers.is_empty() {
+    let servers = shared.eligible_servers();
+    if !shared.sufficient_diversity(&servers) {
         for r in reqs {
             shared.finish(
                 (r.t, r.block),
                 &r.wait,
-                Err(RawtxError::Unavailable("tx mode: no server".into())),
+                Err(RawtxError::Unavailable(
+                    "tx mode: not enough qualified operators".into(),
+                )),
             );
         }
         return;
     }
-    let p = &shared.params;
-    let spread = ((1.0 / p.max_share).ceil() as usize)
-        .max(p.min_servers)
-        .clamp(1, servers.len());
-
     // Groups: per connection, the real requests and each decoy wallet.
     let mut by_ctx: HashMap<u64, Vec<Req>> = HashMap::new();
     for mut r in reqs {
@@ -961,6 +990,111 @@ fn dispatch(shared: &Shared, reqs: Vec<Req>, staged: &mut VecDeque<Session>) {
         );
     }
 
+    assign(shared, servers, groups, Instant::now(), staged);
+}
+
+type Servers = Vec<(usize, String, bool)>;
+type Groups = Vec<((u64, usize), Vec<Item>)>;
+
+impl Shared {
+    fn session_generation(&self, session: &Session) -> Option<u64> {
+        let src = self.sources[session.source].as_ref();
+        if src.requires_qualification() {
+            self.qualification.admit(&Route::tx(src, &session.key))
+        } else {
+            Some(0)
+        }
+    }
+
+    fn eligible_servers(&self) -> Servers {
+        let mut out = Vec::new();
+        for (i, source) in self.sources.iter().enumerate() {
+            let keys = if source.requires_qualification() {
+                source.all_servers()
+            } else {
+                source.servers()
+            };
+            for key in keys {
+                if !source.requires_qualification()
+                    || self
+                        .qualification
+                        .admit(&Route::tx(source.as_ref(), &key))
+                        .is_some()
+                {
+                    let onion = key.to_ascii_lowercase().contains(".onion");
+                    out.push((i, key, onion));
+                }
+            }
+        }
+        out
+    }
+
+    fn sufficient_diversity(&self, servers: &Servers) -> bool {
+        if servers.is_empty() {
+            return false;
+        }
+        !self.sources.iter().any(|s| s.requires_qualification())
+            || servers
+                .iter()
+                .map(|(_, key, _)| server_operator(key))
+                .collect::<HashSet<_>>()
+                .len()
+                >= self
+                    .params
+                    .min_servers
+                    .max((1.0 / self.params.max_share).ceil() as usize)
+    }
+}
+
+fn reassign_session(shared: &Shared, session: Session, staged: &mut VecDeque<Session>) {
+    let servers = shared.eligible_servers();
+    let enough = shared.sufficient_diversity(&servers);
+    let mut groups: HashMap<_, Vec<_>> = HashMap::new();
+    let mut counts = shared.spread.lock().unwrap_or_else(|p| p.into_inner());
+    let op = server_operator(&session.key);
+    for item in session.items {
+        let group = match &item {
+            Item::Real(r) => (r.ctx, 0),
+            Item::Decoy { ctx, wallet, .. } => (*ctx, *wallet + 1),
+        };
+        if let Some(n) = counts.get_mut(&group).and_then(|by_op| by_op.get_mut(&op)) {
+            *n = n.saturating_sub(1);
+        }
+        if enough {
+            groups.entry(group).or_default().push(item);
+        } else if let Item::Real(r) = item {
+            shared.finish(
+                (r.t, r.block),
+                &r.wait,
+                Err(RawtxError::Unavailable(
+                    "tx mode: not enough qualified operators".into(),
+                )),
+            );
+        }
+    }
+    drop(counts);
+    if enough {
+        assign(
+            shared,
+            servers,
+            groups.into_iter().collect(),
+            session.queued,
+            staged,
+        );
+    }
+}
+
+fn assign(
+    shared: &Shared,
+    servers: Servers,
+    groups: Groups,
+    queued: Instant,
+    staged: &mut VecDeque<Session>,
+) {
+    let p = &shared.params;
+    let spread = ((1.0 / p.max_share).ceil() as usize)
+        .max(p.min_servers)
+        .clamp(1, servers.len());
     // Spread each group over `spread` servers (onion first, then random),
     // round robin, skipping servers a real request already failed on.
     let mut per_server: HashMap<usize, Vec<Item>> = HashMap::new();
@@ -982,7 +1116,7 @@ fn dispatch(shared: &Shared, reqs: Vec<Req>, staged: &mut VecDeque<Session>) {
             } else {
                 1.0
             };
-            shared.expected_ms(key) * jitter * singles * if *onion { 0.8 } else { 1.0 }
+            shared.expected_ms(*source, key) * jitter * singles * if *onion { 0.8 } else { 1.0 }
         })
         .collect();
     // Candidates: the faster half of the servers, never fewer than `spread`.
@@ -1047,13 +1181,13 @@ fn dispatch(shared: &Shared, reqs: Vec<Req>, staged: &mut VecDeque<Session>) {
                 .copied()
                 .filter(|&i| !tried.contains(&servers[i].1))
                 .min_by(|&a, &b| {
-                    let ca = counts.get(&servers[a].1).copied().unwrap_or(0);
-                    let cb = counts.get(&servers[b].1).copied().unwrap_or(0);
+                    let ca = counts.get(&operators[a]).copied().unwrap_or(0);
+                    let cb = counts.get(&operators[b]).copied().unwrap_or(0);
                     ca.cmp(&cb).then(rank[a].total_cmp(&rank[b]))
                 })
                 .or_else(|| (0..servers.len()).find(|i| !tried.contains(&servers[*i].1)))
                 .unwrap_or(candidates[0]);
-            *counts.entry(servers[pick].1.clone()).or_insert(0) += 1;
+            *counts.entry(operators[pick].clone()).or_insert(0) += 1;
             per_server.entry(pick).or_default().push(item);
         }
     }
@@ -1080,7 +1214,7 @@ fn dispatch(shared: &Shared, reqs: Vec<Req>, staged: &mut VecDeque<Session>) {
                 source: src_idx,
                 key: key.clone(),
                 items: chunk.to_vec(),
-                queued: now,
+                queued,
                 ready: now + Duration::from_millis(jitter),
             });
         }
@@ -1135,6 +1269,16 @@ fn admit(shared: &Shared, session: &Session, lane: Lane) -> Option<Admission> {
 }
 
 fn run_session(shared: &Shared, session: Session, lane: Lane, mut permits: Admission) {
+    // The route may have expired while the scheduler assigned the thread.
+    if shared.session_generation(&session).is_none()
+        || (shared.sources[session.source].requires_qualification()
+            && !shared.sufficient_diversity(&shared.eligible_servers()))
+    {
+        shared.qualification.skipped();
+        let mut queue = shared.queue.lock().unwrap_or_else(|p| p.into_inner());
+        queue.unsent.push(session);
+        return;
+    }
     let Session {
         source,
         key,
@@ -1192,14 +1336,34 @@ fn run_session(shared: &Shared, session: Session, lane: Lane, mut permits: Admis
     }
     let txids: Vec<Hash32> = items.iter().map(Item::txid).collect();
     let real = items.iter().filter(|i| matches!(i, Item::Real(_))).count() as u64;
+    let route = Route::tx(src.as_ref(), key);
+    let generation = if src.requires_qualification() {
+        let Some(generation) = shared.qualification.admit(&route) else {
+            shared.qualification.skipped();
+            let mut queue = shared.queue.lock().unwrap_or_else(|p| p.into_inner());
+            queue.unsent.push(Session {
+                source,
+                key: key.to_owned(),
+                items,
+                queued,
+                ready: queued,
+            });
+            return;
+        };
+        generation
+    } else {
+        0
+    };
     shared.stats.tx_sessions.fetch_add(1, Ordering::Relaxed);
     let ctl = AttemptCtl::new()
         .with_streams(Arc::clone(&shared.governor), lane, permits.stream.take())
-        .with_health(lane == Lane::Wallet);
+        .with_health(lane == Lane::Wallet && !src.requires_qualification());
     let waited = queued.elapsed();
     // The session's budget starts once it holds everything it waited for.
     let started = Instant::now();
     let result = src.fetch_from(key, &txids, started + SESSION_BUDGET, &ctl);
+    let network_time = started.elapsed();
+    ctl.close_sockets();
     let ms = started.elapsed().as_millis() as f64;
     let skipped: HashSet<Hash32> = ctl.skipped().into_iter().collect();
     let local = matches!(&result, Err(RawtxError::Unavailable(m)) if m.contains(crate::LOCAL_BUSY));
@@ -1242,13 +1406,15 @@ fn run_session(shared: &Shared, session: Session, lane: Lane, mut permits: Admis
     }
     // Real time, success or failure: a fast rejection must not look like a
     // 40 s stall (the old code used the whole session budget on failure).
-    if lane == Lane::Wallet {
+    if lane == Lane::Wallet && !src.requires_qualification() {
         shared.note_latency(key, ms);
     }
+    let failed = result.is_err();
     let batch = result.unwrap_or_default();
     let mut bad = false;
     let mut unsent = Vec::new();
     let mut sent = 0;
+    let mut useful = 0;
     for item in items {
         if !skipped.contains(&item.txid()) || batch.contains_key(&item.txid()) {
             sent += 1;
@@ -1267,6 +1433,7 @@ fn run_session(shared: &Shared, session: Session, lane: Lane, mut permits: Admis
                 match batch.get(&r.t.txid) {
                     Some(raw) => match shared.verify(&r.t, r.block, raw) {
                         Ok(hex) => {
+                            useful += 1;
                             shared.stats.tx_verified.fetch_add(1, Ordering::Relaxed);
                             shared.finish((r.t, r.block), &r.wait, Ok(hex));
                         }
@@ -1308,7 +1475,27 @@ fn run_session(shared: &Shared, session: Session, lane: Lane, mut permits: Admis
         shared.provider_total.fetch_add(sent, Ordering::Relaxed);
     }
     shared.defer_decoys(source, key, queued, unsent);
-    if bad && lane == Lane::Wallet {
+    if src.requires_qualification() && lane != Lane::Decoy && !ctl.aborted() {
+        let sample = if bad {
+            Some(Sample::Invalid)
+        } else if let Some(after) = ctl.retry_after() {
+            Some(Sample::RateLimited(after))
+        } else if failed && !ctl.non_health_failure() {
+            Some(Sample::Failed)
+        } else if useful > 0 {
+            shared.note_latency(key, ms);
+            Some(if network_time <= TX_FAST {
+                Sample::Fast
+            } else {
+                Sample::Slow
+            })
+        } else {
+            None
+        };
+        if let Some(sample) = sample {
+            shared.qualification.observe(&route, generation, sample);
+        }
+    } else if bad && lane == Lane::Wallet {
         src.penalize(key);
     }
 }
@@ -1395,6 +1582,11 @@ fn server_operator(key: &str) -> String {
         .unwrap_or(key)
         .trim_start_matches("www.")
         .to_ascii_lowercase();
+    // An operator's onion alias does not count as another recipient. This
+    // is identity metadata only: it never adds a configured route.
+    if host == "mempoolhqx4isw62xs7abwphsq7ldayuidyx2v2oethdhhj6mlo2r6ad.onion" {
+        return "mempool.space".into();
+    }
     let parts: Vec<&str> = host.split('.').collect();
     if parts.len() >= 2 {
         format!("{}.{}", parts[parts.len() - 2], parts[parts.len() - 1])
@@ -1406,6 +1598,18 @@ fn server_operator(key: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mempool_transports_share_the_same_operator() {
+        let operator = server_operator("https://mempool.space/api");
+        assert_eq!(operator, server_operator("electrum.mempool.space:50002:s"));
+        assert_eq!(
+            operator,
+            server_operator(
+                "http://mempoolhqx4isw62xs7abwphsq7ldayuidyx2v2oethdhhj6mlo2r6ad.onion/api"
+            )
+        );
+    }
 
     #[test]
     fn over_quota_operators_move_to_the_back() {

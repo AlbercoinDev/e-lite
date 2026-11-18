@@ -496,6 +496,44 @@ How to read it:
 `/status.rawtx.tor_governor` carries the same counters (cumulative, with
 `peak` and per lane).
 
+### External wallet route qualification
+
+The startup `/block/<genesis>/raw` readiness probe is not admission to
+serve a wallet. The resolver checks each Electrum, Esplora-tx, Esplora-block
+and P2P-block route separately. HTTPS and onion status are independent, as
+are direct and Tor. Tests use public fixtures from the active index, never
+wallet history: at most four old txids (one for Esplora), or a representative
+historical block. The worker runs one probe at a time with spare Tor
+capacity and leaves a stream free. Block mode does not send txid probes.
+
+Txid probes must return the expected transactions in 2.5 s. Blocks must
+verify, start answering within 6 s over Tor (2 s direct) and finish within
+20 s (8 s direct), or the source's stricter configured limits. Approval
+lasts 180 s and can be refreshed by a fast, verified response in that
+operation. Two slow or failed real sessions pause the route; a failed
+verification or explicit rate limit pauses it at once. Public probes retry
+with backoff from 5 to 60 s, subject to a bounded HTTP `Retry-After`.
+A downloaded-but-invalid answer is never cached or served.
+
+If diversity falls below `sessions.min_servers` or the number implied by
+`sessions.max_share`, the txid path does not send work. The verified block
+fallback can still serve it if a block route is qualified. At startup or
+during an outage some external data can therefore be unavailable until a
+probe passes; local data and indexing are unaffected. The optional manual
+Umbrel probe remains diagnostic, not an admission override.
+`provider_status` is the legacy startup diagnostic; current wallet admission
+is reported separately under `rawtx.qualification`. Index repair, when
+needed, keeps its separate recovery path.
+
+For a cold-load comparison, use a disposable node or separate test caches.
+Keep the wallet, Tor settings and providers fixed. Compare multiple runs
+of the same Sparrow load (time to first batch and `Finished loading`), and
+take `/status.rawtx.qualification` before/after: `probe_streams`,
+`probe_passes`, `probe_slow`, `probe_failures`, `skipped`, `paused` and
+`failed_streams`. `tor_governor` separates queued time from network attempts;
+`tx_mode.items_by_operator` lets you check that traffic did not concentrate.
+Do not reset the production index or its transaction cache for the test.
+
 ### A script with too many history rows
 
 A wallet that subscribes a script with more than 100,000 index rows gets

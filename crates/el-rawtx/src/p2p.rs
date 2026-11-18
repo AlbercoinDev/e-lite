@@ -518,7 +518,11 @@ impl P2pSource {
 
     /// Per-attempt limit of the next connection (Tor or direct).
     fn per_attempt(&self) -> Duration {
-        if self.via_tor() {
+        self.transport_budget(self.via_tor())
+    }
+
+    fn transport_budget(&self, via_tor: bool) -> Duration {
+        if via_tor {
             self.tor_timeout
         } else {
             self.timeout
@@ -531,10 +535,11 @@ impl P2pSource {
     }
 
     /// Deadline and stall time of one protocol attempt inside a call.
-    fn attempt(&self, call_deadline: Instant) -> (Instant, Duration) {
-        let limit = self.per_attempt();
+    fn attempt(&self, call_deadline: Instant, ctl: &AttemptCtl) -> (Instant, Duration) {
+        let via_tor = ctl.0.fixed_transport.unwrap_or_else(|| self.via_tor());
+        let limit = self.transport_budget(via_tor);
         let deadline = call_deadline.min(Instant::now() + limit);
-        let stall = if self.via_tor() {
+        let stall = if via_tor {
             P2P_TOR_STALL
         } else {
             P2P_DIRECT_STALL
@@ -543,15 +548,15 @@ impl P2pSource {
     }
 
     /// Limit of the connection phase to `peer` (circuit + TCP).
-    fn connect_limit(&self, peer: &str) -> Duration {
-        let phase = if !self.via_tor() {
+    fn connect_limit(&self, peer: &str, via_tor: bool) -> Duration {
+        let phase = if !via_tor {
             P2P_DIRECT_CONNECT
         } else if peer.to_ascii_lowercase().contains(".onion") {
             P2P_ONION_CONNECT
         } else {
             P2P_TOR_CONNECT
         };
-        phase.min(self.per_attempt())
+        phase.min(self.transport_budget(via_tor))
     }
 
     fn direct_connect(&self, peer: &str, timeout: Duration) -> Result<TcpStream> {
@@ -599,11 +604,18 @@ impl P2pSource {
         stall: Duration,
         ctl: &AttemptCtl,
     ) -> std::result::Result<DeadlineIo, Failure> {
+        let fixed = ctl.0.fixed_transport;
+        let via_tor = fixed.unwrap_or_else(|| self.via_tor());
         let timeout = deadline
             .saturating_duration_since(Instant::now())
-            .min(self.connect_limit(peer))
+            .min(self.connect_limit(peer, via_tor))
             .max(Duration::from_millis(100));
-        let stream = match &self.tor_socks {
+        let proxy = if fixed == Some(false) {
+            None
+        } else {
+            self.tor_socks.as_ref()
+        };
+        let stream = match proxy {
             Some(proxy) if !self.proxy_down() => match socks_connect(proxy, peer, timeout) {
                 Ok(s) => s,
                 Err(SocksError::Proxy(e)) => {
@@ -613,7 +625,8 @@ impl P2pSource {
                         stats.p2p_tor_failures.fetch_add(1, Ordering::Relaxed);
                     });
                     self.set_proxy_down(true);
-                    if self.fallback_clearnet {
+                    ctl.mark_local_failure();
+                    if fixed.is_none() && self.fallback_clearnet {
                         self.fallback_connect(peer, timeout, "proxy")?
                     } else {
                         return Err(Failure {
@@ -626,7 +639,7 @@ impl P2pSource {
                 // The proxy works; this peer does not answer through it (a
                 // reply code, or no reply within the connect limit).
                 Err(e) => {
-                    if self.fallback_clearnet {
+                    if fixed.is_none() && self.fallback_clearnet {
                         self.fallback_connect(peer, timeout, "circuit")?
                     } else {
                         return Err(Failure {
@@ -638,7 +651,7 @@ impl P2pSource {
                 }
             },
             Some(_) => {
-                if self.fallback_clearnet {
+                if fixed.is_none() && self.fallback_clearnet {
                     self.fallback_connect(peer, timeout, "proxy paused")?
                 } else {
                     return Err(Failure {
@@ -649,6 +662,13 @@ impl P2pSource {
                         connected: false,
                     });
                 }
+            }
+            None if fixed == Some(true) => {
+                return Err(Failure {
+                    err: RawtxError::Unavailable("tor proxy unavailable".into()),
+                    blame: None,
+                    connected: false,
+                })
             }
             None => self.direct_connect(peer, timeout).map_err(|err| Failure {
                 err,
@@ -684,10 +704,16 @@ impl P2pSource {
                 // v1 attempt would pay another connection for the same
                 // result (AUD-153).
                 Err(f) if !f.connected || f.blame != Some(Blame::Transient) => return Err(f),
-                Err(f) => v2_error = Some(f),
+                Err(f) => {
+                    ctl.close_sockets();
+                    v2_error = Some(f);
+                }
             }
         }
-        if call_deadline.saturating_duration_since(Instant::now()) < self.min_attempt() {
+        let via_tor = ctl.0.fixed_transport.unwrap_or_else(|| self.via_tor());
+        if call_deadline.saturating_duration_since(Instant::now())
+            < crate::MIN_ATTEMPT.min(self.transport_budget(via_tor))
+        {
             return Err(v2_error.unwrap_or_else(|| {
                 Failure::transient(RawtxError::Unavailable(format!("{peer} p2p timeout")))
             }));
@@ -715,7 +741,7 @@ impl P2pSource {
         call_deadline: Instant,
         ctl: &AttemptCtl,
     ) -> std::result::Result<Vec<u8>, Failure> {
-        let (deadline, stall) = self.attempt(call_deadline);
+        let (deadline, stall) = self.attempt(call_deadline, ctl);
         let mut stream = self.connect_raw(peer, deadline, stall, ctl)?;
         let fail = |what: &str, e: io::Error| {
             Failure::transient(RawtxError::Unavailable(format!("{peer} {what}: {e}")))
@@ -755,6 +781,7 @@ impl P2pSource {
         }
         self.require_network(peer, services)?;
 
+        ctl.reset_progress();
         send_message(&mut stream, self.magic, "getdata", &getdata_payload(hash))
             .map_err(|e| fail("getdata", e))?;
         loop {
@@ -785,7 +812,7 @@ impl P2pSource {
         call_deadline: Instant,
         ctl: &AttemptCtl,
     ) -> std::result::Result<Vec<u8>, Failure> {
-        let (deadline, stall) = self.attempt(call_deadline);
+        let (deadline, stall) = self.attempt(call_deadline, ctl);
         let stream = self.connect_raw(peer, deadline, stall, ctl)?;
         let reader = BufReader::new(
             stream
@@ -824,6 +851,7 @@ impl P2pSource {
         }
         self.require_network(peer, services)?;
 
+        ctl.reset_progress();
         self.v2_send(&mut protocol, "getdata", &getdata_payload(hash))?;
         loop {
             let (cmd, payload) = self.v2_read(&mut protocol, peer)?;
@@ -958,6 +986,35 @@ impl BlockSource for P2pSource {
         "p2p"
     }
 
+    fn requires_qualification(&self) -> bool {
+        true
+    }
+
+    fn probe_endpoints(&self) -> Vec<Endpoint> {
+        let Ok(peers) = self.peers.read() else {
+            return Vec::new();
+        };
+        let mut routes = Vec::new();
+        for peer in peers.iter() {
+            if self.tor_socks.is_some() {
+                routes.push(Endpoint {
+                    key: peer.addr.clone(),
+                    tier: 0,
+                    via_tor: true,
+                });
+            }
+            if (self.tor_socks.is_none() || self.fallback_clearnet) && !peer.addr.contains(".onion")
+            {
+                routes.push(Endpoint {
+                    key: peer.addr.clone(),
+                    tier: u8::from(self.tor_socks.is_some()),
+                    via_tor: false,
+                });
+            }
+        }
+        routes
+    }
+
     fn fetch_block(&self, hash: &Hash32) -> Result<Vec<u8>> {
         self.fetch_block_until(
             hash,
@@ -987,10 +1044,15 @@ impl BlockSource for P2pSource {
         mode: FetchMode,
         ctl: &AttemptCtl,
     ) -> Result<Vec<u8>> {
-        if self.tor_socks.is_some() && self.proxy_down() && !self.fallback_clearnet {
-            return Err(RawtxError::Unavailable(
-                "tor proxy unavailable; clearnet fallback disabled".into(),
-            ));
+        let fixed = ctl.0.fixed_transport;
+        let via_tor = fixed.unwrap_or_else(|| self.via_tor());
+        if self.proxy_down()
+            && (fixed == Some(true) || (fixed.is_none() && !self.fallback_clearnet))
+        {
+            return Err(RawtxError::Unavailable(format!(
+                "tor proxy unavailable: {}",
+                crate::LOCAL_BUSY
+            )));
         }
         let hint = self
             .peers
@@ -998,25 +1060,35 @@ impl BlockSource for P2pSource {
             .ok()
             .and_then(|p| p.iter().find(|h| h.addr == endpoint.key).cloned())
             .unwrap_or_else(|| PeerHint::from(endpoint.key.clone()));
-        let call_deadline = deadline.min(Instant::now() + self.per_attempt().saturating_mul(2));
-        if call_deadline.saturating_duration_since(Instant::now()) < self.min_attempt() {
+        let attempt = self.transport_budget(via_tor);
+        let call_deadline = deadline.min(Instant::now() + attempt.saturating_mul(2));
+        if call_deadline.saturating_duration_since(Instant::now()) < crate::MIN_ATTEMPT.min(attempt)
+        {
             return Err(RawtxError::Unavailable("p2p deadline reached".into()));
         }
         // At most N blocks in flight with one peer (rawtx.p2p_blocks_per_peer):
         // a peer that is slow keeps its slots but does not open circuits for
         // every queued block at once.
         let slot = self.peer_slot(&endpoint.key);
-        let Some(_permit) = slot.acquire_until(call_deadline, 0) else {
-            return Err(RawtxError::Unavailable(
-                "p2p peer in-flight limit reached".into(),
-            ));
+        let permit = if fixed.is_some() {
+            slot.try_acquire(0)
+        } else {
+            slot.acquire_until(call_deadline, 0)
+        };
+        let Some(_permit) = permit else {
+            return Err(RawtxError::Unavailable(format!(
+                "p2p peer in-flight limit reached: {}",
+                crate::LOCAL_BUSY
+            )));
         };
         self.bump(|stats| {
             stats.p2p_attempts.fetch_add(1, Ordering::Relaxed);
         });
         match self.fetch_from(&hint, hash, call_deadline, ctl) {
             Ok(bytes) => {
-                self.record_success(&hint.addr);
+                if mode == FetchMode::Normal && fixed.is_none() && !ctl.aborted() {
+                    self.record_success(&hint.addr);
+                }
                 Ok(bytes)
             }
             Err(f) => {

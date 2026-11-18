@@ -25,6 +25,9 @@ pub trait TxSource: Send + Sync {
     fn all_servers(&self) -> Vec<String>;
     /// Whether the server is reached through Tor.
     fn via_tor(&self, server: &str) -> bool;
+    fn requires_qualification(&self) -> bool {
+        false
+    }
     /// Electrum batches many txids on one stream. Esplora needs one isolated
     /// connection per transaction and is scheduled accordingly.
     fn max_batch_size(&self) -> usize {
@@ -133,10 +136,16 @@ impl EsploraTxSource {
         })?;
         ctl.mark_connected();
         let status = resp.status();
+        if status == reqwest::StatusCode::NOT_FOUND {
+            ctl.ignore_failure_for_health();
+            return Err(Blame::Transient);
+        }
         if status == reqwest::StatusCode::TOO_MANY_REQUESTS
             || status == reqwest::StatusCode::SERVICE_UNAVAILABLE
         {
-            return Err(Blame::RateLimited(None));
+            let after = crate::esplora::retry_after(resp.headers());
+            ctl.mark_rate_limit(after);
+            return Err(Blame::RateLimited(after));
         }
         if status.is_server_error() {
             return Err(Blame::Transient);
@@ -160,6 +169,9 @@ impl EsploraTxSource {
 }
 
 impl TxSource for EsploraTxSource {
+    fn requires_qualification(&self) -> bool {
+        true
+    }
     fn name(&self) -> &str {
         "esplora-tx"
     }

@@ -151,14 +151,18 @@ impl ElectrumTxSource {
         &self,
         s: &ElectrumServer,
         deadline: Instant,
+        ctl: &AttemptCtl,
     ) -> std::result::Result<TcpStream, Blame> {
         let addr = format!("{}:{}", s.host, s.port);
         let factor = if s.is_onion() { 2 } else { 1 };
         let limit = self.connect * factor;
         match &self.tor_proxy {
-            Some(proxy) => {
-                socks_connect_until(proxy, &addr, limit, deadline).map_err(|_| Blame::Unreachable)
-            }
+            Some(proxy) => socks_connect_until(proxy, &addr, limit, deadline).map_err(|err| {
+                if matches!(err, crate::socks::SocksError::Proxy(_)) {
+                    ctl.mark_local_failure();
+                }
+                Blame::Unreachable
+            }),
             None if self.allow_clearnet => {
                 let addrs: Vec<_> = addr
                     .to_socket_addrs()
@@ -188,7 +192,7 @@ impl ElectrumTxSource {
         deadline: Instant,
         ctl: &AttemptCtl,
     ) -> std::result::Result<TxBatch, Blame> {
-        let tcp = self.connect_tcp(s, deadline)?;
+        let tcp = self.connect_tcp(s, deadline, ctl)?;
         ctl.mark_connected();
         let stall = self.stall * if s.is_onion() { 2 } else { 1 };
         let left = deadline.saturating_duration_since(Instant::now());
@@ -317,6 +321,9 @@ fn read_json<R: BufRead>(
 }
 
 impl TxSource for ElectrumTxSource {
+    fn requires_qualification(&self) -> bool {
+        true
+    }
     fn name(&self) -> &str {
         "electrum"
     }

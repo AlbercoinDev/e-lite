@@ -222,6 +222,7 @@ impl Shared {
         let (index_bytes, txids_bytes, cache_bytes, log_bytes, snapshot_bytes) =
             self.disk_breakdown();
         let rawtx = self.resolver.stats();
+        let qualification = self.resolver.provider_qualification();
         let id = self.identity();
         let mem = self.mempool.read();
         let mem_count = mem.as_ref().map(|m| m.len()).unwrap_or(0);
@@ -503,11 +504,25 @@ impl Shared {
                 "tx_get_failures": self.stats.tx_get_failures.to_json(),
                 "external_sources": self.resolver.external_sources(),
                 "tor_governor": tor_governor,
+                "qualification": {
+                    "ready": qualification.ready,
+                    "txid_ready": qualification.txid_ready,
+                    "blocks_ready": qualification.blocks_ready,
+                    "probes": qualification.probes,
+                    "probe_passes": qualification.probe_passes,
+                    "probe_slow": qualification.probe_slow,
+                    "probe_failures": qualification.probe_failures,
+                    "probe_streams": qualification.probe_streams,
+                    "skipped": qualification.skipped,
+                    "paused": qualification.paused,
+                    "failed_streams": qualification.failed_streams,
+                },
                 "p2p_attempts": rawtx.p2p_attempts.load(Ordering::Relaxed),
                 "p2p_failures": rawtx.p2p_failures.load(Ordering::Relaxed),
                 "p2p_skipped": rawtx.p2p_skipped.load(Ordering::Relaxed),
                 "p2p_tor_failures": rawtx.p2p_tor_failures.load(Ordering::Relaxed),
                 "tx_mode": {
+                    "items_by_operator": self.resolver.tx_operator_counts(),
                     "active": self.resolver.tx_mode_servers().is_some(),
                     "servers": self.resolver.tx_mode_servers().unwrap_or(0),
                     "preset": self.resolver.privacy().preset,

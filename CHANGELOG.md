@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.1.0-alpha.29.26.2 — 2026-11-19
+
+- Historical wallet requests now require a recent, valid and fast public
+  probe per endpoint, transport and operation. Probes use the same Tor stream
+  cap; no wallet request is used as a probe. Queued txid batches avoid routes
+  that fail qualification before opening a stream.
+- A route that repeatedly times out or is slow pauses and is only readmitted
+  after another successful probe. The block fallback has its own independent
+  qualification. Txid work waits for enough distinct operators instead of
+  weakening the configured spread when few routes qualify.
+- `/status.rawtx.qualification` reports the result and cost of probing;
+  `/status.rawtx.tx_mode.items_by_operator` reports the aggregate traffic split.
+- No index or cache format change. Existing settings and data are retained.
+  Real mainnet/Sparrow cold-load comparison remains to be measured.
+
 ## 0.1.0-alpha.29.26.1 — 2026-11-18
 
 ### Fixed

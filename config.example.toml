@@ -203,6 +203,10 @@ max_parallel_fetches = 16           # external block downloads in flight (the pr
                                     # flight (hedges included) are capped at twice
                                     # this, at most 24 (Tor allows 32 pending circuits)
 # How a pruned transaction is resolved:
+# External wallet routes are checked in the background with public archive
+# data before use. Txid probes must be valid and finish in 2.5 s. Whole-block
+# routes have separate checks. An unqualified route cannot receive wallet
+# queries; insufficient qualified operators selects the whole-block fallback.
 #   auto  = loose transaction first, then start/join the whole-block fallback (default)
 #   tx    = same txid-first path without the optional earlier race
 #   block = whole blocks only, including history prefetch; no txid leaves the node

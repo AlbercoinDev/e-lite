@@ -127,6 +127,12 @@ Notes:
 - A session queued locally does not charge a provider attempt. Unsent cover
   can stay queued while capacity is unavailable, within its bounded lifetime;
   saturation or a disappearing provider can still reduce effective cover.
+- Wallet traffic is sent only to routes that recently passed a fast, public
+  probe of the same operation. Eligibility is per route and transport;
+  the spread is by operator (including known aliases). If too few operators
+  are eligible, use qualified whole-block routes rather than reveal more of
+  the wallet to a smaller set. Public probes do not use wallet txids or
+  change the decoy selection.
 - A ready batch and a queued whole-block download take turns at a freed Tor
   stream (AUD-201): a block backlog cannot hold the cheap path, and a stream
   of batches cannot hold the fallback. Both still fit in `rawtx.tor_streams`;

@@ -121,7 +121,7 @@ fn describe_io(e: &std::io::Error) -> String {
 }
 
 /// `Retry-After` in seconds (the HTTP-date form is ignored).
-fn retry_after(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
+pub(crate) fn retry_after(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
     headers
         .get(reqwest::header::RETRY_AFTER)?
         .to_str()
@@ -266,6 +266,7 @@ impl EsploraSource {
             || status == reqwest::StatusCode::SERVICE_UNAVAILABLE
         {
             let wait = retry_after(resp.headers());
+            ctl.mark_rate_limit(wait);
             return Err((
                 unavailable(format!("HTTP {status}")),
                 Blame::RateLimited(wait),
@@ -357,17 +358,19 @@ impl EsploraSource {
     /// Endpoints usable now: each provider through Tor (tier 0) and, when
     /// clearnet is allowed, directly (tier 0 without Tor, tier 1 with it, so
     /// Tor is always tried first).
-    fn usable_endpoints(&self) -> Vec<Endpoint> {
+    fn available_endpoints(&self, ignore_cooldown: bool) -> Vec<Endpoint> {
         let mut out = Vec::new();
         for base in &self.bases {
-            if self.tor_proxy.is_some() && !self.tor_health.cooling(base) {
+            if self.tor_proxy.is_some() && (ignore_cooldown || !self.tor_health.cooling(base)) {
                 out.push(Endpoint {
                     key: format!("tor {base}"),
                     tier: 0,
                     via_tor: true,
                 });
             }
-            if !is_onion(base) && self.direct_client.is_some() && !self.direct_health.cooling(base)
+            if !is_onion(base)
+                && self.direct_client.is_some()
+                && (ignore_cooldown || !self.direct_health.cooling(base))
             {
                 out.push(Endpoint {
                     key: format!("direct {base}"),
@@ -377,6 +380,10 @@ impl EsploraSource {
             }
         }
         out
+    }
+
+    fn usable_endpoints(&self) -> Vec<Endpoint> {
+        self.available_endpoints(false)
     }
 
     fn attemptable(&self, base: &str) -> bool {
@@ -421,6 +428,13 @@ fn is_onion(base: &str) -> bool {
 }
 
 impl BlockSource for EsploraSource {
+    fn requires_qualification(&self) -> bool {
+        true
+    }
+
+    fn probe_endpoints(&self) -> Vec<Endpoint> {
+        self.available_endpoints(true)
+    }
     fn name(&self) -> &str {
         "esplora"
     }
@@ -461,9 +475,11 @@ impl BlockSource for EsploraSource {
             })?;
             return match Self::fetch_with(&client, base, hash, attempt, ctl) {
                 Ok(bytes) => {
-                    self.tor_health.succeed(base);
-                    if let Some(governor) = &self.governor {
-                        governor.healthy();
+                    if !quiet && !ctl.aborted() {
+                        self.tor_health.succeed(base);
+                        if let Some(governor) = &self.governor {
+                            governor.healthy();
+                        }
                     }
                     Ok(bytes)
                 }
@@ -492,7 +508,9 @@ impl BlockSource for EsploraSource {
                 Ok(bytes) => {
                     // A clearnet success says nothing about Tor: it does not
                     // lift a Tor pause.
-                    self.direct_health.succeed(base);
+                    if !quiet && !ctl.aborted() {
+                        self.direct_health.succeed(base);
+                    }
                     if via_fallback && !self.fallback_warned.swap(true, Ordering::Relaxed) {
                         eprintln!(
                             "[e-lite] WARNING: Tor request failed; using clearnet for {base} (operator IP exposed)"

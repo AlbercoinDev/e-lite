@@ -4,6 +4,7 @@
 
 use super::*;
 use crate::governor::Availability;
+use crate::qualification::{block_fast, Route, Sample};
 use std::sync::atomic::AtomicUsize;
 
 /// When the leader of a block download gives up if it never gets a slot:
@@ -121,6 +122,7 @@ impl Resolver {
         priority: Priority,
         request_deadline: Option<Instant>,
     ) -> Result<Option<BlockLease>> {
+        self.start_provider_probes();
         let mut map = self.inflight.lock().unwrap_or_else(|p| p.into_inner());
         if let Some(job) = map.get(&rec.hash) {
             if job.join() {
@@ -139,10 +141,16 @@ impl Resolver {
             return Ok(Some(self.block_lease(job)));
         }
         if self.sources().is_empty() {
+            if self.p2p.is_some() && priority == Priority::Wallet {
+                return Ok(None); // discovery may still publish a peer
+            }
             self.stats.unavailable.fetch_add(1, Ordering::Relaxed);
             return Err(RawtxError::NoSource(
                 "no external source configured (or Tor is required and unavailable)".into(),
             ));
+        }
+        if self.block_endpoints(FetchMode::Quiet).is_empty() {
+            return Ok(None); // a probe will wake wallet waiters; no slot used
         }
         if let Some(e) = self.recent_failure(&rec.hash) {
             return Err(e);
@@ -194,7 +202,7 @@ impl Resolver {
             {
                 self.remember_failure(&rec.hash, e);
             }
-            if job.wanted() && job.wallet_waiting.load(Ordering::Acquire) {
+            if job.wanted() && job.wallet_waiting.load(Ordering::Acquire) && !is_queue_timeout(e) {
                 let height = rec.height;
                 eprintln!(
                     "[e-lite] rawtx at height {height} failed ({}); sources: {}",
@@ -215,6 +223,28 @@ impl Resolver {
         }
         drop(permit);
         self.recovery_event.notify();
+    }
+
+    fn block_endpoints(&self, mode: FetchMode) -> Vec<(Arc<dyn BlockSource>, Endpoint)> {
+        let mut plan = Vec::new();
+        for source in self.sources() {
+            let endpoints = if source.requires_qualification() {
+                source.probe_endpoints()
+            } else {
+                source.endpoints(mode)
+            };
+            for endpoint in endpoints {
+                if !source.requires_qualification()
+                    || self
+                        .qualification
+                        .admit(&Route::block(source.as_ref(), &endpoint))
+                        .is_some()
+                {
+                    plan.push((Arc::clone(&source), endpoint));
+                }
+            }
+        }
+        plan
     }
 
     /// Race the endpoints of every external source for one block (AUD-160).
@@ -242,20 +272,15 @@ impl Resolver {
         // with wallet > prefetch > decoy priority, so a cold burst waits for
         // a stream instead of saturating Tor (29.25.2: one permit per
         // attempt, not per block).
-        let mut plan: Vec<(Arc<dyn BlockSource>, Endpoint)> = Vec::new();
-        for source in self.sources() {
-            for endpoint in source.endpoints(FetchMode::Normal) {
-                plan.push((Arc::clone(&source), endpoint));
-            }
-        }
+        let mut plan = self.block_endpoints(FetchMode::Normal);
         plan.shuffle(&mut thread_rng());
         // Stable: random order inside each tier, primaries first.
         plan.sort_by_key(|(_, endpoint)| endpoint.tier);
         if plan.is_empty() {
             self.stats.unavailable.fetch_add(1, Ordering::Relaxed);
-            return Err(RawtxError::Unavailable(
-                "every external endpoint is cooling down".into(),
-            ));
+            return Err(RawtxError::Unavailable(format!(
+                "no qualified block route: {LOCAL_BUSY}"
+            )));
         }
         // The first stream is the queue: it is waited for with what the
         // request leaves after the network budget.
@@ -344,12 +369,12 @@ impl Resolver {
         let race_started = Instant::now();
         let mut exhausted_since: Option<Instant> = None;
         // Attempts started per endpoint in this race.
-        let mut tried: HashMap<String, u32> = HashMap::new();
+        let mut tried: HashMap<Route, u32> = HashMap::new();
         let mut running: HashMap<usize, Running> = HashMap::new();
         let mut errors: Vec<String> = Vec::new();
         let mut next = 0usize;
         let mut plan = plan;
-        let mut retried: HashMap<String, u32> = HashMap::new();
+        let mut retried: HashMap<Route, u32> = HashMap::new();
 
         let finish = |running: &mut HashMap<usize, Running>| {
             for r in running.values() {
@@ -381,6 +406,17 @@ impl Resolver {
             };
             let attempts: u32 = tried.values().sum();
             if want_more && next < plan.len() && (attempts as usize) < MAX_RACE_ATTEMPTS {
+                let (source, endpoint) = &plan[next];
+                if source.requires_qualification()
+                    && self
+                        .qualification
+                        .admit(&Route::block(source.as_ref(), endpoint))
+                        .is_none()
+                {
+                    self.qualification.skipped();
+                    next += 1;
+                    continue;
+                }
                 let fallback = plan[next].1.tier > 0;
                 // The fallback tier waits for every primary to be done
                 // (none running, none queued after it).
@@ -434,13 +470,15 @@ impl Resolver {
                             // queues behind them.
                             let keep_free = usize::from(!wallet);
                             if let Some(permit) = self.external_attempts.try_acquire(keep_free) {
-                                self.stats.race_attempts.fetch_add(1, Ordering::Relaxed);
-                                if !running.is_empty() {
-                                    self.stats.race_hedges.fetch_add(1, Ordering::Relaxed);
-                                }
                                 let (source, endpoint) = plan[next].clone();
-                                *tried.entry(endpoint.key.clone()).or_insert(0) += 1;
-                                let ctl = AttemptCtl::new();
+                                *tried
+                                    .entry(Route::block(source.as_ref(), &endpoint))
+                                    .or_insert(0) += 1;
+                                let ctl = if source.requires_qualification() {
+                                    AttemptCtl::for_endpoint(&endpoint)
+                                } else {
+                                    AttemptCtl::new()
+                                };
                                 running.insert(
                                     next,
                                     Running {
@@ -507,14 +545,17 @@ impl Resolver {
                     }
                 }
                 let mut fresh: Vec<(Arc<dyn BlockSource>, Endpoint)> = Vec::new();
-                for source in self.sources() {
-                    for endpoint in source.endpoints(FetchMode::Quiet) {
-                        let tries = tried.get(&endpoint.key).copied().unwrap_or(0);
-                        let allowed =
-                            tries == 0 || (endpoint.via_tor && tries <= TOR_RETRIES_PER_ENDPOINT);
-                        if allowed && !fresh.iter().any(|(_, e)| e.key == endpoint.key) {
-                            fresh.push((Arc::clone(&source), endpoint));
-                        }
+                for (source, endpoint) in self.block_endpoints(FetchMode::Quiet) {
+                    let route = Route::block(source.as_ref(), &endpoint);
+                    let tries = tried.get(&route).copied().unwrap_or(0);
+                    let allowed =
+                        tries == 0 || (endpoint.via_tor && tries <= TOR_RETRIES_PER_ENDPOINT);
+                    if allowed
+                        && !fresh
+                            .iter()
+                            .any(|(s, e)| Route::block(s.as_ref(), e) == route)
+                    {
+                        fresh.push((source, endpoint));
                     }
                 }
                 if !fresh.is_empty() {
@@ -554,6 +595,13 @@ impl Resolver {
                 Ok((idx, Err(e))) => {
                     if let Some(ended) = running.remove(&idx) {
                         let (source, endpoint) = plan[idx].clone();
+                        if is_queue_timeout(&e) {
+                            let route = Route::block(source.as_ref(), &endpoint);
+                            if let Some(count) = tried.get_mut(&route) {
+                                *count = count.saturating_sub(1);
+                            }
+                            continue;
+                        }
                         errors.push(format!("{}: {e}", source.name()));
                         // Over Tor the next attempt is a new circuit (new exit):
                         // after a failure a new circuit may fix, the endpoint
@@ -561,7 +609,9 @@ impl Resolver {
                         // queue. The attempt says so itself: by now the
                         // endpoint is cooling down and no longer listed, so
                         // asking the source would always say no.
-                        let tries = retried.entry(endpoint.key.clone()).or_insert(0);
+                        let tries = retried
+                            .entry(Route::block(source.as_ref(), &endpoint))
+                            .or_insert(0);
                         if endpoint.via_tor
                             && *tries < TOR_RETRIES_PER_ENDPOINT
                             && ended.ctl.wants_retry()
@@ -580,7 +630,7 @@ impl Resolver {
             }
         }
         Err(RawtxError::Unavailable(if errors.is_empty() {
-            "no external attempt could be made".to_string()
+            format!("no external attempt could be made: {LOCAL_BUSY}")
         } else {
             errors.join("; ")
         }))
@@ -600,6 +650,7 @@ impl Resolver {
         log: AttemptLog,
     ) {
         let stats = Arc::clone(&self.stats);
+        let qualification = Arc::clone(&self.qualification);
         let event = Arc::clone(&self.recovery_event);
         let failed = tx.clone();
         let spawned = std::thread::Builder::new()
@@ -613,16 +664,39 @@ impl Resolver {
                     permit,
                 } = log;
                 let hash = rec.hash;
+                let route = Route::block(source.as_ref(), &endpoint);
+                let generation = if source.requires_qualification() {
+                    let Some(generation) = qualification.admit(&route) else {
+                        qualification.skipped();
+                        drop((stream, permit));
+                        let _ = tx.send((idx, Err(RawtxError::Unavailable(LOCAL_BUSY.into()))));
+                        event.notify();
+                        return;
+                    };
+                    Some(generation)
+                } else {
+                    None
+                };
                 let started = Instant::now();
+                stats.race_attempts.fetch_add(1, Ordering::Relaxed);
+                if role == "hedge" {
+                    stats.race_hedges.fetch_add(1, Ordering::Relaxed);
+                }
                 let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
-                    let mode = if lane == Lane::Wallet { FetchMode::Normal } else { FetchMode::Quiet };
+                    let mode = if lane == Lane::Wallet && generation.is_none() {
+                        FetchMode::Normal
+                    } else {
+                        FetchMode::Quiet
+                    };
                     source.fetch_endpoint(&endpoint, &hash, deadline, mode, &ctl)
                 }))
                 .unwrap_or_else(|_| Err(RawtxError::Unavailable("attempt panicked".into())));
                 // The connection is gone once the source returns: only now is
                 // the Tor stream given back, also for an aborted loser that
                 // took a while to notice (29.25.2).
+                ctl.close_sockets();
                 drop(stream);
+                let finished = Instant::now();
                 if debug_logs() {
                     eprintln!(
                         "[e-lite] debug: stream block obj={} src={} ep={} lane={} {role} wait {} ms, {} ms, {} KiB: {}",
@@ -654,6 +728,28 @@ impl Resolver {
                         }
                     }
                 });
+                if let Some(generation) = generation {
+                    if !ctl.aborted() && !ctl.non_health_failure() {
+                        let sample = match &result {
+                            Ok(_) if block_fast(&ctl, started, finished, endpoint.via_tor) => Some(Sample::Fast),
+                            Ok(_) => Some(Sample::Slow),
+                            Err(RawtxError::Verify(_)) => Some(Sample::Invalid),
+                            Err(_) if ctl.retry_after().is_some() => {
+                                ctl.retry_after().map(Sample::RateLimited)
+                            }
+                            Err(e) if !is_queue_timeout(e)
+                                && deadline.saturating_duration_since(started) >= if endpoint.via_tor {
+                                    HEDGE_FIRST_BYTE_TOR
+                                } else {
+                                    HEDGE_FIRST_BYTE_DIRECT
+                                } => Some(Sample::Failed),
+                            _ => None,
+                        };
+                        if let Some(sample) = sample {
+                            qualification.observe(&route, generation, sample);
+                        }
+                    }
+                }
                 drop(permit);
                 event.notify();
                 let _ = tx.send((idx, result));
@@ -732,6 +828,7 @@ fn is_queue_timeout(e: &RawtxError) -> bool {
         e,
         RawtxError::Unavailable(m)
             if m.contains("download slot stayed busy") || m.contains("attempt slot stayed busy")
+                || m.contains(LOCAL_BUSY)
     )
 }
 

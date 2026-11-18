@@ -8,7 +8,7 @@ Rules for agents and maintainers are in [`../AGENTS.md`](../AGENTS.md).
 2. [`FEATURES.md`](FEATURES.md) — what exists today.
 3. [`ROADMAP.md`](ROADMAP.md) — future features and proposed improvements.
 4. [`AUDIT.md`](AUDIT.md) — open findings and residual risks.
-   [`audit/FIXED.md`](audit/FIXED.md) — fixed findings (AUD-001..201, except the ones open in AUDIT).
+   [`audit/FIXED.md`](audit/FIXED.md) — fixed findings (AUD-001..202, except the ones open in AUDIT).
 5. [`../CHANGELOG.md`](../CHANGELOG.md) — every release.
 
 ## Using e-lite

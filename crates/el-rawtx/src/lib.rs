@@ -15,6 +15,7 @@ pub mod governor;
 pub(crate) mod health;
 pub mod p2p;
 pub mod privacy;
+mod qualification;
 mod race;
 mod socks;
 pub mod txbatch;
@@ -143,6 +144,7 @@ pub use esplora::{isolated_tor_client, EsploraSource};
 pub use governor::{Demand, GovernorPermit, Lane, TorGovernor};
 pub use p2p::{P2pSource, PeerHint};
 pub use privacy::{ExternalMode, PrivacyParams};
+pub use qualification::QualificationSnapshot;
 pub use txsource::{EsploraTxSource, TxBatch, TxSource};
 pub use verify::{extract_tx, verify_block, verify_block_by_hash, verify_witness_commitment};
 
@@ -343,6 +345,11 @@ struct CtlInner {
     /// Txids a session never asked for (no stream was free for them).
     skipped: Mutex<Vec<Hash32>>,
     quiet: AtomicBool,
+    non_health_failure: AtomicBool,
+    local_failure: AtomicBool,
+    retry_after_ms: AtomicU64,
+    first_byte: Mutex<Option<Instant>>,
+    fixed_transport: Option<bool>,
 }
 
 struct StreamBudget {
@@ -384,6 +391,37 @@ impl AttemptCtl {
         !self.aborted() && !self.0.quiet.load(Ordering::Relaxed)
     }
 
+    fn ignore_failure_for_health(&self) {
+        self.0.non_health_failure.store(true, Ordering::Relaxed);
+    }
+
+    fn non_health_failure(&self) -> bool {
+        self.0.non_health_failure.load(Ordering::Relaxed)
+    }
+
+    fn mark_local_failure(&self) {
+        self.0.local_failure.store(true, Ordering::Relaxed);
+        self.ignore_failure_for_health();
+    }
+
+    fn local_failure(&self) -> bool {
+        self.0.local_failure.load(Ordering::Relaxed)
+    }
+
+    fn mark_rate_limit(&self, after: Option<Duration>) {
+        let after = after
+            .unwrap_or(health::LIMITED_BASE)
+            .clamp(health::LIMITED_BASE, health::LIMITED_CAP);
+        self.0
+            .retry_after_ms
+            .store(after.as_millis() as u64, Ordering::Relaxed);
+    }
+
+    fn retry_after(&self) -> Option<Duration> {
+        let ms = self.0.retry_after_ms.load(Ordering::Relaxed);
+        (ms > 0).then(|| Duration::from_millis(ms))
+    }
+
     pub fn abort(&self) {
         self.0.aborted.store(true, Ordering::Relaxed);
         if let Ok(sockets) = self.0.sockets.lock() {
@@ -405,7 +443,36 @@ impl AttemptCtl {
     }
 
     pub fn add_bytes(&self, n: usize) {
+        if n > 0 && self.0.bytes.load(Ordering::Relaxed) == 0 {
+            if let Ok(mut first) = self.0.first_byte.lock() {
+                first.get_or_insert_with(Instant::now);
+            }
+        }
         self.0.bytes.fetch_add(n as u64, Ordering::Relaxed);
+    }
+
+    pub(crate) fn first_byte(&self) -> Option<Instant> {
+        self.0.first_byte.lock().ok().and_then(|first| *first)
+    }
+
+    fn reset_progress(&self) {
+        self.0.bytes.store(0, Ordering::Relaxed);
+        if let Ok(mut first) = self.0.first_byte.lock() {
+            *first = None;
+        }
+    }
+
+    fn for_endpoint(endpoint: &Endpoint) -> Self {
+        Self(Arc::new(CtlInner {
+            fixed_transport: Some(endpoint.via_tor),
+            ..CtlInner::default()
+        }))
+    }
+
+    fn close_sockets(&self) {
+        if let Ok(mut sockets) = self.0.sockets.lock() {
+            sockets.clear();
+        }
     }
 
     pub fn bytes(&self) -> u64 {
@@ -524,6 +591,15 @@ pub trait BlockSource: Send + Sync {
     fn endpoints(&self, mode: FetchMode) -> Vec<Endpoint> {
         let _ = mode;
         vec![Endpoint::whole()]
+    }
+    /// Routes for a public probe, including temporarily unhealthy ones. The
+    /// in-process adapters used in tests/custom embeddings are trusted by
+    /// default; all concrete external sources opt into qualification.
+    fn probe_endpoints(&self) -> Vec<Endpoint> {
+        Vec::new()
+    }
+    fn requires_qualification(&self) -> bool {
+        false
     }
     /// One attempt on one endpoint returned by `endpoints`. It updates the
     /// endpoint's health itself (never after `ctl` was aborted) and reports
@@ -951,6 +1027,8 @@ impl std::ops::Deref for Resolver {
 /// Shared ownership lets a whole-block job outlive its initiating request.
 #[doc(hidden)]
 pub struct ResolverState {
+    provider_worker: std::sync::OnceLock<Option<qualification::Worker>>,
+    qualification: Arc<qualification::Qualification>,
     store: Arc<Store>,
     /// Local source, tried first and never cached.
     local: Option<Arc<dyn BlockSource>>,
@@ -1020,6 +1098,7 @@ impl Resolver {
         let governor = TorGovernor::new(cfg.tor_streams);
         let recovery_event = Arc::new(governor::Availability::default());
         governor.watch(&recovery_event);
+        let qualification = qualification::Qualification::new(Arc::clone(&recovery_event));
         let prune_height = Arc::new(std::sync::atomic::AtomicU32::new(0));
 
         if cfg.enabled {
@@ -1105,6 +1184,7 @@ impl Resolver {
                 Arc::clone(&governor),
                 Arc::clone(&prune_height),
                 Arc::clone(&recovery_event),
+                Arc::clone(&qualification),
             )
         } else {
             None
@@ -1112,6 +1192,8 @@ impl Resolver {
 
         Ok(Resolver {
             state: Arc::new(ResolverState {
+                provider_worker: std::sync::OnceLock::new(),
+                qualification,
                 store,
                 local: None,
                 external,
@@ -1162,6 +1244,7 @@ impl Resolver {
     /// bound the circuits Tor has to build.
     const MAX_TX_CONNECTIONS: usize = 8;
 
+    #[allow(clippy::too_many_arguments)]
     fn build_tx_mode(
         store: &Arc<Store>,
         cfg: &RawtxConfig,
@@ -1170,6 +1253,7 @@ impl Resolver {
         governor: Arc<TorGovernor>,
         prune_height: Arc<std::sync::atomic::AtomicU32>,
         event: Arc<governor::Availability>,
+        qualification: Arc<qualification::Qualification>,
     ) -> Option<txbatch::TxMode> {
         let tor = cfg.tor_socks.clone();
         if tor.is_none() && !cfg.allow_clearnet {
@@ -1233,6 +1317,7 @@ impl Resolver {
             governor,
             prune_height,
             event,
+            qualification,
         )
     }
 
@@ -1256,6 +1341,7 @@ impl Resolver {
             Arc::clone(&self.governor),
             Arc::clone(&self.prune_height),
             Arc::clone(&self.recovery_event),
+            Arc::clone(&self.qualification),
         );
         self.state_mut().tx_mode = mode;
         self
@@ -1287,6 +1373,38 @@ impl Resolver {
         self.tx_mode.as_ref().map(|t| t.servers())
     }
 
+    /// Called after the local and external sources have been configured.
+    /// Does not wait for the network or involve any wallet data.
+    pub fn start_provider_probes(&self) {
+        self.provider_worker.get_or_init(|| {
+            let mut blocks = self.external.clone();
+            if let Some(p2p) = &self.p2p {
+                blocks.push(Arc::clone(p2p) as Arc<dyn BlockSource>);
+            }
+            blocks.retain(|source| source.requires_qualification());
+            qualification::Worker::start(
+                Arc::clone(&self.qualification),
+                Arc::clone(&self.governor),
+                Arc::clone(&self.store),
+                self.chain,
+                self.tx_mode
+                    .as_ref()
+                    .map_or_else(Vec::new, |t| t.probe_sources()),
+                blocks,
+            )
+        });
+    }
+
+    pub fn provider_qualification(&self) -> QualificationSnapshot {
+        self.qualification.snapshot()
+    }
+
+    pub fn tx_operator_counts(&self) -> HashMap<String, u64> {
+        self.tx_mode
+            .as_ref()
+            .map_or_else(HashMap::new, txbatch::TxMode::provider_counts)
+    }
+
     pub fn uses_txid_recovery(&self) -> bool {
         self.tx_mode.is_some()
     }
@@ -1295,6 +1413,7 @@ impl Resolver {
     /// mode, fetch every transaction of it now (with the connection's decoy
     /// wallets), before the wallet asks. Returns how many were queued.
     pub fn want_history(&self, ctx: u64, script: el_model::ScriptHash, hist: &[TxRef]) -> usize {
+        self.start_provider_probes();
         match &self.tx_mode {
             Some(tm) => tm.want_history(ctx, script, hist),
             None => 0,
@@ -1355,7 +1474,11 @@ impl Resolver {
     /// Replace the P2P peer list (discovered from Core). Returns the new
     /// count, or `None` when P2P is disabled.
     pub fn refresh_p2p_peers(&self, peers: Vec<PeerHint>) -> Option<usize> {
-        self.p2p.as_ref().map(|p2p| p2p.set_peers(peers))
+        self.p2p.as_ref().map(|p2p| {
+            let count = p2p.set_peers(peers);
+            self.recovery_event.notify();
+            count
+        })
     }
 
     /// Current P2P peer count, `None` when P2P is disabled.
@@ -1836,6 +1959,7 @@ impl Resolver {
         let p2p = self.p2p.clone();
         let stats = Arc::clone(&self.stats);
         let governor = Arc::clone(&self.governor);
+        let qualification = Arc::clone(&self.qualification);
         self.decoy_lane.started.call_once(move || {
             let spawned = std::thread::Builder::new()
                 .name("el-decoys".to_string())
@@ -1870,32 +1994,70 @@ impl Resolver {
                             }
                             continue;
                         }
-                        // The decoy's stream comes from the same budget, in
-                        // the lowest lane: it never takes a stream a wallet
-                        // or a prefetch is waiting for (29.25.2; it used to
-                        // be outside the governor).
-                        let stream = loop {
-                            if let Some(stream) = governor
-                                .acquire(Lane::Decoy, Instant::now() + Duration::from_secs(1))
-                            {
-                                break stream;
+                        let mut routes = Vec::new();
+                        for source in &sources {
+                            let endpoints = if source.requires_qualification() {
+                                source.probe_endpoints()
+                            } else {
+                                source.endpoints(FetchMode::Quiet)
+                            };
+                            for endpoint in endpoints {
+                                if !source.requires_qualification()
+                                    || qualification
+                                        .admit(&qualification::Route::block(
+                                            source.as_ref(),
+                                            &endpoint,
+                                        ))
+                                        .is_some()
+                                {
+                                    routes.push((source, endpoint));
+                                }
                             }
-                            if !lane.pause(Duration::ZERO) {
+                        }
+                        if routes.is_empty() && !sources.is_empty() {
+                            if !lane.pause(Duration::from_secs(1)) {
                                 return;
                             }
-                        };
-                        sources.shuffle(&mut thread_rng());
+                            continue;
+                        }
+                        routes.shuffle(&mut thread_rng());
+                        routes.sort_by_key(|(_, endpoint)| endpoint.tier);
                         let deadline = Instant::now() + EXTERNAL_BUDGET;
-                        for source in &sources {
-                            if source
-                                .fetch_block_until(&hash, deadline, FetchMode::Quiet)
-                                .is_ok()
+                        for (source, endpoint) in routes {
+                            let stream = endpoint
+                                .via_tor
+                                .then(|| {
+                                    governor.acquire(
+                                        Lane::Decoy,
+                                        deadline.min(Instant::now() + Duration::from_secs(1)),
+                                    )
+                                })
+                                .flatten();
+                            if endpoint.via_tor && stream.is_none() {
+                                continue;
+                            }
+                            if source.requires_qualification()
+                                && qualification
+                                    .admit(&qualification::Route::block(source.as_ref(), &endpoint))
+                                    .is_none()
                             {
+                                continue;
+                            }
+                            let ctl = AttemptCtl::for_endpoint(&endpoint).with_health(false);
+                            let result = source.fetch_endpoint(
+                                &endpoint,
+                                &hash,
+                                deadline,
+                                FetchMode::Quiet,
+                                &ctl,
+                            );
+                            ctl.close_sockets();
+                            drop(stream);
+                            if result.is_ok() {
                                 stats.decoys.fetch_add(1, Ordering::Relaxed);
                                 break;
                             }
                         }
-                        drop(stream);
                         lane.done();
                     }
                 });

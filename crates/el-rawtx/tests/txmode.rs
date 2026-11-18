@@ -352,6 +352,260 @@ fn load(r: &Resolver, c: &Chain, ctx: u64) -> Vec<String> {
         .collect()
 }
 
+struct CheckedSource {
+    raw: HashMap<Hash32, Vec<u8>>,
+    probe: Vec<Hash32>,
+    slow: String,
+    onion: String,
+    calls: Mutex<Vec<(String, bool)>>,
+    qualified_then_fails: bool,
+}
+
+impl TxSource for CheckedSource {
+    fn name(&self) -> &str {
+        "test-archive"
+    }
+    fn servers(&self) -> Vec<String> {
+        self.all_servers()
+    }
+    fn all_servers(&self) -> Vec<String> {
+        let mut routes = vec![
+            self.slow.clone(),
+            self.onion.clone(),
+            "other.example:50002:s".into(),
+        ];
+        if self.qualified_then_fails {
+            routes.push("backup.example.org:50002:s".into());
+        }
+        routes
+    }
+    fn via_tor(&self, _: &str) -> bool {
+        true
+    }
+    fn requires_qualification(&self) -> bool {
+        true
+    }
+    fn fetch_from(
+        &self,
+        server: &str,
+        ids: &[Hash32],
+        _: Instant,
+        ctl: &AttemptCtl,
+    ) -> Result<TxBatch> {
+        let is_probe = ids == self.probe;
+        self.calls.lock().unwrap().push((server.into(), is_probe));
+        let _stream = ctl
+            .take_stream(None)
+            .unwrap()
+            .expect("probe and wallet share the governor");
+        if server == self.slow && (!is_probe || !self.qualified_then_fails) {
+            return Err(RawtxError::Unavailable("simulated HTTP timeout".into()));
+        }
+        if self.qualified_then_fails && is_probe && server != self.slow {
+            std::thread::sleep(Duration::from_millis(30));
+        }
+        Ok(ids
+            .iter()
+            .filter_map(|id| self.raw.get(id).map(|raw| (*id, raw.clone())))
+            .collect())
+    }
+    fn penalize(&self, _: &str) {}
+}
+
+#[test]
+fn wallet_never_uses_the_unqualified_https_route_and_tor_budget_is_shared() {
+    let c = chain("provider-gate");
+    let probe = c
+        .store
+        .block_txids(&c.store.get_block(1).unwrap().unwrap())
+        .unwrap()[..4]
+        .to_vec();
+    let source = Arc::new(CheckedSource {
+        raw: c.raw.clone(),
+        probe,
+        slow: "https://mempool.space/api".into(),
+        onion: "http://mempoolhqx4isw62xs7abwphsq7ldayuidyx2v2oethdhhj6mlo2r6ad.onion/api".into(),
+        calls: Mutex::new(Vec::new()),
+        qualified_then_fails: false,
+    });
+    let r = Resolver::new(
+        Arc::clone(&c.store),
+        &config(PrivacyParams {
+            min_servers: 2,
+            max_share: 0.5,
+            ..PrivacyParams::balanced()
+        }),
+    )
+    .unwrap()
+    .with_tx_sources(vec![Arc::clone(&source) as Arc<dyn TxSource>], [19; 32]);
+    r.set_prune_height(u32::MAX);
+    let tx = c.real.1[3];
+    let raw = r.raw_tx_for(1, tx.txid, tx.height).unwrap();
+    assert_eq!(raw, hex::encode(&c.raw[&tx.txid]));
+    let calls = source.calls.lock().unwrap();
+    for (index, (route, probe)) in calls.iter().enumerate() {
+        if !probe {
+            assert_ne!(route, &source.slow);
+            assert!(calls[..index]
+                .iter()
+                .any(|(checked, probe)| checked == route && *probe));
+        }
+    }
+    assert!(calls
+        .iter()
+        .any(|(route, probe)| route == &source.slow && *probe));
+    let stats = r.provider_qualification();
+    assert_eq!(stats.txid_ready, 2);
+    assert_eq!(stats.probe_passes, 2);
+    assert_eq!(stats.probe_failures, 1);
+    assert_eq!(stats.probe_streams, 3);
+}
+
+#[test]
+fn queued_batches_are_reassigned_after_an_approved_route_fails_twice() {
+    let c = chain_with_real_count("provider-reassignment", 32);
+    let probe = c
+        .store
+        .block_txids(&c.store.get_block(1).unwrap().unwrap())
+        .unwrap()[..4]
+        .to_vec();
+    let source = Arc::new(CheckedSource {
+        raw: c.raw.clone(),
+        probe,
+        slow: "https://mempool.space/api".into(),
+        onion: "http://mempoolhqx4isw62xs7abwphsq7ldayuidyx2v2oethdhhj6mlo2r6ad.onion/api".into(),
+        calls: Mutex::new(Vec::new()),
+        qualified_then_fails: true,
+    });
+    let mut cfg = config(PrivacyParams {
+        min_servers: 2,
+        max_share: 0.5,
+        session_size: 2,
+        decoy_wallets: 0,
+        ..PrivacyParams::balanced()
+    });
+    cfg.sessions_total = 1;
+    let r = Resolver::new(Arc::clone(&c.store), &cfg)
+        .unwrap()
+        .with_tx_sources(vec![Arc::clone(&source) as Arc<dyn TxSource>], [21; 32]);
+    r.set_prune_height(u32::MAX);
+    r.start_provider_probes();
+    let until = Instant::now() + Duration::from_secs(3);
+    while r.provider_qualification().txid_ready != 4 && Instant::now() < until {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(r.provider_qualification().txid_ready, 4);
+    // Avoid the four public sample txids when scheduling real work.
+    r.want_history(2, c.real.0, &c.real.1[1..]);
+    for tx in &c.real.1[1..] {
+        assert_eq!(
+            r.raw_tx_for(2, tx.txid, tx.height).unwrap(),
+            hex::encode(&c.raw[&tx.txid])
+        );
+    }
+    let stats = r.provider_qualification();
+    let calls = source.calls.lock().unwrap();
+    let failed = calls
+        .iter()
+        .filter(|(name, probe)| name == &source.slow && !*probe)
+        .count();
+    assert_eq!(failed, 2, "no new socket to HTTPS after quarantine");
+    assert_eq!(stats.paused, 1);
+    assert!(stats.skipped > 0, "batches already waiting were reassigned");
+}
+
+struct CheckedBlocks {
+    blocks: HashMap<Hash32, Vec<u8>>,
+    sample: Hash32,
+    calls: Mutex<Vec<(String, Hash32)>>,
+}
+
+impl BlockSource for CheckedBlocks {
+    fn name(&self) -> &str {
+        "test-block-archive"
+    }
+    fn requires_qualification(&self) -> bool {
+        true
+    }
+    fn probe_endpoints(&self) -> Vec<el_rawtx::Endpoint> {
+        ["invalid", "verified"]
+            .iter()
+            .map(|key| el_rawtx::Endpoint {
+                key: (*key).into(),
+                tier: 0,
+                via_tor: true,
+            })
+            .collect()
+    }
+    fn fetch_block(&self, _: &Hash32) -> Result<Vec<u8>> {
+        unreachable!("wallet and probes select an explicit route")
+    }
+    fn fetch_endpoint(
+        &self,
+        endpoint: &el_rawtx::Endpoint,
+        hash: &Hash32,
+        _: Instant,
+        _: el_rawtx::FetchMode,
+        ctl: &AttemptCtl,
+    ) -> Result<Vec<u8>> {
+        self.calls
+            .lock()
+            .unwrap()
+            .push((endpoint.key.clone(), *hash));
+        if endpoint.key == "invalid" {
+            assert_eq!(
+                hash, &self.sample,
+                "a bad probe must never receive wallet data"
+            );
+            return Ok(vec![0; 80]);
+        }
+        let bytes = self.blocks[hash].clone();
+        ctl.add_bytes(bytes.len());
+        Ok(bytes)
+    }
+}
+
+#[test]
+fn fallback_waits_for_a_verified_block_probe_and_never_sends_txid_in_block_mode() {
+    let c = chain("block-provider-gate");
+    let archive = Arc::new(CheckedBlocks {
+        blocks: c.blocks.clone(),
+        sample: c.store.get_block(1).unwrap().unwrap().hash,
+        calls: Mutex::new(Vec::new()),
+    });
+    let tx_source = Arc::new(CheckedSource {
+        raw: c.raw.clone(),
+        probe: Vec::new(),
+        slow: "won't be used".into(),
+        onion: "nor this".into(),
+        calls: Mutex::new(Vec::new()),
+        qualified_then_fails: false,
+    });
+    let mut cfg = config(PrivacyParams::balanced());
+    cfg.path = el_rawtx::ExternalPath::Block;
+    let r = Resolver::new(Arc::clone(&c.store), &cfg)
+        .unwrap()
+        .with_tx_sources(vec![Arc::clone(&tx_source) as Arc<dyn TxSource>], [20; 32])
+        .with_external(Arc::clone(&archive) as Arc<dyn BlockSource>);
+    let tx = c.real.1[4];
+    assert_eq!(
+        r.raw_tx_for(0, tx.txid, tx.height).unwrap(),
+        hex::encode(&c.raw[&tx.txid])
+    );
+    let calls = archive.calls.lock().unwrap();
+    assert_eq!(calls[0], ("invalid".into(), archive.sample));
+    assert_eq!(calls[1], ("verified".into(), archive.sample));
+    assert_eq!(
+        calls[2],
+        (
+            "verified".into(),
+            c.store.get_block(tx.height).unwrap().unwrap().hash
+        )
+    );
+    assert!(tx_source.calls.lock().unwrap().is_empty());
+    assert_eq!(r.provider_qualification().blocks_ready, 1);
+}
+
 #[test]
 fn a_provider_that_rejects_a_batch_is_retried_with_a_smaller_one() {
     let c = chain("batchcap");

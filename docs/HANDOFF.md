@@ -1,8 +1,7 @@
 # Session handoff
 
-**Updated:** 2026-11-18 (alpha.29.26.1: wallet recovery admission fix)
-**Latest published release:** `0.1.0-alpha.29.26.1`
-**Release:** https://github.com/AlbercoinDev/e-lite/releases/tag/v0.1.0-alpha.29.26.1
+**Updated:** 2026-11-19 (alpha.29.26.2: qualify external wallet routes)
+**Release:** https://github.com/AlbercoinDev/e-lite/releases/tag/v0.1.0-alpha.29.26.2
 
 This is the short “where we are”. The invariants live in
 [`AGENTS.md`](../AGENTS.md); the
@@ -88,7 +87,17 @@ no repitas contexto ni rehagas decisiones ya documentadas.
   `docs/ROADMAP.md` is future work only, and `docs/AUDIT.md` holds the open
   findings (`docs/audit/FIXED.md` is the fixed history).
 
-## Last change (alpha.29.26.1): stream admission in wallet recovery
+## Last change (alpha.29.26.2): qualify external wallet routes
+
+`crates/el-rawtx/src/qualification.rs` runs public probes with a single
+background worker. The txid scheduler and block race check the result
+again before opening a connection. Expired or paused routes cannot use
+wallet traffic to become eligible again. See
+[OPERATIONS](OPERATIONS.md#external-wallet-route-qualification) for the
+metrics to record on several clean-cache Sparrow runs. Mainnet A/B remains
+pending, as do AUD-198 and AUD-199; do not clear a live node's cache to test.
+
+## Previous change (alpha.29.26.1): stream admission in wallet recovery
 
 `TorGovernor` now separates the two wallet demands: a ready per-txid batch and
 a block download. Each has its own queue and they alternate at every freed

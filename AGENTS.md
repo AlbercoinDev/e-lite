@@ -186,8 +186,13 @@ Each rule names where the detail is. Read it before touching that area.
 - Logs never print a script hash, txid or the block hash of a wallet request
   (`bin/e-lite/tests/log_redaction.rs`). Debug lines are aggregate counts and latencies.
   INFO lines never change format; extra detail goes to `debug:`/`trace:`.
-- Decoys and prefetch run outside the wallet's download slots and never
-  change provider health. The prefetch is an optimisation, never correctness.
+- Decoys and prefetch run outside the wallet's last download slot. Decoy-only
+  work never changes eligibility. A verified result or an actual network
+  failure of a real prefetch may update the wallet route's qualification;
+  queued or canceled work must not. Prefetch is never correctness.
+- External wallet traffic needs a fresh proof per route, transport and
+  operation. Probe only public fixtures and do not relax txid operator
+  diversity during an outage. Probes share the Tor stream governor.
 - The rawtx cache is a transaction cache with a size cap; only
   `e-lite cache` may delete it, through `crates/el-rawtx/src/cachelayout.rs`.
 - The readiness gate applies to a pruned Core only and is fail-closed by
