@@ -135,8 +135,8 @@ Include:
 ```bash
 e-lite --version
 e-lite status --json
-tail -100 <data-dir>/bitcoind.log
-tail -100 <data-dir>/LOG
+tail -100 <data-dir>/e-lite.log        # the same lines as the console
+tail -100 <data-dir>/bitcoind.log      # Core's own log
 dmesg -T | grep -i -E 'oom|killed process'
 ```
 

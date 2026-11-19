@@ -164,7 +164,7 @@ P1 (before any public exposure or mainnet production claim):
 P2/P3: the verified near-term list is in `ROADMAP.md` (no provider penalty
 on a reorg, subscription caps, `privacy.toml` per network, slowloris,
 per-network e2e); open findings with their plan are in `AUDIT.md`
-(AUD-130, 143, 166, 174, 176, 177, 179).
+(AUD-130, 143, 166, 174, 176, 177, 179, 191, 198, 199).
 
 ## Commands
 

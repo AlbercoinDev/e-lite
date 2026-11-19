@@ -503,7 +503,9 @@ use (`e-lite --help`); every other setting is a config key, set in
 `config.toml` or with `--set section.key=value`. The old flags below still
 work for now: each one acts exactly like its `--set` in the same position
 (so a later `--set` of the same key wins) and prints one line naming the
-replacement. They will be removed two releases later.
+replacement. Their removal is scheduled and still pending (the original
+"two releases after 29.19.0" target has passed); see
+[`ROADMAP.md`](ROADMAP.md#cleanup-scheduled).
 
 | Old flag | Use instead |
 |---|---|
