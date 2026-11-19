@@ -117,8 +117,9 @@ overrides the file for one run (`e-lite --set privacy.decoys.wallets=5 run`).
 
 Notes:
 
-- `sessions.max_share` never goes below `1 / servers available`: with two
-  servers configured, each one gets half.
+- `sessions.max_share` sets how many distinct operators are needed:
+  `max(min_servers, ceil(1 / max_share))`. It is not relaxed to fit fewer
+  servers; see the qualification note below.
 - At most two sessions are open to one server at a time. Measured over Tor:
   32 parallel sessions over 11 servers lost 87 of 480 transactions to refused
   or dropped connections, 16 lost 2. That is why `sessions.parallel` defaults

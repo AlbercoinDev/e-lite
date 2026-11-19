@@ -350,9 +350,9 @@ and should be restricted to loopback/self-hosted use.
 
 ## Limits
 
-- If a pruned block cannot be obtained from any configured source, raw
-  `transaction.get` fails with an explicit `rawtx unavailable` error. History,
-  balances and UTXOs still work from the index.
+- If no source is configured, or a permanent failure remains (not found),
+  raw `transaction.get` fails with an explicit `rawtx unavailable` error.
+  History, balances and UTXOs still work from the index.
 - A confirmed transaction whose external recovery only meets temporary
   failures closes the Electrum connection at its deadline so the wallet
   retries, instead of returning a per-item RPC error that Sparrow would
