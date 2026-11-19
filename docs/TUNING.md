@@ -431,7 +431,9 @@ never go below `min_readers` (half the physical cores, at least 2).
 ### Compaction debt, L0 files and `background_jobs`
 
 The 10-minute `rocksdb:` log line and `/status.rocksdb` sample the counters
-needed to attribute slow commits:
+needed to attribute slow commits (log names below; `/status.rocksdb` uses
+`pending_compaction_bytes`, `running_compactions`, `level0_files`,
+`block_cache_bytes`, `memtable_bytes` and `table_readers_bytes`):
 
 | Signal | Meaning |
 |---|---|

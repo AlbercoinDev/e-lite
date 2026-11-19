@@ -118,9 +118,9 @@ data dir/network require restart.
 - [ ] Custom `banner_file` is created if missing and its placeholders are substituted.
 - [ ] Prune gate advances every 5,000 safe blocks (`min_gain_blocks`) and
   keeps a 20 GiB free-space margin while Core downloads or the index drains;
-  once caught up it prunes to the safe maximum and then every
-  `min_gain_live_blocks` (144). Emergency pruning still happens below the
-  low-disk floor.
+  once the index is caught up the deferral is bypassed and the gain becomes
+  `min_gain_live_blocks` (144), so each prune waits for the safe cut to
+  advance that far. Emergency pruning still happens below the low-disk floor.
 - [ ] `--set index.profile=hdd|ssd|nvme|manual` and other `--set` keys work without a config file.
 - [ ] Raw tx works from Core/cache; pruned fallback is explicit if unavailable.
 - [ ] Disk-low pauses downloads; indexing continues until the critical floor.

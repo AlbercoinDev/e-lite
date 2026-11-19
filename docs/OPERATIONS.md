@@ -605,8 +605,9 @@ Useful fields: `state`, `ready`, `at_core_tip`, `fully_synced`, `offline`,
 ### `Killed` / OOM in LXC
 
 Check `dmesg`/`journalctl -k`. Set explicit `readers`/`cache_mib`, or
-`adaptive = false`. Alpha.15+ uses cgroup memory accounting and caps automatic
-readers at 4/8/16 by profile.
+`adaptive = false`. Automatic readers use physical cores clamped to the disk
+class cap (NVMe 8, SATA SSD/ZFS/virtual 4, HDD/network 2); see
+[`TUNING.md`](TUNING.md#machine-plan-cpu-ram-disk).
 
 ### Index lags behind Core
 
