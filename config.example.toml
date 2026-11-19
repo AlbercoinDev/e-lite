@@ -267,6 +267,8 @@ open_without_provider = false       # true: open Electrum with local data after
 enabled = false                     # opt-in gate; BIP352 indexer not included yet
 
 [logging]
+# Debug and trace events begin with an ISO 8601 timestamp in UTC (Z).
+# INFO keeps its existing format; durations are still measured independently.
 # file = "/var/log/e-lite/e-lite.log"  # default <data-dir>/e-lite.log
 max_mib = 16                        # rotate to e-lite.log.1 above this; 0 = never
 # Verbosity of the extra diagnostic lines: `info` = standard lines only;

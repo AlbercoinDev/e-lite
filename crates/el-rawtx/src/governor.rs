@@ -240,8 +240,8 @@ impl TorGovernor {
         self.notify();
         let n = self.pauses.fetch_add(1, Ordering::Relaxed) + 1;
         if crate::debug_logs() {
-            eprintln!(
-                "[e-lite] debug: tor governor: pause {} ms ({reason}); streams {}/{}, pause #{n}",
+            el_model::debug_event!(
+                "tor governor: pause {} ms ({reason}); streams {}/{}, pause #{n}",
                 hold.as_millis(),
                 self.in_use(),
                 self.total
@@ -257,8 +257,8 @@ impl TorGovernor {
         let lifted = state.pause_until.take().is_some();
         drop(state);
         if lifted && crate::debug_logs() {
-            eprintln!(
-                "[e-lite] debug: tor governor: pause lifted by a success; streams {}/{}",
+            el_model::debug_event!(
+                "tor governor: pause lifted by a success; streams {}/{}",
                 self.in_use(),
                 self.total
             );
@@ -505,8 +505,8 @@ impl TorGovernor {
                 )
             })
             .collect();
-        eprintln!(
-            "[e-lite] debug: tor governor {}s: streams {}/{} (peak {}), pauses {}{}; {}",
+        el_model::debug_event!(
+            "tor governor {}s: streams {}/{} (peak {}), pauses {}{}; {}",
             last.0.elapsed().as_secs(),
             now.in_use,
             now.total,

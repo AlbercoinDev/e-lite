@@ -7,6 +7,7 @@ rust-version.workspace = true
 
 [dependencies]
 hex.workspace = true
+libc.workspace = true
 sha2.workspace = true
 
 [dev-dependencies]

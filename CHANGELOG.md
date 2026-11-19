@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.1.0-alpha.29.26.3 — 2026-11-19
+
+- Prefix every debug and trace event with its UTC date and time, to the second.
+  The console and `e-lite.log` display the same line. INFO format is unchanged.
+- Wallet diagnostics carry a connection number and report why block recovery
+  started or joined a download, with the current eligible/required count of
+  txid operators. A failed fallback lookup distinguishes Core RPC `-5` from
+  other errors; an index miss does not imply a transaction was unconfirmed.
+- Diagnostics only: no change to provider selection, Tor limits, deadlines
+  or Electrum replies. No reindex or cache migration.
+
 ## 0.1.0-alpha.29.26.2 — 2026-11-19
 
 - Historical wallet requests now require a recent, valid and fast public

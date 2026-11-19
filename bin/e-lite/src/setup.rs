@@ -966,8 +966,8 @@ pub(crate) fn log_startup_diagnostics(cfg: &Config, chain: Chain, shared: &Share
     if !logging::debug_enabled() {
         return;
     }
-    eprintln!(
-        "[e-lite] debug: server: banner {:?} | electrumx compat {} | batches max {} items, \
+    el_model::debug_event!(
+        "server: banner {:?} | electrumx compat {} | batches max {} items, \
          {} workers ({} with transaction.get), pipeline {} | plain {} | tls {}",
         el_serve::banner_for_log(),
         if cfg.server.advertise_electrumx_compat {
@@ -988,8 +988,8 @@ pub(crate) fn log_startup_diagnostics(cfg: &Config, chain: Chain, shared: &Share
     );
     let (block_mib, tx_mib) = el_rawtx::cache_split(cfg.rawtx.cache_mib);
     let inv = shared.resolver.cache_inventory();
-    eprintln!(
-        "[e-lite] debug: rawtx cache: {} | blocks {} files {} / {} MiB | txs {} files {} / {} MiB",
+    el_model::debug_event!(
+        "rawtx cache: {} | blocks {} files {} / {} MiB | txs {} files {} / {} MiB",
         shared.resolver.cache_dir().display(),
         inv.block_files,
         display_size(inv.block_bytes),
@@ -998,8 +998,8 @@ pub(crate) fn log_startup_diagnostics(cfg: &Config, chain: Chain, shared: &Share
         display_size(inv.tx_bytes),
         tx_mib,
     );
-    eprintln!(
-        "[e-lite] debug: rawtx: path {} | probe {}s (tor >= {}s), ready {}s, tor \
+    el_model::debug_event!(
+        "rawtx: path {} | probe {}s (tor >= {}s), ready {}s, tor \
          connect/stall/attempt {}/{}/{}s (onion x2), p2p {}s (tor {}s), race {} (hedge tor \
          {}/{}s, direct {}/{}s), prefetch {}, decoys {}, max_parallel {}, clearnet fallback {}",
         cfg.rawtx.transport(),
@@ -1025,8 +1025,8 @@ pub(crate) fn log_startup_diagnostics(cfg: &Config, chain: Chain, shared: &Share
             "off"
         },
     );
-    eprintln!(
-        "[e-lite] debug: network: {} (same data dir and Core per network)",
+    el_model::debug_event!(
+        "network: {} (same data dir and Core per network)",
         chain.name()
     );
 }

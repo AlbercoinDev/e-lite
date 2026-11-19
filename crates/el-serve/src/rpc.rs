@@ -62,7 +62,7 @@ pub(crate) const ERROR_LOG_MAX: usize = 256;
 /// distinct values, and it may carry control characters into the log). A
 /// known method keeps its name whatever the code (a 1.6 method called on a
 /// 1.4 connection also answers -32601).
-pub(crate) fn log_rpc_error(shared: &Shared, method: &str, error: &RpcError) {
+pub(crate) fn log_rpc_error(shared: &Shared, conn: u64, method: &str, error: &RpcError) {
     let code = error.code;
     let method = if error.unknown_method {
         "<unknown>"
@@ -92,8 +92,8 @@ pub(crate) fn log_rpc_error(shared: &Shared, method: &str, error: &RpcError) {
         // The INFO line stays code-only (AUD-132); the debug line carries the
         // cause with any 64-hex value redacted, so a persistent subscribe or
         // tx.get error can be diagnosed without guessing.
-        eprintln!(
-            "[e-lite] debug: rpc error: method={method} code={code} message={}",
+        el_model::debug_event!(
+            "rpc error: conn={conn} method={method} code={code} message={}",
             el_rawtx::redact_hashes(&error.message)
         );
     }
@@ -103,7 +103,38 @@ pub(crate) fn log_rpc_error(shared: &Shared, method: &str, error: &RpcError) {
 /// `debug:` line, at most one per cause every 5 s (the INFO `rpc error` line
 /// is one per minute and has no cause). The line carries the cause, the
 /// height and the running total: never a txid or a block hash (AUD-132).
-pub(crate) fn note_tx_get_failure(shared: &Shared, cause: TxGetFailure, height: Option<u32>) {
+pub(crate) fn note_tx_get_failure(shared: &Shared, cause: TxGetFailure, height: u32) {
+    log_tx_get_failure(shared, cause, &format_args!("height {height}"));
+}
+
+pub(crate) fn note_core_lookup_failure(
+    shared: &Shared,
+    error: &el_rpc::CoreError,
+    pool_checked: bool,
+) {
+    let code = error.rpc_code("getrawtransaction");
+    let cause = if code == Some(-5) {
+        TxGetFailure::NotFound
+    } else {
+        TxGetFailure::Internal
+    };
+    let lookup = if pool_checked {
+        "index_miss mempool_view_miss"
+    } else {
+        "index_miss verbose_core_lookup"
+    };
+    if let Some(code) = code {
+        log_tx_get_failure(
+            shared,
+            cause,
+            &format_args!("{lookup} core_rpc_code={code}"),
+        );
+    } else {
+        log_tx_get_failure(shared, cause, &format_args!("{lookup} no_core_rpc_code"));
+    }
+}
+
+fn log_tx_get_failure(shared: &Shared, cause: TxGetFailure, detail: &std::fmt::Arguments<'_>) {
     let total = shared.stats.tx_get_failures.add(cause);
     if !debug_logs() {
         return;
@@ -120,15 +151,15 @@ pub(crate) fn note_tx_get_failure(shared: &Shared, cause: TxGetFailure, height: 
     }
     seen.insert(key, Instant::now());
     drop(seen);
-    let at = height.map_or_else(|| "unconfirmed".to_string(), |h| format!("height {h}"));
-    eprintln!(
-        "[e-lite] debug: tx.get failed: {} ({at}, {total} so far)",
+    let conn = current_client();
+    el_model::debug_event!(
+        "tx.get failed: conn={conn} {} ({detail}, {total} so far)",
         cause.label()
     );
 }
 
 pub(crate) fn rawtx_failure(shared: &Shared, height: u32, e: el_rawtx::RawtxError) -> RpcError {
-    note_tx_get_failure(shared, TxGetFailure::of(&e), Some(height));
+    note_tx_get_failure(shared, TxGetFailure::of(&e), height);
     let mut rpc = RpcError::server(e.to_string());
     rpc.retry_transport = e.is_retryable_wallet();
     rpc

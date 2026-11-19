@@ -350,6 +350,13 @@ impl TxMode {
             .sufficient_diversity(&self.shared.eligible_servers())
     }
 
+    pub(crate) fn route_operator_counts(&self) -> (usize, usize) {
+        (
+            operator_count(&self.shared.eligible_servers()),
+            self.shared.operator_minimum(),
+        )
+    }
+
     pub(crate) fn provider_counts(&self) -> HashMap<String, u64> {
         self.shared
             .provider_counts
@@ -996,6 +1003,14 @@ fn dispatch(shared: &Shared, reqs: Vec<Req>, staged: &mut VecDeque<Session>) {
 type Servers = Vec<(usize, String, bool)>;
 type Groups = Vec<((u64, usize), Vec<Item>)>;
 
+fn operator_count(servers: &Servers) -> usize {
+    servers
+        .iter()
+        .map(|(_, key, _)| server_operator(key))
+        .collect::<HashSet<_>>()
+        .len()
+}
+
 impl Shared {
     fn session_generation(&self, session: &Session) -> Option<u64> {
         let src = self.sources[session.source].as_ref();
@@ -1034,15 +1049,13 @@ impl Shared {
             return false;
         }
         !self.sources.iter().any(|s| s.requires_qualification())
-            || servers
-                .iter()
-                .map(|(_, key, _)| server_operator(key))
-                .collect::<HashSet<_>>()
-                .len()
-                >= self
-                    .params
-                    .min_servers
-                    .max((1.0 / self.params.max_share).ceil() as usize)
+            || operator_count(servers) >= self.operator_minimum()
+    }
+
+    fn operator_minimum(&self) -> usize {
+        self.params
+            .min_servers
+            .max((1.0 / self.params.max_share).ceil() as usize)
     }
 }
 
@@ -1368,8 +1381,8 @@ fn run_session(shared: &Shared, session: Session, lane: Lane, mut permits: Admis
     let skipped: HashSet<Hash32> = ctl.skipped().into_iter().collect();
     let local = matches!(&result, Err(RawtxError::Unavailable(m)) if m.contains(crate::LOCAL_BUSY));
     if crate::debug_logs() {
-        eprintln!(
-            "[e-lite] debug: stream session src={} ep={key} lane={} items {} ({real} real), wait {} ms, {} ms, {}: {}",
+        el_model::debug_event!(
+            "stream session src={} ep={key} lane={} items {} ({real} real), wait {} ms, {} ms, {}: {}",
             src.name(),
             lane.name(),
             txids.len(),

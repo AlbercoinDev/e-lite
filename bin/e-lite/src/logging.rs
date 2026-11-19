@@ -56,22 +56,22 @@ pub fn name(level: u8) -> &'static str {
     }
 }
 
-/// Print a DEBUG-gated line with a greppable `[e-lite] debug:` prefix.
+/// Print a DEBUG-gated line with a UTC event timestamp.
 #[macro_export]
 macro_rules! debug_log {
     ($($arg:tt)*) => {
         if $crate::logging::debug_enabled() {
-            eprintln!("[e-lite] debug: {}", ::std::format_args!($($arg)*));
+            el_model::debug_event!($($arg)*);
         }
     };
 }
 
-/// Print a TRACE-gated line with a greppable `[e-lite] trace:` prefix.
+/// Print a TRACE-gated line with a UTC event timestamp.
 #[macro_export]
 macro_rules! trace_log {
     ($($arg:tt)*) => {
         if $crate::logging::trace_enabled() {
-            eprintln!("[e-lite] trace: {}", ::std::format_args!($($arg)*));
+            el_model::trace_event!($($arg)*);
         }
     };
 }

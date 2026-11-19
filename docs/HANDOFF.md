@@ -1,7 +1,7 @@
 # Session handoff
 
-**Updated:** 2026-11-19 (alpha.29.26.2: qualify external wallet routes)
-**Release:** https://github.com/AlbercoinDev/e-lite/releases/tag/v0.1.0-alpha.29.26.2
+**Updated:** 2026-11-19 (alpha.29.26.3: timestamp wallet diagnostics)
+**Release:** https://github.com/AlbercoinDev/e-lite/releases/tag/v0.1.0-alpha.29.26.3
 
 This is the short “where we are”. The invariants live in
 [`AGENTS.md`](../AGENTS.md); the
@@ -87,7 +87,13 @@ no repitas contexto ni rehagas decisiones ya documentadas.
   `docs/ROADMAP.md` is future work only, and `docs/AUDIT.md` holds the open
   findings (`docs/audit/FIXED.md` is the fixed history).
 
-## Last change (alpha.29.26.2): qualify external wallet routes
+## Last change (alpha.29.26.3): timestamp wallet diagnostics
+
+For the next cold Sparrow run, align the UTC debug timestamps with Sparrow's
+local time, then follow `conn=` and `wallet block:`. `index_miss`
+does not mean *unconfirmed*. No change to fetching, timeouts or Tor limits.
+
+## Previous change (alpha.29.26.2): qualify external wallet routes
 
 `crates/el-rawtx/src/qualification.rs` runs public probes with a single
 background worker. The txid scheduler and block race check the result

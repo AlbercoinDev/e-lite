@@ -16,6 +16,16 @@ use std::time::Duration;
 #[derive(Debug)]
 pub struct CoreError(pub String);
 
+impl CoreError {
+    /// Recover the code from the detail produced by `call_with_timeout`.
+    /// Transport, HTTP and decoding errors have no Core RPC code.
+    pub fn rpc_code(&self, method: &str) -> Option<i64> {
+        let detail = self.0.strip_prefix(method)?.strip_prefix(" failed: ")?;
+        let (_, suffix) = detail.rsplit_once(" (code ")?;
+        suffix.strip_suffix(')')?.parse().ok()
+    }
+}
+
 /// Socket-level failures worth retrying once. HTTP/RPC errors ("method not
 /// found", "pruneblockchain failed", ...) are not included.
 fn is_transient_rpc_error(e: &CoreError) -> bool {

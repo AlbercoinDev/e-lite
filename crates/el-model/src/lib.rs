@@ -2,6 +2,7 @@
 
 pub mod codec;
 pub mod hash;
+pub mod logging;
 pub mod merkle;
 pub mod sync;
 pub mod types;

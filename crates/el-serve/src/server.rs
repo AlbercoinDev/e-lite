@@ -342,10 +342,7 @@ pub(crate) fn read_line_limited<R: BufRead>(
 pub(crate) fn handle_client(shared: &Shared, client: Arc<ClientState>) -> std::io::Result<()> {
     client.set_baseline(shared);
     if debug_logs() {
-        eprintln!(
-            "[e-lite] debug: wallet: connection {} (tls {})",
-            client.id, client.tls
-        );
+        el_model::debug_event!("wallet: conn={} opened (tls {})", client.id, client.tls);
     }
     let result = client_loop(shared, &client);
     // The slot, the registry entry and the resolver state are released by
@@ -677,17 +674,22 @@ pub(crate) fn process_batch(
         .stats
         .batch_max_items
         .fetch_max(items_len, Ordering::Relaxed);
-    let mut first_batch = false;
     if let Some(c) = client {
-        if let Ok(mut s) = c.stats.lock() {
-            first_batch = s.batch_lines == 0;
+        let first_batch = if let Ok(mut s) = c.stats.lock() {
+            let first = s.batch_lines == 0;
             s.batch_lines += 1;
             s.batch_items += items_len;
             s.batch_max_items = s.batch_max_items.max(items_len);
+            first
+        } else {
+            false
+        };
+        if first_batch && debug_logs() {
+            el_model::debug_event!(
+                "wallet: conn={} first batch, {items_len} items (parallel JSON-RPC)",
+                c.id
+            );
         }
-    }
-    if first_batch && debug_logs() {
-        eprintln!("[e-lite] debug: wallet: first batch, {items_len} items (parallel JSON-RPC)");
     }
     let ordered = items.iter().any(|item| {
         item.get("method")
@@ -825,7 +827,7 @@ pub(crate) fn process_request(
         },
         Err(e) => {
             shared.stats.errors_total.fetch_add(1, Ordering::Relaxed);
-            log_rpc_error(shared, method, &e);
+            log_rpc_error(shared, client.map_or(0, |c| c.id), method, &e);
             if e.retry_transport {
                 if let Some(client) = client {
                     client.kill();

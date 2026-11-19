@@ -520,8 +520,8 @@ impl Worker {
                                 }
                             };
                             if crate::debug_logs() && result != ProbeResult::Local {
-                                eprintln!(
-                                    "[e-lite] debug: provider probe src={} ep={} tor={} {:?} {} ms",
+                                el_model::debug_event!(
+                                    "provider probe src={} ep={} tor={} {:?} {} ms",
                                     route.operation,
                                     crate::redact_hashes(&route.endpoint),
                                     route.tor,

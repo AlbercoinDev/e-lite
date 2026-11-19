@@ -66,6 +66,7 @@ pub(super) struct BlockLease {
     job: Arc<InflightBlock>,
     event: Arc<Availability>,
     governor: Arc<TorGovernor>,
+    pub(super) joined_existing: bool,
 }
 
 impl BlockLease {
@@ -99,14 +100,15 @@ impl Resolver {
         if priority == Priority::Wallet {
             self.promote(job);
         }
-        Some(self.block_lease(Arc::clone(job)))
+        Some(self.block_lease(Arc::clone(job), true))
     }
 
-    fn block_lease(&self, job: Arc<InflightBlock>) -> BlockLease {
+    fn block_lease(&self, job: Arc<InflightBlock>, joined_existing: bool) -> BlockLease {
         BlockLease {
             job,
             event: Arc::clone(&self.recovery_event),
             governor: Arc::clone(&self.governor),
+            joined_existing,
         }
     }
 
@@ -129,7 +131,7 @@ impl Resolver {
                 if priority == Priority::Wallet {
                     self.promote(job);
                 }
-                return Ok(Some(self.block_lease(Arc::clone(job))));
+                return Ok(Some(self.block_lease(Arc::clone(job), true)));
             }
             // The last waiter left. Let the canceled job drain and publish
             // any genuine source exhaustion before starting another race.
@@ -138,7 +140,7 @@ impl Resolver {
         if let Some(block) = self.recent_block(&rec.hash) {
             let job = Arc::new(InflightBlock::new(Instant::now(), false));
             *job.result.lock().unwrap_or_else(|p| p.into_inner()) = Some(Ok(block));
-            return Ok(Some(self.block_lease(job)));
+            return Ok(Some(self.block_lease(job, false)));
         }
         if self.sources().is_empty() {
             if self.p2p.is_some() && priority == Priority::Wallet {
@@ -165,7 +167,7 @@ impl Resolver {
             block_path_deadline(Instant::now(), request_deadline),
             priority == Priority::Wallet,
         ));
-        let lease = self.block_lease(Arc::clone(&job));
+        let lease = self.block_lease(Arc::clone(&job), false);
         let runner = self.worker_handle();
         let rec = *rec;
         map.insert(rec.hash, Arc::clone(&job));
@@ -311,8 +313,8 @@ impl Resolver {
                 }
                 self.stats.unavailable.fetch_add(1, Ordering::Relaxed);
                 if debug_logs() {
-                    eprintln!(
-                        "[e-lite] debug: block obj={} lane={} no tor stream after {} ms (streams {}/{})",
+                    el_model::debug_event!(
+                        "block obj={} lane={} no tor stream after {} ms (streams {}/{})",
                         log_tag(hash),
                         lane.name(),
                         queue_started.elapsed().as_millis(),
@@ -336,8 +338,8 @@ impl Resolver {
             self.stats.unavailable.fetch_add(1, Ordering::Relaxed);
         }
         if debug_logs() {
-            eprintln!(
-                "[e-lite] debug: block obj={} lane={} queued {queued_ms} ms, race {} ms: {}",
+            el_model::debug_event!(
+                "block obj={} lane={} queued {queued_ms} ms, race {} ms: {}",
                 log_tag(hash),
                 lane.name(),
                 started.elapsed().as_millis(),
@@ -698,8 +700,8 @@ impl Resolver {
                 drop(stream);
                 let finished = Instant::now();
                 if debug_logs() {
-                    eprintln!(
-                        "[e-lite] debug: stream block obj={} src={} ep={} lane={} {role} wait {} ms, {} ms, {} KiB: {}",
+                    el_model::debug_event!(
+                        "stream block obj={} src={} ep={} lane={} {role} wait {} ms, {} ms, {} KiB: {}",
                         log_tag(&hash),
                         source.name(),
                         endpoint_label(&endpoint),

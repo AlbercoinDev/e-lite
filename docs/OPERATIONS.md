@@ -496,6 +496,16 @@ How to read it:
 `/status.rawtx.tor_governor` carries the same counters (cumulative, with
 `peak` and per lane).
 
+Debug and trace lines begin with the event date and time in UTC
+(`2026-11-19T08:10:08Z`). Convert the timestamp if Sparrow uses local time.
+Follow `conn=` for the request and connection summaries. `wallet block:`
+reports whether a block job started or was joined, why, how long recovery
+had already waited, and how many distinct txid operators were eligible versus
+the required count at log time. `index_miss mempool_view_miss core_rpc_code=-5`
+means that neither local view located the transaction and Core did not have it
+via `getrawtransaction`; it is not evidence that a transaction was unconfirmed.
+Fields retain the existing wallet-data redaction. INFO format is unchanged.
+
 ### External wallet route qualification
 
 The startup `/block/<genesis>/raw` readiness probe is not admission to

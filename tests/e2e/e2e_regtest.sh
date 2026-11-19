@@ -48,6 +48,7 @@ CUSTOM READY {height} {percent} {state}
 EOF
 
 elite_start "$RUN/serve.log" run "${COMMON[@]}" --no-follow --set index.reorg_window=8 \
+  --log-level debug \
   --listen "127.0.0.1:$ELECTRUM_PORT" --metrics "127.0.0.1:$METRICS_PORT" \
   --tls-listen "127.0.0.1:$TLS_PORT" --set server.tls_cert="$TLS_DIR/cert.pem" --set server.tls_key="$TLS_DIR/key.pem" \
   --set server.banner_file="$DATA/banner.txt"
@@ -106,6 +107,9 @@ assert call(10, "blockchain.transaction.id_from_pos", [txheight, 0, False]) == t
 assert call(11, "blockchain.scripthash.get_history", ["00"*32]) == []
 banner = call(12, "server.banner", [])
 assert "CUSTOM" in banner and str(height) in banner, banner
+missing = el.request("blockchain.transaction.get", ["12" * 32])
+assert missing["error"]["code"] == -32000, missing
+assert "(code -5)" in missing["error"]["message"], missing
 print("electrum queries OK")
 PY
 
@@ -158,6 +162,26 @@ for line in "started at" "stopped at" "debug: server: banner" "debug: rawtx cach
     "debug: rawtx summary:"; do
   grep -q "$line" "$DATA/e-lite.log" || fail "e-lite.log lacks '$line'" "$DATA/e-lite.log"
 done
+python3 - "$RUN/serve.log" "$DATA/e-lite.log" <<'PY'
+import re, sys
+from datetime import datetime
+from pathlib import Path
+
+console, saved = (Path(path).read_text().splitlines() for path in sys.argv[1:])
+debug = [line for line in console if "[e-lite] debug:" in line]
+assert debug
+for line in debug:
+    at, _ = line.split(" [e-lite] debug:", 1)
+    assert datetime.strptime(at, "%Y-%m-%dT%H:%M:%SZ"), line
+    assert line in saved, line
+lookup = next(line for line in debug if "index_miss mempool_view_miss core_rpc_code=-5" in line)
+conn = re.search(r"conn=(\d+)", lookup).group(1)
+assert int(conn) > 0, lookup
+assert any(f"wallet: conn={conn} closed after " in line for line in debug), conn
+assert "12" * 32 not in "\n".join(debug)
+print("UTC debug timestamps match console and e-lite.log; Core -5 and connection ID verified")
+print(lookup)
+PY
 grep -qE "READY|FULLY SYNCED" "$DATA/e-lite.log" || fail "e-lite.log lacks READY" "$DATA/e-lite.log"
 tail -n 5 "$RUN/serve.log" | grep -qE "Connection refused|mempool refresh" \
   && fail "unexpected shutdown error" "$RUN/serve.log"

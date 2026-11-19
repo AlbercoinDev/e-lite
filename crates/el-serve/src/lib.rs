@@ -116,8 +116,8 @@ pub fn log_rawtx_summary(shared: &Shared) {
         failures.join(" ")
     };
     let cache = shared.resolver.cache_inventory();
-    eprintln!(
-        "[e-lite] debug: rawtx summary: fetch {} ({}), cache hits {} puts {}, decoys {} \
+    el_model::debug_event!(
+        "rawtx summary: fetch {} ({}), cache hits {} puts {}, decoys {} \
          (pending {}), tx.get failed {}, batches {} ({} items, max {}), cache now {} blocks / {} \
          txs ({})",
         load(&rawtx.fetches),

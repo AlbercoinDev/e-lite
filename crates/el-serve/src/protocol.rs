@@ -44,8 +44,9 @@ pub(crate) fn server_version(
                 }
             })
             .collect();
-        eprintln!(
-            "[e-lite] debug: wallet: client {shown:?} protocol {negotiated} (banner {})",
+        el_model::debug_event!(
+            "wallet: conn={} client {shown:?} protocol {negotiated} (banner {})",
+            client.map_or(0, |c| c.id),
             server_banner()
         );
     }
@@ -1286,7 +1287,7 @@ pub(crate) fn transaction_get(
         // raw bytes locally through Core. This works on a pruned node, where
         // getrawtransaction(txid, true, blockhash) would fail.
         let mut decoded = shared.core.decode_raw_transaction(&raw).map_err(|e| {
-            note_tx_get_failure(shared, TxGetFailure::Internal, Some(block.height));
+            note_tx_get_failure(shared, TxGetFailure::Internal, block.height);
             RpcError::server(format!("rawtx decode: {e}"))
         })?;
         decorate_verbose_tx(&mut decoded, &raw, &block, tip)?;
@@ -1294,7 +1295,7 @@ pub(crate) fn transaction_get(
     }
     if verbose {
         let mut value = shared.core.raw_transaction_json(txid, None).map_err(|e| {
-            note_tx_get_failure(shared, TxGetFailure::NotFound, None);
+            note_core_lookup_failure(shared, &e, false);
             RpcError::server(format!("rawtx unavailable: {e}"))
         })?;
         if let Some(obj) = value.as_object_mut() {
@@ -1319,7 +1320,7 @@ pub(crate) fn transaction_get(
         .raw_transaction_hex_opt(txid, None)
         .map(|raw| json!(raw))
         .map_err(|e| {
-            note_tx_get_failure(shared, TxGetFailure::NotFound, None);
+            note_core_lookup_failure(shared, &e, true);
             RpcError::server(format!("transaction not found: {e}"))
         })
 }

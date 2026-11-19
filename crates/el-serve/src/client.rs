@@ -233,9 +233,10 @@ impl ClientState {
                     if let Some(at) = s.first_history_at {
                         let ms = at.elapsed().as_millis() as u64;
                         s.first_tx_after_history = Some(ms);
-                        eprintln!(
-                            "[e-lite] debug: wallet: first tx.get {ms} ms after the first \
-                             get_history (history scan -> loading transactions)"
+                        el_model::debug_event!(
+                            "wallet: conn={} first completed tx.get {ms} ms after the first \
+                             completed get_history",
+                            self.id
                         );
                     }
                 }
@@ -248,10 +249,11 @@ impl ClientState {
         if s.last_summary.elapsed() >= Duration::from_secs(60) && s.window_requests >= 3 {
             let avg = |total: u64, n: u64| total.checked_div(n).unwrap_or(0);
             let delta = s.window_base.since(shared);
-            eprintln!(
-                "[e-lite] debug: wallet session: {}s, history {} ({} avg, {} max), \
+            el_model::debug_event!(
+                "wallet session: conn={} {}s, history {} ({} avg, {} max), \
                  tx.get {} ({} avg, {} max), batches {} ({} items, max {}), cache hits {} \
                  puts {} fetch {}, tx.get failed {}",
+                self.id,
                 s.opened.elapsed().as_secs(),
                 s.history_requests,
                 fmt_latency(avg(s.history_us_total, s.history_requests)),
@@ -283,9 +285,10 @@ impl ClientState {
             return;
         };
         let delta = s.session_base.since(shared);
-        eprintln!(
-            "[e-lite] debug: wallet: closed after {}s (history {}, tx.get {}; batches {} \
+        el_model::debug_event!(
+            "wallet: conn={} closed after {}s (history {}, tx.get {}; batches {} \
              ({} items, max {}); cache hits {} puts {} fetch {}; tx.get failed {})",
+            self.id,
             s.opened.elapsed().as_secs(),
             s.history_requests,
             s.tx_gets,

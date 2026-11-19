@@ -45,23 +45,34 @@ impl Resolver {
         };
         let tried_tx = tx.is_some();
         let now = Instant::now();
+        let recovery_started = now;
         let head_start = if self.path == ExternalPath::Auto && self.txid_race {
             TXID_HEAD_START
         } else {
             self.txid_attempt * 2
         };
-        let fallback_at = if tried_tx
+        let tx_head_start = tried_tx
             && self
                 .tx_mode
                 .as_ref()
-                .is_some_and(txbatch::TxMode::routes_ready)
-        {
+                .is_some_and(txbatch::TxMode::routes_ready);
+        let fallback_at = if tx_head_start {
             (now + head_start).min(deadline.checked_sub(MIN_ATTEMPT).unwrap_or(now))
         } else {
             now
         };
         let mut block = self.join_block(&rec.hash, Priority::Wallet);
         let mut joined = block.is_some();
+        if joined {
+            self.log_wallet_block(
+                ctx,
+                &txid,
+                height,
+                "join",
+                "block_in_flight",
+                recovery_started,
+            );
+        }
         let mut retry_at = fallback_at;
         let mut last_error = None;
         let mut tx_failure = None;
@@ -176,6 +187,14 @@ impl Resolver {
             }
             if block.is_none() && !block_terminal {
                 if let Some(existing) = self.join_block(&rec.hash, Priority::Wallet) {
+                    self.log_wallet_block(
+                        ctx,
+                        &txid,
+                        height,
+                        "join",
+                        "block_in_flight",
+                        recovery_started,
+                    );
                     joined = true;
                     block_started = true;
                     block = Some(existing);
@@ -196,6 +215,27 @@ impl Resolver {
                     }
                     match self.start_block(&rec, Priority::Wallet, Some(deadline)) {
                         Ok(Some(lease)) => {
+                            let (action, reason) = if lease.joined_existing {
+                                ("join", "block_in_flight")
+                            } else if block_started {
+                                ("start", "block_retry")
+                            } else if !tried_tx {
+                                ("start", "txid_path_unavailable")
+                            } else if !tx_head_start {
+                                ("start", "txid_operators_insufficient")
+                            } else if tx_failure.is_some() {
+                                ("start", "txid_round_failed")
+                            } else {
+                                ("start", "txid_head_start_elapsed")
+                            };
+                            self.log_wallet_block(
+                                ctx,
+                                &txid,
+                                height,
+                                action,
+                                reason,
+                                recovery_started,
+                            );
                             joined = false;
                             block_started = true;
                             block = Some(lease);
@@ -212,6 +252,29 @@ impl Resolver {
                 }
             }
             self.recovery_event.wait(seq, Some(wake_at));
+        }
+    }
+
+    fn log_wallet_block(
+        &self,
+        ctx: u64,
+        txid: &Hash32,
+        height: u32,
+        action: &str,
+        reason: &str,
+        recovery_started: Instant,
+    ) {
+        if debug_logs() {
+            let (qualified, required) = self
+                .tx_mode
+                .as_ref()
+                .map_or((0, 0), |m| m.route_operator_counts());
+            let wait_ms = recovery_started.elapsed().as_millis();
+            el_model::debug_event!(
+                "wallet block: conn={ctx} obj={} height={height} action={action} reason={reason} \
+                 txid_operators={qualified}/{required} external_wait_ms={wait_ms}",
+                log_tag(txid)
+            );
         }
     }
 

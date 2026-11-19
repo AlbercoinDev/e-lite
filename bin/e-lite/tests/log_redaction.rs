@@ -6,11 +6,13 @@
 
 use std::path::{Path, PathBuf};
 
-const MACROS: [&str; 5] = [
+const MACROS: [&str; 7] = [
     "eprintln!(",
     "println!(",
     "debug_log!(",
     "trace_log!(",
+    "debug_event!(",
+    "trace_event!(",
     "eprint!(",
 ];
 

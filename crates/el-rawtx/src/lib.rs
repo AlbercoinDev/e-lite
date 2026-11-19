@@ -1680,8 +1680,8 @@ impl Resolver {
         let mut path = "local";
         let result = self.recover_wallet(ctx, txid, height, &mut path, connected);
         if debug_logs() {
-            eprintln!(
-                "[e-lite] debug: tx.get obj={} height {height}: {path}, {} ms{}",
+            el_model::debug_event!(
+                "tx.get conn={ctx} obj={} height {height}: {path}, {} ms{}",
                 log_tag(&txid),
                 started.elapsed().as_millis(),
                 match &result {
