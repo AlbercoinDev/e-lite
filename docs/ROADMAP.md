@@ -84,7 +84,7 @@ Left open by the 2026-11 review ([`reviews/2026-11-analisis.md`](reviews/2026-11
 
 | When | Item |
 |---|---|
-| Two releases after 0.1.0-alpha.29.19.0 | Remove `DEPRECATED_FLAGS` (`bin/e-lite/src/cli.rs`): the retired flags then fail as unknown, and their table leaves `docs/CLI.md`. |
+| Next cleanup pass | Remove `DEPRECATED_FLAGS` (`bin/e-lite/src/cli.rs`): the retired flags then fail as unknown, and their table leaves `docs/CLI.md`. Scheduled for two releases after 29.19.0 and overdue as of 29.26.3; it is a behaviour change (flags stop being accepted), so it needs its own release note. |
 
 ## Explicit non-goals for now
 

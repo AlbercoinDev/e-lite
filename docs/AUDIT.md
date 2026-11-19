@@ -86,7 +86,7 @@ Covered by `online_history_waits_only_for_the_live_ready_transition`.
 | AUD-090 | P2 | Cross-container sync | The per-user sync lock is a local file lock; two containers (for example Umbrel apps) with different mount namespaces do not see it and can still run two intensive syncs. | Documented in TUNING.md; a real fix needs a shared lock medium or an orchestrator-level policy. |
 | AUD-017 | P3 | Docs drift | Historically `prune=550`, `lag 512`, snapshots and TLS claims appeared inconsistently. | Documentation rewritten in alpha.16; `AGENTS.md` and `scripts/check-docs.sh` enforce consistency. |
 | AUD-040 | P3 | Fee estimate | `blockchain.estimatefee` returns a relayfee/mempool fallback instead of `-1` when Core has no estimate; the protocol allows `-1`. | Intentional compatibility choice: some wallets (Sparrow) treat `-1` as a send failure. Documented in `docs/FEATURES.md`; revisit if wallets handle `-1` correctly. |
-| AUD-041 | P3 | Version negotiation | The spec says to close when client and server ranges do not intersect. e-lite instead downgrades to the newest implemented version at or below the client maximum, so a client requesting `1.4.3`/`1.5` connects on `1.4.2` and `1.7` on `1.6`. | Deliberate leniency for wallet compatibility; the negotiated version is returned so a compliant client adapts. Only a client maximum below 1.4 is refused. Tests cover the matrix; documented in `AGENTS.md`/`FEATURES.md`. Confirmed by the owner on 2026-11-16 (AUD-178 closed): `client_min` is not enforced; the reply carries the negotiated version, so a strict client can close. |
+| AUD-041 | P3 | Version negotiation | The spec says to close when client and server ranges do not intersect. e-lite instead downgrades to the newest implemented version at or below the client maximum, so a client asking for a future or skipped version (for example `1.5`, or a hypothetical `1.8`) is served the newest version below it. | Deliberate leniency for wallet compatibility; the negotiated version is returned so a compliant client adapts. Only a client maximum below 1.4 is refused. Tests cover the matrix; documented in `AGENTS.md`/`FEATURES.md`. Confirmed by the owner on 2026-11-16 (AUD-178 closed): `client_min` is not enforced; the reply carries the negotiated version, so a strict client can close. |
 
 ## Reviewed and considered correct
 
@@ -123,9 +123,7 @@ Covered by `online_history_waits_only_for_the_live_ready_transition`.
 cargo fmt --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
-tests/e2e/e2e_launch_core.sh
-tests/e2e/e2e_pruned_ibd.sh
-tests/e2e/e2e_regtest.sh
+tests/run-e2e.sh launch_core pruned_ibd regtest
 ```
 
 For LXC/OOM checks:

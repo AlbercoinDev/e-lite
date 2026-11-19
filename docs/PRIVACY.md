@@ -261,7 +261,9 @@ alpha.29.12.0 (AUD-159).
 What a provider can observe is the same as for the wallet's own requests:
 each block goes to a random provider on its own circuit, and each external
 download owes decoys exactly like a wallet request (AUD-134 is superseded).
-It queues up to 64 blocks per history response and downloads them with
+It queues up to 256 blocks per history response in block mode (on-demand
+only in per-txid mode; `prefetch_history_blocks` overrides, 0..4096) and
+downloads them with
 every download slot but one (it never takes the last free slot), so a wallet request is never queued
 behind it. Blocks whose transactions are already in the transaction cache are
 not downloaded, so a wallet that loaded once costs nothing on reconnect. Set

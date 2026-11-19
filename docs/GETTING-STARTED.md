@@ -61,15 +61,10 @@ Expected:
 ## 4. Automated suite
 
 ```bash
-tests/e2e/e2e_launch_core.sh
-tests/e2e/e2e_wait_core.sh
-tests/e2e/e2e_pruned_ibd.sh
-tests/e2e/e2e_regtest.sh
-tests/e2e/e2e_resilience.sh
-tests/e2e/e2e_external_pruned.sh
+tests/run-e2e.sh    # every regtest suite, one build; `tests/run-e2e.sh <suite>...` for a subset
 ```
 
-Or:
+Details and prerequisites in [`TESTS.md`](TESTS.md). Or:
 
 ```bash
 bash scripts/e-lite-all-in-one.sh --network regtest --suite --with-core --yes

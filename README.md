@@ -6,10 +6,12 @@ the authority for consensus and the active chain; e-lite never invents data.
 
 > **Status: `v0.1.0-alpha.29.26.3` — experimental, no funds.**
 > Test on regtest/signet/testnet4 before mainnet.
-> Electrum is plain TCP on loopback by default. Optional TLS is available on a
-> separate listener; e-lite also runs its own Tor and publishes an onion service
-> by default. There is no client authentication: treat the onion address as a
-> secret and use a firewall/VPN/access policy where needed.
+> Electrum TLS is on by default on a separate listener bound to all
+> interfaces; the plain listener binds loopback unless `plain_lan` or an
+> explicit `listen` says otherwise. e-lite also runs its own Tor and publishes
+> an onion service by default. There is no client authentication: TLS encrypts
+> the transport but does not authenticate; treat the onion address as a secret
+> and restrict access with a firewall/VPN/access policy.
 
 ## Install or update (one line)
 
@@ -95,11 +97,14 @@ The map is [`docs/README.md`](docs/README.md). The usual entry points:
 
 ## Security notes
 
-- Electrum listens on `0.0.0.0:55022` (TLS) and, on this host only,
-  `127.0.0.1:55011` (plain) by default for mainnet; `[server] plain_lan = true`
-  offers plain on the LAN too. TLS encrypts the connection but there is **no client
-  authentication**: restrict access with a firewall, SSH/VPN tunnel or Tor. If
-  you only want local access, set `[server] listen = "127.0.0.1:55011"` (the TLS
+- Electrum TLS is on by default and binds `0.0.0.0:55022` (mainnet; `55122`
+  testnet4, `55222` signet, `55322` regtest); the plain listener stays on
+  `127.0.0.1:55011` on this host only. `[server] plain_lan = true` offers plain
+  on the LAN too. TLS encrypts the connection but there is **no client
+  authentication**: restrict access with a firewall, SSH/VPN tunnel or Tor.
+  Disabling TLS (`tls = false` or `--no-tls`) without an explicit `listen`
+  also moves the plain listener to `0.0.0.0`; set
+  `[server] listen = "127.0.0.1:55011"` for local-only access (the TLS
   listener follows the same host). Each network has its own ports, so several
   instances can run side by side.
 - Core RPC is HTTP. LAN/WAN use requires SSH/VPN; never expose the RPC port.
@@ -118,10 +123,7 @@ cargo fmt --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 scripts/check-docs.sh
-tests/e2e/e2e_defaults.sh
-tests/e2e/e2e_launch_core.sh
-tests/e2e/e2e_pruned_ibd.sh
-tests/e2e/e2e_regtest.sh
+tests/run-e2e.sh    # every regtest suite in one build; `tests/run-e2e.sh <suite>...` for a subset
 ```
 
 See [`docs/TESTS.md`](docs/TESTS.md) for every suite and
