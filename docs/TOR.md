@@ -10,7 +10,7 @@ connect without opening a port, port-forwarding or using clearnet. Tor is
 On `e-lite run` or `e-lite serve` with the default configuration:
 
 - a v3 onion address, e.g. `abcdef...xyz.onion`;
-- plain Electrum on the network plain port (`50011`-style defaults below);
+- plain Electrum on the network plain port (`55011`-style defaults below);
 - TLS Electrum on the network TLS port (generated local CA + leaf by default);
 - the same Tor SOCKS proxy used for external rawtx/repair requests.
 
@@ -90,7 +90,8 @@ Tor Project; e-lite does not redistribute the binary in its release assets.
 mode = "managed"             # managed | off
 plain = true                 # publish the network plain port
 tls = true                   # publish the network TLS port
-tls_auto_cert = true         # deprecated: use [server] tls_auto_cert
+tls_auto_cert = true         # AND with [server] tls_auto_cert: either one false
+                             # disables generating the local CA/leaf pair
 onion_port = 0               # 0 = same as server.listen
 onion_tls_port = 0           # 0 = same as server.tls_listen
 socks_port = 0               # 0 = per-network (9050 mainnet, 55150/55250/55350),

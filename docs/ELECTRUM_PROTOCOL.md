@@ -92,7 +92,7 @@ opt-in error until a BIP352 indexer is wired; it is not advertised as available.
 | Max clients | 32 (configurable) |
 | Rate limit | 200 req/s, burst 5000, soft wait (never an error) |
 | Request line limit | 1 MiB |
-| Client idle timeout | 600 s |
+| Client idle timeout | 600 s; a loopback peer (a local wallet or the managed onion, whose traffic arrives from the Tor process) gets 1800 s idle and 120 s write timeouts |
 | TLS handshake timeout | 10 s |
 
 ## Deliberate deviations
@@ -105,8 +105,10 @@ opt-in error until a BIP352 indexer is wired; it is not advertised as available.
   used as a fallback because some wallets treat `-1` as a send failure.
 - **JSON-RPC batches** are answered in order with one array (max
   `MAX_BATCH_REQUESTS` = 1000 items; empty or larger batches get `-32600`;
-  notifications inside get no entry). Items run on up to 8 threads unless the
-  batch contains `server.version` or an unsubscribe. Sparrow upgrades to
+  notifications inside get no entry). Items run on up to 8 threads; a batch
+  that contains `transaction.get` uses up to 32 so a slow download does not
+  hold the rest. A batch with `server.version` or an unsubscribe runs ordered
+  on one thread. Sparrow upgrades to
   batches only for servers it recognises by the `server.version` name
   (ElectrumX, electrs >= 0.9, Fulcrum >= 1.6, mempool-electrs, Frigate,
   Cormorant), so by default it sends one request per line to e-lite. With

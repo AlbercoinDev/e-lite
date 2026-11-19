@@ -217,7 +217,9 @@ Each rule names where the detail is. Read it before touching that area.
   configuration are never copied (AUD-126).
 - Import needs an empty target, validates in a staging directory and renames
   only when every check passed (AUD-141). An archive containing secrets or
-  configuration is refused, not silently skipped (AUD-167).
+  configuration is refused, not silently skipped (AUD-167). `--verify=full` is
+  a separate post-restore check: it runs the Core `verifychain` after the
+  rename and cannot roll the target back.
 - Cover: `tests/e2e/e2e_snapshot.sh`.
 
 ## Quality gates

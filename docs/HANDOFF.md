@@ -45,8 +45,12 @@ no repitas contexto ni rehagas decisiones ya documentadas.
   or the index drains.
 - **Snapshots are optional**, never required by the from-zero flow.
   `export-snapshot` is per network (manifest format 3, digest, optional
-  `--with-core` allowlist); `import-snapshot` is atomic, refuses secrets and
-  validates network/genesis/schema/tip/digest plus `--verify[=full]`.
+  `--with-core` allowlist); `import-snapshot` stages the extraction and
+  renames it only after the archive, index and manifest checks pass (network,
+  genesis, schema, tip, digest, optional `--expect-digest`). `--verify=full`
+  runs the bounded `verifychain` on the restored Core *after* that rename, so
+  a failure there leaves the directory in place and must not be read as a
+  validated restore.
 - **Listeners**: plain/TLS/metrics are `55011/55022/55084` (mainnet),
   `55111/55122/55184` (testnet4), `55211/55222/55284` (signet),
   `55311/55322/55384` (regtest). TLS is on by default with a generated local

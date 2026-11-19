@@ -47,9 +47,12 @@ export-identity  write the TLS identity (CA + leaf), the onion keys, decoy.key
 import-identity  restore them from --input; files that differ are kept unless
                  --yes; on a host with no config yet the archived config.toml
                  says where the data dir is (--data-dir still wins)
-import-snapshot  restore --input into an empty target (atomic: staged, then renamed)
-                 (--verify checks per-file hashes; --verify=full opens the
-                 restored Core and runs a bounded verifychain;
+import-snapshot  restore --input into an empty target (staged, then renamed
+                 after the archive/index/manifest checks pass)
+                 (the recorded per-file hashes are always checked; --verify=full
+                 then starts the restored Core and runs a bounded verifychain on
+                 the target that is already in place -- a failure there does not
+                 roll the restore back;
                  --expect-digest <hex> refuses an archive that is not yours)
 version          print version
 ```
@@ -77,7 +80,7 @@ ends the command quietly by SIGPIPE (shell status 141). `run`, `serve` and
 | `--output <path>` | file written by `export-snapshot` / `export-identity` |
 | `--input <path>` | file read by `import-snapshot` / `import-identity` |
 | `--with-core`, `--no-hash-files`, `--compress-level <n>` | export-snapshot: bundle the Core chain data (`blocks/`, `chainstate/`, `indexes/` only; never wallets, keys or `bitcoin.conf`), with a SHA-256 per file unless `--no-hash-files` (gzip: index 0, Core 3; the flag sets both) |
-| `--verify [basic\|full]` | import-snapshot: per-file hash check, or open the restored Core and `verifychain` |
+| `--verify [basic\|full]` | import-snapshot: recorded per-file sizes/hashes are always checked; `full` additionally starts the restored Core and runs `verifychain`. That full check runs after the restore has been renamed into place, so a failure does not roll it back |
 | `--expect-digest <hex>` | import-snapshot: refuse unless the recomputed index digest equals the `logical_snapshot_hash` printed by your export |
 | `--yes`, `-y` | onion reset / cache clear: do not ask for confirmation (required by `cache clear`) |
 | `--dry-run` | cache clear: report what would be removed and delete nothing |
@@ -270,19 +273,23 @@ e-lite run --network mainnet --allow-mainnet \
 | `--set server.tls_cert=<path>`, `--set server.tls_key=<path>` | `server.tls_cert`, `server.tls_key` | auto-generated local CA + leaf |
 | `--set server.tls_auto_cert=false` | `server.tls_auto_cert` | `true` |
 
-### Wallet request budgets (alpha.29.20.0)
+### Wallet request budgets
 
-- A per-txid session gets **3 s**; a provider that misses it is replaced.
-- The per-txid path gets **6 s** per transaction (two session attempts). A
-  pruned `transaction.get` joins a block download already in flight instead of
-  spending the txid budget; no block is downloaded while the txid budget lasts.
-- A wallet request gets **45 s** total: the per-txid path two 3 s session
-  attempts (6 s) in `auto` and `tx`, and the block a queue of ~25 s plus 20 s
-  of network once it has a slot. A 1.9 MB block takes ~3.2 s over Tor at
-  581 KiB/s; under 16 concurrent downloads it needs more, hence 20 s.
+- A per-txid **round** asks up to 3 servers; a provider that misses
+  `txid_attempt_seconds` (3 s) is replaced. If the round fails and the wallet
+  still has time, up to 3 rounds run two seconds apart (up to nine servers).
+- `auto` gives the per-txid path a head start of twice `txid_attempt_seconds`
+  (6 s) before starting a block, and only while enough distinct operators
+  qualify; `txid_race = true` shortens that to 2.5 s. A block download already
+  in flight for the same block is joined immediately, and if the txid routes
+  do not qualify the block starts at once.
+- A wallet request gets **45 s** total (`wallet_deadline_seconds`, queue plus
+  network). The block gets up to 20 s of network once it has a slot; a failed
+  block is remembered for 10 s and retried inside the deadline. Waiters on the
+  same transaction or block share one job, each with its own deadline, and the
+  first verified answer wins.
 - The batch size per server is **adaptive**: 50 by default and halved (down to
-  2) when a provider closes the connection. Measured:
-  `electrum.blockstream.info` accepts 20 txids and closes above that.
+  2) when a provider closes the connection.
 - Decoy wallets use a quarter of the session slots; real sessions go first.
 
 ## Listener defaults per network
@@ -301,8 +308,13 @@ By default TLS binds `0.0.0.0` and the plain listener `127.0.0.1` (wallets on
 this host and the onion service). `--plain-lan` / `[server] plain_lan = true`
 puts plain on `0.0.0.0` too. An explicit `listen` is used as given and the TLS
 listener then copies its host, so `[server] listen = "127.0.0.1:55011"` keeps
-TLS on loopback. `--listen`,
+TLS on loopback. With TLS disabled (`tls = false`/`--no-tls`) and no explicit
+`listen`, plain binds `0.0.0.0`; set both if you want a local-only plain
+service. `--listen`,
 `--tls-listen` and `--metrics` override the ports.
+
+Neither TLS nor Tor authenticates the wallet: the rate limiter is a throttle,
+not access control. Restrict access with a firewall, SSH/VPN or the onion.
 
 The default data directory only applies to new installs. An existing
 `~/.local/share/e-lite/<network>` is still used until it is moved. A single

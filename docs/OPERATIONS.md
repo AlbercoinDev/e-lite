@@ -23,8 +23,10 @@ e-lite run --network signet --prune-mib 1
 - Stop with Ctrl+C/SIGTERM. With `stop_on_exit=true`, a Core started by e-lite is
   stopped too.
 
-Disk guidance: signet ≥15 GiB free for a from-zero test, testnet4 ≥20 GiB.
-Use `[pruning] min_free_gib` and a separate index disk for production.
+Disk guidance: the acceptance harness needs ≥15 GiB on signet and ≥20 GiB on
+testnet4 for a from-zero **test**; those are test thresholds, not a capacity
+guarantee. A mainnet index is ~260 GiB before Core's own datadir. Use
+`[pruning] min_free_gib` and a separate index disk for production.
 
 ## Modes
 
@@ -201,8 +203,9 @@ TLS is **on by default** on a separate listener. Without operator PEMs e-lite
 generates a local CA and a leaf in `<data-dir>/tls/`; wallets trust **`ca.crt`**.
 The identity, the SANs, Java wallets and verification are explained in
 [`TOR.md`](TOR.md#tls-certificate-and-wallet-trust). Disable TLS with
-`tls = false` or `--no-tls`. This section covers the listeners and an
-operator-managed certificate.
+`tls = false` or `--no-tls`; without an explicit `listen`, plain then binds
+`0.0.0.0`, so set `listen = "127.0.0.1:<port>"` too if the service must stay
+local. This section covers the listeners and an operator-managed certificate.
 
 ```toml
 [server]
@@ -365,12 +368,15 @@ contents is kept unless you pass `--yes`.
   detects corruption, while `--expect-digest` also detects an archive that
   was replaced or tampered with. Only restore snapshots you made yourself.
 - The import extracts into a hidden `.<name>.import-partial` directory next
-  to the target and renames it into place only after every check passed, so
-  a failed or interrupted import leaves the target untouched; the next
-  import removes the leftover.
-- `--verify` checks the per-file sizes/hashes; `--verify=full` opens the
-  restored Core isolated (`-connect=0 -listen=0`), checks both tips and runs
-  a bounded `verifychain(2, 288)` before e-lite is started again.
+  to the target and renames it into place only after the archive, index and
+  manifest checks passed, so a failed or interrupted import leaves the target
+  untouched; the next import removes the leftover.
+- The import always checks the recorded per-file sizes/hashes. `--verify`
+  only states it; `--verify=full` runs **after** the rename: it starts the
+  restored Core isolated (`-connect=0 -listen=0`), checks both tips and runs a
+  bounded `verifychain(2, 288)`. A failure there reports an error but the
+  restored directory stays in place; treat it as unverified and do not start
+  serving from it.
 - Run the command once per network: `mainnet`, `testnet4` and `signet` each
   produce their own archive with their own manifest identity checks.
 - A restored instance starts with a new onion address (`tor/` is excluded)
@@ -560,18 +566,17 @@ row count with a public explorer for the same address. A script that is
 empty there but has rows here points at the index, not at the wallet
 (AUD-198).
 
-### A cold run for measurements
+### A first-load measurement (disposable instance only)
 
 `get_history` has no cache (it is computed from the index every time); what can
-hide the cost of a first load is the on-disk transaction cache. To measure the
-first load of a wallet honestly:
+hide the cost of a first load is the on-disk transaction cache. Measure on a
+disposable instance or a separate test cache, never by clearing the cache of a
+live production node:
 
 ```bash
-# stop the network first
 e-lite cache status --network mainnet
-e-lite cache clear  --network mainnet --yes
-# optional: also drop the OS page cache (root) for a colder disk
-# then start and restore the wallet from the xpub
+e-lite cache clear  --network mainnet --yes   # disposable node only
+# then restart and restore the wallet from the xpub
 ```
 
 Restarting e-lite also releases the in-memory block cache; clearing the disk

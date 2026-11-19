@@ -11,8 +11,9 @@ Core datadirs are never touched by an install or update.
 2. Add a `CHANGELOG.md` entry at the top, with the same version and date.
    Describe behaviour changes, defaults and upgrade notes; no unexplained
    internal detail.
-3. Update `docs/HANDOFF.md`: latest release, tag link, "Last change" and, when
-   a decision or default changed, the binding decisions/risks sections.
+3. Update `docs/HANDOFF.md`: latest release, tag link, a "Recent releases"
+   entry and, when a decision or default changed, the pending-measurements,
+   binding-decisions and risks sections.
 4. Update `docs/FEATURES.md` for anything users can now do, and
    `docs/ROADMAP.md` for anything that moved out of the future list.
 5. If a default changed, say it in the changelog and in `README`/`INSTALL`
@@ -28,9 +29,10 @@ scripts/check-docs.sh
 shellcheck install.sh scripts/*.sh tests/*.sh tests/lib/*.sh tests/e2e/*.sh tests/bench/*.sh tests/manual/*.sh
 ```
 
-Plus the e2e suites relevant to the change; before a release at least
-`tests/e2e/e2e_defaults.sh`, `e2e_regtest.sh` and `e2e_snapshot.sh`. Never tag
-with a red gate or an untested default change.
+Plus the e2e suites relevant to the change; before a release run
+`tests/run-e2e.sh` (every regtest suite) and `tests/run-e2e.sh --release
+launch_core regtest` against the binary that will be published. Never tag with
+a red gate or an untested default change.
 
 ## 3. Commit and tag
 

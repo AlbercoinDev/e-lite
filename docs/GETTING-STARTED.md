@@ -18,8 +18,10 @@ e-lite --version
 
 - Debian 12+/LMDE 6+, x86_64, Core 28+.
 - `python3` for query/report scripts.
-- Free disk: regtest <1 GiB; signet ≥15 GiB; testnet4 ≥20 GiB for a full
-  from-zero test.
+- Free disk: regtest <1 GiB. For a from-zero **test**, signet ≥15 GiB and
+  testnet4 ≥20 GiB; these are the acceptance harness minimums, not a capacity
+  guarantee. Size a mainnet node from the index (~260 GiB) plus Core's own
+  datadir; see [`TUNING.md`](TUNING.md).
 - For a pruned from-zero IBD: local Core owned by e-lite and read access to its
   `blocks/` directory.
 
@@ -54,7 +56,8 @@ Expected:
   (plain) for mainnet;
   signet uses `55211`/`55222`; metrics at `127.0.0.1:55084` (`55284` signet).
 - TLS is enabled by default on the network TLS port with a generated
-  certificate signed by a local CA (`tls/ca.crt`); `--no-tls` disables it. Operator PEMs:
+  certificate signed by a local CA (`tls/ca.crt`); `--no-tls` disables it
+  (with no explicit `listen`, plain then binds `0.0.0.0`). Operator PEMs:
   `--tls-listen`, `[server] tls_cert`/`tls_key` (see
   [`OPERATIONS.md`](OPERATIONS.md#electrum-tls)).
 
@@ -113,7 +116,11 @@ data dir/network require restart.
 - [ ] `<data-dir>/e-lite.log` contains the same lines as the console (start/stop, progress, milestones).
 - [ ] `READY`/`FULLY SYNCED` appears in the log/status and `server.banner` shows INDEXING then READY.
 - [ ] Custom `banner_file` is created if missing and its placeholders are substituted.
-- [ ] Prune gate advances in 1k-safe-block steps; free-space deferral is off by default.
+- [ ] Prune gate advances every 5,000 safe blocks (`min_gain_blocks`) and
+  keeps a 20 GiB free-space margin while Core downloads or the index drains;
+  once caught up it prunes to the safe maximum and then every
+  `min_gain_live_blocks` (144). Emergency pruning still happens below the
+  low-disk floor.
 - [ ] `--set index.profile=hdd|ssd|nvme|manual` and other `--set` keys work without a config file.
 - [ ] Raw tx works from Core/cache; pruned fallback is explicit if unavailable.
 - [ ] Disk-low pauses downloads; indexing continues until the critical floor.

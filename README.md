@@ -51,8 +51,9 @@ certificate signed by it in `<data-dir>/tls/`, and prints both fingerprints.
 Import **`ca.crt`** into the wallet trust store (Java/Sparrow rejects a
 self-signed server certificate as a trust anchor). Alternatively configure
 `[server] tls_cert`/`tls_key` with a public-CA certificate.
-`tls = false` (or `--no-tls`) disables TLS. `e-lite run`/`serve` also start a
-managed Tor and show an onion address:
+`tls = false` (or `--no-tls`) disables TLS; without an explicit `listen`, plain
+then binds `0.0.0.0` as well (see Security notes). `e-lite run`/`serve` also
+start a managed Tor and show an onion address:
 
 ```
 [e-lite] Tor onion: <addr>.onion:55011 (plain), :55022 (tls)

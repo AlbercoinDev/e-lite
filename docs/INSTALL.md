@@ -18,8 +18,11 @@ a `.deb`, and an installer/updater script. The installer never edits
   value, but a low limit makes prevout reads re-open SSTs.
 - `curl` and `ca-certificates` for the installer.
 - Bitcoin Core 28+ for indexing/serving. `txindex` is not required.
-- The e-lite index directory on a filesystem with enough free space:
-  signet usually needs ≥15 GiB free for a from-zero test; testnet4 ≥20 GiB.
+- The e-lite index directory on a filesystem with enough free space. For a
+  from-zero **test**, the acceptance harness requires ≥15 GiB on signet and
+  ≥20 GiB on testnet4; those are test thresholds, not a capacity guarantee.
+  Size a mainnet node from the index (~260 GiB) plus Core's datadir; see
+  [`TUNING.md`](TUNING.md).
 - For a from-zero pruned IBD: e-lite and Core on the same host, e-lite owning
   the Core process, and read access to Core's `blocks/` directory (including
   `xor.dat`).
@@ -42,12 +45,16 @@ The installer:
 
 1. downloads the latest release tarball or `.deb`;
 2. verifies it against the release `SHA256SUMS`;
-3. atomically replaces the binary;
+3. atomically replaces the binary (a user install writes a temporary
+   `.e-lite.new` next to the target and renames it; `--system` installs the
+   `.deb` with `dpkg`, which places the system binary and does not touch a
+   per-user install in `~/.local/bin`);
 4. downloads the official Tor expert bundle (pinned version, SHA-256 verified)
    to `<prefix>/lib/e-lite/tor`; `--without-tor` skips it. If the download fails
    or `tor` is already in `PATH`, Tor still works through the system binary;
 5. optionally installs/updates the latest official Bitcoin Core from
-   bitcoincore.org, verifying its published checksums;
+   bitcoincore.org, verifying its published checksums; a failed download or
+   checksum leaves Core as it is (the installer warns and continues);
 6. leaves configuration, index data and Core's datadir untouched.
 
 The Tor bundle is GPLv3 and is downloaded directly from the Tor Project; it is
@@ -91,6 +98,10 @@ curl -fLO https://github.com/AlbercoinDev/e-lite/releases/latest/download/e-lite
 sudo dpkg -i e-lite_amd64.deb
 ```
 
+`--system` requires root and replaces the system package; it does not update a
+per-user install under `~/.local/bin`. Either path leaves configuration, index
+and Core's datadir untouched.
+
 ## Only e-lite, use an existing Core
 
 ```bash
@@ -132,6 +143,11 @@ store (Sparrow/Java rejects a non-CA certificate as a trust anchor). Use `[serve
 tls_cert = "/etc/e-lite/tls/fullchain.pem"
 tls_key = "/etc/e-lite/tls/privkey.pem"
 ```
+
+Disabling TLS alone does not keep the service local: with `tls = false` and no
+explicit `[server] listen`, the plain listener moves to `0.0.0.0`. Set
+`listen = "127.0.0.1:55011"` as well to stay on loopback. TLS encrypts the
+transport but does not authenticate the wallet.
 
 The certificate must match the name the wallet uses (not a private IP). See
 [`OPERATIONS.md`](OPERATIONS.md#electrum-tls) for trust, Let's Encrypt reuse,

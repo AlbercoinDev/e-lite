@@ -459,6 +459,11 @@ commit/blk in the same phase before changing it back.
 
 ### Measured on a real mainnet IBD with defaults (2026-11-08)
 
+These two sections are reference points from those hosts and dates, not
+promises for the current build. Use them to read the shape of a run, and
+measure again with `tests/bench/bench_ibd.sh` after changing prefetch, cache
+or commit settings.
+
 At ~640k height on a 32 GiB machine, default settings:
 
 | Signal | Observation |

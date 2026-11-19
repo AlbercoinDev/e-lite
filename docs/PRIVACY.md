@@ -35,12 +35,14 @@ built from the local index and spread over several servers:
 
 ```text
 tx cache -> Core local block -> per-txid (Electrum batch / Esplora /tx, with
-decoy wallets, verified against the index) -> whole block by hash (fallback)
+decoy wallets, verified against the index) -> whole block by hash (fallback:
+joined when already downloading, started after the txid head start)
 ```
 
 A server learns the txids it is asked for, never the wallet's scripts,
-addresses, xpub or IP; it sees `k + 1` plausible wallets loading at once
-(`decoys.wallets`, default 3). Every loose transaction is checked before use:
+addresses, xpub or IP; it sees `k + 1` plausible loads at once
+(`decoys.wallets`, default 3), which reduces but does not remove the chance
+of attribution. Every loose transaction is checked before use:
 its txid, its position in the indexed block and its merkle branch up to the
 indexed header. That proof does **not** authenticate a standalone SegWit
 witness. To use only whole-block verification for historical external
@@ -98,9 +100,11 @@ on the mode: the default `balanced` preset asks for loose transactions by txid
 and `spk_hint` never leave the node. Clearnet entries must be `https://`; plain
 `http://` is accepted only for `.onion` hosts and still requires Tor.
 
-P2P peers are discovered from Core's address manager (`getnodeaddresses`) or set
-explicitly with `p2p_peers`. Only peers advertising full `NODE_NETWORK` service
-are used for historical blocks; pruned/limited peers are rejected.
+P2P peers come from Core's current outbound connections first, then from its
+address manager (`getnodeaddresses`), or are set explicitly with `p2p_peers`;
+inbound peers are skipped. Only peers advertising full `NODE_NETWORK` **and**
+`NODE_WITNESS` are used for historical blocks, onion peers first; pruned or
+limited peers are rejected.
 
 `[rawtx] esplora_urls` remains a one-off override (CLI/`--set` or config); if it
 is non-empty, it replaces the file for that run:
@@ -349,6 +353,11 @@ and should be restricted to loopback/self-hosted use.
 - If a pruned block cannot be obtained from any configured source, raw
   `transaction.get` fails with an explicit `rawtx unavailable` error. History,
   balances and UTXOs still work from the index.
+- A confirmed transaction whose external recovery only meets temporary
+  failures closes the Electrum connection at its deadline so the wallet
+  retries, instead of returning a per-item RPC error that Sparrow would
+  remember as a missing transaction. A permanent failure (not found, no source
+  configured) still gets an explicit RPC error.
 - External providers can be unavailable, rate-limited or blocked. Configure
   multiple `esplora_urls`/`p2p_peers` or use a full node if this matters.
 - Electrum serves TLS on a separate listener by default (`[server] tls_listen`)

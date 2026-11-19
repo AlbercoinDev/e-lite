@@ -29,14 +29,13 @@ Requests that do leave the node:
 | What is requested | loose transactions by txid | whole blocks by hash |
 | Sources | public Electrum servers (one JSON-RPC batch per short session) and Esplora `/tx/:txid/raw` | Esplora `/block/:hash/raw` and Bitcoin P2P peers |
 | Bytes per transaction | ~0.3-3 KB | ~1.5 MB per block |
-| A deep wallet cold over Tor (owner's wallet: 239 transactions in ~144 pruned blocks) | tens of seconds | ~3.5 minutes |
+| A deep wallet cold over Tor | seconds to tens of seconds | minutes (whole blocks) |
 | What a server learns | the txids it is asked for | the block hashes it is asked for |
-| Fallback | whole blocks, when every per-txid server failed | none |
+| Fallback | whole blocks run beside the txid path (joined if already downloading, otherwise started after the txid head start); the first verified answer wins | none |
 
-Measured over Tor on 2026-11-14 with the code of 29.15.0 and real mainnet
-blocks: 480 transactions in **33 s**, and 907 transactions (the owner's
-wallet plus three decoy wallets) in **50.6 s**, against ~3.5 minutes for the
-owner's load in `block` mode.
+The recovery path was rebuilt in 29.26.x (shared jobs, route qualification and
+the Tor stream governor), so older timings do not predict a current load.
+Measure `debug:` lines and `/status.rawtx` on your own node instead.
 
 ## Why decoys must be wallets, not random transactions
 
@@ -79,8 +78,11 @@ e-lite therefore loads **decoy wallets**:
 5. **Verified, never served.** Decoy transactions are only parsed for their
    outputs. They are never cached and never answered to a wallet.
 
-What a server sees: `k + 1` plausible wallets loading at once. Without other
-information, its chance of picking yours is `1 / (k + 1)`.
+What a server sees: `k + 1` plausible wallets loading at once, which reduces
+but does not remove the chance of attribution. The `1 / (k + 1)` figure holds
+only in the ideal case where the decoys are indistinguishable and the server
+has no other information; timing, repeated loads, traffic patterns or any
+external knowledge break that assumption.
 
 What this does **not** protect against: an adversary who already knows
 something else about you (for example, the moment you broadcast a
@@ -129,10 +131,12 @@ Notes:
   saturation or a disappearing provider can still reduce effective cover.
 - Wallet traffic is sent only to routes that recently passed a fast, public
   probe of the same operation. Eligibility is per route and transport;
-  the spread is by operator (including known aliases). If too few operators
-  are eligible, use qualified whole-block routes rather than reveal more of
-  the wallet to a smaller set. Public probes do not use wallet txids or
-  change the decoy selection.
+  the spread is by operator (including known aliases). If fewer distinct
+  operators qualify than `min_servers` or `ceil(1 / max_share)`, the txid path
+  sends nothing: a qualified whole-block route can still answer, otherwise the
+  pruned transaction stays unavailable until a route qualifies. The configured
+  minimum is never lowered to keep using the cheap path. Public probes do not
+  use wallet txids or change the decoy selection.
 - A ready batch and a queued whole-block download take turns at a freed Tor
   stream (AUD-201): a block backlog cannot hold the cheap path, and a stream
   of batches cannot hold the fallback. Both still fit in `rawtx.tor_streams`;
@@ -152,8 +156,8 @@ Notes:
 - **Maximum privacy:** `preset = "max"`. No txid ever leaves the node; decoy
   blocks follow every block download. Slow over Tor for a deep wallet.
 - **More hiding, same speed class:** `[decoys] wallets = 5`. Five decoy
-  wallets: the chance of picking yours drops to 1/6; requests grow about 1.5x
-  over the default.
+  wallets: the ideal-case attribution chance drops to 1/6; requests grow about
+  1.5x over the default.
 - **Slow or busy Tor:** `[sessions] size = 40` and `parallel = 12`: fewer
   circuits to build, each one carries more.
 - **Few servers:** add servers to `public-servers.toml` (`electrum = [...]`,

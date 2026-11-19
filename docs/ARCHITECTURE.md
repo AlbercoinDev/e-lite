@@ -24,7 +24,9 @@ e-lite indexer  --->  RocksDB index (history, UTXO, txids, blocks, undo)
 
 The plain and TLS Electrum listeners share the same JSON-RPC dispatcher. TLS
 wraps each accepted socket with rustls; the certificate/key PEM files are
-reloaded when they change on disk. There is no client authentication.
+reloaded when they change on disk. TLS is on by default and binds every
+interface while plain stays on loopback; with `tls = false` and no explicit
+`listen`, plain takes `0.0.0.0`. Neither listener authenticates the client.
 
 ## Source layout
 
