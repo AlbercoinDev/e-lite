@@ -168,6 +168,33 @@ fn scripthash_param_is_reversed() {
 }
 
 #[test]
+fn default_banner_layout() {
+    let (indexing, ready) = split_banner(DEFAULT_BANNER_TEMPLATE);
+    let indexing = indexing.expect("indexing section");
+    let ready = ready.expect("ready section");
+    // A wallet prints its own "Server Banner: " before the first byte, so both
+    // sections start with a blank line to keep the layout readable.
+    assert!(indexing.starts_with('\n'), "{indexing:?}");
+    assert!(ready.starts_with('\n'), "{ready:?}");
+    // Version, state and network each get their own line.
+    assert!(indexing.contains("\ne-lite {version}\n{state} · {network}\n"));
+    assert!(indexing.contains("\nBe patient my friend...\n"));
+    // The READY box is 50 columns wide and nothing exceeds it before
+    // substituting {listen}/{tls} (a loopback address fits; a long custom
+    // listen may not).
+    assert!(ready.contains("\n   e-lite (Electrum-Lite)\n   {state} · {network}\n"));
+    let separator = ready
+        .lines()
+        .find(|line| line.starts_with('='))
+        .expect("separator");
+    assert_eq!(separator.len(), 50);
+    assert_eq!(ready.matches(separator).count(), 2, "open and close box");
+    for line in ready.lines().filter(|line| !line.trim().is_empty()) {
+        assert!(line.chars().count() <= 50, "{line:?} is wider than the box");
+    }
+}
+
+#[test]
 fn banner_sections_and_formatting() {
     let (indexing, ready) = split_banner("[indexing]\nINDEX {height}\n[ready]\nREADY {percent}\n");
     assert_eq!(indexing.as_deref(), Some("INDEX {height}\n"));

@@ -1,5 +1,18 @@
 # Changelog
 
+## Unreleased
+
+### Changed
+
+- Built-in wallet banner: the `READY`/`FULLY SYNCED` box is 50 columns wide,
+  the title is `e-lite (Electrum-Lite)` on its own line, and the fully-synced
+  note reads `Wallet ready to use. Enjoy and be careful.`
+- The `INDEXING` banner drops the box and lists `e-lite <version>`, the state
+  and the network on separate lines, ending with `Be patient my friend...`.
+- Both templates start with a blank line so a wallet that prints its own
+  `Server Banner: ` label keeps the alignment. `server.version`, batching and
+  custom `banner_file` templates are unchanged.
+
 ## 0.1.0-alpha.29.26.3 — 2026-11-19
 
 - Prefix every debug and trace event with its UTC date and time, to the second.

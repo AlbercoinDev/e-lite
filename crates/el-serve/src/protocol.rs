@@ -114,20 +114,25 @@ pub const DEFAULT_BANNER_TEMPLATE: &str = r#"# e-lite wallet banner template
 # Sections: [indexing] while the index catches up, [ready] when usable.
 
 [indexing]
-e-lite {version} · {network} · {state}
+
+e-lite {version}
+{state} · {network}
 {bar} {percent}
 height {height} / {headers} · Core {core_height} ({core_percent})
 lag {lag} · {blocks_per_sec} blk/s · ETA {eta}
 Electrum {listen}{tls}
 Some wallet queries may be unavailable until caught up.
+Be patient my friend...
 
 [ready]
-==============================================
-   e-lite  ·  {state}  ·  {network}
+
+==================================================
+   e-lite (Electrum-Lite)
+   {state} · {network}
    height {height} / {headers}  ({percent})
    Electrum {listen}{tls}
    {ready_note}
-==============================================
+==================================================
 "#;
 
 pub(crate) const BANNER_MAX_BYTES: u64 = 32 * 1024;
@@ -227,7 +232,7 @@ pub(crate) fn render_banner(template: &str, shared: &Shared, status: &SyncStatus
         "INDEXING"
     };
     let ready_note = if status.fully_synced {
-        "Fully synced. Wallet ready to use."
+        "Wallet ready to use. Enjoy and be careful."
     } else if status.offline {
         "Offline cached index; Core is unavailable."
     } else if status.core_ibd {

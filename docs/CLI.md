@@ -404,7 +404,25 @@ JSON contract (used by the Umbrel app):
 
 `server.banner` returns a dynamic banner. Built-in templates show `INDEXING`
 with height/percent/bar/ETA, or `READY`/`FULLY SYNCED` with the Electrum
-endpoints. Set `--set server.banner_file=<path>` (or `[server] banner_file`) to customize:
+endpoints. A wallet that prefixes its own label (Sparrow prints
+`Server Banner: `) gets a clean layout because both built-in templates start
+with a blank line:
+
+```text
+Server Banner:
+==================================================
+   e-lite (Electrum-Lite)
+   FULLY SYNCED · mainnet
+   height 976,591 / 976,591  (100.0%)
+   Electrum 0.0.0.0:55011 · SSL 0.0.0.0:55022
+   Wallet ready to use. Enjoy and be careful.
+==================================================
+```
+
+The `INDEXING` banner has no box; version, state and network are one per line
+and it ends with `Be patient my friend...`.
+
+Set `--set server.banner_file=<path>` (or `[server] banner_file`) to customize:
 
 - the file is created with the default template if it does not exist;
 - a relative path is resolved inside the network `data-dir`;
