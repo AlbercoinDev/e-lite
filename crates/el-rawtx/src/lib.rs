@@ -249,15 +249,9 @@ pub const EXTERNAL_QUEUE_MAX: Duration = Duration::from_secs(120);
 /// 50-tx batch takes 0.3-1.2 s; 8 s leaves room for two 3 s attempts and one
 /// switch. The old 60 s made a single slow provider hold the wallet.
 pub const WALLET_TX_BUDGET: Duration = Duration::from_secs(8);
-/// Total budget of a wallet block request (queue + network). A 1.9 MB block
-/// takes ~3.2 s over Tor (581 KiB/s measured) and a first load queues ~55 of
-/// them behind 16 slots, so the queue needs room; 20 s still beats the old
-/// 60 s network + 120 s queue and never returns a transient error for a
-/// confirmed transaction (AUD-045).
-pub const WALLET_BLOCK_BUDGET: Duration = Duration::from_secs(20);
 /// Network part of a wallet block request, once it holds a download slot.
-/// Eight seconds covers a 1.9 MB block on a slow circuit and leaves the race
-/// engine room to retry a recovering endpoint (MIN_ATTEMPT * 3).
+/// 20 s covers a 1.9 MB block on a slow circuit under concurrent downloads
+/// and leaves the race engine room to retry a recovering endpoint.
 pub const WALLET_BLOCK_NET: Duration = Duration::from_secs(20);
 /// Head start given to a block download already in flight before the per-txid
 /// path starts: both run concurrently and the first verified answer wins.

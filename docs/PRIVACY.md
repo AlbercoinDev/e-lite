@@ -103,8 +103,8 @@ and `spk_hint` never leave the node. Clearnet entries must be `https://`; plain
 P2P peers come from Core's current outbound connections first, then from its
 address manager (`getnodeaddresses`), or are set explicitly with `p2p_peers`;
 inbound peers are skipped. Only peers advertising full `NODE_NETWORK` **and**
-`NODE_WITNESS` are used for historical blocks, onion peers first; pruned or
-limited peers are rejected.
+`NODE_WITNESS` are used for historical blocks; onion peers are ordered first
+within each group, and pruned or limited peers are rejected.
 
 `[rawtx] esplora_urls` remains a one-off override (CLI/`--set` or config); if it
 is non-empty, it replaces the file for that run:
