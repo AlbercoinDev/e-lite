@@ -1,8 +1,6 @@
 # Changelog
 
-## Unreleased
-
-### Changed
+## 0.1.0-alpha.29.26.4 — 2026-11-19
 
 - Built-in wallet banner: the `READY`/`FULLY SYNCED` box is 50 columns wide,
   the title is `e-lite (Electrum-Lite)` on its own line, and the fully-synced
@@ -11,7 +9,8 @@
   and the network on separate lines, ending with `Be patient my friend...`.
 - Both templates start with a blank line so a wallet that prints its own
   `Server Banner: ` label keeps the alignment. `server.version`, batching and
-  custom `banner_file` templates are unchanged.
+  custom `banner_file` templates are unchanged. No restart of the index or
+  configuration change is needed; a wallet reconnecting sees the new banner.
 
 ## 0.1.0-alpha.29.26.3 — 2026-11-19
 

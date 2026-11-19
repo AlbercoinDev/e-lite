@@ -1,7 +1,7 @@
 # Session handoff
 
-**Updated:** 2026-11-19 (alpha.29.26.3: timestamp wallet diagnostics)
-**Release:** https://github.com/AlbercoinDev/e-lite/releases/tag/v0.1.0-alpha.29.26.3
+**Updated:** 2026-11-19 (alpha.29.26.4: wallet banner layout)
+**Release:** https://github.com/AlbercoinDev/e-lite/releases/tag/v0.1.0-alpha.29.26.4
 
 This is the short “where we are”. The invariants live in
 [`AGENTS.md`](../AGENTS.md); the
@@ -96,6 +96,11 @@ no repitas contexto ni rehagas decisiones ya documentadas.
 Per-release detail lives in [`CHANGELOG.md`](../CHANGELOG.md); these lines are
 only orientation for a new session.
 
+- **29.26.4** — built-in wallet banner restructured: 50-column READY box with
+  `e-lite (Electrum-Lite)` on its own line, a boxless INDEXING banner and the
+  closing `Wallet ready to use. Enjoy and be careful.` / `Be patient my
+  friend...`. Both start with a blank line so a wallet that prints
+  `Server Banner: ` keeps the alignment. No data or configuration change.
 - **29.26.3** — UTC timestamps on debug/trace plus richer wallet-recovery
   diagnostics (`conn=`, `wallet block:`, `index_miss` with Core's RPC code);
   no behaviour change. For the next cold Sparrow run, align the UTC timestamps
